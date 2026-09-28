@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 # 0.3.0 is the first release with job leases (`with_lease`, `job_lease_token`).
-camunda-orchestration-sdk = { version = "0.3", default-features = false, features = ["rustls"] }
+camunda-orchestration-sdk = { version = "0.3.1", default-features = false, features = ["rustls"] }
 anyhow = "1"
 # Raw job commands in the Nano engine's dialect (src/jobs.rs); same reqwest as the SDK.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
