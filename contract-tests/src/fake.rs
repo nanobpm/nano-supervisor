@@ -290,7 +290,7 @@ impl AcpClient {
                 // Notification from the agent.
                 (Some("session/update"), None) => self.on_update(&msg),
                 // Request from the agent (e.g. permission): answer it.
-                (Some(m), Some(rid)) => self.on_agent_request(m, rid.clone())?,
+                (Some(m), Some(rid)) => self.on_agent_request(m, rid.clone(), &msg)?,
                 _ => {}
             }
         }
@@ -310,13 +310,32 @@ impl AcpClient {
         }
     }
 
-    fn on_agent_request(&mut self, method: &str, id: Value) -> Result<(), AcpError> {
+    fn on_agent_request(&mut self, method: &str, id: Value, msg: &Value) -> Result<(), AcpError> {
         if method == "session/request_permission" {
             self.out.permissions_granted += 1;
-            // yolo: reply with a selected option (the worker's shape).
+            // Pick an allowed option actually offered by the request, mirroring
+            // the worker's `permission_choice`: prefer `allow_always`, then
+            // `allow_once`, then the first option. A hardcoded `"allow"` would
+            // be an invalid selection whenever the agent offers different ids.
+            let options = msg["params"]["options"].as_array();
+            let pick = |kind: &str| -> Option<String> {
+                options?.iter().find_map(|o| {
+                    (o["kind"].as_str() == Some(kind))
+                        .then(|| o["optionId"].as_str().map(str::to_string))
+                        .flatten()
+                })
+            };
+            let option_id = pick("allow_always")
+                .or_else(|| pick("allow_once"))
+                .or_else(|| {
+                    options
+                        .and_then(|o| o.first())
+                        .and_then(|o| o["optionId"].as_str().map(str::to_string))
+                })
+                .unwrap_or_else(|| "allow".to_string());
             let reply = json!({
                 "jsonrpc": "2.0", "id": id,
-                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } }
+                "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
             });
             self.send(&reply)
         } else {

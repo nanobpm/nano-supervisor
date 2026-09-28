@@ -1,6 +1,6 @@
 //! **Housekeeping**: the startup and periodic sweeps (`--reap-age`,
-//! `--reap-interval`), the disk-space check (`--min-free-mb`), `--clone-timeout`
-//! and `--keep-runs`. The worker reaps stale run directories on startup and on a
+//! `--reap-interval`), the disk-space check (`--min-free-mb`), and
+//! `--keep-runs`. The worker reaps stale run directories on startup and on a
 //! cadence, and refuses to start work when free disk is below the floor.
 
 use contract_tests::{require_engine_and_target, run_worker_job, skip, Skip};

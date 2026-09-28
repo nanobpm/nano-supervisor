@@ -186,5 +186,8 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .trim()
         .parse()
         .map_err(|_| format!("invalid duration {s:?} (use e.g. `30s`, `500ms`, or a ms count)"))?;
-    Ok(Duration::from_millis(n * mult))
+    let ms = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("duration {s:?} is too large (overflows milliseconds)"))?;
+    Ok(Duration::from_millis(ms))
 }

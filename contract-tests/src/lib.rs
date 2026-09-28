@@ -12,8 +12,8 @@
 //! another issue's tests depend on.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 pub mod bpmn;
 pub mod fake;
@@ -431,7 +431,7 @@ pub fn run_worker_job(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = cmd.output().expect("run worker");
+    let output = output_within(cmd, WORKER_TEST_TIMEOUT);
     JobOutcome {
         job_type,
         record_path,
@@ -439,6 +439,60 @@ pub fn run_worker_job(
         output,
         _home: home,
         _work: work,
+    }
+}
+
+/// Cap on how long a single worker subprocess may run in a contract test.
+/// The worker retries activation forever on errors and can also sit for its
+/// idle timeout, so a bad endpoint, auth failure, or missing activation would
+/// otherwise hang the whole CI run. Generous enough for a real single-job run.
+const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run `cmd` to completion, but kill it and panic if it outstays `timeout`,
+/// so a wedged worker fails the test fast instead of hanging CI forever.
+/// Drains stdout/stderr on reader threads to avoid pipe-buffer deadlocks.
+fn output_within(mut cmd: Command, timeout: Duration) -> Output {
+    use std::io::Read;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn worker");
+    let mut out = child.stdout.take().expect("worker stdout");
+    let mut err = child.stderr.take().expect("worker stderr");
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait worker") {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let status = child.wait().expect("wait killed worker");
+            let stdout = out_h.join().unwrap_or_default();
+            let stderr = err_h.join().unwrap_or_default();
+            panic!(
+                "worker did not finish within {timeout:?}; killed it. status={status:?}\n\
+                 --- stdout ---\n{}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    Output {
+        status,
+        stdout,
+        stderr,
     }
 }
 

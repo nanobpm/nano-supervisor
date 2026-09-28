@@ -5,9 +5,10 @@
 //! window. With a lease, every command carries the token, so a superseded
 //! worker gets 409 instead of silently settling someone else's activation.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -52,16 +53,24 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
         jobs.backend()
     ));
 
-    // Housekeeping: make sure the run root exists, sweep stale run dirs on
-    // startup, then keep sweeping on the configured cadence.
-    let _ = std::fs::create_dir_all(&opts.runs_dir);
-    sweep_runs(&opts);
+    // Housekeeping: make sure the run root exists before taking any work — a
+    // misconfigured/unwritable run root should fail loudly here, not silently
+    // burn a job's retries when its cwd can't be created. Then sweep stale run
+    // dirs on startup and keep sweeping on the configured cadence.
+    std::fs::create_dir_all(&opts.runs_dir)
+        .with_context(|| format!("creating run root {}", opts.runs_dir.display()))?;
+    // Paths of runs that are currently executing; the sweeper must never reap a
+    // live agent's cwd, even under `--keep-runs 0` or when another worker's runs
+    // push it out of the newest set.
+    let active: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+    sweep_runs(&opts, &active);
     if let Some(interval) = opts.reap_interval.filter(|d| !d.is_zero()) {
         let sweep_opts = opts.clone();
+        let sweep_active = active.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                sweep_runs(&sweep_opts);
+                sweep_runs(&sweep_opts, &sweep_active);
             }
         });
     }
@@ -114,14 +123,26 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
                     job.job.job_key.value()
                 );
             }
-            handle(&jobs, &opts, job).await;
+            handle(&jobs, &opts, &active, job).await;
             done += 1;
         }
     }
 }
 
-async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
+async fn handle(
+    jobs: &Jobs,
+    opts: &WorkerOptions,
+    active: &Arc<Mutex<HashSet<PathBuf>>>,
+    Job { job, lease }: Job,
+) {
     let key = job.job_key.value().to_string();
+    let cwd = opts.runs_dir.join(&key);
+    // Guard this run's cwd against the background sweeper for its whole lifetime.
+    active.lock().unwrap().insert(cwd.clone());
+    let _guard = ActiveGuard {
+        active: active.clone(),
+        path: cwd,
+    };
     let started = Instant::now();
     log(&format!(
         "job {key} activated (type {}, retries {}, lease {})",
@@ -276,15 +297,32 @@ fn free_mb(path: &std::path::Path) -> Option<u64> {
     Some(avail_kib / 1024)
 }
 
+/// Removes a run path from the active set when a job finishes (or its future is
+/// dropped/cancelled), so the sweeper stops protecting it.
+struct ActiveGuard {
+    active: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.active.lock() {
+            set.remove(&self.path);
+        }
+    }
+}
+
 /// Reap stale per-job run directories: remove immediate subdirectories of
 /// `runs_dir` older than `reap_age`, always keeping the `keep_runs` most recent
-/// (default 1). A no-op unless `reap_age` is set.
-fn sweep_runs(opts: &WorkerOptions) {
+/// (default 1). Never touches a directory currently backing a running job. A
+/// no-op unless `reap_age` is set.
+fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
     let Some(age) = opts.reap_age else {
         return;
     };
     let keep = opts.keep_runs.unwrap_or(1);
     let now = std::time::SystemTime::now();
+    let active: HashSet<PathBuf> = active.lock().map(|s| s.clone()).unwrap_or_default();
 
     let Ok(entries) = std::fs::read_dir(&opts.runs_dir) else {
         return;
@@ -302,6 +340,9 @@ fn sweep_runs(opts: &WorkerOptions) {
 
     let mut reaped = 0usize;
     for (path, modified) in dirs.into_iter().skip(keep) {
+        if active.contains(&path) {
+            continue;
+        }
         let stale = now
             .duration_since(modified)
             .map(|d| d >= age)
