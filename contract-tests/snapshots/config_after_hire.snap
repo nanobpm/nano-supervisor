@@ -5,22 +5,22 @@ expression: value
 {
   "hires": {
     "coder": {
+      "name": "coder",
+      "rank": "senior",
+      "command": "nano-coder",
       "args": [],
+      "model": "gpt5",
       "capabilities": [
         "feature",
         "pr-review"
       ],
-      "command": "nano-coder",
-      "createdAt": "[timestamp]",
-      "env": {},
-      "image": "",
-      "model": "gpt5",
-      "name": "coder",
-      "permission": "yolo",
-      "protocol": "acp",
-      "rank": "senior",
       "sandbox": "none",
-      "terminal": "pipe"
+      "image": "",
+      "terminal": "pipe",
+      "protocol": "acp",
+      "permission": "yolo",
+      "env": {},
+      "createdAt": "[timestamp]"
     }
   }
 }

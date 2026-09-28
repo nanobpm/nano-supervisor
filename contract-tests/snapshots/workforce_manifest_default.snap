@@ -3,12 +3,12 @@ source: contract-tests/tests/state.rs
 expression: value
 ---
 {
-  "name": "default",
   "version": 1,
+  "name": "default",
   "workers": [
     {
-      "instances": 2,
       "profile": "coder",
+      "instances": 2,
       "roles": "auto"
     }
   ]
