@@ -244,7 +244,7 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
             // pid to be recycled by an unrelated group — `group_alive` (a
             // `kill(-pgid, 0)` liveness check) ensures we only SIGKILL a group
             // that still genuinely holds this pgid.
-            if wait_parent_or_group_gone(parent_pid, pgid) && group_alive(pgid) {
+            if wait_parent_or_group_gone(parent_pid, pgid, None) && group_alive(pgid) {
                 sigkill_group(pgid);
             }
             return;
@@ -301,26 +301,58 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
 /// lifetime.
 #[cfg(target_os = "linux")]
 pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
+    // Capture the daemon's start time up front (it is still alive here) so the
+    // poll can tell the real parent apart from a later process that recycles its
+    // pid: a bare `kill(pid, 0)` is blind to PID reuse, so without this a
+    // restarted-then-reused daemon pid would look alive forever and the agent
+    // group would never be reaped.
+    let expected_start = parent_start_time(parent_pid);
     // SAFETY: plain libc calls; no shared Rust state is touched.
     unsafe {
         // Re-probe the group immediately before signalling: the parent may have
         // exited while the agent's group already went away, freeing the pid to
         // be recycled by an unrelated group. `group_alive` gates the kill so a
         // stale numeric pgid can never target a recycled group.
-        if wait_parent_or_group_gone(parent_pid, pgid) && group_alive(pgid) {
+        if wait_parent_or_group_gone(parent_pid, pgid, expected_start) && group_alive(pgid) {
             sigkill_group(pgid);
         }
     }
+}
+
+/// Read the parent's start time (field 22 of `/proc/<pid>/stat`) so the Linux
+/// watchdog can detect PID reuse. After the daemon exits its numeric pid can be
+/// recycled (e.g. `Restart=on-failure`); the start time is unique per pid
+/// incarnation, so a later mismatch means the original parent is gone even when
+/// `kill(pid, 0)` still succeeds for the unrelated reusing process.
+#[cfg(target_os = "linux")]
+fn parent_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) may itself contain spaces and parentheses, so parse from
+    // just past the final ')'. After it, field 3 (state) is the first token, so
+    // starttime (field 22) is the 20th token — 0-based index 19.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Poll until either the parent (daemon) exits or the agent's process group has
 /// already gone away. Returns `true` when the parent died (the caller should
 /// reap the group), `false` when the group vanished on its own (nothing to do).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-unsafe fn wait_parent_or_group_gone(parent_pid: u32, pgid: u32) -> bool {
+unsafe fn wait_parent_or_group_gone(parent_pid: u32, pgid: u32, expected_start: Option<u64>) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    let _ = expected_start;
     loop {
         if libc::kill(parent_pid as libc::pid_t, 0) != 0 {
             return true; // parent gone -> reap the group
+        }
+        // Detect PID reuse: the pid answers `kill(_, 0)` but now belongs to a
+        // different process incarnation, so the daemon we guard has exited and
+        // its group must be reaped rather than waited on forever.
+        #[cfg(target_os = "linux")]
+        if let Some(start) = expected_start {
+            if parent_start_time(parent_pid) != Some(start) {
+                return true;
+            }
         }
         if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
             return false; // process group already gone -> nothing to reap

@@ -218,7 +218,24 @@ fn default_runs_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(home).join(".local/state/nano-supervisor/runs");
     }
-    std::env::temp_dir().join(format!("nano-supervisor-runs-{}", unsafe { libc::getuid() }))
+    std::env::temp_dir().join(format!("nano-supervisor-runs-{}", current_user_id()))
+}
+
+/// Per-user discriminator for the fallback temp runs root. `libc` is a Unix-only
+/// dependency (see `Cargo.toml`), so the UID lookup lives behind a Unix-only
+/// helper; the non-Unix stub keeps the crate building for the `pdeath` stubs'
+/// platforms by falling back to the login name (or a fixed token when unknown).
+#[cfg(unix)]
+fn current_user_id() -> String {
+    // SAFETY: `getuid` is always successful and touches no shared state.
+    unsafe { libc::getuid() }.to_string()
+}
+
+#[cfg(not(unix))]
+fn current_user_id() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "shared".to_string())
 }
 
 fn default_name() -> String {
