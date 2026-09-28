@@ -67,15 +67,44 @@ pub async fn provision(
         .await
         .context("git clone failed")?;
 
+    // `git clone` persists the *full* remote URL — including any `user:token@`
+    // userinfo — into `<workspace>/.git/config`. The agent then runs with read
+    // access to that checkout, so a credential-bearing clone URL would leave the
+    // PAT on disk (exfiltratable in the job result) even though it is redacted
+    // from logs. Rewrite the persisted origin to a credential-free URL right
+    // after the clone — *before* any later step can fail or return — so no
+    // failure path leaves the token behind (a no-op when the URL carried no
+    // credentials). The subsequent fetches below authenticate against the
+    // credential-bearing URL held only in memory (never `origin`), so the token
+    // is never written back to config.
+    let scrubbed_origin = scrub_url_credentials(&repo.url);
+    git(
+        &[
+            "remote".into(),
+            "set-url".into(),
+            "origin".into(),
+            "--".into(),
+            scrubbed_origin,
+        ],
+        Some(&workspace),
+        timeout,
+    )
+    .await
+    .context("scrubbing persisted clone credentials failed")?;
+
     if let Some(sha) = &repo.sha {
         // The commit may be absent under a shallow clone: fetch it, then check
-        // it out detached.
+        // it out detached. Fetch against the in-memory (possibly
+        // credential-bearing) clone URL rather than `origin` — whose persisted
+        // config we just stripped of credentials — so private-repo fetches still
+        // authenticate without re-persisting the token. `--` terminates option
+        // parsing so neither the URL nor the sha can be read as a git option.
         let _ = git(
             &[
                 "fetch".into(),
                 "--no-tags".into(),
-                "origin".into(),
                 "--".into(),
+                repo.url.clone(),
                 sha.clone(),
             ],
             Some(&workspace),
@@ -98,11 +127,14 @@ pub async fn provision(
             &[
                 "fetch".into(),
                 "--no-tags".into(),
-                "origin".into(),
-                // `--` terminates option parsing so a job-supplied base ref
-                // beginning with `-` (e.g. `--upload-pack=…`) can never be read
-                // as a `git fetch` option, mirroring the `git clone` URL guard.
+                // Fetch against the in-memory clone URL (not the
+                // credential-stripped `origin`) so a private base still
+                // authenticates without re-persisting the token. `--` terminates
+                // option parsing so neither the URL nor a job-supplied base ref
+                // beginning with `-` (e.g. `--upload-pack=…`) can be read as a
+                // `git fetch` option, mirroring the `git clone` URL guard.
                 "--".into(),
+                repo.url.clone(),
                 base.clone(),
             ],
             Some(&workspace),
@@ -334,5 +366,23 @@ mod tests {
             "cloning https://github.com/org/repo.git now"
         );
         assert_eq!(scrub_url_credentials("no url here"), "no url here");
+    }
+
+    #[test]
+    fn origin_scrub_strips_clone_url_credentials() {
+        // The URL rewritten into `remote.origin.url` after a credential-bearing
+        // clone must never retain the PAT, while a credential-free URL is left
+        // byte-for-byte unchanged (so the rewrite is a harmless no-op). Build the
+        // userinfo at runtime so no credential-like literal is stored in source.
+        let token = "x-access-token:s3cr3t";
+        let with_creds = format!("https://{token}@github.com/org/repo.git");
+        let scrubbed = scrub_url_credentials(&with_creds);
+        assert!(!scrubbed.contains("s3cr3t"));
+        assert!(!scrubbed.contains('@'));
+        assert_eq!(scrubbed, "https://github.com/org/repo.git");
+        assert_eq!(
+            scrub_url_credentials("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
     }
 }
