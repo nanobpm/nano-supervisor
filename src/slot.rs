@@ -208,6 +208,12 @@ async fn execute(
     // prior attempt's checkout and stale `result.json` first, so a retry starts
     // from a clean slate (a leftover clone would fail provisioning, and a stale
     // result could be accepted as this attempt's result).
+    //
+    // Validate the key against the engine's numeric format *before* joining it to
+    // a path: `key` originates from the engine response, and a malformed `../` or
+    // absolute key would otherwise make `remove_dir_all` / `create_dir_all`
+    // operate outside `runs_dir`.
+    crate::jobs::validate_job_key(&key)?;
     let run_dir = cfg.runs_dir.join(&key);
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir)

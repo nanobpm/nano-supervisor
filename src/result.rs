@@ -50,14 +50,16 @@ fn parse_object(text: &str) -> Option<Map<String, Value>> {
 /// Read and parse the agent's result file, if it wrote one. Best-effort: a
 /// missing, oversized, non-regular, or malformed file is treated as "no
 /// structured result". The file is agent-controlled, so a symlink or an
-/// oversized payload is rejected (`symlink_metadata`, size cap).
+/// oversized payload is rejected (atomic no-follow open, size cap).
 pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
     use std::io::Read;
     // Open first, then bound the read against the OPEN file handle. Checking a
     // `symlink_metadata` snapshot and then `read_to_string`ing the path is a TOCTOU
     // gap: an agent could grow or swap the path in between and force an unbounded
-    // allocation despite the cap. `O_NOFOLLOW` preserves the no-symlink guarantee
-    // atomically, and `take` caps the bytes we will actually read/allocate.
+    // allocation despite the cap. An atomic no-follow open (`O_NOFOLLOW` on unix,
+    // `FILE_FLAG_OPEN_REPARSE_POINT` + reparse-point rejection on Windows)
+    // preserves the no-symlink guarantee, and `take` caps the bytes we will
+    // actually read/allocate.
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -65,8 +67,37 @@ pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point / symlink itself
+        // rather than following it, the Windows analogue of `O_NOFOLLOW`. A
+        // swapped-in symlink is then opened as the link and rejected below via
+        // its reparse-point attribute, so the daemon never reads through it.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    // No atomic no-follow open on other platforms: reject a symlink explicitly so
+    // the documented no-symlink guarantee still holds (best-effort; such targets
+    // are not supported daemon hosts).
+    #[cfg(not(any(unix, windows)))]
+    {
+        if std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+            return None;
+        }
+    }
     let file = opts.open(path).ok()?;
     let meta = file.metadata().ok()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Reject a reparse point (symlink / junction) opened via
+        // FILE_FLAG_OPEN_REPARSE_POINT above, so we never read through it.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
+    }
     if !meta.is_file() || meta.len() > MAX_RESULT_FILE_BYTES {
         return None;
     }

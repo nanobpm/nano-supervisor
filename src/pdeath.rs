@@ -233,8 +233,13 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
         let kq = libc::kqueue();
         if kq < 0 {
             // No kqueue: fall back to polling both conditions.
-            if wait_parent_or_group_gone(parent_pid, pgid) {
-                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            // Re-probe the group immediately before signalling: the parent may
+            // have exited while the agent's group already went away, freeing the
+            // pid to be recycled by an unrelated group — `group_alive` (a
+            // `kill(-pgid, 0)` liveness check) ensures we only SIGKILL a group
+            // that still genuinely holds this pgid.
+            if wait_parent_or_group_gone(parent_pid, pgid) && group_alive(pgid) {
+                sigkill_group(pgid);
             }
             return;
         }
@@ -272,8 +277,12 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
             }
         };
         libc::close(kq);
-        if parent_died {
-            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        // Re-probe the group immediately before signalling: after the parent
+        // exited the agent's group may already have vanished, freeing the pid to
+        // be recycled by an unrelated group. `group_alive` gates the kill so a
+        // stale numeric pgid can never target a recycled group.
+        if parent_died && group_alive(pgid) {
+            sigkill_group(pgid);
         }
     }
 }
@@ -288,8 +297,12 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
 pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
     // SAFETY: plain libc calls; no shared Rust state is touched.
     unsafe {
-        if wait_parent_or_group_gone(parent_pid, pgid) {
-            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        // Re-probe the group immediately before signalling: the parent may have
+        // exited while the agent's group already went away, freeing the pid to
+        // be recycled by an unrelated group. `group_alive` gates the kill so a
+        // stale numeric pgid can never target a recycled group.
+        if wait_parent_or_group_gone(parent_pid, pgid) && group_alive(pgid) {
+            sigkill_group(pgid);
         }
     }
 }

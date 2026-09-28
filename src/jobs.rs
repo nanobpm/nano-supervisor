@@ -25,6 +25,19 @@ pub struct Job {
     pub lease: Option<String>,
 }
 
+/// Reject any job key that is not the engine's canonical numeric key format
+/// before it is joined onto a filesystem path. The engine hands out job keys as
+/// decimal integer strings; a malformed or untrusted response carrying `../`, an
+/// absolute path, or path separators must never reach `runs_dir.join(key)`, or a
+/// per-job run directory (which is recursively removed and re-created every
+/// attempt) could escape `runs_dir` and delete/run from an arbitrary location.
+pub(crate) fn validate_job_key(key: &str) -> Result<()> {
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("job key {key:?} is not a numeric engine key; refusing to use it as a run-dir name");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub enum Jobs {
     Sdk(Box<CamundaClient>),
@@ -243,6 +256,36 @@ impl Jobs {
                 .await
                 .map(|_| ())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_job_key;
+
+    #[test]
+    fn accepts_numeric_engine_keys() {
+        assert!(validate_job_key("0").is_ok());
+        assert!(validate_job_key("2251799813685249").is_ok());
+    }
+
+    #[test]
+    fn rejects_traversal_and_non_numeric_keys() {
+        for bad in [
+            "",
+            "../escape",
+            "/abs",
+            "12/34",
+            "12..34",
+            "12 34",
+            "abc",
+            "12a",
+        ] {
+            assert!(
+                validate_job_key(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 }

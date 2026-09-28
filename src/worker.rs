@@ -148,6 +148,10 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
         .and_then(Value::as_str)
         .context("job has no string variable `prompt`")?
         .to_string();
+    // Validate the engine-supplied key against the numeric key format before
+    // joining it to a path: a malformed `../`/absolute key must not let
+    // `create_dir_all` (and the agent's cwd) escape `runs_dir`.
+    crate::jobs::validate_job_key(key)?;
     let cwd = opts.runs_dir.join(key);
     std::fs::create_dir_all(&cwd).with_context(|| format!("creating {}", cwd.display()))?;
     let env = vec![
