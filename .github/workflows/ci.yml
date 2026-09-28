@@ -69,8 +69,13 @@ jobs:
   # cases run in full. The plain `test` job above also compiles this crate, but
   # skips its target cases there (the Node plugin is not installed on that runner).
   contract-tests-node:
-    name: contract tests (Node target)
-    runs-on: ubuntu-latest
+    name: contract tests (Node target, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Issue #3 acceptance: the Node-target suite must pass on Linux AND macOS.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     env:
       NS_TARGET: node
       NANO_NO_UPDATE_NOTIFIER: "1"
@@ -84,7 +89,13 @@ jobs:
           node-version: "24"
       - name: install c8ctl CLI + pinned nano plugin
         run: |
-          npm install -g @camunda8/cli
+          # Pin the host CLI: the snapshots record exact host output, so the
+          # host contract must be reproducible.
+          npm install -g @camunda8/cli@4.2.0
+          # Keep the `name@version` form: `c8 load plugin` passes the package
+          # straight to `npm install`, so this installs exactly 1.69.2. The
+          # separate-args form (`c8 load plugin c8ctl-plugin-nano 1.69.2`)
+          # silently drops the version and installs latest.
           c8 load plugin c8ctl-plugin-nano@1.69.2
           # Fail fast if the pinned plugin is not the one that loaded.
           c8 nano --help | head -1
