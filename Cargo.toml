@@ -1,0 +1,24 @@
+[package]
+name = "nano-supervisor"
+version = "0.0.1"
+edition = "2021"
+description = "Standalone Rust supervisor and job workers for Nano BPM coding agents"
+license = "Apache-2.0"
+repository = "https://github.com/nanobpm/nano-supervisor"
+publish = false
+
+[dependencies]
+# 0.3.0 is the first release with job leases (`with_lease`, `job_lease_token`).
+camunda-orchestration-sdk = { version = "0.3", default-features = false, features = ["rustls"] }
+anyhow = "1"
+# Raw job commands in the Nano engine's dialect (src/jobs.rs); same reqwest as the SDK.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
