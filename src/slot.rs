@@ -222,6 +222,34 @@ fn reject_symlink(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bail when any *existing ancestor* of `dir` is a symlink. [`reject_symlink`]
+/// only inspects the leaf `runs_dir` / `run_dir`, but `create_dir_all` follows a
+/// symlinked ancestor: if a configurable `--runs-dir` (or an `$XDG_STATE_HOME`
+/// state root) is missing under a world-writable parent, another local user can
+/// pre-create a symlinked ancestor so the job directory is materialised outside
+/// the intended root — and the leaf check cannot see it, because the final path
+/// is then a real directory at the redirected location. Walking every existing
+/// ancestor and rejecting the first symlink refuses that redirection before we
+/// create or touch job data. A non-existent ancestor (`symlink_metadata` errors)
+/// is skipped: `create_dir_all` will materialise it as a fresh real directory,
+/// not follow a link. Paired with the leaf [`reject_symlink`] and re-run after
+/// the non-atomic create, this closes the whole chain to symlink redirection.
+fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
+    for ancestor in dir.ancestors() {
+        if std::fs::symlink_metadata(ancestor)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            bail!(
+                "refusing to use {}: ancestor {} is a symlink (possible local symlink attack)",
+                dir.display(),
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run one job to completion: assemble the prompt, provision the repo, drive the
 /// agent over its protocol, and return the completion variables. An error means
 /// the job should be failed (including the empty-result case).
@@ -256,6 +284,10 @@ async fn execute(
     // symlink, and `remove_dir_all` / `create_dir_all` would follow it.
     reject_symlink(&cfg.runs_dir)?;
     reject_symlink(&run_dir)?;
+    // Also reject a symlinked *ancestor* above the runs root: `create_dir_all`
+    // would otherwise follow it and plant the job dir outside the intended root
+    // while the leaf checks (which only inspect the final paths) see a real dir.
+    reject_symlinked_ancestors(&run_dir)?;
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir)
             .with_context(|| format!("clearing stale {}", run_dir.display()))?;
@@ -266,6 +298,7 @@ async fn execute(
     // agent cwd, so confirm neither the root nor the job dir is now a link.
     reject_symlink(&cfg.runs_dir)?;
     reject_symlink(&run_dir)?;
+    reject_symlinked_ancestors(&run_dir)?;
     // Restrict the runs root and this job dir to owner-only (0700) on Unix, so
     // the cloned repo, prompt-derived files, and `result.json` are not
     // readable/traversable by other local users regardless of umask. This still

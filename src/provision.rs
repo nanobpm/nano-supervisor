@@ -200,9 +200,18 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
         Err(_) => {
             // Timed out: SIGKILL the whole group (not just the leader that
             // `kill_on_drop` reaps) so a helper git spawned cannot outlive it.
+            // Re-probe `group_alive` immediately before signalling — mirroring
+            // `terminate_group_and_reap` and the success path above: the `wait`
+            // future (and its `child.wait()`) is dropped when the timeout fires,
+            // so if git and every descendant exited in that interval the pgid can
+            // be released and recycled by an unrelated group before this call.
+            // Only signal while the group is genuinely still present, so a timeout
+            // never SIGKILLs a recycled pid — upholding the guard's guarantee.
             #[cfg(unix)]
             if let Some(pid) = gpid {
-                crate::pdeath::sigkill_group(pid);
+                if crate::pdeath::group_alive(pid) {
+                    crate::pdeath::sigkill_group(pid);
+                }
             }
             #[cfg(unix)]
             group_guard.disarm();
