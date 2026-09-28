@@ -211,6 +211,18 @@ fn supervisor_add_unknown_profile_reports_error() {
     let home = TempHome::with_target(target);
     let out = home.run(&["supervisor", "add", "nosuch"]);
     let combined = format!("{}{}", out.stdout, out.stderr);
+    // NODE-QUIRK: adding an unknown profile is a validation failure, so it exits
+    // non-zero (exit 1), like `work` on an unknown profile and an invalid
+    // `hire --rank`. Asserting only the message would let a build that prints the
+    // same error but exits 0 pass, silently dropping the failure contract.
+    // Exit code recorded from the Node reference (c8ctl-plugin-nano 1.69.2).
+    assert_eq!(
+        out.code,
+        Some(1),
+        "unknown profile must exit non-zero; stdout={} stderr={}",
+        out.stdout,
+        out.stderr
+    );
     assert!(
         combined.contains("no hire named \"nosuch\""),
         "message: {combined}"

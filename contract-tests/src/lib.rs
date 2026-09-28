@@ -99,10 +99,23 @@ impl Target {
     /// cleanly rather than fail — the dedicated Node-target CI job is where they
     /// really run.
     pub fn available(self) -> bool {
+        // Probe through a throwaway isolated home so loading the command for the
+        // availability check can never read or initialize a real fleet under the
+        // caller's `C8CTL_NANO_HOME`. Mirror `TempHome::cmd`'s hermetic
+        // environment (isolated home, no launchd/update-notifier, `NS_*`
+        // selectors cleared). The temp dir is removed when `probe_home` drops.
+        let probe_home = match tempfile::Builder::new().prefix("ct-probe-").tempdir() {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        };
         let mut probe = self.cmd(&["--help"]);
         probe
+            .env("C8CTL_NANO_HOME", probe_home.path())
             .env("C8CTL_NANO_NO_LAUNCHD", "1")
             .env("NANO_NO_UPDATE_NOTIFIER", "1")
+            .env_remove("NS_TARGET")
+            .env_remove("NS_NODE_CMD")
+            .env_remove("NS_BIN")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         matches!(probe.status(), Ok(s) if s.success())
