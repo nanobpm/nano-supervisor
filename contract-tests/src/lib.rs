@@ -341,9 +341,16 @@ pub fn fake_agent_path() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
-/// The `--agent` argument that runs the bundled `fake-agent` over ACP.
+/// The `--agent` argument that runs the bundled `fake-agent` over ACP. The
+/// executable path is shell-quoted so a checkout path containing spaces (the
+/// `--agent` value is parsed with shell-style quoting) is preserved intact
+/// rather than split into a bogus program plus arguments.
 pub fn fake_agent_acp_arg() -> String {
-    format!("{} --acp", fake_agent_path().display())
+    let path = fake_agent_path();
+    let quoted = shlex::try_quote(&path.to_string_lossy())
+        .expect("fake-agent path is not shell-quotable")
+        .into_owned();
+    format!("{quoted} --acp")
 }
 
 /// Resolve the target CLI and a reachable local engine together, or a [`Skip`]

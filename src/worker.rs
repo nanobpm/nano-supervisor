@@ -456,8 +456,17 @@ impl Drop for ActiveGuard {
     fn drop(&mut self) {
         // Drop the cross-process liveness marker first so a completed run's dir
         // (retained by `--keep-runs`) is immediately reapable by any sweeper,
-        // then release the in-process guard.
-        let _ = std::fs::remove_file(self.path.join(ACTIVE_MARKER));
+        // then release the in-process guard. Only remove the marker if it still
+        // names *this* process: if we lost our lease and another worker has
+        // since reactivated the same run dir and written its own marker, that
+        // marker belongs to the new live owner — erasing it would let a foreign
+        // sweeper delete an active cwd.
+        let marker = self.path.join(ACTIVE_MARKER);
+        if let Ok(contents) = std::fs::read_to_string(&marker) {
+            if contents.trim() == std::process::id().to_string() {
+                let _ = std::fs::remove_file(&marker);
+            }
+        }
         if let Ok(mut set) = self.active.lock() {
             set.remove(&self.path);
         }
@@ -501,6 +510,12 @@ fn marker_owner_alive(dir: &Path) -> bool {
 /// as dead; `EPERM` (alive but unsignalable) and any other error keep the dir.
 #[cfg(unix)]
 fn pid_is_live(pid: u32) -> bool {
+    // Never probe PID 0: `kill(0, 0)` targets the caller's whole process group
+    // and returns success, which would misreport a stale/corrupt `0` marker as
+    // live and prevent reaping. Zero is not a valid individual process id.
+    if pid == 0 {
+        return false;
+    }
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if ret == 0 {
         return true;
@@ -707,16 +722,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn marker_with_dead_pid_reads_not_live() {
-        // PID 0 never names a live process on Linux, so its marker is orphaned.
+        // PID 0 is never a valid individual process id, so its marker is
+        // orphaned: `pid_is_live` rejects it before any `kill(0, 0)` probe
+        // (which would otherwise target the caller's process group).
         let dir = std::env::temp_dir().join(format!("ns-dead-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(ACTIVE_MARKER), "0").unwrap();
         assert!(
             !marker_owner_alive(&dir),
             "a dead PID must read as not live"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_guard_drop_keeps_a_foreign_owners_marker() {
+        // If another worker reactivated the same dir and wrote its own marker,
+        // dropping our guard must not erase that live owner's marker.
+        let dir = std::env::temp_dir().join(format!("ns-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A marker owned by a different PID (not us).
+        let foreign_pid = std::process::id() + 1;
+        std::fs::write(dir.join(ACTIVE_MARKER), foreign_pid.to_string()).unwrap();
+        drop(ActiveGuard {
+            active: Arc::new(Mutex::new(HashSet::new())),
+            path: dir.clone(),
+        });
+        assert!(
+            dir.join(ACTIVE_MARKER).exists(),
+            "a foreign owner's marker must survive our guard drop"
+        );
+        // Our own marker, by contrast, is cleaned up.
+        write_active_marker(&dir);
+        drop(ActiveGuard {
+            active: Arc::new(Mutex::new(HashSet::new())),
+            path: dir.clone(),
+        });
+        assert!(
+            !dir.join(ACTIVE_MARKER).exists(),
+            "our own marker must be removed on guard drop"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

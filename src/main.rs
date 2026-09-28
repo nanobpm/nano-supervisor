@@ -40,7 +40,8 @@ enum Cmd {
         /// c8ctl connection profile (default: c8ctl's active profile, else CAMUNDA_* env).
         #[arg(long)]
         profile: Option<String>,
-        /// Agent command, split on whitespace, e.g. "nano-coder --acp".
+        /// Agent command, parsed with shell-style quoting, e.g. "nano-coder
+        /// --acp" or "'/path with spaces/agent' --acp".
         #[arg(long, default_value = "nano-coder --acp")]
         agent: String,
         /// Worker name reported to the engine (default ‹host›-spike-‹pid›).
@@ -103,7 +104,12 @@ async fn main() -> Result<()> {
             reap_interval,
             job_api,
         } => {
-            let mut parts = agent.split_whitespace().map(String::from);
+            // Shell-style split so an executable path or argument containing
+            // spaces can be preserved by quoting it (plain unquoted commands
+            // behave exactly like whitespace splitting).
+            let Some(mut parts) = shlex::split(&agent).map(Vec::into_iter) else {
+                bail!("--agent has unbalanced quotes: {agent:?}")
+            };
             let Some(program) = parts.next() else {
                 bail!("--agent is empty")
             };
