@@ -186,7 +186,7 @@ impl Engine {
         // merlin engine would pollute a live cluster, so a merlin host is
         // rejected unconditionally, ahead of the remote-override escape hatch —
         // an accidental opt-in can never deploy the contract suite to merlin.
-        if host_of(&url).contains("merlin") {
+        if host_of(&url).to_ascii_lowercase().contains("merlin") {
             return Err(Skip(format!(
                 "engine {url} targets merlin; refusing unconditionally (the contract suite must never touch merlin)"
             )));
@@ -463,13 +463,61 @@ pub fn run_worker_job(
 /// otherwise hang the whole CI run. Generous enough for a real single-job run.
 const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Best-effort kill of an entire process group by pid. Because the worker was
-/// spawned with `process_group(0)`, its pgid equals its pid, so `kill -<pid>`
-/// signals the worker and every descendant it started. Shells out to `kill(1)`
-/// so no libc dependency is needed; failures are ignored (the group may already
-/// be gone).
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
+/// Kill `pid` and all of its transitive descendants with `SIGKILL`.
+///
+/// The worker spawns agents in their *own* process groups, so signalling only
+/// the worker's group leaves those agents alive holding the worker's inherited
+/// stderr open — which wedges the reader-thread joins the watchdog depends on.
+/// Walking the descendant tree (via `/proc` on Linux) reaps them regardless of
+/// their group. Off Linux, fall back to a best-effort worker process-group kill.
+/// Shells out to `kill(1)` so no libc dependency is needed; failures are ignored
+/// (a process may already be gone).
+#[cfg(target_os = "linux")]
+fn kill_process_tree(pid: u32) {
+    use std::collections::HashMap;
+    // Map ppid -> children, from every /proc/<pid>/stat (field 4 = ppid).
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            if let Ok(cpid) = e.file_name().to_string_lossy().parse::<u32>() {
+                if let Some(ppid) = read_ppid(cpid) {
+                    children.entry(ppid).or_default().push(cpid);
+                }
+            }
+        }
+    }
+    // Depth-first collect the worker and every descendant.
+    let mut stack = vec![pid];
+    let mut victims = Vec::new();
+    while let Some(p) = stack.pop() {
+        victims.push(p);
+        if let Some(kids) = children.get(&p) {
+            stack.extend(kids);
+        }
+    }
+    for p in victims {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(p.to_string())
+            .status();
+    }
+}
+
+/// Parent PID of `pid` from `/proc/<pid>/stat`, or `None` if it can't be read.
+#[cfg(target_os = "linux")]
+fn read_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`; `comm` may contain spaces and parens, so
+    // parse the fields *after* the final ')': state (skip) then ppid.
+    let after = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn kill_process_tree(pid: u32) {
+    // No portable /proc on non-Linux unix; signal the worker's process group.
     let _ = Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{pid}"))
@@ -513,11 +561,15 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Output {
             break status;
         }
         if start.elapsed() >= timeout {
-            // Kill the entire process group (worker + agent descendants), not
-            // just the worker, so nothing keeps the pipes open and wedges the
-            // reader-thread joins below.
+            // Reap the worker AND every descendant it spawned. The worker runs
+            // agents in their *own* process groups (`acp::Agent::spawn` calls
+            // `process_group(0)`) and passes them its inherited stderr, so a
+            // single group-kill of the worker leaves a `go_silent` agent alive
+            // holding that pipe open — and the reader-thread joins below would
+            // block forever, defeating this very watchdog. Walking the process
+            // tree kills those agents regardless of their group.
             #[cfg(unix)]
-            kill_process_group(child.id());
+            kill_process_tree(child.id());
             let _ = child.kill();
             let status = child.wait().expect("wait killed worker");
             let stdout = out_h.join().unwrap_or_default();

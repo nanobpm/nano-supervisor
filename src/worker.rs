@@ -154,8 +154,23 @@ async fn handle(
 ) {
     let key = job.job_key.value().to_string();
     let cwd = opts.runs_dir.join(&key);
-    // Guard this run's cwd against the background sweeper for its whole lifetime.
+    // Claim this cwd against the background sweeper for the run's whole lifetime.
+    // Because the run root is a *stable* namespace shared by every worker of the
+    // same host+job type (the PID is stripped from the path), an in-process
+    // `HashSet` alone cannot stop *another* worker's sweeper from reaping our
+    // live cwd. So we also drop a cross-process liveness marker recording our
+    // PID: a foreign sweeper reads it, sees the owner process is alive, and
+    // skips the directory. Create the dir up front so the marker lands before
+    // the agent starts producing output.
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
+        log(&format!(
+            "job {key}: cannot create run dir {}: {e:#}; skipping",
+            cwd.display()
+        ));
+        return;
+    }
     active.lock().unwrap().insert(cwd.clone());
+    write_active_marker(&cwd);
     let _guard = ActiveGuard {
         active: active.clone(),
         path: cwd,
@@ -292,19 +307,33 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Derive the *stable* run-root namespace for a worker. Keyed on the host plus
-/// the job type — never the PID — so a worker that restarts keeps the same run
-/// root and can see (and its sweeper can reap) the runs it owned before the
-/// restart. The worker name embeds the PID only to give the engine a unique
-/// activation identity; for the on-disk namespace we strip that trailing
-/// `-<pid>` so the path is restart-stable. Falls back to the raw name when it
-/// has no PID suffix (e.g. an explicit `--name`).
+/// the job type — never the live PID — so a worker that restarts keeps the same
+/// run root and can see (and its sweeper can reap) the runs it owned before the
+/// restart. `default_name()` is `<host>-spike-<pid>`; we strip only that exact
+/// trailing `-<pid>` (a run of digits directly after a `-spike` segment) so the
+/// path is restart-stable. Explicit `--name`s (e.g. `worker-1`, `worker-2`) do
+/// NOT carry the `-spike-<pid>` shape and are preserved verbatim, so they keep
+/// distinct namespaces instead of collapsing to a shared one.
 fn stable_namespace(worker_name: &str, job_type: &str) -> String {
-    let host = worker_name
-        .rsplit_once('-')
-        .filter(|(_, tail)| tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty())
-        .map(|(head, _)| head)
-        .unwrap_or(worker_name);
-    sanitize_component(&format!("{host}-{job_type}"))
+    let base = strip_default_pid_suffix(worker_name);
+    sanitize_component(&format!("{base}-{job_type}"))
+}
+
+/// Strip the default `-spike-<pid>` PID suffix from a worker name, reducing
+/// `<host>-spike-<pid>` to `<host>-spike`. Any other name (including explicit
+/// `--name`s such as `worker-1`) is returned unchanged, so only the known
+/// default shape is collapsed — an explicit numeric suffix is preserved.
+fn strip_default_pid_suffix(name: &str) -> &str {
+    match name.rsplit_once('-') {
+        Some((head, tail))
+            if !tail.is_empty()
+                && tail.chars().all(|c| c.is_ascii_digit())
+                && head.ends_with("-spike") =>
+        {
+            head
+        }
+        _ => name,
+    }
 }
 
 /// Make a string safe to use as a single path component: keep alphanumerics,
@@ -361,10 +390,57 @@ struct ActiveGuard {
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
+        // Drop the cross-process liveness marker first so a completed run's dir
+        // (retained by `--keep-runs`) is immediately reapable by any sweeper,
+        // then release the in-process guard.
+        let _ = std::fs::remove_file(self.path.join(ACTIVE_MARKER));
         if let Ok(mut set) = self.active.lock() {
             set.remove(&self.path);
         }
     }
+}
+
+/// Filename of the cross-process liveness marker written inside each *active*
+/// run directory. It records the owning worker's PID so a sweeper in a
+/// different process (sharing the same stable run root) can distinguish a live
+/// run from an orphaned one.
+const ACTIVE_MARKER: &str = ".nano-active";
+
+/// Record this process as the live owner of `cwd` by writing its PID into the
+/// run's liveness marker. Best-effort: the in-process active set still guards
+/// same-process runs if the marker can't be written.
+fn write_active_marker(cwd: &Path) {
+    let _ = std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string());
+}
+
+/// Whether `dir` is a *live* run owned by some still-running worker — i.e. its
+/// liveness marker names a PID that is currently alive. Such a directory must
+/// never be reaped, even by a foreign worker whose in-process active set can't
+/// see it. Fail-safe: a present-but-unparseable marker is treated as live so a
+/// possibly-active cwd is never deleted; a missing marker means "not live".
+fn marker_owner_alive(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
+        Ok(contents) => match contents.trim().parse::<u32>() {
+            Ok(pid) => pid_is_live(pid),
+            Err(_) => true,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Best-effort liveness check for a PID on the local host (run roots are
+/// host-local, so any worker sharing this namespace is on this host).
+#[cfg(target_os = "linux")]
+fn pid_is_live(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Off Linux there is no portable pure-`std` liveness probe, so treat a present
+/// marker as live and never risk deleting an active cwd; stale dirs off Linux
+/// are still reaped once their marker is removed on normal completion.
+#[cfg(not(target_os = "linux"))]
+fn pid_is_live(_pid: u32) -> bool {
+    true
 }
 
 /// Reap stale per-job run directories: remove immediate subdirectories of
@@ -409,6 +485,13 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
         };
         for (path, modified) in dirs.into_iter().skip(keep) {
             if active.contains(&path) {
+                continue;
+            }
+            // Cross-process guard: another worker sharing this stable run root
+            // may be running a job here. If its liveness marker names a live
+            // PID, skip — only this in-process set sees *our* runs, so without
+            // this check we could `remove_dir_all` a foreign worker's live cwd.
+            if marker_owner_alive(&path) {
                 continue;
             }
             let stale = now
@@ -468,9 +551,56 @@ mod tests {
     }
 
     #[test]
+    fn namespace_preserves_explicit_numeric_names() {
+        // Explicit `--name worker-1`/`worker-2` must NOT be mistaken for the
+        // default `-spike-<pid>` shape; they keep distinct namespaces.
+        let a = stable_namespace("worker-1", "job");
+        let b = stable_namespace("worker-2", "job");
+        assert_eq!(a, "worker-1-job");
+        assert_eq!(b, "worker-2-job");
+        assert_ne!(a, b, "explicit numeric names must not collide");
+    }
+
+    #[test]
+    fn strip_only_touches_default_spike_shape() {
+        assert_eq!(strip_default_pid_suffix("host-spike-99"), "host-spike");
+        assert_eq!(strip_default_pid_suffix("worker-1"), "worker-1");
+        assert_eq!(strip_default_pid_suffix("plain"), "plain");
+        // A numeric tail not preceded by `-spike` is preserved.
+        assert_eq!(strip_default_pid_suffix("a-b-7"), "a-b-7");
+    }
+
+    #[test]
     fn sanitize_replaces_unsafe_chars() {
         assert_eq!(sanitize_component("a/b c"), "a-b-c");
         assert_eq!(sanitize_component("ok_name-1.2"), "ok_name-1.2");
         assert_eq!(sanitize_component("///"), "worker");
+    }
+
+    #[test]
+    fn active_marker_roundtrips_and_reads_live() {
+        // A written marker names *this* live process, so it reads back as live;
+        // once removed, the directory reads as not-live (reapable).
+        let dir = std::env::temp_dir().join(format!("ns-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_active_marker(&dir);
+        assert!(marker_owner_alive(&dir), "own PID must read as live");
+        std::fs::remove_file(dir.join(ACTIVE_MARKER)).unwrap();
+        assert!(!marker_owner_alive(&dir), "no marker means not live");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn marker_with_dead_pid_reads_not_live() {
+        // PID 0 never names a live process on Linux, so its marker is orphaned.
+        let dir = std::env::temp_dir().join(format!("ns-dead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ACTIVE_MARKER), "0").unwrap();
+        assert!(
+            !marker_owner_alive(&dir),
+            "a dead PID must read as not live"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
