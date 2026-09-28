@@ -181,8 +181,20 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     };
     let (status, stderr_tail) = match tokio::time::timeout(timeout, wait).await {
         Ok(res) => {
+            // git finished within the timeout, but a credential/remote helper it
+            // spawned can outlive the leader while sharing git's process group
+            // (`child.wait()` reaped only the direct git leader). Tear the whole
+            // group down before disarming the guard — mirroring the ACP and pipe
+            // paths — so a lingering helper can't keep mutating the run directory
+            // after provisioning "succeeds". `terminate_group_and_reap` gates on
+            // `group_alive`, so this is a no-op when git left nothing behind and
+            // never re-signals a pid that may have been recycled.
             #[cfg(unix)]
-            group_guard.disarm();
+            {
+                crate::pdeath::terminate_group_and_reap(&mut child, gpid, Duration::from_secs(3))
+                    .await;
+                group_guard.disarm();
+            }
             res
         }
         Err(_) => {
