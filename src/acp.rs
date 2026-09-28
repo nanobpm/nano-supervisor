@@ -44,6 +44,13 @@ struct Shared {
 pub struct Agent {
     child: Child,
     out: mpsc::UnboundedSender<Value>,
+    /// Explicit stdin-close signal for `write_loop`. Dropping `out` alone does
+    /// not close stdin: `read_loop` holds an `out.clone()` (to answer the
+    /// agent's requests) that keeps the channel — and thus `write_loop`'s owned
+    /// `stdin` — alive until the agent closes its stdout. Firing this on
+    /// `shutdown` makes `write_loop` drop `stdin` so the agent sees EOF promptly
+    /// instead of waiting out the full terminate grace on every job.
+    close_stdin: Option<oneshot::Sender<()>>,
     shared: Arc<Mutex<Shared>>,
     next_id: u64,
     /// Cancellation cleanup: SIGKILLs the agent's process group if this `Agent`
@@ -95,7 +102,8 @@ impl Agent {
             ..Default::default()
         }));
         let (out, rx) = mpsc::unbounded_channel::<Value>();
-        tokio::spawn(write_loop(stdin, rx));
+        let (close_stdin, close_rx) = oneshot::channel::<()>();
+        tokio::spawn(write_loop(stdin, rx, close_rx));
         tokio::spawn(read_loop(
             BufReader::new(stdout),
             shared.clone(),
@@ -104,6 +112,7 @@ impl Agent {
         Ok(Self {
             child,
             out,
+            close_stdin: Some(close_stdin),
             shared,
             next_id: 1,
             group_guard,
@@ -189,7 +198,13 @@ impl Agent {
 
     /// Close stdin, give the agent a moment to exit, then kill its process group.
     pub async fn shutdown(mut self) {
-        drop(self.out); // close stdin: the agent sees EOF and can flush + exit
+        // Close stdin so the agent sees EOF and can flush + exit. Dropping `out`
+        // is not enough on its own — `read_loop` keeps a clone alive — so signal
+        // `write_loop` to drop `stdin` explicitly as well.
+        if let Some(close) = self.close_stdin.take() {
+            let _ = close.send(());
+        }
+        drop(self.out);
         // Tear the whole process group down (TERM → grace → SIGKILL → reap), not
         // just the ACP leader: a tool the agent started shares its group but is
         // not reaped by `child.wait()`, so killing only the leader would leave a
@@ -204,14 +219,29 @@ impl Agent {
     }
 }
 
-async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Value>) {
-    while let Some(msg) = rx.recv().await {
+async fn write_loop(
+    mut stdin: ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    mut close: oneshot::Receiver<()>,
+) {
+    loop {
+        let msg = tokio::select! {
+            // An explicit close signal (or its sender being dropped) wins over
+            // draining `rx`: `read_loop`'s retained `out` clone would otherwise
+            // keep `rx` open — and `stdin` alive — until the agent closes stdout.
+            _ = &mut close => break,
+            msg = rx.recv() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
         let mut line = msg.to_string();
         line.push('\n');
         if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
             break;
         }
     }
+    // Dropping `stdin` here closes the agent's stdin so it sees EOF.
 }
 
 /// Upper bound on a single JSON-RPC line the ACP agent may send. A misbehaving
