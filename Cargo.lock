@@ -178,8 +178,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "camunda-orchestration-api-client"
-version = "0.2.2"
-source = "git+https://github.com/camunda/orchestration-cluster-api-rust?rev=5d811a3#5d811a3a1df7c3904c1fb757f79c906bbd0af1b5"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6ee6d8db79a6ff75e610fc3fa6a459146292ef8e32a5212ac6df06dbf98e10e"
 dependencies = [
  "chrono",
  "regex",
@@ -195,8 +196,9 @@ dependencies = [
 
 [[package]]
 name = "camunda-orchestration-sdk"
-version = "0.2.2"
-source = "git+https://github.com/camunda/orchestration-cluster-api-rust?rev=5d811a3#5d811a3a1df7c3904c1fb757f79c906bbd0af1b5"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae19e45f614ceb749c186e5335d03c43bc5530550420dc69c1e008e052b72a3"
 dependencies = [
  "async-trait",
  "camunda-orchestration-api-client",

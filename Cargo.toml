@@ -8,9 +8,8 @@ repository = "https://github.com/nanobpm/nano-supervisor"
 publish = false
 
 [dependencies]
-# Job leases (`with_lease`, `job_lease_token`) landed in #49 and are not in a
-# crates.io release yet (0.2.2 predates them), so pin the commit.
-camunda-orchestration-sdk = { git = "https://github.com/camunda/orchestration-cluster-api-rust", rev = "5d811a3", default-features = false, features = ["rustls"] }
+# 0.3.0 is the first release with job leases (`with_lease`, `job_lease_token`).
+camunda-orchestration-sdk = { version = "0.3", default-features = false, features = ["rustls"] }
 anyhow = "1"
 # Raw job commands in the Nano engine's dialect (src/jobs.rs); same reqwest as the SDK.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
