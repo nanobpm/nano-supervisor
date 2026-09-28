@@ -49,6 +49,18 @@ jobs:
         run: cargo build --workspace --release --locked
       - name: binary smoke test
         run: ./target/release/nano-supervisor --help
+      # rustls only: the Linux binary must not need the system OpenSSL (#11 ships
+      # a self-contained binary). Regressed once via the SDK (orchestration-cluster-api-rust#50).
+      - name: no OpenSSL linked
+        if: runner.os == 'Linux'
+        run: |
+          ldd target/release/nano-supervisor
+          if ldd target/release/nano-supervisor | grep -Ei 'libssl|libcrypto'; then
+            echo "::error::nano-supervisor links OpenSSL; it must use rustls only"; exit 1
+          fi
+          if cargo tree --locked -i openssl >/dev/null 2>&1 || cargo tree --locked -i native-tls >/dev/null 2>&1; then
+            echo "::error::openssl/native-tls is in the dependency tree"; cargo tree --locked -i openssl -i native-tls || true; exit 1
+          fi
 
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:
