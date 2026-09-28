@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
                 other => other,
             };
             let jobs = match job_api {
-                "sdk" => jobs::Jobs::Sdk(client),
+                "sdk" => jobs::Jobs::Sdk(Box::new(client)),
                 "nano" => {
                     let (address, basic) = profile::rest_address_and_basic(resolved.as_ref());
                     jobs::Jobs::Nano(jobs::NanoHttp::new(&address, basic)?)

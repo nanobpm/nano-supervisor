@@ -27,7 +27,7 @@ pub struct Job {
 
 #[derive(Clone)]
 pub enum Jobs {
-    Sdk(CamundaClient),
+    Sdk(Box<CamundaClient>),
     Nano(NanoHttp),
 }
 
