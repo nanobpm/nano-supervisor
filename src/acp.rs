@@ -51,6 +51,10 @@ pub struct Agent {
     /// `execute` on lease loss instead of calling `shutdown`), so descendants the
     /// agent started cannot survive and overlap the job's redelivery.
     group_guard: crate::pdeath::GroupGuard,
+    /// The agent's process-group id (its pid at spawn), preserved so the group
+    /// can still be torn down after `child.wait()` has reaped the leader and
+    /// dropped `child.id()` to `None`.
+    pgid: Option<u32>,
 }
 
 impl Agent {
@@ -76,13 +80,15 @@ impl Agent {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting agent {program:?}"))?;
+        // Preserve the pgid (== leader pid) before anything can reap the leader.
+        let pgid = child.id();
         #[cfg(unix)]
-        if let Some(pid) = child.id() {
+        if let Some(pid) = pgid {
             crate::pdeath::watch(pid);
         }
         let stdin = child.stdin.take().context("agent stdin")?;
         let stdout = child.stdout.take().context("agent stdout")?;
-        let group_guard = crate::pdeath::GroupGuard::new(child.id());
+        let group_guard = crate::pdeath::GroupGuard::new(pgid);
 
         let shared = Arc::new(Mutex::new(Shared {
             last_activity: Some(Instant::now()),
@@ -101,6 +107,7 @@ impl Agent {
             shared,
             next_id: 1,
             group_guard,
+            pgid,
         })
     }
 
@@ -187,10 +194,12 @@ impl Agent {
         // just the ACP leader: a tool the agent started shares its group but is
         // not reaped by `child.wait()`, so killing only the leader would leave a
         // TERM-resistant descendant running under the daemon while the job may be
-        // redelivered. The group is killed while the leader pid is still valid;
-        // only then is the guard disarmed (the pid must not be re-signalled once
-        // reaped — it may be recycled).
-        crate::pdeath::terminate_group_and_reap(&mut self.child, Duration::from_secs(3)).await;
+        // redelivered. The preserved `pgid` is used so the group is still torn
+        // down even if a prior `request` reaped the leader (dropping `child.id()`
+        // to None); only then is the guard disarmed (the pid must not be
+        // re-signalled once the group is gone — it may be recycled).
+        crate::pdeath::terminate_group_and_reap(&mut self.child, self.pgid, Duration::from_secs(3))
+            .await;
         self.group_guard.disarm();
     }
 }

@@ -87,38 +87,68 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 }
 
 /// Gracefully tear down an agent's whole process group and reap the leader:
-/// `SIGTERM` the group, poll up to `grace` for it to exit (without reaping the
-/// leader, so the pgid stays valid), then `SIGKILL` the group to catch any
-/// `TERM`-resistant descendant, and finally reap the leader. Killing the group —
-/// not just `start_kill`ing the direct leader — is what prevents a tool the agent
-/// started from surviving a timeout / lease-loss cancellation and overlapping the
+/// `SIGTERM` the group, poll up to `grace` for it to exit (reaping the leader as
+/// soon as it does), then `SIGKILL` the group to catch any `TERM`-resistant
+/// descendant, and finally reap the leader. Killing the group — not just
+/// `start_kill`ing the direct leader — is what prevents a tool the agent started
+/// from surviving a timeout / lease-loss cancellation and overlapping the
 /// redelivered job. Safe to call when the group is already gone.
+///
+/// `pgid` is the *preserved* process-group id (the leader's pid captured at
+/// spawn), passed in rather than read from `child.id()`: a caller may already
+/// have reaped the leader (the pipe EOF path and ACP request path call
+/// `child.wait()`), which drops `child.id()` to `None`; keying the group kill off
+/// that would silently skip it and leak descendants. A reaped leader's pid stays
+/// reserved as a pgid while any descendant remains in the group, so probing it
+/// still identifies the right group.
 #[cfg(unix)]
 pub(crate) async fn terminate_group_and_reap(
     child: &mut tokio::process::Child,
+    pgid: Option<u32>,
     grace: std::time::Duration,
 ) {
-    if let Some(pid) = child.id() {
-        // Negative pid = the whole process group (agent + tools it started).
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .status();
-        let deadline = std::time::Instant::now() + grace;
-        while std::time::Instant::now() < deadline && group_alive(pid) {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    if let Some(pid) = pgid {
+        // Only signal the pgid while the group genuinely still has a member. If
+        // the leader was already reaped and no descendant remains, the pid is no
+        // longer reserved and could have been recycled — signalling it would risk
+        // hitting an unrelated group.
+        if group_alive(pid) {
+            // Negative pid = the whole process group (agent + tools it started).
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .status();
+            let deadline = std::time::Instant::now() + grace;
+            loop {
+                // Reap the leader the instant it exits. Otherwise its unreaped
+                // zombie keeps `group_alive` true for the entire grace window,
+                // forcing a fixed multi-second wait on every clean shutdown. A
+                // live descendant keeps the pgid reserved, so reaping the leader
+                // here does not free the pid still needed for the group SIGKILL.
+                let _ = child.try_wait();
+                if !group_alive(pid) {
+                    // Leader reaped and no descendant left: the group is gone.
+                    // Don't re-signal (the freed pid could now be recycled).
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // A `TERM`-resistant descendant survived; the pgid is still
+                    // valid (that descendant holds it). SIGKILL the whole group.
+                    sigkill_group(pid);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
-        // Escalate: SIGKILL the whole group so a descendant that ignored TERM
-        // cannot survive. Done before the leader is reaped, so the pgid is valid.
-        sigkill_group(pid);
     }
     let _ = child.start_kill();
-    // Best-effort reap so we don't leak a zombie.
+    // Best-effort reap so we don't leak a zombie (no-op if already reaped).
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
 }
 
 #[cfg(not(unix))]
 pub(crate) async fn terminate_group_and_reap(
     child: &mut tokio::process::Child,
+    _pgid: Option<u32>,
     _grace: std::time::Duration,
 ) {
     let _ = child.start_kill();

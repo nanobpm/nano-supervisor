@@ -49,15 +49,19 @@ pub async fn run(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting agent {program:?}"))?;
+    // Preserve the pgid (== leader pid) before the EOF path's `child.wait()` can
+    // reap the leader and drop `child.id()` to None; `kill_tree` needs it to tear
+    // the group down even then.
+    let pgid = child.id();
     // Cancellation guard: if this future is dropped before we reach `kill_tree`
     // (e.g. the slot aborts `execute` on lease loss), `kill_on_drop` reaps only
     // the direct child — its process-group descendants (tools the agent started)
     // would leak. Declared after `child` so it drops first, SIGKILLing the whole
     // group while the child pid is still valid (unreaped). Disarmed once
     // `kill_tree` has torn the group down on the normal path.
-    let mut group_guard = crate::pdeath::GroupGuard::new(child.id());
+    let mut group_guard = crate::pdeath::GroupGuard::new(pgid);
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = pgid {
         crate::pdeath::watch(pid);
     }
 
@@ -117,7 +121,7 @@ pub async fn run(
     };
 
     // Kill the whole process group (agent + any tools it started), then reap.
-    kill_tree(&mut child).await;
+    kill_tree(&mut child, pgid).await;
     // The group is now torn down and the child reaped, so its pid must not be
     // signalled again (it may be recycled by the OS): disarm the guard.
     group_guard.disarm();
@@ -153,11 +157,13 @@ pub(crate) fn bound_capture(collected: &mut String) {
     collected.replace_range(..cut, "");
 }
 
-async fn kill_tree(child: &mut tokio::process::Child) {
+async fn kill_tree(child: &mut tokio::process::Child, pgid: Option<u32>) {
     // TERM the whole group, grace, then SIGKILL the group (catching a
     // TERM-resistant descendant) before reaping the leader — `start_kill` alone
-    // would only SIGKILL the direct agent and let a tool it started survive.
-    crate::pdeath::terminate_group_and_reap(child, Duration::from_secs(3)).await;
+    // would only SIGKILL the direct agent and let a tool it started survive. The
+    // preserved `pgid` is used so the group is still torn down even though the
+    // EOF path may already have reaped the leader.
+    crate::pdeath::terminate_group_and_reap(child, pgid, Duration::from_secs(3)).await;
 }
 
 #[cfg(test)]

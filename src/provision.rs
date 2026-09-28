@@ -152,8 +152,22 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     if let Some(pid) = gpid {
         crate::pdeath::watch(pid);
     }
+    // Cancellation cleanup: if this future is dropped mid-clone/fetch (e.g. the
+    // slot aborts `execute` on lease loss), the `wait_with_output` future — and
+    // the `child` it owns — is dropped, but `kill_on_drop` reaps only the direct
+    // git leader; transports / credential helpers it spawned share git's process
+    // group and would leak, still mutating the run directory while the job is
+    // redelivered. The guard SIGKILLs the whole git group on drop. Disarmed once
+    // git has completed (or we have already killed the group on timeout), so a
+    // recycled pid is never re-signalled.
+    #[cfg(unix)]
+    let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(res) => res.context("collecting git output")?,
+        Ok(res) => {
+            #[cfg(unix)]
+            group_guard.disarm();
+            res.context("collecting git output")?
+        }
         Err(_) => {
             // Timed out: SIGKILL the whole group (not just the leader that
             // `kill_on_drop` reaps) so a helper git spawned cannot outlive it.
@@ -161,6 +175,8 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
             if let Some(pid) = gpid {
                 crate::pdeath::sigkill_group(pid);
             }
+            #[cfg(unix)]
+            group_guard.disarm();
             bail!(
                 "git {} timed out after {}s",
                 args.first().map(String::as_str).unwrap_or(""),
