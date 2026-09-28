@@ -182,22 +182,15 @@ impl Agent {
 
     /// Close stdin, give the agent a moment to exit, then kill its process group.
     pub async fn shutdown(mut self) {
-        drop(self.out);
-        if tokio::time::timeout(Duration::from_secs(3), self.child.wait())
-            .await
-            .is_err()
-        {
-            #[cfg(unix)]
-            if let Some(pid) = self.child.id() {
-                // Negative pid = the whole process group (tools the agent started).
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &format!("-{pid}")])
-                    .status();
-            }
-            let _ = self.child.kill().await;
-        }
-        // The group has now been reaped on the graceful path, so its pid must not
-        // be signalled again (it may be recycled): disarm the cancellation guard.
+        drop(self.out); // close stdin: the agent sees EOF and can flush + exit
+        // Tear the whole process group down (TERM → grace → SIGKILL → reap), not
+        // just the ACP leader: a tool the agent started shares its group but is
+        // not reaped by `child.wait()`, so killing only the leader would leave a
+        // TERM-resistant descendant running under the daemon while the job may be
+        // redelivered. The group is killed while the leader pid is still valid;
+        // only then is the guard disarmed (the pid must not be re-signalled once
+        // reaped — it may be recycled).
+        crate::pdeath::terminate_group_and_reap(&mut self.child, Duration::from_secs(3)).await;
         self.group_guard.disarm();
     }
 }

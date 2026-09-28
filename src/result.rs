@@ -101,20 +101,31 @@ pub fn parse_result_from_stdout(stdout: &str) -> Option<Map<String, Value>> {
 
 /// Collect the inner text of every ```` ``` ````-fenced block in `text`.
 fn fenced_blocks(text: &str) -> Vec<String> {
+    fenced_spans(text).into_iter().map(|(_, body)| body).collect()
+}
+
+/// Every ```` ``` ````-fenced block as `(full-fence byte range, inner body)`. The
+/// range covers the opening backticks through the closing backticks, so a caller
+/// can excise a *specific* block unambiguously — a content search (`find(&body)`)
+/// misbehaves for a zero-length body (`find("")` returns 0, matching the start of
+/// the string) and for duplicate bodies (always the first match).
+fn fenced_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("```") {
-        let after_open = &rest[open + 3..];
+    let mut base = 0usize;
+    while let Some(open_rel) = text[base..].find("```") {
+        let open = base + open_rel;
+        let after_open = open + 3;
         // Skip an optional language tag up to the newline.
-        let Some(nl) = after_open.find('\n') else {
+        let Some(nl_rel) = text[after_open..].find('\n') else {
             break;
         };
-        let body_start = &after_open[nl + 1..];
-        let Some(close) = body_start.find("```") else {
+        let body_start = after_open + nl_rel + 1;
+        let Some(close_rel) = text[body_start..].find("```") else {
             break;
         };
-        out.push(body_start[..close].to_string());
-        rest = &body_start[close + 3..];
+        let close = body_start + close_rel;
+        out.push((open..close + 3, text[body_start..close].to_string()));
+        base = close + 3;
     }
     out
 }
@@ -164,23 +175,20 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
             None => line.to_string(),
         })
         .collect();
-    // Also drop value-less fenced blocks entirely.
-    let joined = kept.join("\n");
-    let mut result = joined.clone();
-    for block in fenced_blocks(&joined) {
-        if let Some(obj) = parse_object(block.trim()) {
-            if !has_effective_result_vars(&obj) {
-                // Remove the whole fence occurrence.
-                if let Some(pos) = result.find(&block) {
-                    // Cut back to the opening fence and forward to the closing one.
-                    let before = result[..pos].rfind("```").unwrap_or(pos);
-                    let after = result[pos + block.len()..]
-                        .find("```")
-                        .map(|i| pos + block.len() + i + 3)
-                        .unwrap_or(result.len());
-                    result.replace_range(before..after, "");
-                }
-            }
+    // Also drop value-less fenced blocks entirely. Iterate spans back-to-front so
+    // each removal leaves earlier byte offsets valid. A zero-length or
+    // reserved-only/null fence body carries no result, so it is excised too rather
+    // than being mistaken for substantive stdout (an empty ```` ```json\n``` ````
+    // fence would otherwise defeat `detect_empty`). Genuine prose/code fences
+    // (non-empty, non-object bodies) are left untouched.
+    let mut result = kept.join("\n");
+    let spans = fenced_spans(&result);
+    for (span, body) in spans.into_iter().rev() {
+        let trimmed = body.trim();
+        let value_less = trimmed.is_empty()
+            || parse_object(trimmed).is_some_and(|obj| !has_effective_result_vars(&obj));
+        if value_less {
+            result.replace_range(span, "");
         }
     }
     result
@@ -255,6 +263,32 @@ mod tests {
     fn empty_when_only_valueless_sentinel() {
         let out = "::nano:result:: {}\n";
         assert!(detect_empty(None, out, false).is_some());
+    }
+
+    #[test]
+    fn empty_when_only_empty_fence() {
+        // A fenced block with a zero-length body carries no result. It must be
+        // stripped (not mistaken for substantive stdout) so `detect_empty` still
+        // flags the run as empty — a `find(&block)` on the empty body would match
+        // at offset 0 and leave the fence residue behind.
+        let out = "```json\n```\n";
+        assert!(
+            detect_empty(None, out, false).is_some(),
+            "empty fence should not count as work"
+        );
+    }
+
+    #[test]
+    fn empty_when_only_valueless_fence() {
+        let out = "```json\n{}\n```\n";
+        assert!(detect_empty(None, out, false).is_some());
+    }
+
+    #[test]
+    fn not_empty_with_prose_fence() {
+        // A non-empty, non-result fenced block is genuine output and is kept.
+        let out = "```\nsome code the agent wrote\n```\n";
+        assert!(detect_empty(None, out, false).is_none());
     }
 
     #[test]

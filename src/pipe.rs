@@ -154,16 +154,10 @@ pub(crate) fn bound_capture(collected: &mut String) {
 }
 
 async fn kill_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // Negative pid = the whole process group.
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .status();
-    }
-    let _ = child.start_kill();
-    // Best-effort reap so we don't leak a zombie.
-    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+    // TERM the whole group, grace, then SIGKILL the group (catching a
+    // TERM-resistant descendant) before reaping the leader — `start_kill` alone
+    // would only SIGKILL the direct agent and let a tool it started survive.
+    crate::pdeath::terminate_group_and_reap(child, Duration::from_secs(3)).await;
 }
 
 #[cfg(test)]

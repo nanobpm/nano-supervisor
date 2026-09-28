@@ -70,6 +70,61 @@ pub(crate) fn sigkill_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn sigkill_group(_pid: u32) {}
 
+/// True while at least one process in the group led by `pid` is still alive.
+/// `kill(-pid, 0)` probes the group without delivering a signal: `0` means a
+/// member still exists, an error (`ESRCH`) means the group is gone. Used to poll
+/// for graceful group exit *without reaping the leader* — reaping would free the
+/// pid and invalidate the pgid we still need for the final group kill.
+#[cfg(unix)]
+pub(crate) fn group_alive(pid: u32) -> bool {
+    // SAFETY: a plain libc kill(_, 0) liveness probe; touches no Rust state.
+    unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn group_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Gracefully tear down an agent's whole process group and reap the leader:
+/// `SIGTERM` the group, poll up to `grace` for it to exit (without reaping the
+/// leader, so the pgid stays valid), then `SIGKILL` the group to catch any
+/// `TERM`-resistant descendant, and finally reap the leader. Killing the group —
+/// not just `start_kill`ing the direct leader — is what prevents a tool the agent
+/// started from surviving a timeout / lease-loss cancellation and overlapping the
+/// redelivered job. Safe to call when the group is already gone.
+#[cfg(unix)]
+pub(crate) async fn terminate_group_and_reap(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) {
+    if let Some(pid) = child.id() {
+        // Negative pid = the whole process group (agent + tools it started).
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .status();
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline && group_alive(pid) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Escalate: SIGKILL the whole group so a descendant that ignored TERM
+        // cannot survive. Done before the leader is reaped, so the pgid is valid.
+        sigkill_group(pid);
+    }
+    let _ = child.start_kill();
+    // Best-effort reap so we don't leak a zombie.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn terminate_group_and_reap(
+    child: &mut tokio::process::Child,
+    _grace: std::time::Duration,
+) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+}
+
 /// Cancellation cleanup guard: SIGKILLs the agent's process group when dropped,
 /// unless disarmed. Ensures a dropped (aborted) in-flight agent tears down the
 /// whole tree — not just the leader `kill_on_drop` reaps — while the normal path

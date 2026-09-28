@@ -75,6 +75,7 @@ pub async fn provision(
                 "fetch".into(),
                 "--no-tags".into(),
                 "origin".into(),
+                "--".into(),
                 sha.clone(),
             ],
             Some(&workspace),
@@ -98,6 +99,10 @@ pub async fn provision(
                 "fetch".into(),
                 "--no-tags".into(),
                 "origin".into(),
+                // `--` terminates option parsing so a job-supplied base ref
+                // beginning with `-` (e.g. `--upload-pack=…`) can never be read
+                // as a `git fetch` option, mirroring the `git clone` URL guard.
+                "--".into(),
                 base.clone(),
             ],
             Some(&workspace),
@@ -115,6 +120,7 @@ fn is_hex_sha(s: &str) -> bool {
 }
 
 async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
+    use std::process::Stdio;
     let mut cmd = Command::new("git");
     cmd.args(args);
     // Kill (and reap) the git child if this future is dropped — e.g. when the
@@ -126,16 +132,42 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     }
     // Never prompt for credentials interactively (would hang the slot).
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let output = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .with_context(|| {
-            format!(
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Give git the same parent-death/process-group cleanup as agent children.
+    // `kill_on_drop` only runs on a graceful daemon shutdown; a `kill -9` of the
+    // daemon mid-clone would otherwise orphan git (and any transport/credential
+    // helper it spawned), which could keep mutating the run directory while the
+    // job is redelivered. Its own process group + PDEATHSIG/watchdog tears the
+    // whole git tree down with the daemon.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(unix)]
+    crate::pdeath::arm(&mut cmd);
+    let child = cmd.spawn().context("spawning git")?;
+    #[cfg(unix)]
+    let gpid = child.id();
+    #[cfg(unix)]
+    if let Some(pid) = gpid {
+        crate::pdeath::watch(pid);
+    }
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(res) => res.context("collecting git output")?,
+        Err(_) => {
+            // Timed out: SIGKILL the whole group (not just the leader that
+            // `kill_on_drop` reaps) so a helper git spawned cannot outlive it.
+            #[cfg(unix)]
+            if let Some(pid) = gpid {
+                crate::pdeath::sigkill_group(pid);
+            }
+            bail!(
                 "git {} timed out after {}s",
                 args.first().map(String::as_str).unwrap_or(""),
                 timeout.as_secs()
-            )
-        })?
-        .context("spawning git")?;
+            );
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(

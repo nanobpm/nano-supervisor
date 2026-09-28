@@ -249,14 +249,18 @@ async fn execute(
         .as_ref()
         .map(result::sanitize_result_vars)
         .unwrap_or_default();
-    // If an ACP run produced turns but no effective structured result, surface
-    // its transcript as `agentResult` (as the spike worker does) instead of
-    // silently completing with only bookkeeping and dropping the agent's
-    // response — the empty-result guard above only fails runs that did NOTHING.
+    // If the agent returned no effective structured result but still produced
+    // substantive output, surface that output as `agentResult` (as the spike
+    // worker does) instead of silently completing with only bookkeeping and
+    // dropping the agent's response. This applies to BOTH protocols: for a pipe
+    // harness `had_turns` is always false, so keying on it would drop a pipe
+    // agent's answer whenever it printed output without writing a result file.
+    // The empty-result guard above already failed runs that did NOTHING, so
+    // reaching here with non-empty `detect_stdout` means real work to preserve.
     let has_effective = result_obj
         .as_ref()
         .is_some_and(result::has_effective_result_vars);
-    if !has_effective && had_turns && !detect_stdout.trim().is_empty() {
+    if !has_effective && !detect_stdout.trim().is_empty() {
         vars.insert("agentResult".into(), json!(detect_stdout));
     }
     vars.insert("agentWorker".into(), json!(cfg.worker_name));
