@@ -119,6 +119,38 @@ fn is_hex_sha(s: &str) -> bool {
     (7..=40).contains(&n) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Strip `user:secret@` userinfo from every `scheme://…@authority` occurrence in
+/// arbitrary text (such as a git stderr tail). Git can echo a credential-bearing
+/// remote URL in its diagnostics, and that text is propagated into job-failure
+/// and daemon logs, so any embedded PAT must be removed before it is logged.
+/// Non-URL text (and credential-free URLs) is returned unchanged.
+fn scrub_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        let after = pos + 3;
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        // The authority runs until the first character that cannot be part of it
+        // (path/query/fragment separators or any whitespace/quoting that ends the
+        // URL inside surrounding prose).
+        let auth_end = tail
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '|' | '\\' | '`')
+                    || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..auth_end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[auth_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
     use std::process::Stdio;
     let mut cmd = Command::new("git");
@@ -230,6 +262,11 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
         let chars: Vec<char> = stderr.chars().collect();
         let start = chars.len().saturating_sub(500);
         let tail: String = chars[start..].iter().collect();
+        // Git can echo a credential-bearing remote URL in its fatal diagnostics
+        // (e.g. `unable to access 'https://user:pat@host/...'`); this tail is
+        // propagated into the job-failure/daemon logs, so scrub any embedded
+        // userinfo before including it.
+        let tail = scrub_url_credentials(&tail);
         bail!(
             "git {} exited with {}: {}",
             args.first().map(String::as_str).unwrap_or(""),
@@ -280,5 +317,22 @@ mod tests {
         assert!(!is_hex_sha("xyz"));
         assert!(!is_hex_sha("short"));
         assert!(!is_hex_sha("0123456789abcdef0123456789abcdef012345678")); // 41 chars
+    }
+
+    #[test]
+    fn scrub_credentials_from_git_stderr() {
+        // A credential-bearing URL echoed in a git diagnostic is redacted.
+        let line = "fatal: unable to access 'https://x-access-token:ghp_SECRET@github.com/org/repo.git/': The requested URL returned error: 403";
+        let scrubbed = scrub_url_credentials(line);
+        assert!(!scrubbed.contains("ghp_SECRET"));
+        assert!(!scrubbed.contains("x-access-token"));
+        assert!(scrubbed.contains("https://github.com/org/repo.git/"));
+        assert!(scrubbed.contains("error: 403"));
+        // Credential-free URLs and plain text are left untouched.
+        assert_eq!(
+            scrub_url_credentials("cloning https://github.com/org/repo.git now"),
+            "cloning https://github.com/org/repo.git now"
+        );
+        assert_eq!(scrub_url_credentials("no url here"), "no url here");
     }
 }
