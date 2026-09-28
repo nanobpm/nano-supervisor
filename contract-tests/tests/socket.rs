@@ -31,6 +31,14 @@ fn socket_path_derivation_is_deterministic() {
     );
     let name = a.file_name().unwrap().to_string_lossy();
     assert!(name.starts_with("c8ctl-nano-sup-") && name.ends_with(".sock"));
+    // Pin the exact derivation, not just its shape: sha1("/tmp/ct-b")[:8] is
+    // `57425ec9`. A silent change of hash (e.g. SHA-1 → something else) would
+    // still produce a stable 8-char suffix and slip past a shape-only check, so
+    // assert the known value the Node plugin emits.
+    assert_eq!(
+        name, "c8ctl-nano-sup-57425ec9.sock",
+        "socket derivation drifted from the Node plugin's sha1(home)[:8]"
+    );
 }
 
 #[test]
@@ -92,6 +100,19 @@ fn live_status_round_trip() {
         return;
     }
     let engine = Engine::from_env();
+    // Safety gate: this case starts a real worker against the engine, so it must
+    // never touch a shared/remote cluster even if `NS_ALLOW_REMOTE_ENGINE=1` was
+    // set to let *non-live* engine checks run against a remote URL. Enforce the
+    // localhost-only rule here regardless of that override.
+    if !engine.is_local() {
+        eprintln!(
+            "SKIP socket::live_status_round_trip: engine {:?} is not localhost; \
+             live-worker tests refuse remote engines (NS_ALLOW_REMOTE_ENGINE does \
+             not relax this)",
+            engine.url()
+        );
+        return;
+    }
     if !engine.reachable() {
         eprintln!(
             "SKIP socket::live_status_round_trip: engine {:?} unreachable",

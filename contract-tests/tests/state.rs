@@ -100,4 +100,49 @@ fn state_writes_stay_under_home() {
     // covered by tests/socket.rs.)
     assert!(home.path().join("config.json").is_file());
     assert!(home.path().join("workforce/default.json").is_file());
+
+    // Confinement is part of the contract: an implementation that leaked config
+    // or manifests to an unexpected path would still pass the two `is_file`
+    // checks above. So enumerate every file actually written under the home and
+    // assert it is *exactly* the documented set — any extra file is a leak.
+    let mut written = files_under(home.path());
+    written.sort();
+    assert_eq!(
+        written,
+        vec![
+            "config.json".to_string(),
+            "workforce/default.json".to_string()
+        ],
+        "unexpected files written under C8CTL_NANO_HOME (possible state leak)"
+    );
+
+    // These daemon-less commands must not create the one documented *external*
+    // artifact — the control socket in the system temp dir. Its absence here
+    // proves nothing escaped the home outside of a live supervisor.
+    assert!(
+        !home.socket_path().exists(),
+        "no daemon was started, so the external control socket must not exist"
+    );
+}
+
+/// Every regular file under `root`, as `/`-joined paths relative to `root`.
+fn files_under(root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let rel = path.strip_prefix(base).unwrap_or(&path);
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
 }

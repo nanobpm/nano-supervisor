@@ -30,12 +30,20 @@ pub enum Target {
 }
 
 impl Target {
-    /// Resolve the target from `NS_TARGET`. Unknown values fall back to `node`
-    /// so a stray value never silently tests the wrong binary in CI.
+    /// Resolve the target from `NS_TARGET` (default `node` when unset or empty).
+    ///
+    /// An **unknown** value is rejected with a panic rather than falling back to
+    /// `node`: silently coercing e.g. `NS_TARGET=typo` to Node lets a run that
+    /// meant to exercise the Rust port report green while testing the wrong
+    /// binary. Failing loud keeps the selector contract honest.
     pub fn from_env() -> Target {
         match std::env::var("NS_TARGET").ok().as_deref() {
+            None | Some("") | Some("node") => Target::Node,
             Some("rust") => Target::Rust,
-            _ => Target::Node,
+            Some(other) => panic!(
+                "unknown NS_TARGET {other:?}; expected \"node\" or \"rust\" \
+                 (leave unset for the default \"node\")"
+            ),
         }
     }
 
@@ -259,6 +267,17 @@ impl Engine {
     /// The engine base URL.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Whether the configured engine host is loopback (`localhost`/`127.0.0.1`/
+    /// `::1`). Tests that actually **start a worker** against the engine use this
+    /// to refuse a remote/shared engine outright — the `NS_ALLOW_REMOTE_ENGINE`
+    /// override only relaxes construction, never the live-worker safety check.
+    pub fn is_local(&self) -> bool {
+        matches!(
+            host_of(&self.url).as_deref(),
+            Some("localhost") | Some("127.0.0.1") | Some("::1")
+        )
     }
 
     /// Whether the engine's TCP port accepts a connection right now. When it

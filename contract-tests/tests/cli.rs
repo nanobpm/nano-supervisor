@@ -155,8 +155,9 @@ fn work_unknown_profile_exits_nonzero() {
     require_target!(target);
     let home = TempHome::with_target(target);
     let out = home.run(&["work", "nosuch"]);
-    // NODE-QUIRK: `work` on an unknown profile is the one error path that exits
-    // non-zero (exit 1); most other "not found" paths print ✗ and exit 0.
+    // NODE-QUIRK: `work` on an unknown profile exits non-zero (exit 1), like the
+    // other validation-failure paths (e.g. an invalid `hire --rank`); many plain
+    // "not found" lookups instead print ✗ and still exit 0.
     // https://github.com/nanobpm/nano-supervisor/issues/3
     assert_eq!(
         out.code,
@@ -178,6 +179,16 @@ fn hire_bad_rank_is_rejected() {
     require_target!(target);
     let home = TempHome::with_target(target);
     let out = home.run(&["hire", "--name", "x", "--rank", "bogus", "--command", "foo"]);
+    // A rejected hire is a validation failure, so it must exit non-zero (exit 1):
+    // asserting only the message would let a build that prints the same error but
+    // exits 0 pass, silently dropping the failure contract.
+    assert_eq!(
+        out.code,
+        Some(1),
+        "invalid rank must exit non-zero; stdout={} stderr={}",
+        out.stdout,
+        out.stderr
+    );
     let combined = format!("{}{}", out.stdout, out.stderr);
     assert!(
         combined.contains("Invalid rank \"bogus\"")
