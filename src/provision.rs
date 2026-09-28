@@ -133,7 +133,9 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     // Never prompt for credentials interactively (would hang the slot).
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        // stdout is never consumed (git() returns `()`); discard it so a
+        // job-controlled remote can't exhaust memory by flooding it.
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
     // Give git the same parent-death/process-group cleanup as agent children.
     // `kill_on_drop` only runs on a graceful daemon shutdown; a `kill -9` of the
@@ -145,7 +147,7 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     cmd.process_group(0);
     #[cfg(unix)]
     crate::pdeath::arm(&mut cmd);
-    let child = cmd.spawn().context("spawning git")?;
+    let mut child = cmd.spawn().context("spawning git")?;
     #[cfg(unix)]
     let gpid = child.id();
     #[cfg(unix)]
@@ -162,11 +164,26 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     // recycled pid is never re-signalled.
     #[cfg(unix)]
     let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    // Drain git's stderr to EOF while retaining only a bounded tail: the pipe is
+    // always read so git never blocks on a full buffer, but a job-controlled
+    // repository/remote helper emitting unbounded progress/diagnostics can't grow
+    // this without limit and exhaust the daemon. stdout is discarded (`null`)
+    // above; only a short stderr tail is ever needed for the error message.
+    let stderr = child.stderr.take();
+    let wait = async {
+        let drain = async {
+            match stderr {
+                Some(e) => drain_capped(e, GIT_STDERR_TAIL).await,
+                None => Vec::new(),
+            }
+        };
+        tokio::join!(child.wait(), drain)
+    };
+    let (status, stderr_tail) = match tokio::time::timeout(timeout, wait).await {
         Ok(res) => {
             #[cfg(unix)]
             group_guard.disarm();
-            res.context("collecting git output")?
+            res
         }
         Err(_) => {
             // Timed out: SIGKILL the whole group (not just the leader that
@@ -184,16 +201,51 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
             );
         }
     };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = status.context("waiting for git")?;
+    if !status.success() {
+        // Show the *last* 500 chars of the retained tail — a git failure message
+        // (e.g. `fatal: …`) lands at the very end of stderr.
+        let stderr = String::from_utf8_lossy(&stderr_tail);
+        let chars: Vec<char> = stderr.chars().collect();
+        let start = chars.len().saturating_sub(500);
+        let tail: String = chars[start..].iter().collect();
         bail!(
             "git {} exited with {}: {}",
             args.first().map(String::as_str).unwrap_or(""),
-            output.status,
-            stderr.chars().take(500).collect::<String>()
+            status,
+            tail
         );
     }
     Ok(())
+}
+
+/// Bytes of a child stream's *tail* retained for diagnostics. The stream is
+/// still drained fully; only the last `GIT_STDERR_TAIL` bytes are kept.
+const GIT_STDERR_TAIL: usize = 8 * 1024;
+
+/// Read `reader` to EOF, retaining only its last `cap` bytes. Always consumes the
+/// whole stream (so the writer never blocks on a full pipe) while bounding memory
+/// to `cap` regardless of how much a job-controlled process emits.
+async fn drain_capped<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > cap {
+                    let excess = buf.len() - cap;
+                    buf.drain(..excess);
+                }
+            }
+        }
+    }
+    buf
 }
 
 #[cfg(test)]

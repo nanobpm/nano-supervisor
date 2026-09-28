@@ -174,7 +174,17 @@ impl GroupGuard {
 impl Drop for GroupGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
-            sigkill_group(pid);
+            // Only signal while the group genuinely still has a member. A
+            // cancellation can drop the guard in the window after the leader was
+            // reaped (by `kill_on_drop`, or a prior `child.wait()` on the pipe
+            // EOF / ACP request path) but before `disarm` runs; once the group is
+            // empty the pid is no longer reserved as a pgid and may have been
+            // recycled for an unrelated group, so an unconditional kill could hit
+            // it. Gating on `group_alive` mirrors `terminate_group_and_reap` and
+            // keeps a live descendant reserving the pgid the target of the kill.
+            if group_alive(pid) {
+                sigkill_group(pid);
+            }
         }
     }
 }
