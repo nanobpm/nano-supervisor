@@ -1,0 +1,52 @@
+[
+  {
+    "name": "empty",
+    "token": "",
+    "expected": "empty"
+  },
+  {
+    "name": "whitespace",
+    "token": "planning .decide",
+    "expected": "whitespace"
+  },
+  {
+    "name": "leading-dot",
+    "token": ".decide",
+    "expected": "empty-segment"
+  },
+  {
+    "name": "trailing-dot",
+    "token": "planning.",
+    "expected": "empty-segment"
+  },
+  {
+    "name": "double-dot",
+    "token": "planning..decide",
+    "expected": "empty-segment"
+  },
+  {
+    "name": "uppercase-segment",
+    "token": "Planning.decide",
+    "expected": "bad-segment"
+  },
+  {
+    "name": "segment-starts-with-digit",
+    "token": "1planning.decide",
+    "expected": "bad-segment"
+  },
+  {
+    "name": "two-seat-markers",
+    "token": "qa.review#red#blue",
+    "expected": "multiple-seat-markers"
+  },
+  {
+    "name": "empty-seat",
+    "token": "qa.review#",
+    "expected": "empty-seat"
+  },
+  {
+    "name": "uppercase-seat",
+    "token": "qa.review#Red",
+    "expected": "bad-seat"
+  }
+]

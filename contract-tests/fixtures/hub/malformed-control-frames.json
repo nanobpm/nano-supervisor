@@ -1,0 +1,37 @@
+[
+  {
+    "name": "tagged-missing-kind",
+    "chunk": "{\"nanoControlFrame\":1,\"text\":\"no kind\"}",
+    "expected": "bad-kind"
+  },
+  {
+    "name": "tagged-unknown-kind",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"explode\"}",
+    "expected": "bad-kind"
+  },
+  {
+    "name": "prompt-missing-text",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"prompt\"}",
+    "expected": "bad-prompt-text"
+  },
+  {
+    "name": "prompt-non-string-text",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"prompt\",\"text\":123}",
+    "expected": "bad-prompt-text"
+  },
+  {
+    "name": "cancel-non-string-reason",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"cancel\",\"reason\":5}",
+    "expected": "bad-cancel-reason"
+  },
+  {
+    "name": "permission-missing-request-id",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"permission\",\"outcome\":\"granted\"}",
+    "expected": "bad-permission-request-id"
+  },
+  {
+    "name": "permission-bad-outcome",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"permission\",\"requestId\":\"req-9\",\"outcome\":\"maybe\"}",
+    "expected": "bad-permission-outcome"
+  }
+]
