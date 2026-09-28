@@ -132,8 +132,14 @@ pub(crate) async fn terminate_group_and_reap(
                 }
                 if std::time::Instant::now() >= deadline {
                     // A `TERM`-resistant descendant survived; the pgid is still
-                    // valid (that descendant holds it). SIGKILL the whole group.
-                    sigkill_group(pid);
+                    // valid (that descendant holds it). Re-probe immediately
+                    // before the SIGKILL: the last survivor can exit in the
+                    // window since the loop's top-of-iteration `group_alive`
+                    // check, freeing the pgid to be recycled by an unrelated
+                    // group — only signal when the group is still present.
+                    if group_alive(pid) {
+                        sigkill_group(pid);
+                    }
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;

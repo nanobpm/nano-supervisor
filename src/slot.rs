@@ -203,6 +203,25 @@ fn restrict_dir_mode(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bail when `dir` (or the runs root above it) is a symlink. The check/remove/
+/// create sequence in [`execute`] is not atomic: another local process can swap
+/// a numeric job dir — or the runs root — for a symlink between operations, so
+/// the agent cwd and `restrict_dir_mode` would otherwise target a path outside
+/// `runs_dir`. `symlink_metadata` inspects the link itself rather than
+/// following it, so a dangling or replaced link is still caught.
+fn reject_symlink(dir: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "refusing to use symlinked path {} (possible local symlink attack)",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Run one job to completion: assemble the prompt, provision the repo, drive the
 /// agent over its protocol, and return the completion variables. An error means
 /// the job should be failed (including the empty-result case).
@@ -232,16 +251,25 @@ async fn execute(
     // operate outside `runs_dir`.
     crate::jobs::validate_job_key(&key)?;
     let run_dir = cfg.runs_dir.join(&key);
+    // Reject a symlinked runs root / job dir before touching it: on a shared
+    // temp-based `runs_dir` another local user could pre-create either as a
+    // symlink, and `remove_dir_all` / `create_dir_all` would follow it.
+    reject_symlink(&cfg.runs_dir)?;
+    reject_symlink(&run_dir)?;
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir)
             .with_context(|| format!("clearing stale {}", run_dir.display()))?;
     }
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    // Restrict the runs root and this job dir to owner-only (0700) on Unix: the
-    // default `runs_dir` lives under the shared system temp directory, so with a
-    // typical umask the cloned repo, prompt-derived files, and `result.json`
-    // would otherwise be readable/traversable by other local users. Tighten the
-    // mode after creation so job data is never exposed regardless of umask.
+    // Re-check after the non-atomic remove/create: a local process can swap the
+    // fresh numeric dir for a symlink in the window before we use it as the
+    // agent cwd, so confirm neither the root nor the job dir is now a link.
+    reject_symlink(&cfg.runs_dir)?;
+    reject_symlink(&run_dir)?;
+    // Restrict the runs root and this job dir to owner-only (0700) on Unix, so
+    // the cloned repo, prompt-derived files, and `result.json` are not
+    // readable/traversable by other local users regardless of umask. This still
+    // matters when `runs_dir` falls back to a shared system temp location.
     restrict_dir_mode(&cfg.runs_dir)?;
     restrict_dir_mode(&run_dir)?;
     let agent_cwd = match &env.repository {

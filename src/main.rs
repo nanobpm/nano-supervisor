@@ -157,8 +157,7 @@ async fn main() -> Result<()> {
                 recovery_window: Duration::from_millis(recovery_window),
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
-                runs_dir: runs_dir
-                    .unwrap_or_else(|| std::env::temp_dir().join("nano-supervisor-runs")),
+                runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
                 with_lease,
                 max_jobs,
             };
@@ -190,8 +189,7 @@ async fn main() -> Result<()> {
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 clone_timeout: Duration::from_millis(clone_timeout),
-                runs_dir: runs_dir
-                    .unwrap_or_else(|| std::env::temp_dir().join("nano-supervisor-runs")),
+                runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
                 config_path: config,
             };
             daemon::run(opts).await
@@ -203,6 +201,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Default per-job working-directory root. Prefers a user-private state home
+/// (`$XDG_STATE_HOME`, else `$HOME/.local/state`) over the shared system temp
+/// dir: a predictable `nano-supervisor-runs` directly under world-writable
+/// `/tmp` lets another local user pre-create it as a symlink before the daemon
+/// starts, so `create_dir_all` would follow the link and clone job data into an
+/// attacker-chosen location. The state home is owner-only, removing that
+/// pre-creation/symlink race. Falls back to a per-user temp subdir (which
+/// `restrict_dir_mode` then tightens to 0700) only when no home is known.
+fn default_runs_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("nano-supervisor/runs");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join(".local/state/nano-supervisor/runs");
+    }
+    std::env::temp_dir().join(format!("nano-supervisor-runs-{}", unsafe { libc::getuid() }))
 }
 
 fn default_name() -> String {
