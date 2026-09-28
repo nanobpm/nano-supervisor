@@ -6,7 +6,7 @@
 //! worker gets 409 instead of silently settling someone else's activation.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,15 +42,21 @@ pub struct WorkerOptions {
 }
 
 pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
-    // Confine this worker's runs (and its sweeper) to a per-worker subtree of
-    // the configured run root. The sweeper only knows about *this* process's
-    // active runs, so if several workers shared one runs_dir a sweep in one
-    // worker could delete a live job's cwd owned by another. Nesting under the
-    // worker name (unique per process — it defaults to a pid-tagged name) keeps
-    // each worker's runs and sweeping inside its own subtree.
+    // Confine this worker's runs (and its sweeper) to a *stable* per-worker
+    // subtree of the configured run root. The namespace must NOT change across
+    // a restart: `default_name()` embeds the PID, so keying the subtree on the
+    // worker name would move every run to a fresh `.../host-spike-<pid>/` on
+    // each launch — a reactivated job's prior cwd would become invisible
+    // (breaking checkpoint/resume) and the old PID subtree unreachable by the
+    // new worker's sweeper. Instead derive the subtree from the host plus the
+    // job type — stable for a given worker role across restarts, while still
+    // separating workers that run different job types. Cross-process safety
+    // (two live workers, or a worker vs. a stale run) is handled by the
+    // per-job active markers + the synchronized sweeper below, not by the path.
     let opts = {
         let mut opts = opts;
-        opts.runs_dir = opts.runs_dir.join(&opts.worker_name);
+        let ns = stable_namespace(&opts.worker_name, &opts.job_type);
+        opts.runs_dir = opts.runs_dir.join(ns);
         opts
     };
     let mut done = 0usize;
@@ -285,9 +291,47 @@ fn truncate(s: &str, max: usize) -> String {
     t
 }
 
+/// Derive the *stable* run-root namespace for a worker. Keyed on the host plus
+/// the job type — never the PID — so a worker that restarts keeps the same run
+/// root and can see (and its sweeper can reap) the runs it owned before the
+/// restart. The worker name embeds the PID only to give the engine a unique
+/// activation identity; for the on-disk namespace we strip that trailing
+/// `-<pid>` so the path is restart-stable. Falls back to the raw name when it
+/// has no PID suffix (e.g. an explicit `--name`).
+fn stable_namespace(worker_name: &str, job_type: &str) -> String {
+    let host = worker_name
+        .rsplit_once('-')
+        .filter(|(_, tail)| tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty())
+        .map(|(head, _)| head)
+        .unwrap_or(worker_name);
+    sanitize_component(&format!("{host}-{job_type}"))
+}
+
+/// Make a string safe to use as a single path component: keep alphanumerics,
+/// `-`, `_` and `.`, and replace anything else (path separators, spaces, …)
+/// with `-`. Never empty.
+fn sanitize_component(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let out = out.trim_matches(['-', '.'].as_ref()).to_string();
+    if out.is_empty() {
+        "worker".to_string()
+    } else {
+        out
+    }
+}
+
 /// Free space in MiB available under `path`, via POSIX `df -Pk` (portable across
 /// macOS and Linux). `None` if `df` is unavailable or its output can't be parsed.
-fn free_mb(path: &std::path::Path) -> Option<u64> {
+fn free_mb(path: &Path) -> Option<u64> {
     let out = std::process::Command::new("df")
         .arg("-Pk")
         .arg(path)
@@ -333,7 +377,6 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
     };
     let keep = opts.keep_runs.unwrap_or(1);
     let now = std::time::SystemTime::now();
-    let active: HashSet<PathBuf> = active.lock().map(|s| s.clone()).unwrap_or_default();
 
     let Ok(entries) = std::fs::read_dir(&opts.runs_dir) else {
         return;
@@ -349,17 +392,35 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
         .collect();
     dirs.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
 
+    // Hold the active-set lock for the whole sweep so a job cannot register its
+    // cwd in the gap between "snapshot the active set" and "remove_dir_all".
+    // Checking membership against a cloned set and *then* deleting is a TOCTOU
+    // race: a job could register its cwd after the snapshot but before the
+    // delete, and we'd remove a live agent's working directory. Deleting while
+    // holding the lock makes the active check and the removal atomic w.r.t.
+    // registration (which takes the same lock in `handle`/`ActiveGuard`).
     let mut reaped = 0usize;
-    for (path, modified) in dirs.into_iter().skip(keep) {
-        if active.contains(&path) {
-            continue;
-        }
-        let stale = now
-            .duration_since(modified)
-            .map(|d| d >= age)
-            .unwrap_or(false);
-        if stale && std::fs::remove_dir_all(&path).is_ok() {
-            reaped += 1;
+    {
+        let mut active = match active.lock() {
+            Ok(g) => g,
+            // A poisoned lock means a job panicked while holding it; fail safe by
+            // reaping nothing this pass rather than risk deleting a live cwd.
+            Err(_) => return,
+        };
+        for (path, modified) in dirs.into_iter().skip(keep) {
+            if active.contains(&path) {
+                continue;
+            }
+            let stale = now
+                .duration_since(modified)
+                .map(|d| d >= age)
+                .unwrap_or(false);
+            if stale && std::fs::remove_dir_all(&path).is_ok() {
+                // Keep the set tidy if a path was reaped while (somehow) still
+                // present; removal is idempotent.
+                active.remove(&path);
+                reaped += 1;
+            }
         }
     }
     if reaped > 0 {
@@ -377,4 +438,39 @@ pub fn log(msg: &str) {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     eprintln!("[{now:.3}] {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_strips_pid_suffix_for_stability() {
+        // `default_name()` is `<host>-spike-<pid>`; the namespace must drop the
+        // PID so a restarted worker keeps the same run root.
+        let a = stable_namespace("host-spike-123", "my-job");
+        let b = stable_namespace("host-spike-456", "my-job");
+        assert_eq!(a, b, "namespace must be stable across restarts (no PID)");
+        assert_eq!(a, "host-spike-my-job");
+    }
+
+    #[test]
+    fn namespace_separates_job_types() {
+        let a = stable_namespace("host-spike-123", "job-a");
+        let b = stable_namespace("host-spike-123", "job-b");
+        assert_ne!(a, b, "different job types get different subtrees");
+    }
+
+    #[test]
+    fn namespace_keeps_explicit_name_without_pid() {
+        // An explicit `--name` with no trailing -<pid> is used as-is.
+        assert_eq!(stable_namespace("alice", "job"), "alice-job");
+    }
+
+    #[test]
+    fn sanitize_replaces_unsafe_chars() {
+        assert_eq!(sanitize_component("a/b c"), "a-b-c");
+        assert_eq!(sanitize_component("ok_name-1.2"), "ok_name-1.2");
+        assert_eq!(sanitize_component("///"), "worker");
+    }
 }
