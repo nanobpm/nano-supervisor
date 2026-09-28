@@ -60,14 +60,20 @@ pub fn build(profile: Option<&Profile>, job_api: JobApi, with_lease: bool) -> Re
     Ok(match job_api.resolve(with_lease) {
         JobApi::Sdk => Jobs::Sdk(Box::new(profile::client(profile)?)),
         JobApi::Nano => {
-            // The raw Nano client only speaks none/basic. An OAuth profile would
-            // otherwise silently send unauthenticated requests, so refuse the
-            // combination up front rather than claim its credentials are honoured.
-            if let Some(p) = profile.filter(|p| profile::has_oauth(p)) {
+            // The raw Nano client only speaks none/basic. OAuth — whether from a
+            // resolved profile OR the ambient CAMUNDA_*/ZEEBE_* environment (when
+            // no profile resolved) — would otherwise silently send unauthenticated
+            // requests, so refuse the combination up front rather than claim its
+            // credentials are honoured.
+            let oauth_source = match profile {
+                Some(p) if profile::has_oauth(p) => Some(format!("c8ctl profile {:?}", p.name)),
+                None if profile::env_has_oauth() => Some("the CAMUNDA_* environment".to_string()),
+                _ => None,
+            };
+            if let Some(src) = oauth_source {
                 bail!(
-                    "c8ctl profile {:?} uses OAuth, which the nano/lease job transport does not \
-                     support; use --job-api sdk (drop --with-lease) or a none/basic profile",
-                    p.name
+                    "{src} uses OAuth, which the nano/lease job transport does not support; \
+                     use --job-api sdk (drop --with-lease) or none/basic credentials"
                 );
             }
             let (address, basic) = profile::rest_address_and_basic(profile);

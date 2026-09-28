@@ -142,6 +142,21 @@ pub fn has_oauth(p: &Profile) -> bool {
     p.client_id.is_some() && p.client_secret.is_some()
 }
 
+/// Whether the ambient `CAMUNDA_*`/`ZEEBE_*` environment configures OAuth. Used
+/// when no c8ctl profile resolved and the connection comes from the environment
+/// instead — the raw Nano client would otherwise send unauthenticated requests.
+pub fn env_has_oauth() -> bool {
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    if std::env::var("CAMUNDA_AUTH_STRATEGY")
+        .map(|s| s.eq_ignore_ascii_case("oauth"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    (set("CAMUNDA_CLIENT_ID") && set("CAMUNDA_CLIENT_SECRET"))
+        || (set("ZEEBE_CLIENT_ID") && set("ZEEBE_CLIENT_SECRET"))
+}
+
 /// Engine address and basic-auth credentials for the raw Nano job client:
 /// the profile's settings, else the `CAMUNDA_*` environment, else localhost.
 /// (OAuth is not supported on this path; the spike only needs none/basic.)

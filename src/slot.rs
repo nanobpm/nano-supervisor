@@ -293,11 +293,20 @@ async fn run_pipe(
             cfg.idle_timeout.as_secs()
         );
     }
-    if let Some(code) = out.exit_code.filter(|&c| c != 0) {
-        log(&format!("job {key}: pipe agent exited with code {code}"));
-    }
     let result_obj = result::read_result_file(result_file)
         .or_else(|| result::parse_result_from_stdout(&out.stdout));
+    // A non-zero harness exit means the run failed. Only tolerate it when the
+    // agent still emitted an explicit structured result (result file or stdout
+    // sentinel) — otherwise diagnostic stdout must not be mistaken for real work
+    // and silently settle the job; fail it so it is retried instead.
+    if let Some(code) = out.exit_code.filter(|&c| c != 0) {
+        if result_obj.is_none() {
+            bail!("pipe agent exited with code {code} without writing a result");
+        }
+        log(&format!(
+            "job {key}: pipe agent exited with code {code}; honoring the explicit result it wrote"
+        ));
+    }
     // The pipe path has no "turns"; substantive stdout is the work signal.
     Ok((result_obj, out.stdout, false))
 }

@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 /// What a pipe run produced.
@@ -65,24 +65,32 @@ pub async fn run(
     }
 
     let stdout = child.stdout.take().context("agent stdout")?;
-    let mut lines = BufReader::new(stdout).lines();
+    // Read raw fixed-size chunks rather than whole lines: a line reader buffers
+    // an entire line before yielding, so one very large unterminated line could
+    // exhaust memory before the cap is applied. Chunked reads let `bound_capture`
+    // run continuously and hold `collected` to `MAX_STDOUT` regardless of how the
+    // agent frames (or fails to frame) its output.
+    let mut reader = BufReader::new(stdout);
+    let mut buf = [0u8; 64 * 1024];
     let mut collected = String::new();
     let mut last_activity = Instant::now();
     let mut idle_timed_out = false;
 
     let exit_code = loop {
         tokio::select! {
-            line = lines.next_line() => match line {
-                Ok(Some(l)) => {
-                    last_activity = Instant::now();
-                    collected.push_str(&l);
-                    collected.push('\n');
-                    bound_capture(&mut collected);
-                }
-                Ok(None) | Err(_) => {
-                    // stdout closed: wait for the process to reap.
+            n = reader.read(&mut buf) => match n {
+                Ok(0) | Err(_) => {
+                    // stdout closed (EOF) or errored: wait for the process to reap.
                     let status = child.wait().await.ok();
                     break status.and_then(|s| s.code());
+                }
+                Ok(n) => {
+                    last_activity = Instant::now();
+                    // Lossy is safe here: the `::nano:result::` sentinel is ASCII,
+                    // so it survives chunk boundaries exactly; only split multibyte
+                    // prose (a diagnostic fallback channel) may gain replacements.
+                    collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    bound_capture(&mut collected);
                 }
             },
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
@@ -104,16 +112,17 @@ pub async fn run(
     })
 }
 
-/// Upper bound on captured stdout. The result is delivered out-of-band via
-/// `$AGENT_RESULT_FILE`; stdout is only a fallback channel for the trailing
-/// `::nano:result::` sentinel, so a noisy or adversarial agent must not be able
-/// to grow this `String` without limit and exhaust the daemon's memory.
-const MAX_STDOUT: usize = 1 << 20; // 1 MiB
+/// Upper bound on captured agent output. The result is delivered out-of-band via
+/// `$AGENT_RESULT_FILE`; captured stdout / the ACP transcript is only a fallback
+/// channel for the trailing `::nano:result::` sentinel, so a noisy or adversarial
+/// agent must not be able to grow it without limit and exhaust the daemon's
+/// memory. Shared with the ACP path ([`crate::acp`]).
+pub(crate) const MAX_STDOUT: usize = 1 << 20; // 1 MiB
 
 /// Keep `collected` within [`MAX_STDOUT`] by dropping from the front (oldest
 /// output) once it overflows. Retaining the tail preserves a trailing
 /// `::nano:result::` sentinel for result parsing.
-fn bound_capture(collected: &mut String) {
+pub(crate) fn bound_capture(collected: &mut String) {
     if collected.len() <= MAX_STDOUT {
         return;
     }

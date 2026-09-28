@@ -13,7 +13,9 @@
 //!   pid via `EVFILT_PROC`/`NOTE_EXIT` and then `SIGKILL`s the agent's process
 //!   group.
 
-#[cfg(unix)]
+// Imported unconditionally: the no-op `arm` below is compiled on every non-Linux
+// target (including Windows), so the `Command` type must always resolve or the
+// crate fails to build there.
 use tokio::process::Command;
 
 /// Arm parent-death cleanup on the command about to be spawned. On Linux this
@@ -85,54 +87,88 @@ pub fn watch(_agent_pid: u32) {}
 
 /// The macOS watchdog loop: block on the parent pid via kqueue `NOTE_EXIT`,
 /// then `SIGKILL` the agent's process group. Returns when the parent is gone
-/// and the group has been signalled.
+/// and the group has been signalled — or early, without signalling, once the
+/// agent's process group has exited on its own (a completed job), so the
+/// watchdog does not linger as a polling child for the daemon's whole lifetime.
 #[cfg(target_os = "macos")]
 pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
     // SAFETY: standard kqueue usage; the fd is closed before return.
     unsafe {
         let kq = libc::kqueue();
-        if kq >= 0 {
-            let mut change: libc::kevent = std::mem::zeroed();
-            change.ident = parent_pid as libc::uintptr_t;
-            change.filter = libc::EVFILT_PROC;
-            change.flags = libc::EV_ADD | libc::EV_ONESHOT;
-            change.fflags = libc::NOTE_EXIT;
-            let mut event: libc::kevent = std::mem::zeroed();
-            // Registering the change also polls it: if the parent is already
-            // gone, kevent returns an EV_ERROR/ESRCH immediately and we fall
-            // through to the poll fallback below.
-            let n = libc::kevent(kq, &change, 1, &mut event, 1, std::ptr::null());
-            if n <= 0 || (event.flags & libc::EV_ERROR) != 0 {
-                // Parent already dead (or could not be watched): fall back to a
-                // short poll so we never block forever, then proceed to reap.
-                poll_until_parent_gone(parent_pid);
+        if kq < 0 {
+            // No kqueue: fall back to polling both conditions.
+            if wait_parent_or_group_gone(parent_pid, pgid) {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
             }
-            libc::close(kq);
-        } else {
-            poll_until_parent_gone(parent_pid);
+            return;
         }
-        // Parent is gone: kill the whole agent process group.
-        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        let mut change: libc::kevent = std::mem::zeroed();
+        change.ident = parent_pid as libc::uintptr_t;
+        change.filter = libc::EVFILT_PROC;
+        change.flags = libc::EV_ADD | libc::EV_CLEAR;
+        change.fflags = libc::NOTE_EXIT;
+        // Register the parent-exit filter without blocking (nevents = 0).
+        let registered =
+            libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        let parent_died = if registered != 0 {
+            // Could not watch the parent (e.g. it already exited): reap the group.
+            true
+        } else {
+            loop {
+                // Wait up to 200ms for the parent to exit, then re-check the
+                // group so a watchdog whose job already finished exits instead
+                // of polling until the daemon itself dies.
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 200_000_000,
+                };
+                let mut event: libc::kevent = std::mem::zeroed();
+                let n = libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &ts);
+                if n > 0
+                    && ((event.flags & libc::EV_ERROR) != 0
+                        || (event.fflags & libc::NOTE_EXIT) != 0)
+                {
+                    break true; // parent gone -> reap the group
+                }
+                if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
+                    break false; // group already gone -> nothing to do
+                }
+            }
+        };
+        libc::close(kq);
+        if parent_died {
+            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        }
     }
 }
 
-/// The Linux watchdog loop: poll until the daemon (parent) is gone, then
+/// The Linux watchdog loop: wait until the daemon (parent) is gone, then
 /// `SIGKILL` the agent's entire process group so descendants the agent started
-/// are reaped too (PDEATHSIG alone would only kill the direct agent).
+/// are reaped too (PDEATHSIG alone would only kill the direct agent). Returns
+/// early, without signalling, once the agent's process group has exited on its
+/// own (a completed job), so the watchdog does not linger for the daemon's whole
+/// lifetime.
 #[cfg(target_os = "linux")]
 pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
     // SAFETY: plain libc calls; no shared Rust state is touched.
     unsafe {
-        poll_until_parent_gone(parent_pid);
-        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        if wait_parent_or_group_gone(parent_pid, pgid) {
+            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        }
     }
 }
 
+/// Poll until either the parent (daemon) exits or the agent's process group has
+/// already gone away. Returns `true` when the parent died (the caller should
+/// reap the group), `false` when the group vanished on its own (nothing to do).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-unsafe fn poll_until_parent_gone(parent_pid: u32) {
+unsafe fn wait_parent_or_group_gone(parent_pid: u32, pgid: u32) -> bool {
     loop {
         if libc::kill(parent_pid as libc::pid_t, 0) != 0 {
-            return; // no such process
+            return true; // parent gone -> reap the group
+        }
+        if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
+            return false; // process group already gone -> nothing to reap
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }

@@ -234,6 +234,12 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
                     Some("agent_message_chunk") => {
                         if let Some(t) = update["content"]["text"].as_str() {
                             s.text.push_str(t);
+                            // Bound the transcript the same way the pipe path bounds
+                            // stdout: `Agent::run` appends every chunk to this
+                            // `String`, so a verbose or misbehaving ACP agent could
+                            // otherwise exhaust daemon memory (one unbounded buffer
+                            // per slot). The tail is retained for result detection.
+                            crate::pipe::bound_capture(&mut s.text);
                         }
                     }
                     Some("tool_call") => s.tool_calls += 1,
