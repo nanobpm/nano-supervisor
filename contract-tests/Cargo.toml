@@ -1,0 +1,23 @@
+[package]
+name = "contract-tests"
+version = "0.0.0"
+edition = "2021"
+description = "Black-box contract tests for the c8ctl nano fleet surface (Node plugin and nano-supervisor)"
+license = "Apache-2.0"
+publish = false
+
+# Black-box only: the suite runs the CLIs as subprocesses, reads/writes the state
+# files and talks to `supervisor.sock`. It never links nano-supervisor internals,
+# so the very same test runs against the Node plugin (`NS_TARGET=node`) and the
+# Rust binary (`NS_TARGET=rust`).
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json", "redactions", "filters"] }

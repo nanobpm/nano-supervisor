@@ -1,0 +1,15 @@
+---
+source: contract-tests/tests/state.rs
+expression: value
+---
+{
+  "name": "default",
+  "version": 1,
+  "workers": [
+    {
+      "instances": 2,
+      "profile": "coder",
+      "roles": "auto"
+    }
+  ]
+}

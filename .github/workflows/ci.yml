@@ -62,11 +62,41 @@ jobs:
             echo "::error::openssl/native-tls is in the dependency tree"; cargo tree --locked -i openssl -i native-tls || true; exit 1
           fi
 
+  # Contract tests against the Node plugin (issue #3). This is the target the
+  # suite is written against, so it runs for real here (installs the pinned
+  # `c8ctl-plugin-nano` 1.69.2). No engine is available on CI, so engine-backed
+  # and live-supervisor cases skip cleanly; the CLI, state-file and socket-schema
+  # cases run in full. The plain `test` job above also compiles this crate, but
+  # skips its target cases there (the Node plugin is not installed on that runner).
+  contract-tests-node:
+    name: contract tests (Node target)
+    runs-on: ubuntu-latest
+    env:
+      NS_TARGET: node
+      NANO_NO_UPDATE_NOTIFIER: "1"
+      C8CTL_NANO_NO_LAUNCHD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: install c8ctl CLI + pinned nano plugin
+        run: |
+          npm install -g @camunda8/cli
+          c8 load plugin c8ctl-plugin-nano@1.69.2
+          # Fail fast if the pinned plugin is not the one that loaded.
+          c8 nano --help | head -1
+          c8 nano --help | grep -q 'c8ctl-plugin-nano 1.69.2'
+      - name: contract tests (Node target)
+        run: cargo test -p contract-tests --locked
+
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [lint, test]
+    needs: [lint, test, contract-tests-node]
     runs-on: ubuntu-latest
     steps:
       - name: all jobs passed
@@ -74,3 +104,4 @@ jobs:
           echo '${{ toJSON(needs) }}'
           test "${{ needs.lint.result }}" = success
           test "${{ needs.test.result }}" = success
+          test "${{ needs.contract-tests-node.result }}" = success

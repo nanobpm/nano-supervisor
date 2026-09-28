@@ -1,0 +1,39 @@
+---
+source: contract-tests/tests/cli.rs
+expression: value
+---
+{
+  "entries": [
+    {
+      "autoScope": null,
+      "desired": 2,
+      "profile": "coder",
+      "roles": "auto",
+      "running": 0,
+      "workers": [
+        {
+          "collision": null,
+          "name": "wf-default-coder-1",
+          "pid": null,
+          "present": false,
+          "restarts": 0,
+          "state": "absent",
+          "uptimeMs": null
+        },
+        {
+          "collision": null,
+          "name": "wf-default-coder-2",
+          "pid": null,
+          "present": false,
+          "restarts": 0,
+          "state": "absent",
+          "uptimeMs": null
+        }
+      ]
+    }
+  ],
+  "exists": true,
+  "extra": [],
+  "name": "default",
+  "supervisorRunning": false
+}

@@ -1,0 +1,36 @@
+{
+  "ok": true,
+  "type": "status",
+  "daemon": {
+    "pid": "[pid]",
+    "startedAt": "[timestamp]",
+    "version": "1.69.2",
+    "socket": "[tmp]/c8ctl-nano-sup-[hash].sock",
+    "logFile": "[home]/logs/supervisor/daemon.log"
+  },
+  "pluginVersion": "1.69.2",
+  "workers": [
+    {
+      "id": "[host]-coder-[rand]",
+      "profile": "coder",
+      "pid": "[pid]",
+      "state": "running",
+      "restarts": 0,
+      "uptimeMs": "[uptime]",
+      "startedAtMs": "[epoch]",
+      "lastExit": null,
+      "args": [],
+      "logFile": "[home]/logs/supervisor/worker-[host]-coder-[rand].log",
+      "activity": { "state": "idle", "jobs": [] },
+      "engine": "[engine]",
+      "agentic": {
+        "status": "connected",
+        "mode": "local",
+        "url": "[agentic]",
+        "discovered": { "project": "Workforce", "port": 3000, "host": "[host-ip]" },
+        "message": null
+      }
+    }
+  ],
+  "final": true
+}

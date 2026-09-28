@@ -1,0 +1,26 @@
+---
+source: contract-tests/tests/state.rs
+expression: value
+---
+{
+  "hires": {
+    "coder": {
+      "args": [],
+      "capabilities": [
+        "feature",
+        "pr-review"
+      ],
+      "command": "nano-coder",
+      "createdAt": "[timestamp]",
+      "env": {},
+      "image": "",
+      "model": "gpt5",
+      "name": "coder",
+      "permission": "yolo",
+      "protocol": "acp",
+      "rank": "senior",
+      "sandbox": "none",
+      "terminal": "pipe"
+    }
+  }
+}
