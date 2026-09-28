@@ -187,23 +187,32 @@ impl DecodeErrorCode {
 pub enum EncodeErrorCode {
     InvalidSeq,
     UnserialisablePayload,
+    PayloadTooLarge,
+}
+
+/// Narrow a payload byte length into the frame header's `u32` length field,
+/// rejecting anything that would wrap the header (`> u32::MAX`) instead of
+/// silently truncating and emitting a corrupt frame.
+fn header_payload_len(len: usize) -> Result<u32, EncodeErrorCode> {
+    u32::try_from(len).map_err(|_| EncodeErrorCode::PayloadTooLarge)
 }
 
 /// Encode a frame into its exact wire bytes.
 pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, EncodeErrorCode> {
     // `seq` is a `u32`, so lane/family/seq are structurally valid by
-    // construction; the only encode failure the corpus can express is an
-    // unserialisable payload (kept for parity with the reference codec).
+    // construction; the encode failures the corpus can express are an
+    // unserialisable payload and a payload too large for the `u32` length field.
     let json = serde_json::to_string(&frame.payload)
         .map_err(|_| EncodeErrorCode::UnserialisablePayload)?;
     let payload = json.into_bytes();
+    let payload_len = header_payload_len(payload.len())?;
     let mut out = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
     out.extend_from_slice(&FRAME_MAGIC.to_be_bytes());
     out.push(FRAME_VERSION);
     out.push(frame.lane.code());
     out.push(frame.family.code());
     out.extend_from_slice(&frame.seq.to_be_bytes());
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload_len.to_be_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
 }
@@ -247,4 +256,28 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, DecodeErrorCode> {
         seq,
         payload,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_payload_len_accepts_up_to_u32_max() {
+        assert_eq!(header_payload_len(0), Ok(0));
+        assert_eq!(header_payload_len(u32::MAX as usize), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn header_payload_len_rejects_overflow() {
+        // On 64-bit targets a payload larger than `u32::MAX` must be rejected
+        // rather than silently wrapped into a corrupt frame header.
+        let too_big = (u32::MAX as usize).checked_add(1);
+        if let Some(len) = too_big {
+            assert_eq!(
+                header_payload_len(len),
+                Err(EncodeErrorCode::PayloadTooLarge)
+            );
+        }
+    }
 }
