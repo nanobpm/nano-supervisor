@@ -12,7 +12,7 @@
 //! (preserving retries), and carries on.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -186,6 +186,23 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
     }
 }
 
+/// Restrict a directory to owner-only access (mode 0700) on Unix, so job data
+/// placed under the shared temp directory is not readable/traversable by other
+/// local users. A no-op on non-Unix platforms and when the path is absent.
+fn restrict_dir_mode(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if dir.exists() {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting permissions on {}", dir.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Run one job to completion: assemble the prompt, provision the repo, drive the
 /// agent over its protocol, and return the completion variables. An error means
 /// the job should be failed (including the empty-result case).
@@ -220,6 +237,13 @@ async fn execute(
             .with_context(|| format!("clearing stale {}", run_dir.display()))?;
     }
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    // Restrict the runs root and this job dir to owner-only (0700) on Unix: the
+    // default `runs_dir` lives under the shared system temp directory, so with a
+    // typical umask the cloned repo, prompt-derived files, and `result.json`
+    // would otherwise be readable/traversable by other local users. Tighten the
+    // mode after creation so job data is never exposed regardless of umask.
+    restrict_dir_mode(&cfg.runs_dir)?;
+    restrict_dir_mode(&run_dir)?;
     let agent_cwd = match &env.repository {
         Some(repo) => {
             log(&format!(
