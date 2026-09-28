@@ -5,7 +5,7 @@
 //! window. With a lease, every command carries the token, so a superseded
 //! worker gets 409 instead of silently settling someone else's activation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -240,13 +240,21 @@ async fn handle(
             "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will hand it out again)"
         )),
         Some(Ok(out)) => {
-            let vars = [
+            // Finalize before settling: forward an agent-reported PR, or when the
+            // agent opened none, fall back to a `nano/agent-work/<key>` branch so
+            // any committed work is preserved rather than stranded in the
+            // (reapable) run directory.
+            let pr = finalize(opts, &key, &out);
+            let mut vars: HashMap<String, Value> = [
                 ("agentResult".to_string(), json!(out.text)),
                 ("agentStopReason".to_string(), json!(out.stop_reason)),
                 ("agentWorker".to_string(), json!(opts.worker_name)),
             ]
             .into_iter()
             .collect();
+            if let Some(pr) = &pr {
+                vars.insert("agentPr".to_string(), json!(pr));
+            }
             match jobs.complete(&key, vars, &lease).await {
                 Ok(()) => log(&format!(
                     "job {key} completed in {elapsed:.1}s: stop={} updates={} tool_calls={} permissions={} refreshes={n} result={:?}",
@@ -461,12 +469,20 @@ impl Drop for ActiveGuard {
         // since reactivated the same run dir and written its own marker, that
         // marker belongs to the new live owner — erasing it would let a foreign
         // sweeper delete an active cwd.
+        //
+        // The "is this marker mine? then unlink" read-modify-write runs under
+        // the per-run marker lock so it is atomic against a reactivating
+        // worker's `write_active_marker`: the two can no longer interleave such
+        // that we read our own PID, a new owner overwrites the marker, and we
+        // then delete the new owner's marker (the cross-process TOCTOU).
         let marker = self.path.join(ACTIVE_MARKER);
-        if let Ok(contents) = std::fs::read_to_string(&marker) {
-            if contents.trim() == std::process::id().to_string() {
-                let _ = std::fs::remove_file(&marker);
+        with_marker_lock(&self.path, || {
+            if let Ok(contents) = std::fs::read_to_string(&marker) {
+                if contents.trim() == std::process::id().to_string() {
+                    let _ = std::fs::remove_file(&marker);
+                }
             }
-        }
+        });
         if let Ok(mut set) = self.active.lock() {
             set.remove(&self.path);
         }
@@ -479,11 +495,53 @@ impl Drop for ActiveGuard {
 /// run from an orphaned one.
 const ACTIVE_MARKER: &str = ".nano-active";
 
+/// Filename of the per-run advisory lock guarding all read/modify/write of the
+/// active marker. Unlike the marker, this file is **never unlinked** (only its
+/// advisory lock is taken and released), so there is no open-vs-unlink inode
+/// race; it is reaped only when the whole run directory is. It exists solely to
+/// serialize marker access and is not itself a liveness signal.
+const ACTIVE_LOCK: &str = ".nano-active.lock";
+
+/// Serialize a marker read/modify/write through an exclusive advisory lock on
+/// the run's stable [`ACTIVE_LOCK`] file, so a completing worker's
+/// ownership-check-then-unlink and a reactivating worker's marker write are
+/// mutually exclusive (closing the read-then-unlink TOCTOU). Best-effort: if
+/// the lock file can't be opened, or on non-unix where there is no portable
+/// advisory lock, the closure still runs and degrades to the prior
+/// read-then-unlink behavior. Dropping the file closes its fd, releasing the
+/// lock.
+#[cfg(unix)]
+fn with_marker_lock<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(ACTIVE_LOCK))
+        .ok();
+    if let Some(file) = &lock {
+        // LOCK_EX blocks until the lock is ours; a crashed holder's lock is
+        // auto-released by the kernel, so this cannot wedge on a dead worker.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    }
+    let result = f();
+    drop(lock);
+    result
+}
+
+#[cfg(not(unix))]
+fn with_marker_lock<T>(_dir: &Path, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 /// Record this process as the live owner of `cwd` by writing its PID into the
 /// run's liveness marker. Best-effort: the in-process active set still guards
-/// same-process runs if the marker can't be written.
+/// same-process runs if the marker can't be written. The write runs under the
+/// marker lock so it is atomic against a completing worker's check-then-unlink.
 fn write_active_marker(cwd: &Path) {
-    let _ = std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string());
+    with_marker_lock(cwd, || {
+        let _ = std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string());
+    });
 }
 
 /// Whether `dir` is a *live* run owned by some still-running worker — i.e. its
@@ -492,13 +550,15 @@ fn write_active_marker(cwd: &Path) {
 /// see it. Fail-safe: a present-but-unparseable marker is treated as live so a
 /// possibly-active cwd is never deleted; a missing marker means "not live".
 fn marker_owner_alive(dir: &Path) -> bool {
-    match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
-        Ok(contents) => match contents.trim().parse::<u32>() {
-            Ok(pid) => pid_is_live(pid),
-            Err(_) => true,
-        },
-        Err(_) => false,
-    }
+    with_marker_lock(dir, || {
+        match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
+            Ok(contents) => match contents.trim().parse::<u32>() {
+                Ok(pid) => pid_is_live(pid),
+                Err(_) => true,
+            },
+            Err(_) => false,
+        }
+    })
 }
 
 /// Best-effort liveness check for a PID on the local host (run roots are
@@ -604,6 +664,109 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
             age.as_secs()
         ));
     }
+}
+
+/// After a successful agent run, either forward the PR the agent reported or —
+/// when it opened none — fall back to a `nano/agent-work/<key>` branch so any
+/// committed work is preserved instead of being stranded in the (reapable) run
+/// directory. Returns the reported PR reference, if any. Best-effort: finalize
+/// never fails the already-successful job.
+fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
+    let cwd = opts.runs_dir.join(key);
+    if let Some(pr) = reported_pr(out) {
+        log(&format!(
+            "job {key}: agent reported PR {pr}; forwarding it (no fallback branch)"
+        ));
+        return Some(pr);
+    }
+    let branch = format!("nano/agent-work/{key}");
+    match push_fallback_branch(&cwd, &branch) {
+        Ok(true) => log(&format!(
+            "job {key}: agent reported no PR; pushed fallback branch {branch} to preserve committed work"
+        )),
+        Ok(false) => log(&format!(
+            "job {key}: agent reported no PR and no committed work to save; fallback branch {branch} not created"
+        )),
+        Err(e) => log(&format!(
+            "job {key}: agent reported no PR; fallback branch {branch} could not be created: {e:#}"
+        )),
+    }
+    None
+}
+
+/// Extract a PR reference the agent announced, from its `::nano:result::`
+/// output marker (the last one wins) or the `AGENT_RESULT_FILE` it was handed.
+fn reported_pr(out: &Outcome) -> Option<String> {
+    const MARKER: &str = "::nano:result::";
+    if let Some(pr) = out
+        .text
+        .rmatch_indices(MARKER)
+        .find_map(|(i, m)| {
+            let rest = out.text[i + m.len()..].lines().next()?.trim();
+            // Tolerate trailing text after the JSON object on the same line.
+            serde_json::Deserializer::from_str(rest)
+                .into_iter::<Value>()
+                .next()?
+                .ok()
+        })
+        .and_then(|v| pr_of(&v))
+    {
+        return Some(pr);
+    }
+    if let Ok(path) = std::env::var("AGENT_RESULT_FILE") {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                return pr_of(&v);
+            }
+        }
+    }
+    None
+}
+
+/// The `pr` field of a result object, if present and a string.
+fn pr_of(v: &Value) -> Option<String> {
+    v.get("pr").and_then(Value::as_str).map(str::to_string)
+}
+
+/// Point a `nano/agent-work/<key>` branch at whatever the agent committed in
+/// `cwd` and push it, so unpushed work survives the run dir being reaped.
+/// `Ok(true)` when a branch was created, `Ok(false)` when `cwd` is not a git
+/// repo or has no commit to save. Best-effort — a missing remote or an offline
+/// push is not fatal to the (already successful) job.
+fn push_fallback_branch(cwd: &Path, branch: &str) -> Result<bool> {
+    let is_repo = git(cwd, &["rev-parse", "--git-dir"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !is_repo {
+        return Ok(false);
+    }
+    let has_head = git(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_head {
+        return Ok(false);
+    }
+    git(cwd, &["branch", "-f", branch, "HEAD"])?;
+    let pushed = git(cwd, &["push", "--force-with-lease", "origin", branch])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !pushed {
+        // The branch exists locally even if the push failed (no remote / offline);
+        // the work is still recoverable from the run dir until it is reaped.
+        log(&format!(
+            "finalize: created local branch {branch} but could not push it (no reachable remote?)"
+        ));
+    }
+    Ok(true)
+}
+
+/// Run `git <args>` in `cwd`, capturing its output.
+fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))
 }
 
 pub fn log(msg: &str) {
@@ -764,6 +927,72 @@ mod tests {
         assert!(
             !dir.join(ACTIVE_MARKER).exists(),
             "our own marker must be removed on guard drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn outcome_with(text: &str) -> Outcome {
+        Outcome {
+            stop_reason: "end_turn".to_string(),
+            text: text.to_string(),
+            updates: 0,
+            tool_calls: 0,
+            permissions_granted: 0,
+        }
+    }
+
+    #[test]
+    fn reported_pr_reads_the_last_result_marker() {
+        // The `::nano:result::` marker in the agent's output carries the PR; the
+        // last one wins, and trailing text on the marker line is tolerated.
+        let out = outcome_with(
+            "opened a PR::nano:result::{\"status\":\"opened\",\"pr\":\"nanobpm/x#7\"} done",
+        );
+        assert_eq!(reported_pr(&out).as_deref(), Some("nanobpm/x#7"));
+    }
+
+    #[test]
+    fn reported_pr_is_none_without_a_pr() {
+        // Plain chatter with no marker and no `pr` field reports no PR, so the
+        // worker falls back to a `nano/agent-work/` branch.
+        assert!(reported_pr(&outcome_with("committed but opened no PR")).is_none());
+        let out = outcome_with("::nano:result::{\"status\":\"opened\"}");
+        assert!(reported_pr(&out).is_none());
+    }
+
+    #[test]
+    fn fallback_branch_skips_a_non_repo() {
+        // A run directory that is not a git repo has nothing to preserve, so no
+        // fallback branch is created (and finalize never fails the job).
+        let dir = std::env::temp_dir().join(format!("ns-nofb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            !push_fallback_branch(&dir, "nano/agent-work/k").unwrap(),
+            "a non-repo cwd yields no fallback branch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_lock_serializes_and_never_unlinks_the_lock_file() {
+        // The stable lock file guards marker access and is itself never removed
+        // (only the run dir reaps it), so there is no open-vs-unlink inode race.
+        let dir = std::env::temp_dir().join(format!("ns-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `write_active_marker` takes the lock internally; the guarded closure
+        // returns its value. (These calls are never nested in production — doing
+        // so would self-deadlock, since flock treats each open fd independently.)
+        write_active_marker(&dir);
+        let ran = with_marker_lock(&dir, || 42);
+        assert_eq!(ran, 42, "the guarded closure runs and returns its value");
+        assert!(
+            marker_owner_alive(&dir),
+            "marker written under the lock reads live"
+        );
+        #[cfg(unix)]
+        assert!(
+            dir.join(ACTIVE_LOCK).exists(),
+            "the lock file persists (never unlinked) for stable, race-free locking"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
