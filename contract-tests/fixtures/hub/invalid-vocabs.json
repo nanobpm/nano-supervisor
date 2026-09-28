@@ -1,0 +1,148 @@
+[
+  {
+    "name": "not-an-object",
+    "document": 42,
+    "expectedCode": "not-object"
+  },
+  {
+    "name": "missing-version",
+    "document": {
+      "networks": {}
+    },
+    "expectedCode": "bad-version"
+  },
+  {
+    "name": "zero-version",
+    "document": {
+      "version": 0,
+      "networks": {}
+    },
+    "expectedCode": "bad-version"
+  },
+  {
+    "name": "missing-networks",
+    "document": {
+      "version": 1
+    },
+    "expectedCode": "bad-networks"
+  },
+  {
+    "name": "unknown-document-field",
+    "document": {
+      "version": 1,
+      "networks": {},
+      "extra": true
+    },
+    "expectedCode": "unknown-document-field"
+  },
+  {
+    "name": "bad-network-name",
+    "document": {
+      "version": 1,
+      "networks": {
+        "Bad Name": {
+          "roles": {}
+        }
+      }
+    },
+    "expectedCode": "bad-network-name"
+  },
+  {
+    "name": "unknown-role-field",
+    "document": {
+      "version": 1,
+      "networks": {
+        "planning": {
+          "roles": {
+            "decide": {
+              "bogus": 1
+            }
+          }
+        }
+      }
+    },
+    "expectedCode": "unknown-role-field"
+  },
+  {
+    "name": "bad-weight",
+    "document": {
+      "version": 1,
+      "networks": {
+        "planning": {
+          "roles": {
+            "decide": {
+              "weight": "high"
+            }
+          }
+        }
+      }
+    },
+    "expectedCode": "bad-weight"
+  },
+  {
+    "name": "bad-seats-count",
+    "document": {
+      "version": 1,
+      "networks": {
+        "planning": {
+          "roles": {
+            "decide": {
+              "seats": -1
+            }
+          }
+        }
+      }
+    },
+    "expectedCode": "bad-seats"
+  },
+  {
+    "name": "bad-named-seat",
+    "document": {
+      "version": 1,
+      "networks": {
+        "qa": {
+          "roles": {
+            "review": {
+              "seats": [
+                "Red"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "expectedCode": "bad-seat-label"
+  },
+  {
+    "name": "bad-requires",
+    "document": {
+      "version": 1,
+      "networks": {
+        "planning": {
+          "roles": {
+            "decide": {
+              "requires": "x"
+            }
+          }
+        }
+      }
+    },
+    "expectedCode": "bad-requires"
+  },
+  {
+    "name": "bad-seats-distinct-family",
+    "document": {
+      "version": 1,
+      "networks": {
+        "qa": {
+          "roles": {
+            "review": {
+              "seatsDistinctFamily": "yes"
+            }
+          }
+        }
+      }
+    },
+    "expectedCode": "bad-seats-distinct-family"
+  }
+]

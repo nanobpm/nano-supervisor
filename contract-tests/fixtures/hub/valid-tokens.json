@@ -1,0 +1,64 @@
+[
+  {
+    "name": "single-segment-role",
+    "token": "decide",
+    "parsed": {
+      "subnetworks": [],
+      "role": "decide"
+    }
+  },
+  {
+    "name": "network-and-role",
+    "token": "planning.decide",
+    "parsed": {
+      "network": "planning",
+      "subnetworks": [],
+      "role": "decide"
+    }
+  },
+  {
+    "name": "nested-subnetwork",
+    "token": "implementation.ci.fix",
+    "parsed": {
+      "network": "implementation",
+      "subnetworks": [
+        "ci"
+      ],
+      "role": "fix"
+    }
+  },
+  {
+    "name": "role-with-named-seat",
+    "token": "qa.review#red",
+    "parsed": {
+      "network": "qa",
+      "subnetworks": [],
+      "role": "review",
+      "seat": "red"
+    }
+  },
+  {
+    "name": "role-with-numeric-seat",
+    "token": "implementation.qa.red#1",
+    "parsed": {
+      "network": "implementation",
+      "subnetworks": [
+        "qa"
+      ],
+      "role": "red",
+      "seat": "1"
+    }
+  },
+  {
+    "name": "hyphenated-segments",
+    "token": "code-review.fast-lane.senior-dev#blue",
+    "parsed": {
+      "network": "code-review",
+      "subnetworks": [
+        "fast-lane"
+      ],
+      "role": "senior-dev",
+      "seat": "blue"
+    }
+  }
+]

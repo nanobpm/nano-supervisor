@@ -7,6 +7,9 @@ license = "Apache-2.0"
 repository = "https://github.com/nanobpm/nano-supervisor"
 publish = false
 
+[workspace]
+members = ["contract-tests"]
+
 [dependencies]
 # 0.3.0 is the first release with job leases (`with_lease`, `job_lease_token`).
 camunda-orchestration-sdk = { version = "0.3.1", default-features = false, features = ["rustls"] }

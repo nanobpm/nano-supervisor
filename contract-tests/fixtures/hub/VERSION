@@ -1,0 +1,34 @@
+@nanobpm/agentic 0.14.0
+
+Provenance
+==========
+
+The JSON files in this directory are a byte-exact snapshot of the shared
+agentic-protocol conformance corpus published by `@nanobpm/agentic`, taken from
+the package's `protocol/conformance` export at the version above:
+
+  npm pack @nanobpm/agentic@0.14.0
+  # dump GOLDEN_FRAMES, MALFORMED_FRAMES, VALID_CONTROL_FRAMES,
+  # MALFORMED_CONTROL_FRAMES, ACP_TRANSCRIPT_VECTORS, VALID/INVALID_VOCABS,
+  # VALID/INVALID_TOKENS from dist/protocol/conformance/index.js
+
+The corpus is deliberately cross-repo: the same golden vectors hold BOTH the
+Node worker (jwulf/c8ctl-plugin-nano) and this repo's worker-side hub codec to
+identical wire bytes, so the two can never drift. `tests/hub.rs` replays this
+snapshot and diffs the frames.
+
+Files
+=====
+
+  golden-frames.json            frame <-> exact wire bytes (hex), both directions
+  malformed-frames.json         adversarial byte sequences + expected decode error
+  control-frames.json           inbound steer chunks + typed frame (+ round-trip flag)
+  malformed-control-frames.json tagged-but-malformed steer chunks + expected error
+  transcript-vectors.json       ACP session/update -> exact chunk bytes -> typed event
+  valid-vocabs.json             valid vocab documents (registry schema)
+  invalid-vocabs.json           invalid vocab documents + expected error code
+  valid-tokens.json             routing tokens + their parse
+  invalid-tokens.json           malformed routing tokens + expected error code
+
+To refresh against a newer corpus, re-run the dump above, bump the version at
+the top of this file, and re-run `cargo test -p contract-tests --test hub`.

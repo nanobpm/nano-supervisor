@@ -1,0 +1,14 @@
+[package]
+name = "contract-tests"
+version = "0.0.1"
+edition = "2021"
+description = "Black-box contract tests for the nano fleet (CLI, state, control socket, agentic hub)"
+license = "Apache-2.0"
+repository = "https://github.com/nanobpm/nano-supervisor"
+publish = false
+
+[dependencies]
+# `preserve_order` keeps JSON object key order through decode -> re-encode, so a
+# frame's payload bytes round-trip identically to the golden hex.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
