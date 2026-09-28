@@ -121,6 +121,12 @@ enum Cmd {
         parent_pid: u32,
         #[arg(long)]
         pgid: u32,
+        /// The daemon's start time (Linux `/proc/<pid>/stat` field 22), captured
+        /// by the daemon *before* launching this watchdog so PID-reuse detection
+        /// still works even if the daemon is SIGKILLed before this process can
+        /// read `/proc` itself.
+        #[arg(long)]
+        parent_start: Option<u64>,
     },
 }
 
@@ -194,10 +200,12 @@ async fn main() -> Result<()> {
             };
             daemon::run(opts).await
         }
-        Cmd::ReapWatchdog { parent_pid, pgid } => {
-            tokio::task::spawn_blocking(move || pdeath::reap_watchdog(parent_pid, pgid))
-                .await
-                .ok();
+        Cmd::ReapWatchdog { parent_pid, pgid, parent_start } => {
+            tokio::task::spawn_blocking(move || {
+                pdeath::reap_watchdog(parent_pid, pgid, parent_start)
+            })
+            .await
+            .ok();
             Ok(())
         }
     }

@@ -210,14 +210,28 @@ pub fn watch(agent_pid: u32) {
         return;
     };
     let parent = std::process::id();
+    // Capture the daemon's start time here, while the daemon is *guaranteed*
+    // alive, and pass it to the watchdog. If we left the watchdog to read
+    // `/proc/<parent>/stat` itself (as it used to), a daemon SIGKILLed in the
+    // window between this spawn and the watchdog reaching that read would leave
+    // `expected_start = None`, disabling PID-reuse detection and letting the
+    // watchdog wait forever on a recycled pid. On non-Linux the value is unused.
+    #[cfg(target_os = "linux")]
+    let parent_start = parent_start_time(parent);
+    #[cfg(not(target_os = "linux"))]
+    let parent_start: Option<u64> = None;
     // Detached so it survives independently and can reap us; it exits on its own
     // once the target process group is gone.
-    let _ = std::process::Command::new(exe)
-        .arg("__reap-watchdog")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__reap-watchdog")
         .arg("--parent-pid")
         .arg(parent.to_string())
         .arg("--pgid")
-        .arg(agent_pid.to_string())
+        .arg(agent_pid.to_string());
+    if let Some(start) = parent_start {
+        cmd.arg("--parent-start").arg(start.to_string());
+    }
+    let _ = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -233,7 +247,7 @@ pub fn watch(_agent_pid: u32) {}
 /// agent's process group has exited on its own (a completed job), so the
 /// watchdog does not linger as a polling child for the daemon's whole lifetime.
 #[cfg(target_os = "macos")]
-pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
+pub fn reap_watchdog(parent_pid: u32, pgid: u32, _parent_start: Option<u64>) {
     // SAFETY: standard kqueue usage; the fd is closed before return.
     unsafe {
         let kq = libc::kqueue();
@@ -300,13 +314,14 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
 /// own (a completed job), so the watchdog does not linger for the daemon's whole
 /// lifetime.
 #[cfg(target_os = "linux")]
-pub fn reap_watchdog(parent_pid: u32, pgid: u32) {
-    // Capture the daemon's start time up front (it is still alive here) so the
-    // poll can tell the real parent apart from a later process that recycles its
-    // pid: a bare `kill(pid, 0)` is blind to PID reuse, so without this a
-    // restarted-then-reused daemon pid would look alive forever and the agent
-    // group would never be reaped.
-    let expected_start = parent_start_time(parent_pid);
+pub fn reap_watchdog(parent_pid: u32, pgid: u32, parent_start: Option<u64>) {
+    // Prefer the start time the daemon captured for us while it was still alive
+    // (passed via `--parent-start`); only fall back to reading `/proc` ourselves
+    // if it was not supplied. Reading it here is racy: the daemon may already be
+    // gone, yielding `None` and silently disabling PID-reuse detection. Using the
+    // daemon-supplied value keeps `expected_start` populated so a recycled parent
+    // pid can never masquerade as the original and strand the agent group.
+    let expected_start = parent_start.or_else(|| parent_start_time(parent_pid));
     // SAFETY: plain libc calls; no shared Rust state is touched.
     unsafe {
         // Re-probe the group immediately before signalling: the parent may have
@@ -363,4 +378,22 @@ unsafe fn wait_parent_or_group_gone(parent_pid: u32, pgid: u32, expected_start: 
 
 /// Stub on platforms without a watchdog process (they rely on [`arm`]).
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn reap_watchdog(_parent_pid: u32, _pgid: u32) {}
+pub fn reap_watchdog(_parent_pid: u32, _pgid: u32, _parent_start: Option<u64>) {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_start_time_reads_own_incarnation() {
+        // Our own process is alive, so its start time must be readable and stable
+        // across reads — this is the value the daemon captures up front and hands
+        // to the watchdog so PID-reuse detection survives a daemon SIGKILL that
+        // races the watchdog's own `/proc` read.
+        let me = std::process::id();
+        let a = parent_start_time(me).expect("own start time readable");
+        let b = parent_start_time(me).expect("own start time readable");
+        assert_eq!(a, b);
+        assert!(a > 0);
+    }
+}
