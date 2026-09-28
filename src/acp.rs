@@ -73,9 +73,14 @@ impl Agent {
         env: &[(String, String)],
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(cwd)
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        cmd.args(args).current_dir(cwd);
+        // Strip the daemon's own engine-connection secrets from the inherited
+        // environment before layering the agent env, so the agent can never read
+        // or exfiltrate the credentials the daemon uses to talk to the engine.
+        for k in crate::slot::SENSITIVE_DAEMON_ENV {
+            cmd.env_remove(k);
+        }
+        cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

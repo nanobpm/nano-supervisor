@@ -490,6 +490,23 @@ fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope
     payload.to_string()
 }
 
+/// The daemon's own engine-connection credentials, read from its environment by
+/// [`crate::profile`]. A coding agent never needs them, so they are stripped
+/// from the inherited environment at every agent launch (`acp` and `pipe`) —
+/// otherwise a daemon configured via ambient `CAMUNDA_*`/`ZEEBE_*` OAuth or
+/// basic-auth secrets would expose those secrets to the agent, which could read
+/// and exfiltrate them even with `NANO_AGENTIC=off`. Deployment secrets the
+/// agent legitimately needs (e.g. its own GitHub credentials for push) are
+/// delivered through the deliberate `hire.env` channel and are unaffected.
+pub(crate) const SENSITIVE_DAEMON_ENV: &[&str] = &[
+    "CAMUNDA_CLIENT_ID",
+    "CAMUNDA_CLIENT_SECRET",
+    "CAMUNDA_BASIC_AUTH_USERNAME",
+    "CAMUNDA_BASIC_AUTH_PASSWORD",
+    "ZEEBE_CLIENT_ID",
+    "ZEEBE_CLIENT_SECRET",
+];
+
 /// The environment every harness gets: the reserved `AGENT_*`/`NANO_*` vars, the
 /// result-file path, the agentic off-switch, and the hire's own env last-but-one
 /// (reserved vars always win).
@@ -575,6 +592,33 @@ mod tests {
         assert_eq!(get("AGENT_RESULT_FILE"), Some("/tmp/r.json"));
         assert_eq!(get("AGENT_JOB_TYPE"), Some("senior:pr-review"));
         assert_eq!(get("AGENT_PROFILE"), Some("coder"));
+    }
+
+    #[test]
+    fn sensitive_daemon_env_covers_engine_secrets() {
+        // The daemon's engine-connection secrets must be in the strip list so a
+        // launched agent never inherits them. `build_agent_env` never emits them
+        // either (it only adds reserved + hire vars), so the leak can only come
+        // from the inherited environment — which the launch sites strip via this
+        // list.
+        for k in [
+            "CAMUNDA_CLIENT_SECRET",
+            "ZEEBE_CLIENT_SECRET",
+            "CAMUNDA_BASIC_AUTH_PASSWORD",
+        ] {
+            assert!(
+                SENSITIVE_DAEMON_ENV.contains(&k),
+                "{k} missing from SENSITIVE_DAEMON_ENV"
+            );
+        }
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&cfg(), "1", &job, std::path::Path::new("/tmp/r.json"));
+        for (k, _) in &env {
+            assert!(
+                !SENSITIVE_DAEMON_ENV.contains(&k.as_str()),
+                "build_agent_env must never emit daemon secret {k}"
+            );
+        }
     }
 
     #[test]

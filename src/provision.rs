@@ -63,9 +63,17 @@ pub async fn provision(
     args.push(repo.url.clone());
     args.push(workspace.to_string_lossy().into_owned());
 
-    git(&args, None, timeout)
-        .await
-        .context("git clone failed")?;
+    if let Err(e) = git(&args, None, timeout).await {
+        // A failed clone can still leave a *partially populated* checkout — most
+        // notably a `--recurse-submodules` clone whose submodule step failed
+        // after the superproject was created — with the credential-bearing URL
+        // already written into `<workspace>/.git/config` (and any nested
+        // submodule configs). This early return would otherwise leave that token
+        // on disk. Remove the whole partial checkout before propagating so no
+        // failure path leaves credentials behind.
+        remove_partial_checkout(&workspace).await;
+        return Err(e).context("git clone failed");
+    }
 
     // `git clone` persists the *full* remote URL — including any `user:token@`
     // userinfo — into `<workspace>/.git/config`. The agent then runs with read
@@ -78,7 +86,7 @@ pub async fn provision(
     // credential-bearing URL held only in memory (never `origin`), so the token
     // is never written back to config.
     let scrubbed_origin = scrub_url_credentials(&repo.url);
-    git(
+    if let Err(e) = git(
         &[
             "remote".into(),
             "set-url".into(),
@@ -90,7 +98,13 @@ pub async fn provision(
         timeout,
     )
     .await
-    .context("scrubbing persisted clone credentials failed")?;
+    {
+        // The scrub itself failed, so the credential-bearing origin is still
+        // persisted in the checkout config. Remove the whole checkout rather
+        // than leaving the token on disk.
+        remove_partial_checkout(&workspace).await;
+        return Err(e).context("scrubbing persisted clone credentials failed");
+    }
 
     if let Some(sha) = &repo.sha {
         // The commit may be absent under a shallow clone: fetch it, then check
@@ -144,6 +158,18 @@ pub async fn provision(
     }
 
     Ok(workspace)
+}
+
+/// Best-effort removal of a partially provisioned checkout after a git step
+/// failed. The checkout config may still hold a credential-bearing remote URL
+/// (see the clone/scrub failure paths above), so it must not be left on disk. A
+/// removal error is deliberately ignored — the checkout may not exist yet, and
+/// there is nothing more to do about a filesystem failure here beyond the caller
+/// already propagating the original git error.
+async fn remove_partial_checkout(workspace: &Path) {
+    if tokio::fs::try_exists(workspace).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_dir_all(workspace).await;
+    }
 }
 
 fn is_hex_sha(s: &str) -> bool {
