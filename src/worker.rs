@@ -163,10 +163,26 @@ async fn handle(
     // skips the directory. Create the dir up front so the marker lands before
     // the agent starts producing output.
     if let Err(e) = std::fs::create_dir_all(&cwd) {
-        log(&format!(
-            "job {key}: cannot create run dir {}: {e:#}; skipping",
-            cwd.display()
-        ));
+        // The job is already activated (leased). Bailing out with a bare
+        // `return` would leave it neither completed nor failed, so it would
+        // stay leased until its timeout before the engine could hand it out
+        // again. Route this through the same `jobs.fail`/retry path as a
+        // `run_agent` error so a transient run-dir failure is retried promptly.
+        let msg = format!("cannot create run dir {}: {e:#}", cwd.display());
+        log(&format!("job {key}: {msg}; failing for retry"));
+        if let Err(e2) = jobs
+            .fail(
+                &key,
+                (job.retries - 1).max(0),
+                &truncate(&msg, 2000),
+                &lease,
+            )
+            .await
+        {
+            log(&format!(
+                "job {key}: fail failed: {e2:#} (original error: {msg})"
+            ));
+        }
         return;
     }
     active.lock().unwrap().insert(cwd.clone());
@@ -312,11 +328,35 @@ fn truncate(s: &str, max: usize) -> String {
 /// restart. `default_name()` is `<host>-spike-<pid>`; we strip only that exact
 /// trailing `-<pid>` (a run of digits directly after a `-spike` segment) so the
 /// path is restart-stable. Explicit `--name`s (e.g. `worker-1`, `worker-2`) do
-/// NOT carry the `-spike-<pid>` shape and are preserved verbatim, so they keep
-/// distinct namespaces instead of collapsing to a shared one.
+/// NOT carry the `-spike-<pid>` shape, so their readable prefix is kept intact
+/// and they keep distinct namespaces instead of collapsing to a shared one. A
+/// short identity digest is also appended so roles whose readable form sanitizes
+/// to the same string still get distinct namespaces (see below).
 fn stable_namespace(worker_name: &str, job_type: &str) -> String {
     let base = strip_default_pid_suffix(worker_name);
-    sanitize_component(&format!("{base}-{job_type}"))
+    // Sanitizing to a path-safe component is lossy: distinct identities such as
+    // the job types `spike:nano-supervisor` and `spike-nano-supervisor` both
+    // collapse to `spike-nano-supervisor`, which would let two different worker
+    // roles share one run root and reap each other's retained runs. Keep the
+    // readable, restart-stable prefix but append a short deterministic digest
+    // of the *raw* (base, job_type) identity so distinct roles never collide.
+    let readable = sanitize_component(&format!("{base}-{job_type}"));
+    format!("{readable}-{}", identity_digest(base, job_type))
+}
+
+/// A short, deterministic hex digest of a worker's raw `(base, job_type)`
+/// identity. Used to disambiguate run-root namespaces whose readable form is
+/// lossy (see `stable_namespace`). `DefaultHasher` uses fixed keys, so this is
+/// stable across restarts and processes for a given std version — all that
+/// restart-stable, per-role isolation requires. A domain separator between the
+/// two fields prevents `("a-b", "c")` from colliding with `("a", "b-c")`.
+fn identity_digest(base: &str, job_type: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut h);
+    0u8.hash(&mut h);
+    job_type.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Strip the default `-spike-<pid>` PID suffix from a worker name, reducing
@@ -429,16 +469,28 @@ fn marker_owner_alive(dir: &Path) -> bool {
 }
 
 /// Best-effort liveness check for a PID on the local host (run roots are
-/// host-local, so any worker sharing this namespace is on this host).
-#[cfg(target_os = "linux")]
+/// host-local, so any worker sharing this namespace is on this host). Uses
+/// `kill(pid, 0)`, which performs the kernel's existence/permission checks
+/// without sending a signal, so it works uniformly on Linux and macOS (unlike a
+/// Linux-only `/proc` probe, which left macOS unable to ever reap orphaned run
+/// dirs). Fail-safe: only a definitive `ESRCH` ("no such process") is treated
+/// as dead; `EPERM` (alive but unsignalable) and any other error keep the dir.
+#[cfg(unix)]
 fn pid_is_live(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    )
 }
 
-/// Off Linux there is no portable pure-`std` liveness probe, so treat a present
-/// marker as live and never risk deleting an active cwd; stale dirs off Linux
-/// are still reaped once their marker is removed on normal completion.
-#[cfg(not(target_os = "linux"))]
+/// Off unix there is no portable liveness probe, so treat a present marker as
+/// live and never risk deleting an active cwd; stale dirs are still reaped once
+/// their marker is removed on normal completion.
+#[cfg(not(unix))]
 fn pid_is_live(_pid: u32) -> bool {
     true
 }
@@ -534,7 +586,10 @@ mod tests {
         let a = stable_namespace("host-spike-123", "my-job");
         let b = stable_namespace("host-spike-456", "my-job");
         assert_eq!(a, b, "namespace must be stable across restarts (no PID)");
-        assert_eq!(a, "host-spike-my-job");
+        assert!(
+            a.starts_with("host-spike-my-job-"),
+            "readable prefix preserved: {a}"
+        );
     }
 
     #[test]
@@ -545,9 +600,19 @@ mod tests {
     }
 
     #[test]
+    fn namespace_disambiguates_lossy_sanitization() {
+        // `spike:x` and `spike-x` sanitize to the same readable component; the
+        // identity digest must still keep their namespaces distinct so the two
+        // roles never share (and reap) each other's run root.
+        let a = stable_namespace("host-spike-123", "spike:nano-supervisor");
+        let b = stable_namespace("host-spike-123", "spike-nano-supervisor");
+        assert_ne!(a, b, "distinct raw job types must not collide");
+    }
+
+    #[test]
     fn namespace_keeps_explicit_name_without_pid() {
-        // An explicit `--name` with no trailing -<pid> is used as-is.
-        assert_eq!(stable_namespace("alice", "job"), "alice-job");
+        // An explicit `--name` with no trailing -<pid> keeps its readable prefix.
+        assert!(stable_namespace("alice", "job").starts_with("alice-job-"));
     }
 
     #[test]
@@ -556,8 +621,8 @@ mod tests {
         // default `-spike-<pid>` shape; they keep distinct namespaces.
         let a = stable_namespace("worker-1", "job");
         let b = stable_namespace("worker-2", "job");
-        assert_eq!(a, "worker-1-job");
-        assert_eq!(b, "worker-2-job");
+        assert!(a.starts_with("worker-1-job-"));
+        assert!(b.starts_with("worker-2-job-"));
         assert_ne!(a, b, "explicit numeric names must not collide");
     }
 
