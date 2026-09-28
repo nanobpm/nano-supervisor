@@ -49,6 +49,13 @@ pub async fn run(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting agent {program:?}"))?;
+    // Cancellation guard: if this future is dropped before we reach `kill_tree`
+    // (e.g. the slot aborts `execute` on lease loss), `kill_on_drop` reaps only
+    // the direct child — its process-group descendants (tools the agent started)
+    // would leak. Declared after `child` so it drops first, SIGKILLing the whole
+    // group while the child pid is still valid (unreaped). Disarmed once
+    // `kill_tree` has torn the group down on the normal path.
+    let mut group_guard = crate::pdeath::GroupGuard::new(child.id());
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         crate::pdeath::watch(pid);
@@ -80,8 +87,15 @@ pub async fn run(
         tokio::select! {
             n = reader.read(&mut buf) => match n {
                 Ok(0) | Err(_) => {
-                    // stdout closed (EOF) or errored: wait for the process to reap.
-                    let status = child.wait().await.ok();
+                    // stdout closed (EOF) or errored. The child may still be
+                    // alive (a harness can close or redirect stdout yet keep
+                    // running), so bound the wait by `idle` and then fall through
+                    // to `kill_tree`; an unbounded `wait()` here would let such a
+                    // harness occupy the slot forever, defeating the idle timeout.
+                    let status = match tokio::time::timeout(idle, child.wait()).await {
+                        Ok(Ok(s)) => Some(s),
+                        _ => None,
+                    };
                     break status.and_then(|s| s.code());
                 }
                 Ok(n) => {
@@ -104,6 +118,9 @@ pub async fn run(
 
     // Kill the whole process group (agent + any tools it started), then reap.
     kill_tree(&mut child).await;
+    // The group is now torn down and the child reaped, so its pid must not be
+    // signalled again (it may be recycled by the OS): disarm the guard.
+    group_guard.disarm();
 
     Ok(PipeOutcome {
         stdout: collected,

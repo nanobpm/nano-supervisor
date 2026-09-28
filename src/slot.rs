@@ -49,7 +49,12 @@ pub struct SlotConfig {
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
 /// resilient, logging and retrying transient failures — so one wedged engine
 /// can't take the daemon down.
-pub async fn run(jobs: Jobs, cfg: Arc<SlotConfig>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run(
+    jobs: Jobs,
+    cfg: Arc<SlotConfig>,
+    mut shutdown: watch::Receiver<bool>,
+    fatal: watch::Sender<bool>,
+) {
     log(&format!(
         "slot {} up: types {:?} (recovery {}s, poll {}s, idle {}s, lease {}, protocol {:?})",
         cfg.worker_name,
@@ -86,13 +91,22 @@ pub async fn run(jobs: Jobs, cfg: Arc<SlotConfig>, mut shutdown: watch::Receiver
         };
         for job in batch {
             if cfg.with_lease && job.lease.is_none() {
-                // Same fail-loud rule as the spike: never run a job we can't fence.
+                // The CLI's `--with-lease` contract is to fail LOUDLY when the
+                // engine does not issue leases (see the flag's help). Merely
+                // skipping would leave the activation to expire and be
+                // re-delivered forever — a silent spin that never fences. If the
+                // engine returns an unleased activation here it will do so for
+                // every job, so the requested fencing is impossible: shut the
+                // whole daemon down loudly instead of running on unfenced.
                 log(&format!(
-                    "slot {}: job {} came back without a lease token; refusing to run unfenced",
+                    "slot {}: job {} activated without a lease token under --with-lease; the engine \
+                     is not issuing leases, so the requested fencing is impossible — shutting the \
+                     daemon down instead of running unfenced",
                     cfg.worker_name,
                     job.job.job_key.value()
                 ));
-                continue;
+                let _ = fatal.send(true);
+                return;
             }
             handle(&jobs, &cfg, job).await;
         }
@@ -235,6 +249,16 @@ async fn execute(
         .as_ref()
         .map(result::sanitize_result_vars)
         .unwrap_or_default();
+    // If an ACP run produced turns but no effective structured result, surface
+    // its transcript as `agentResult` (as the spike worker does) instead of
+    // silently completing with only bookkeeping and dropping the agent's
+    // response — the empty-result guard above only fails runs that did NOTHING.
+    let has_effective = result_obj
+        .as_ref()
+        .is_some_and(result::has_effective_result_vars);
+    if !has_effective && had_turns && !detect_stdout.trim().is_empty() {
+        vars.insert("agentResult".into(), json!(detect_stdout));
+    }
     vars.insert("agentWorker".into(), json!(cfg.worker_name));
     Ok(vars)
 }

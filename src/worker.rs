@@ -178,7 +178,11 @@ pub(crate) async fn refresh_loop(
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,
 ) {
-    let every = window / 3;
+    // Refresh at a third of the window, but never a zero-length interval: a
+    // sub-3ms window divides to `Duration::ZERO`, which would spin this loop and
+    // hammer the engine (saturating a Tokio worker). Floor it at a positive
+    // minimum so the loop always yields between extends.
+    let every = (window / 3).max(Duration::from_millis(1));
     let mut failures = 0;
     loop {
         tokio::time::sleep(every).await;

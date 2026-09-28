@@ -103,6 +103,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 jobs.clone(),
                 cfg,
                 shutdown_rx.clone(),
+                shutdown_tx.clone(),
             )));
         }
     }
@@ -116,7 +117,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         handles.len()
     ));
 
-    wait_for_signal().await;
+    wait_for_signal(&shutdown_tx).await;
     log("shutdown signal received; draining slots…");
     let _ = shutdown_tx.send(true);
 
@@ -201,25 +202,39 @@ fn short_hostname() -> String {
 }
 
 /// Resolve when the daemon should shut down: Ctrl-C or (on Unix) SIGTERM.
-async fn wait_for_signal() {
+async fn wait_for_signal(fatal: &watch::Sender<bool>) {
+    // Also wake if a slot flips the shutdown watch (a fatal misconfiguration,
+    // e.g. an unleased activation under --with-lease), so the daemon exits loudly
+    // rather than lingering with the offending slot stopped.
+    let mut fatal_rx = fatal.subscribe();
+    let slot_requested = async {
+        let _ = fatal_rx.wait_for(|stop| *stop).await;
+    };
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = slot_requested => {}
+                }
                 return;
             }
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
+            _ = slot_requested => {}
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = slot_requested => {}
+        }
     }
 }
 

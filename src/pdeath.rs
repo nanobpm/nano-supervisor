@@ -53,6 +53,47 @@ pub fn arm(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn arm(_cmd: &mut Command) {}
 
+/// `SIGKILL` a process group by its leader pid (the pid is also the pgid, since
+/// agents are spawned with `process_group(0)`). Used by the ACP/pipe cancellation
+/// guards so that dropping an in-flight agent — e.g. when a slot aborts its
+/// `execute` future on lease loss — tears down the whole tree, not just the
+/// leader that `kill_on_drop` reaps. Harmless if the group is already gone.
+#[cfg(unix)]
+pub(crate) fn sigkill_group(pid: u32) {
+    // SAFETY: a plain libc kill of a process group; no Rust state is touched and
+    // an already-dead group simply yields ESRCH.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sigkill_group(_pid: u32) {}
+
+/// Cancellation cleanup guard: SIGKILLs the agent's process group when dropped,
+/// unless disarmed. Ensures a dropped (aborted) in-flight agent tears down the
+/// whole tree — not just the leader `kill_on_drop` reaps — while the normal path
+/// disarms it once the group has been reaped (so a recycled pid is never hit).
+pub(crate) struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            sigkill_group(pid);
+        }
+    }
+}
+
 /// Start a watchdog that kills the agent's whole process group when the daemon
 /// dies. `agent_pid` is the agent's pid, which is also its process-group id (the
 /// agent is spawned with `process_group(0)`).

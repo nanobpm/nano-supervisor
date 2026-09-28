@@ -52,11 +52,28 @@ fn parse_object(text: &str) -> Option<Map<String, Value>> {
 /// structured result". The file is agent-controlled, so a symlink or an
 /// oversized payload is rejected (`symlink_metadata`, size cap).
 pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    use std::io::Read;
+    // Open first, then bound the read against the OPEN file handle. Checking a
+    // `symlink_metadata` snapshot and then `read_to_string`ing the path is a TOCTOU
+    // gap: an agent could grow or swap the path in between and force an unbounded
+    // allocation despite the cap. `O_NOFOLLOW` preserves the no-symlink guarantee
+    // atomically, and `take` caps the bytes we will actually read/allocate.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_RESULT_FILE_BYTES {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let mut text = String::new();
+    file.take(MAX_RESULT_FILE_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
     parse_object(&text)
 }
 
@@ -254,5 +271,20 @@ mod tests {
     fn not_empty_with_effective_vars() {
         let o = obj(json!({"status":"done"}));
         assert!(detect_empty(Some(&o), "", false).is_none());
+    }
+
+    #[test]
+    fn result_file_reads_small_and_rejects_oversize() {
+        let dir = std::env::temp_dir();
+        let ok = dir.join(format!("nano-rf-ok-{}.json", std::process::id()));
+        std::fs::write(&ok, br#"{"status":"done"}"#).unwrap();
+        assert_eq!(read_result_file(&ok).unwrap()["status"], json!("done"));
+        let _ = std::fs::remove_file(&ok);
+
+        // A file over the cap is rejected rather than read into memory.
+        let big = dir.join(format!("nano-rf-big-{}.json", std::process::id()));
+        std::fs::write(&big, vec![b'x'; (MAX_RESULT_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(read_result_file(&big).is_none());
+        let _ = std::fs::remove_file(&big);
     }
 }

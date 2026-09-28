@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
@@ -46,6 +46,11 @@ pub struct Agent {
     out: mpsc::UnboundedSender<Value>,
     shared: Arc<Mutex<Shared>>,
     next_id: u64,
+    /// Cancellation cleanup: SIGKILLs the agent's process group if this `Agent`
+    /// is dropped while the child is still running (e.g. the slot aborts
+    /// `execute` on lease loss instead of calling `shutdown`), so descendants the
+    /// agent started cannot survive and overlap the job's redelivery.
+    group_guard: crate::pdeath::GroupGuard,
 }
 
 impl Agent {
@@ -77,6 +82,7 @@ impl Agent {
         }
         let stdin = child.stdin.take().context("agent stdin")?;
         let stdout = child.stdout.take().context("agent stdout")?;
+        let group_guard = crate::pdeath::GroupGuard::new(child.id());
 
         let shared = Arc::new(Mutex::new(Shared {
             last_activity: Some(Instant::now()),
@@ -94,6 +100,7 @@ impl Agent {
             out,
             shared,
             next_id: 1,
+            group_guard,
         })
     }
 
@@ -189,6 +196,9 @@ impl Agent {
             }
             let _ = self.child.kill().await;
         }
+        // The group has now been reaped on the graceful path, so its pid must not
+        // be signalled again (it may be recycled): disarm the cancellation guard.
+        self.group_guard.disarm();
     }
 }
 
@@ -202,67 +212,112 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Value
     }
 }
 
+/// Upper bound on a single JSON-RPC line the ACP agent may send. A misbehaving
+/// agent could otherwise stream one huge unterminated line, and a line reader
+/// would buffer it whole before we ever parse it — exhausting daemon memory (one
+/// buffer per slot). Frames larger than this are dropped rather than accumulated.
+const MAX_ACP_FRAME: usize = 1 << 20; // 1 MiB
+
 async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
-    reader: BufReader<R>,
+    mut reader: BufReader<R>,
     shared: Arc<Mutex<Shared>>,
     out: mpsc::UnboundedSender<Value>,
 ) {
-    let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            continue;
+    // Read fixed-size chunks and split them into newline-delimited frames here,
+    // instead of `lines()` whose reader buffers a whole line unbounded before
+    // yielding. This caps memory at `MAX_ACP_FRAME`: an oversized unterminated
+    // frame is discarded up to its next newline rather than held in full.
+    let mut buf = [0u8; 64 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut skipping = false; // discarding an oversized frame until its newline
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
         };
-        let mut s = shared.lock().unwrap();
-        s.last_activity = Some(Instant::now());
-        let method = msg.get("method").and_then(Value::as_str);
-        match (method, msg.get("id")) {
-            // Response to one of our requests.
-            (None, Some(id)) => {
-                if let Some(tx) = id.as_u64().and_then(|id| s.pending.remove(&id)) {
-                    let r = match msg.get("error") {
-                        Some(e) => Err(anyhow!("agent error: {e}")),
-                        None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
-                    };
-                    let _ = tx.send(r);
-                }
+        let mut chunk = &buf[..n];
+        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            let (line_bytes, rest) = chunk.split_at(pos);
+            chunk = &rest[1..]; // skip the newline
+            if skipping {
+                // The newline ends the oversized frame we were discarding.
+                skipping = false;
+                pending.clear();
+                continue;
             }
-            // Notification.
-            (Some("session/update"), None) => {
-                s.updates += 1;
-                let update = &msg["params"]["update"];
-                match update["sessionUpdate"].as_str() {
-                    Some("agent_message_chunk") => {
-                        if let Some(t) = update["content"]["text"].as_str() {
-                            s.text.push_str(t);
-                            // Bound the transcript the same way the pipe path bounds
-                            // stdout: `Agent::run` appends every chunk to this
-                            // `String`, so a verbose or misbehaving ACP agent could
-                            // otherwise exhaust daemon memory (one unbounded buffer
-                            // per slot). The tail is retained for result detection.
-                            crate::pipe::bound_capture(&mut s.text);
-                        }
-                    }
-                    Some("tool_call") => s.tool_calls += 1,
-                    _ => {}
-                }
-            }
-            (Some(_), None) | (None, None) => {}
-            // Request from the agent.
-            (Some(m), Some(id)) => {
-                let reply = if m == "session/request_permission" {
-                    s.permissions_granted += 1;
-                    json!({"jsonrpc": "2.0", "id": id, "result": { "outcome": permission_choice(&msg["params"]) }})
-                } else {
-                    json!({"jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("method not found: {m}") }})
-                };
-                let _ = out.send(reply);
-            }
+            pending.extend_from_slice(line_bytes);
+            let line = String::from_utf8_lossy(&pending).into_owned();
+            pending.clear();
+            handle_message(&line, &shared, &out);
+        }
+        if skipping {
+            continue; // still discarding until a newline arrives
+        }
+        pending.extend_from_slice(chunk);
+        if pending.len() > MAX_ACP_FRAME {
+            // Oversized unterminated frame: stop buffering and skip to its end.
+            pending.clear();
+            skipping = true;
         }
     }
     // stdout closed: fail anything still waiting.
     let mut s = shared.lock().unwrap();
     for (_, tx) in s.pending.drain() {
         let _ = tx.send(Err(anyhow!("agent closed stdout")));
+    }
+}
+
+/// Process one JSON-RPC line: a response to one of our requests, a notification,
+/// or a request from the agent (permission prompts are auto-answered).
+fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::UnboundedSender<Value>) {
+    let Ok(msg) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let mut s = shared.lock().unwrap();
+    s.last_activity = Some(Instant::now());
+    let method = msg.get("method").and_then(Value::as_str);
+    match (method, msg.get("id")) {
+        // Response to one of our requests.
+        (None, Some(id)) => {
+            if let Some(tx) = id.as_u64().and_then(|id| s.pending.remove(&id)) {
+                let r = match msg.get("error") {
+                    Some(e) => Err(anyhow!("agent error: {e}")),
+                    None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                let _ = tx.send(r);
+            }
+        }
+        // Notification.
+        (Some("session/update"), None) => {
+            s.updates += 1;
+            let update = &msg["params"]["update"];
+            match update["sessionUpdate"].as_str() {
+                Some("agent_message_chunk") => {
+                    if let Some(t) = update["content"]["text"].as_str() {
+                        s.text.push_str(t);
+                        // Bound the transcript the same way the pipe path bounds
+                        // stdout: `Agent::run` appends every chunk to this
+                        // `String`, so a verbose or misbehaving ACP agent could
+                        // otherwise exhaust daemon memory (one unbounded buffer
+                        // per slot). The tail is retained for result detection.
+                        crate::pipe::bound_capture(&mut s.text);
+                    }
+                }
+                Some("tool_call") => s.tool_calls += 1,
+                _ => {}
+            }
+        }
+        (Some(_), None) | (None, None) => {}
+        // Request from the agent.
+        (Some(m), Some(id)) => {
+            let reply = if m == "session/request_permission" {
+                s.permissions_granted += 1;
+                json!({"jsonrpc": "2.0", "id": id, "result": { "outcome": permission_choice(&msg["params"]) }})
+            } else {
+                json!({"jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("method not found: {m}") }})
+            };
+            let _ = out.send(reply);
+        }
     }
 }
 
