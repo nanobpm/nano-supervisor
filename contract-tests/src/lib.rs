@@ -166,7 +166,8 @@ macro_rules! skip {
 /// The engine under test, from `NS_ENGINE_URL` (default `http://localhost:8080`).
 ///
 /// It refuses anything that is not localhost / 127.0.0.1 unless
-/// `NS_ALLOW_REMOTE_ENGINE=1`. **Never point it at merlin.** When the URL is
+/// `NS_ALLOW_REMOTE_ENGINE=1`, and refuses a merlin host **unconditionally**
+/// (even with that override set). **Never point it at merlin.** When the URL is
 /// unreachable, [`Engine::from_env`] returns [`Skip`] so engine tests skip with
 /// a message instead of failing.
 pub struct Engine {
@@ -181,6 +182,16 @@ impl Engine {
             .unwrap_or_else(|_| "http://localhost:8080".into())
             .trim_end_matches('/')
             .to_string();
+        // Refuse a merlin host unconditionally: `NS_ALLOW_REMOTE_ENGINE=1` is a
+        // deliberate escape hatch for *other* remote engines, but the documented
+        // rule that the suite must never deploy test BPMN/jobs to merlin must
+        // hold even when that override is set, so an accidental opt-in can never
+        // target it.
+        if host_of(&url).contains("merlin") {
+            return Err(Skip(format!(
+                "engine {url} targets a merlin host — refused unconditionally, the suite must never point at merlin"
+            )));
+        }
         if !is_local(&url) && std::env::var("NS_ALLOW_REMOTE_ENGINE").as_deref() != Ok("1") {
             return Err(Skip(format!(
                 "engine {url} is not localhost and NS_ALLOW_REMOTE_ENGINE!=1 (never point at merlin)"
@@ -272,6 +283,25 @@ fn is_local(url: &str) -> bool {
         host_port.split(':').next().unwrap_or("")
     };
     host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+/// The host of `url`, computed exactly as [`is_local`] does (userinfo stripped,
+/// IPv6 brackets honoured) so the merlin guard sees the same host the locality
+/// check does.
+fn host_of(url: &str) -> &str {
+    let authority = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    }
 }
 
 fn sanitize(s: &str) -> String {
@@ -454,6 +484,17 @@ const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 fn output_within(mut cmd: Command, timeout: Duration) -> Output {
     use std::io::Read;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Put the worker in its own process group so a timeout can reap the whole
+    // group. The worker launches agents as descendants that inherit the
+    // stdout/stderr pipe write ends; killing only the worker would leave a
+    // lingering agent (e.g. `go_silent`'s 60s sleep) holding those pipes open,
+    // so the `join()` drains below would block until it exits — defeating the
+    // CI timeout. Killing the group closes every write end promptly.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().expect("spawn worker");
     let mut out = child.stdout.take().expect("worker stdout");
     let mut err = child.stderr.take().expect("worker stderr");
@@ -475,6 +516,10 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Output {
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
+            // Reap descendant agents too, so nothing keeps the pipes open and
+            // the reader-thread joins below can't hang.
+            #[cfg(unix)]
+            kill_process_group(child.id());
             let status = child.wait().expect("wait killed worker");
             let stdout = out_h.join().unwrap_or_default();
             let stderr = err_h.join().unwrap_or_default();
@@ -494,6 +539,18 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Output {
         stdout,
         stderr,
     }
+}
+
+/// Kill the entire process group led by `pid` (established via
+/// `process_group(0)`), terminating the worker and any descendant agents. The
+/// negative-PID target is a group signal; we shell out to `kill` to avoid a
+/// `libc`/`nix` dependency in this black-box test crate.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pid}"))
+        .status();
 }
 
 fn which(program: &str) -> Option<PathBuf> {

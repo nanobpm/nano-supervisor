@@ -42,6 +42,18 @@ pub struct WorkerOptions {
 }
 
 pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
+    // Confine this worker's run dirs — and therefore its sweeper — to a
+    // per-worker subtree `<runs_dir>/<worker_name>`. The `active` set that
+    // protects a live cwd from the sweeper is only in-process, so two workers
+    // sharing one reap root could delete each other's running cwd. Because
+    // `worker_name` defaults to a host+PID-unique value, giving each worker its
+    // own subtree means a sweeper only ever sees (and reaps) its own runs, even
+    // when several workers share the same `--runs-dir` parent.
+    let opts = {
+        let mut o = opts;
+        o.runs_dir = o.runs_dir.join(&o.worker_name);
+        o
+    };
     let mut done = 0usize;
     log(&format!(
         "worker {} polling {:?} (recovery window {}s, poll {}s, lease {}, job api {})",
