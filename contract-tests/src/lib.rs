@@ -28,6 +28,34 @@ pub fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+/// Environment-variable prefixes that identify the caller's real fleet
+/// configuration (base URL, agentic hub, supervisor, entry point, and the
+/// harness's own `NS_*` selectors). Any inherited variable under one of these
+/// is cleared before a subprocess runs so a test can never contact or mutate
+/// the caller's configured fleet — the harness's hermetic, no-real-fleet
+/// guarantee. Callers may still re-add a specific variable with `.env(...)`
+/// after `TempHome::cmd`, since a later set on the same key wins.
+fn is_fleet_var(key: &str) -> bool {
+    key.starts_with("NANO_") || key.starts_with("C8CTL_NANO_") || key.starts_with("NS_")
+}
+
+/// Apply the standard hermetic environment to `c`: drop every inherited
+/// fleet-related variable (see [`is_fleet_var`]), then set the isolated
+/// `C8CTL_NANO_HOME` and the launchd/update-notifier suppressors. Shared by
+/// [`Target::available`] and [`TempHome::cmd`] so both isolate identically.
+fn apply_hermetic_env(c: &mut Command, home: &Path) {
+    for (key, _) in std::env::vars_os() {
+        if let Some(k) = key.to_str() {
+            if is_fleet_var(k) {
+                c.env_remove(k);
+            }
+        }
+    }
+    c.env("C8CTL_NANO_HOME", home)
+        .env("C8CTL_NANO_NO_LAUNCHD", "1")
+        .env("NANO_NO_UPDATE_NOTIFIER", "1");
+}
+
 /// Which implementation the suite exercises, chosen by `NS_TARGET` (default
 /// `node`). One suite, both targets — no test hard-codes the program name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,21 +129,16 @@ impl Target {
     pub fn available(self) -> bool {
         // Probe through a throwaway isolated home so loading the command for the
         // availability check can never read or initialize a real fleet under the
-        // caller's `C8CTL_NANO_HOME`. Mirror `TempHome::cmd`'s hermetic
-        // environment (isolated home, no launchd/update-notifier, `NS_*`
-        // selectors cleared). The temp dir is removed when `probe_home` drops.
+        // caller's `C8CTL_NANO_HOME`. Apply `apply_hermetic_env` (isolated home,
+        // no launchd/update-notifier, and every inherited fleet variable
+        // cleared). The temp dir is removed when `probe_home` drops.
         let probe_home = match tempfile::Builder::new().prefix("ct-probe-").tempdir() {
             Ok(dir) => dir,
             Err(_) => return false,
         };
         let mut probe = self.cmd(&["--help"]);
+        apply_hermetic_env(&mut probe, probe_home.path());
         probe
-            .env("C8CTL_NANO_HOME", probe_home.path())
-            .env("C8CTL_NANO_NO_LAUNCHD", "1")
-            .env("NANO_NO_UPDATE_NOTIFIER", "1")
-            .env_remove("NS_TARGET")
-            .env_remove("NS_NODE_CMD")
-            .env_remove("NS_BIN")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         matches!(probe.status(), Ok(s) if s.success())
@@ -173,17 +196,14 @@ impl TempHome {
 
     /// A `Command` for the bound target, with this home and the standard
     /// hermetic environment applied (`C8CTL_NANO_NO_LAUNCHD=1`,
-    /// `NANO_NO_UPDATE_NOTIFIER=1`). The parent's own `C8CTL_NANO_HOME` and the
-    /// `NS_*` selector variables are cleared so a test can never leak into the
-    /// developer's real fleet.
+    /// `NANO_NO_UPDATE_NOTIFIER=1`). The parent's own `C8CTL_NANO_HOME`, the
+    /// `NS_*` selector variables, and every inherited fleet variable (see
+    /// [`is_fleet_var`]) are cleared so a test can never leak into or mutate the
+    /// developer's real fleet. Callers may re-add a specific variable with
+    /// `.env(...)` on the returned `Command` (a later set on the same key wins).
     pub fn cmd(&self, args: &[&str]) -> Command {
         let mut c = self.target.cmd(args);
-        c.env("C8CTL_NANO_HOME", self.path())
-            .env("C8CTL_NANO_NO_LAUNCHD", "1")
-            .env("NANO_NO_UPDATE_NOTIFIER", "1")
-            .env_remove("NS_TARGET")
-            .env_remove("NS_NODE_CMD")
-            .env_remove("NS_BIN");
+        apply_hermetic_env(&mut c, self.path());
         c
     }
 

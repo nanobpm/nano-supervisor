@@ -55,6 +55,21 @@ fn recorded_status_frame_matches_schema() {
     for key in ["pid", "startedAt", "version", "socket", "logFile"] {
         assert!(daemon.get(key).is_some(), "daemon.{key} missing");
     }
+    // Value types, not just presence, for the fields whose type is stable and
+    // not redacted in the fixture. `pid`/`startedAt` are redacted to placeholder
+    // strings here, so only their presence is pinned above.
+    assert!(
+        daemon["version"].is_string(),
+        "daemon.version must be a string"
+    );
+    assert!(
+        daemon["socket"].is_string(),
+        "daemon.socket must be a string"
+    );
+    assert!(
+        daemon["logFile"].is_string(),
+        "daemon.logFile must be a string"
+    );
 
     let workers = frame["workers"].as_array().expect("workers is an array");
     let w = &workers[0];
@@ -75,10 +90,43 @@ fn recorded_status_frame_matches_schema() {
     ] {
         assert!(w.get(key).is_some(), "worker.{key} missing");
     }
+    // Enforce the documented value types/shapes for the non-redacted worker
+    // fields so a wrong type (e.g. a non-array `args` or a numeric `state`)
+    // fails here, not just a missing key. `pid`/`uptimeMs`/`startedAtMs` are
+    // redacted placeholders in the fixture, so they stay presence-only above.
+    assert!(w["id"].is_string(), "worker.id must be a string");
+    assert!(w["profile"].is_string(), "worker.profile must be a string");
+    assert!(w["state"].is_string(), "worker.state must be a string");
+    assert!(
+        w["restarts"].is_number(),
+        "worker.restarts must be a number"
+    );
+    assert!(w["args"].is_array(), "worker.args must be an array");
+    assert!(w["logFile"].is_string(), "worker.logFile must be a string");
+    assert!(
+        w["activity"]["state"].is_string(),
+        "worker.activity.state must be a string"
+    );
     assert!(w["activity"]["jobs"].is_array());
     for key in ["status", "mode", "url", "discovered", "message"] {
         assert!(w["agentic"].get(key).is_some(), "agentic.{key} missing");
     }
+    assert!(
+        w["agentic"]["status"].is_string(),
+        "agentic.status must be a string"
+    );
+    assert!(
+        w["agentic"]["mode"].is_string(),
+        "agentic.mode must be a string"
+    );
+    assert!(
+        w["agentic"]["url"].is_string(),
+        "agentic.url must be a string"
+    );
+    assert!(
+        w["agentic"]["discovered"].is_object(),
+        "agentic.discovered must be an object"
+    );
 }
 
 /// Live round-trip against a real daemon. Opt-in only: it starts a supervised
