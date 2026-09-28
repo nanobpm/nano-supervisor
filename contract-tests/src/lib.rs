@@ -181,6 +181,16 @@ impl Engine {
             .unwrap_or_else(|_| "http://localhost:8080".into())
             .trim_end_matches('/')
             .to_string();
+        // Hard safety rail: never target merlin, even if someone sets
+        // NS_ALLOW_REMOTE_ENGINE=1. Deploying test BPMN/jobs to the shared
+        // merlin engine would pollute a live cluster, so a merlin host is
+        // rejected unconditionally, ahead of the remote-override escape hatch —
+        // an accidental opt-in can never deploy the contract suite to merlin.
+        if host_of(&url).contains("merlin") {
+            return Err(Skip(format!(
+                "engine {url} targets merlin; refusing unconditionally (the contract suite must never touch merlin)"
+            )));
+        }
         if !is_local(&url) && std::env::var("NS_ALLOW_REMOTE_ENGINE").as_deref() != Ok("1") {
             return Err(Skip(format!(
                 "engine {url} is not localhost and NS_ALLOW_REMOTE_ENGINE!=1 (never point at merlin)"
@@ -251,7 +261,7 @@ impl Engine {
     }
 }
 
-fn is_local(url: &str) -> bool {
+fn host_of(url: &str) -> &str {
     // The authority is everything after `://` and before the first `/`.
     let authority = url
         .split("://")
@@ -266,11 +276,16 @@ fn is_local(url: &str) -> bool {
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     // Extract the host, honouring bracketed IPv6 literals (`[::1]:8080`); a
     // plain `split(':')` would yield `[` for those and reject loopback.
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
+    if let Some(rest) = host_port.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
         host_port.split(':').next().unwrap_or("")
-    };
+    }
+}
+
+/// `true` when `url`'s host is a loopback address the contract suite may touch.
+fn is_local(url: &str) -> bool {
+    let host = host_of(url);
     host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
@@ -448,12 +463,36 @@ pub fn run_worker_job(
 /// otherwise hang the whole CI run. Generous enough for a real single-job run.
 const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Best-effort kill of an entire process group by pid. Because the worker was
+/// spawned with `process_group(0)`, its pgid equals its pid, so `kill -<pid>`
+/// signals the worker and every descendant it started. Shells out to `kill(1)`
+/// so no libc dependency is needed; failures are ignored (the group may already
+/// be gone).
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pid}"))
+        .status();
+}
+
 /// Run `cmd` to completion, but kill it and panic if it outstays `timeout`,
 /// so a wedged worker fails the test fast instead of hanging CI forever.
 /// Drains stdout/stderr on reader threads to avoid pipe-buffer deadlocks.
 fn output_within(mut cmd: Command, timeout: Duration) -> Output {
     use std::io::Read;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Put the worker in its own process group so the watchdog can reap the whole
+    // subtree on timeout. The worker launches agents as separate processes;
+    // killing only the worker would leave a descendant (e.g. a `go_silent`
+    // agent) holding the stdout/stderr pipes open, so the reader-thread joins
+    // below would block forever and defeat this very watchdog. With its own
+    // group, a single signal to the group takes the worker and its agents down.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().expect("spawn worker");
     let mut out = child.stdout.take().expect("worker stdout");
     let mut err = child.stderr.take().expect("worker stderr");
@@ -474,6 +513,11 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Output {
             break status;
         }
         if start.elapsed() >= timeout {
+            // Kill the entire process group (worker + agent descendants), not
+            // just the worker, so nothing keeps the pipes open and wedges the
+            // reader-thread joins below.
+            #[cfg(unix)]
+            kill_process_group(child.id());
             let _ = child.kill();
             let status = child.wait().expect("wait killed worker");
             let stdout = out_h.join().unwrap_or_default();

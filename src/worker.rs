@@ -42,6 +42,17 @@ pub struct WorkerOptions {
 }
 
 pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
+    // Confine this worker's runs (and its sweeper) to a per-worker subtree of
+    // the configured run root. The sweeper only knows about *this* process's
+    // active runs, so if several workers shared one runs_dir a sweep in one
+    // worker could delete a live job's cwd owned by another. Nesting under the
+    // worker name (unique per process — it defaults to a pid-tagged name) keeps
+    // each worker's runs and sweeping inside its own subtree.
+    let opts = {
+        let mut opts = opts;
+        opts.runs_dir = opts.runs_dir.join(&opts.worker_name);
+        opts
+    };
     let mut done = 0usize;
     log(&format!(
         "worker {} polling {:?} (recovery window {}s, poll {}s, lease {}, job api {})",
