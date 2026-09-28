@@ -57,8 +57,14 @@ pub fn resolve(wanted: Option<&str>) -> Result<Option<Profile>> {
     let Some(dir) = c8ctl_config_dir() else {
         return Ok(None);
     };
+    // An explicit engine address in the environment beats c8ctl's remembered
+    // active profile (but not an explicit --profile).
+    let env_address = ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
     let name = match wanted {
         Some(n) => Some(n.to_string()),
+        None if env_address => None,
         None => std::fs::read(dir.join("session.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
