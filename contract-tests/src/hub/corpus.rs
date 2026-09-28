@@ -81,6 +81,38 @@ pub struct TranscriptVector {
     pub offset: i64,
 }
 
+/// A vocabulary document the registry must accept.
+#[derive(Debug, Deserialize)]
+pub struct ValidVocab {
+    pub name: String,
+    pub document: Value,
+}
+
+/// A vocabulary document the registry must reject with `expected_code`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvalidVocab {
+    pub name: String,
+    pub document: Value,
+    pub expected_code: String,
+}
+
+/// A routing token and the structured parse it must yield.
+#[derive(Debug, Deserialize)]
+pub struct ValidToken {
+    pub name: String,
+    pub token: String,
+    pub parsed: Value,
+}
+
+/// A malformed routing token and the error code it must raise.
+#[derive(Debug, Deserialize)]
+pub struct InvalidToken {
+    pub name: String,
+    pub token: String,
+    pub expected: String,
+}
+
 pub fn golden_frames() -> Vec<GoldenFrame> {
     load("golden-frames.json")
 }
@@ -99,4 +131,20 @@ pub fn malformed_control_frames() -> Vec<MalformedControlVector> {
 
 pub fn transcript_vectors() -> Vec<TranscriptVector> {
     load("transcript-vectors.json")
+}
+
+pub fn valid_vocabs() -> Vec<ValidVocab> {
+    load("valid-vocabs.json")
+}
+
+pub fn invalid_vocabs() -> Vec<InvalidVocab> {
+    load("invalid-vocabs.json")
+}
+
+pub fn valid_tokens() -> Vec<ValidToken> {
+    load("valid-tokens.json")
+}
+
+pub fn invalid_tokens() -> Vec<InvalidToken> {
+    load("invalid-tokens.json")
 }

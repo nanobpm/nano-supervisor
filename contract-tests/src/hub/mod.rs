@@ -7,6 +7,8 @@
 //! - [`frame`] — the binary channel envelope (frame <-> bytes).
 //! - [`control`] — the inbound steer vocabulary (prompt / cancel / permission).
 //! - [`transcript`] — the ACP `session/update` -> transcript-chunk bridge.
+//! - [`vocab`] — the registry vocabulary-document validator.
+//! - [`token`] — the routing-token grammar parser.
 //!
 //! [`corpus`] loads the byte-exact fixture snapshot in `fixtures/hub/`
 //! (`@nanobpm/agentic` version in `fixtures/hub/VERSION`). `tests/hub.rs`
@@ -14,7 +16,9 @@
 
 pub mod control;
 pub mod frame;
+pub mod token;
 pub mod transcript;
+pub mod vocab;
 
 pub mod corpus;
 

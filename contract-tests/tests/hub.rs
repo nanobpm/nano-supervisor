@@ -16,7 +16,9 @@ use std::collections::BTreeSet;
 use contract_tests::hub::control::{parse_inbound_relay_chunk, ControlErrorCode, ControlFrame};
 use contract_tests::hub::corpus;
 use contract_tests::hub::frame::{decode_frame, encode_frame, DecodeErrorCode, Family, Lane};
+use contract_tests::hub::token::{parse_token, RoutingToken, TokenErrorCode};
 use contract_tests::hub::transcript::{acp_update_to_transcript_chunk, parse_transcript_event};
+use contract_tests::hub::vocab::{validate_vocab, VocabErrorCode};
 use contract_tests::hub::{hex_decode, hex_encode};
 
 // --- Frame codec ---------------------------------------------------------
@@ -314,20 +316,171 @@ fn transcript_vectors_produce_the_exact_chunk_and_decode_back() {
     }
 }
 
+// --- Vocabulary documents (registry schema) -----------------------------
+
+#[test]
+fn valid_vocab_corpus_is_accepted() {
+    let vectors = corpus::valid_vocabs();
+    assert!(!vectors.is_empty(), "valid-vocabs corpus is empty");
+    for v in &vectors {
+        validate_vocab(&v.document).unwrap_or_else(|e| {
+            panic!("{}: expected accept, rejected with {}", v.name, e.as_str())
+        });
+    }
+}
+
+#[test]
+fn invalid_vocab_corpus_is_rejected_with_the_expected_code() {
+    let vectors = corpus::invalid_vocabs();
+    assert!(!vectors.is_empty(), "invalid-vocabs corpus is empty");
+    for v in &vectors {
+        match validate_vocab(&v.document) {
+            Ok(()) => panic!(
+                "{}: expected rejection ({}), accepted",
+                v.name, v.expected_code
+            ),
+            Err(code) => assert_eq!(
+                code.as_str(),
+                v.expected_code,
+                "{}: wrong vocab-error code",
+                v.name
+            ),
+        }
+    }
+}
+
+#[test]
+fn invalid_vocab_corpus_covers_every_vocab_error_code() {
+    let covered: BTreeSet<String> = corpus::invalid_vocabs()
+        .into_iter()
+        .map(|v| v.expected_code)
+        .collect();
+    for code in [
+        VocabErrorCode::NotObject,
+        VocabErrorCode::BadVersion,
+        VocabErrorCode::BadNetworks,
+        VocabErrorCode::UnknownDocumentField,
+        VocabErrorCode::BadNetworkName,
+        VocabErrorCode::UnknownRoleField,
+        VocabErrorCode::BadWeight,
+        VocabErrorCode::BadSeats,
+        VocabErrorCode::BadSeatLabel,
+        VocabErrorCode::BadRequires,
+        VocabErrorCode::BadSeatsDistinctFamily,
+    ] {
+        assert!(
+            covered.contains(code.as_str()),
+            "no invalid-vocab vector covers code {}",
+            code.as_str()
+        );
+    }
+}
+
+// --- Routing tokens ------------------------------------------------------
+
+fn routing_token_from_value(v: &serde_json::Value) -> RoutingToken {
+    let obj = v.as_object().expect("parsed token is an object");
+    RoutingToken {
+        network: obj
+            .get("network")
+            .and_then(|n| n.as_str())
+            .map(str::to_string),
+        subnetworks: obj
+            .get("subnetworks")
+            .and_then(|s| s.as_array())
+            .expect("parsed token has subnetworks array")
+            .iter()
+            .map(|s| s.as_str().expect("subnetwork is a string").to_string())
+            .collect(),
+        role: obj
+            .get("role")
+            .and_then(|r| r.as_str())
+            .expect("parsed token has role")
+            .to_string(),
+        seat: obj.get("seat").and_then(|s| s.as_str()).map(str::to_string),
+    }
+}
+
+#[test]
+fn valid_token_corpus_parses_to_its_declared_form() {
+    let vectors = corpus::valid_tokens();
+    assert!(!vectors.is_empty(), "valid-tokens corpus is empty");
+    for v in &vectors {
+        let parsed = parse_token(&v.token)
+            .unwrap_or_else(|e| panic!("{}: expected parse, got {}", v.name, e.as_str()));
+        assert_eq!(
+            parsed,
+            routing_token_from_value(&v.parsed),
+            "{}: parsed token differs",
+            v.name
+        );
+    }
+}
+
+#[test]
+fn invalid_token_corpus_is_rejected_with_the_expected_code() {
+    let vectors = corpus::invalid_tokens();
+    assert!(!vectors.is_empty(), "invalid-tokens corpus is empty");
+    for v in &vectors {
+        match parse_token(&v.token) {
+            Ok(_) => panic!("{}: expected rejection ({}), parsed ok", v.name, v.expected),
+            Err(code) => assert_eq!(
+                code.as_str(),
+                v.expected,
+                "{}: wrong token-error code",
+                v.name
+            ),
+        }
+    }
+}
+
+#[test]
+fn invalid_token_corpus_covers_every_token_error_code() {
+    let covered: BTreeSet<String> = corpus::invalid_tokens()
+        .into_iter()
+        .map(|v| v.expected)
+        .collect();
+    for code in [
+        TokenErrorCode::Empty,
+        TokenErrorCode::Whitespace,
+        TokenErrorCode::EmptySegment,
+        TokenErrorCode::BadSegment,
+        TokenErrorCode::MultipleSeatMarkers,
+        TokenErrorCode::EmptySeat,
+        TokenErrorCode::BadSeat,
+    ] {
+        assert!(
+            covered.contains(code.as_str()),
+            "no invalid-token vector covers code {}",
+            code.as_str()
+        );
+    }
+}
+
 // --- Live-worker replay seam --------------------------------------------
 
 /// The same corpus is designed to replay against a *running* worker's hub
 /// connection (presence, transcript, steer, relay) once the Rust hub client
 /// (#10) and MVP daemon (#6) exist. That end-to-end path needs a live
 /// supervisor + hub endpoint, which CI does not provide, so — like the engine
-/// tests — it skips cleanly unless `NS_HUB_ENDPOINT` names one.
+/// tests — it skips cleanly when `NS_HUB_ENDPOINT` is unset.
+///
+/// The deferred runtime path (hub client + daemon) does not exist yet, so there
+/// is nothing to replay against a real endpoint. Rather than report a green
+/// "live replay" that exercises nothing, an explicitly configured endpoint
+/// **fails loudly** until #6/#10 land: a requested live run that silently does
+/// no work is worse than an honest "not implemented yet".
 #[test]
 fn replay_corpus_against_live_worker() {
     match std::env::var("NS_HUB_ENDPOINT") {
         Ok(ep) if !ep.is_empty() => {
             // Seam for #6/#10: connect to `ep`, drive the corpus against the live
             // worker, and diff its emitted frames against the goldens above.
-            eprintln!("NS_HUB_ENDPOINT={ep}: live-worker replay lands with the hub client (#10)");
+            panic!(
+                "NS_HUB_ENDPOINT={ep} requests a live-worker replay, but the hub client (#10) \
+                 and MVP daemon (#6) do not exist yet, so there is nothing to replay against. \
+                 Unset NS_HUB_ENDPOINT to skip until the deferred runtime path lands."
+            );
         }
         _ => eprintln!(
             "skipping live-worker replay: set NS_HUB_ENDPOINT to run the corpus against a worker"
