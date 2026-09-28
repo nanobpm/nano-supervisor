@@ -18,6 +18,16 @@ use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 
+/// Worker-side agentic-hub protocol suite (issue #5), held to the shared
+/// `@nanobpm/agentic` conformance corpus in `fixtures/hub/`.
+pub mod hub;
+
+/// Absolute path to the crate's `fixtures/` directory, independent of the
+/// working directory a test runs from.
+pub fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+}
+
 /// Which implementation the suite exercises, chosen by `NS_TARGET` (default
 /// `node`). One suite, both targets — no test hard-codes the program name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

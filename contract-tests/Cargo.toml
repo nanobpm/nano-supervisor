@@ -1,9 +1,10 @@
 [package]
 name = "contract-tests"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
-description = "Black-box contract tests for the c8ctl nano fleet surface (Node plugin and nano-supervisor)"
+description = "Black-box contract tests for the nano fleet (CLI, state, control socket, agentic hub)"
 license = "Apache-2.0"
+repository = "https://github.com/nanobpm/nano-supervisor"
 publish = false
 
 # Black-box only: the suite runs the CLIs as subprocesses, reads/writes the state
@@ -14,8 +15,10 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+# `preserve_order` keeps JSON object key order through decode -> re-encode, so a
+# frame's payload bytes round-trip identically to the golden hex.
+serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 sha1 = "0.10"
 tempfile = "3"
 

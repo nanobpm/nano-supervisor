@@ -1,0 +1,73 @@
+[
+  {
+    "name": "core-shaped-sample",
+    "document": {
+      "version": 1,
+      "networks": {
+        "planning": {
+          "roles": {
+            "decide": {
+              "requires": [
+                "cognition=reasoning"
+              ],
+              "weight": 3,
+              "seats": 1
+            }
+          }
+        },
+        "qa": {
+          "roles": {
+            "review": {
+              "requires": [
+                "cognition=reasoning"
+              ],
+              "weight": 2,
+              "seats": [
+                "red",
+                "blue"
+              ],
+              "seatsDistinctFamily": true
+            }
+          }
+        },
+        "implementation": {
+          "roles": {
+            "senior": {
+              "weight": 3,
+              "seats": 4
+            }
+          },
+          "subnetworks": {
+            "ci": {
+              "roles": {
+                "fix": {
+                  "weight": 1,
+                  "seats": 2
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "author-extension-merges-in-same-schema",
+    "document": {
+      "version": 2,
+      "networks": {
+        "support": {
+          "roles": {
+            "triage": {
+              "requires": [
+                "host=on-call"
+              ],
+              "weight": 1,
+              "seats": 3
+            }
+          }
+        }
+      }
+    }
+  }
+]
