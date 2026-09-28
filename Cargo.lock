@@ -1151,6 +1151,7 @@ dependencies = [
  "anyhow",
  "camunda-orchestration-sdk",
  "clap",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

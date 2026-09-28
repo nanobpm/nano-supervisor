@@ -1,10 +1,9 @@
-//! Spike job loop: activate → keep the activation alive → run the agent over
-//! ACP → complete or fail.
+//! Spike job loop: activate (optionally leased) → keep the activation alive →
+//! run the agent over ACP → complete or fail, fenced by the lease token.
 //!
-//! "Lease" here is what the plugin does today against engines that don't issue
-//! `jobLeaseToken`s: activate with `timeout = recovery window`, then extend the
-//! timeout (`PATCH /v2/jobs/{key}`) every third of the window while the agent
-//! runs. If a token *is* issued it is passed through on every command.
+//! Keep-alive = extend the activation timeout every third of the recovery
+//! window. With a lease, every command carries the token, so a superseded
+//! worker gets 409 instead of silently settling someone else's activation.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,16 +11,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use camunda_orchestration_sdk::apis::job_api::UpdateJobParams;
-use camunda_orchestration_sdk::models::{
-    ActivatedJobResult, JobActivationRequest, JobChangeset, JobCompletionRequest, JobFailRequest,
-    JobLeaseToken, JobUpdateRequest,
-};
-use camunda_orchestration_sdk::CamundaClient;
+use camunda_orchestration_sdk::models::ActivatedJobResult;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use crate::acp::{Agent, Outcome};
+use crate::jobs::{Job, Jobs};
 
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -37,62 +32,68 @@ pub struct WorkerOptions {
     pub max_jobs: Option<usize>,
 }
 
-pub async fn run(client: CamundaClient, opts: WorkerOptions) -> Result<()> {
+pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
     let mut done = 0usize;
     log(&format!(
-        "worker {} polling {:?} (recovery window {}s, poll {}s)",
+        "worker {} polling {:?} (recovery window {}s, poll {}s, lease {}, job api {})",
         opts.worker_name,
         opts.job_type,
         opts.recovery_window.as_secs(),
-        opts.poll_timeout.as_secs()
+        opts.poll_timeout.as_secs(),
+        if opts.with_lease { "on" } else { "off" },
+        jobs.backend()
     ));
     loop {
         if opts.max_jobs.is_some_and(|m| done >= m) {
             return Ok(());
         }
-        let mut req = JobActivationRequest::new(
-            opts.job_type.clone(),
-            opts.recovery_window.as_millis() as i64,
-            1,
-        );
-        req.worker = Some(opts.worker_name.clone());
-        req.request_timeout = Some(opts.poll_timeout.as_millis() as i64);
-        if opts.with_lease {
-            req.with_lease = Some(Some(true));
-        }
-        let jobs = match client.activate_jobs(req).await {
-            Ok(r) => r.jobs,
+        let batch = match jobs
+            .activate(
+                &opts.job_type,
+                &opts.worker_name,
+                opts.recovery_window,
+                opts.poll_timeout,
+                opts.with_lease,
+            )
+            .await
+        {
+            Ok(b) => b,
             Err(e) => {
-                log(&format!("activation failed: {e}; retrying in 5s"));
+                log(&format!("activation failed: {e:#}; retrying in 5s"));
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
-        for job in jobs {
-            handle(&client, &opts, job).await;
+        for job in batch {
+            if opts.with_lease && job.lease.is_none() {
+                // Same fail-loud rule as the SDK: never run a job we can't fence.
+                anyhow::bail!(
+                    "asked for a lease but job {} came back without a lease token; refusing to run unfenced",
+                    job.job.job_key.value()
+                );
+            }
+            handle(&jobs, &opts, job).await;
             done += 1;
         }
     }
 }
 
-async fn handle(client: &CamundaClient, opts: &WorkerOptions, job: ActivatedJobResult) {
+async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
-    let token = job.job_lease_token.clone();
     let started = Instant::now();
     log(&format!(
-        "job {key} activated (type {}, retries {}, lease token {})",
+        "job {key} activated (type {}, retries {}, lease {})",
         job.r#type,
         job.retries,
-        if token.is_some() { "yes" } else { "no" }
+        lease.as_deref().unwrap_or("none")
     ));
 
-    // Keep the activation alive while the agent runs.
     let refreshes = Arc::new(AtomicUsize::new(0));
     let (lost_tx, mut lost_rx) = watch::channel(false);
     let refresher = tokio::spawn(refresh_loop(
-        client.clone(),
+        jobs.clone(),
         key.clone(),
-        token.clone(),
+        lease.clone(),
         opts.recovery_window,
         refreshes.clone(),
         lost_tx,
@@ -111,18 +112,14 @@ async fn handle(client: &CamundaClient, opts: &WorkerOptions, job: ActivatedJobR
             "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will hand it out again)"
         )),
         Some(Ok(out)) => {
-            let mut req = JobCompletionRequest::new();
-            req.variables = Some(Some(
-                [
-                    ("agentResult".to_string(), json!(out.text)),
-                    ("agentStopReason".to_string(), json!(out.stop_reason)),
-                    ("agentWorker".to_string(), json!(opts.worker_name)),
-                ]
-                .into_iter()
-                .collect(),
-            ));
-            req.job_lease_token = token.map(Some);
-            match client.complete_job(&key, Some(req)).await {
+            let vars = [
+                ("agentResult".to_string(), json!(out.text)),
+                ("agentStopReason".to_string(), json!(out.stop_reason)),
+                ("agentWorker".to_string(), json!(opts.worker_name)),
+            ]
+            .into_iter()
+            .collect();
+            match jobs.complete(&key, vars, &lease).await {
                 Ok(()) => log(&format!(
                     "job {key} completed in {elapsed:.1}s: stop={} updates={} tool_calls={} permissions={} refreshes={n} result={:?}",
                     out.stop_reason,
@@ -131,19 +128,14 @@ async fn handle(client: &CamundaClient, opts: &WorkerOptions, job: ActivatedJobR
                     out.permissions_granted,
                     truncate(&out.text, 120)
                 )),
-                Err(e) => log(&format!("job {key}: complete failed: {e}")),
+                Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
             }
         }
         Some(Err(e)) => {
             let msg = format!("{e:#}");
-            let mut req = JobFailRequest::new();
-            req.retries = Some((job.retries - 1).max(0));
-            req.error_message = Some(truncate(&msg, 2000));
-            req.retry_back_off = Some(0);
-            req.job_lease_token = token.map(Some);
-            match client.fail_job(&key, Some(req)).await {
+            match jobs.fail(&key, (job.retries - 1).max(0), &truncate(&msg, 2000), &lease).await {
                 Ok(()) => log(&format!("job {key} failed after {elapsed:.1}s (refreshes={n}): {msg}")),
-                Err(e2) => log(&format!("job {key}: fail_job failed: {e2} (original error: {msg})")),
+                Err(e2) => log(&format!("job {key}: fail failed: {e2:#} (original error: {msg})")),
             }
         }
     }
@@ -179,9 +171,9 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
 }
 
 async fn refresh_loop(
-    client: CamundaClient,
+    jobs: Jobs,
     key: String,
-    token: Option<JobLeaseToken>,
+    lease: Option<String>,
     window: Duration,
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,
@@ -190,27 +182,17 @@ async fn refresh_loop(
     let mut failures = 0;
     loop {
         tokio::time::sleep(every).await;
-        let mut changeset = JobChangeset::new();
-        changeset.timeout = Some(Some(window.as_millis() as i64));
-        let mut body = JobUpdateRequest::new(changeset);
-        body.job_lease_token = token.clone().map(Some);
-        match client
-            .update_job(UpdateJobParams {
-                job_key: key.clone(),
-                job_update_request: body,
-            })
-            .await
-        {
+        match jobs.extend(&key, window, &lease).await {
             Ok(()) => {
                 failures = 0;
                 count.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
-                let msg = e.to_string();
+                let msg = format!("{e:#}");
                 failures += 1;
                 log(&format!("job {key}: refresh failed ({failures}): {msg}"));
-                // Gone or taken over: stop now. Otherwise allow transient errors
-                // until the window would lapse.
+                // 404 = gone, 409 = superseded by a newer (leased) activation: stop
+                // now. Otherwise tolerate one transient error before giving up.
                 if msg.contains("404") || msg.contains("409") || failures >= 2 {
                     let _ = lost.send(true);
                     return;

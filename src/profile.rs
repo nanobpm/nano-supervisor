@@ -136,6 +136,30 @@ pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
     CamundaClient::new(opts).map_err(|e| anyhow::anyhow!("creating engine client: {e}"))
 }
 
+/// Engine address and basic-auth credentials for the raw Nano job client:
+/// the profile's settings, else the `CAMUNDA_*` environment, else localhost.
+/// (OAuth is not supported on this path; the spike only needs none/basic.)
+pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(String, String)>) {
+    let settings = profile.map(sdk_settings).unwrap_or_default();
+    let get = |k: &str| {
+        settings
+            .get(k)
+            .cloned()
+            .or_else(|| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    };
+    let address = get("CAMUNDA_REST_ADDRESS")
+        .or_else(|| get("ZEEBE_REST_ADDRESS"))
+        .unwrap_or_else(|| "http://localhost:8080".into());
+    let basic = match (
+        get("CAMUNDA_BASIC_AUTH_USERNAME"),
+        get("CAMUNDA_BASIC_AUTH_PASSWORD"),
+    ) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
+    (address, basic)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

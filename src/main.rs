@@ -6,6 +6,7 @@
 //! between the SDK's `JobWorker` and our own slot loop (see issue #1).
 
 mod acp;
+mod jobs;
 mod profile;
 mod worker;
 
@@ -60,6 +61,10 @@ enum Cmd {
         /// Exit after this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
+        /// Job command transport: `sdk`, `nano` (raw HTTP, Nano's `leaseToken`
+        /// field), or `auto` (= `nano` with --with-lease, else `sdk`).
+        #[arg(long, default_value = "auto")]
+        job_api: String,
     },
 }
 
@@ -77,6 +82,7 @@ async fn main() -> Result<()> {
             runs_dir,
             with_lease,
             max_jobs,
+            job_api,
         } => {
             let mut parts = agent.split_whitespace().map(String::from);
             let Some(program) = parts.next() else {
@@ -92,6 +98,19 @@ async fn main() -> Result<()> {
                 None => worker::log("no c8ctl profile; using CAMUNDA_* environment"),
             }
             let client = profile::client(resolved.as_ref())?;
+            let job_api = match job_api.as_str() {
+                "auto" if with_lease => "nano",
+                "auto" => "sdk",
+                other => other,
+            };
+            let jobs = match job_api {
+                "sdk" => jobs::Jobs::Sdk(client),
+                "nano" => {
+                    let (address, basic) = profile::rest_address_and_basic(resolved.as_ref());
+                    jobs::Jobs::Nano(jobs::NanoHttp::new(&address, basic)?)
+                }
+                other => bail!("--job-api must be sdk, nano or auto (got {other:?})"),
+            };
             let opts = worker::WorkerOptions {
                 job_type,
                 worker_name: name.unwrap_or_else(default_name),
@@ -106,7 +125,7 @@ async fn main() -> Result<()> {
                 max_jobs,
             };
             tokio::select! {
-                r = worker::run(client, opts) => r,
+                r = worker::run(jobs, opts) => r,
                 _ = tokio::signal::ctrl_c() => { worker::log("interrupted"); Ok(()) }
             }
         }

@@ -34,3 +34,22 @@ c8ctl's remembered active profile.
   no output.
 - No git, no result file / `::nano:result::`, no hub, no sandbox: those are
   the port, not the spike.
+
+## Leases (`--with-lease`)
+
+The Nano engine issues leases (`withLease: true`) and fences complete, fail,
+throw-error and (token-bearing) update with 409. But it still names the token
+`leaseToken` / `jobLease`. Camunda 8.10 renamed both to `jobLeaseToken`
+(camunda/camunda `51b0d787e`), and the SDK follows the spec, so through the SDK
+the token is dropped on activation and never sent. Tracked in
+nanobpm/nano-bpm#1283.
+
+Until that lands, `--job-api auto` (the default) sends the job commands with
+`--with-lease` as raw HTTP in Nano's dialect (`src/jobs.rs`). `--job-api sdk`
+shows the mismatch: the worker refuses the job because it came back without a
+token. `--recovery-window` is in **milliseconds**, as in c8ctl.
+
+```sh
+CAMUNDA_REST_ADDRESS=http://localhost:8080 cargo run --release -- spike \
+  --job-type spike:nano-supervisor --with-lease --recovery-window 9000 --max-jobs 1
+```
