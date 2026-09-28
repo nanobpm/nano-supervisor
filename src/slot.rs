@@ -230,7 +230,7 @@ async fn execute(
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
 
-    let (result_obj, detect_stdout, had_turns) = match cfg.hire.protocol {
+    let (result_obj, detect_stdout) = match cfg.hire.protocol {
         Protocol::Acp => run_acp(&cfg, &key, &agent_cwd, &prompt, &result_file, &agent_env).await?,
         Protocol::Pipe => {
             run_pipe(&cfg, &key, &agent_cwd, &env, &job, &result_file, &agent_env).await?
@@ -239,7 +239,7 @@ async fn execute(
 
     // A run that produced nothing did no work — fail it (retries preserved)
     // rather than silently complete and drop what the job carried.
-    if let Some(reason) = result::detect_empty(result_obj.as_ref(), &detect_stdout, had_turns) {
+    if let Some(reason) = result::detect_empty(result_obj.as_ref(), &detect_stdout) {
         bail!(reason);
     }
 
@@ -252,10 +252,8 @@ async fn execute(
     // If the agent returned no effective structured result but still produced
     // substantive output, surface that output as `agentResult` (as the spike
     // worker does) instead of silently completing with only bookkeeping and
-    // dropping the agent's response. This applies to BOTH protocols: for a pipe
-    // harness `had_turns` is always false, so keying on it would drop a pipe
-    // agent's answer whenever it printed output without writing a result file.
-    // The empty-result guard above already failed runs that did NOTHING, so
+    // dropping the agent's response. This applies to BOTH protocols. The
+    // empty-result guard above already failed runs that did NOTHING, so
     // reaching here with non-empty `detect_stdout` means real work to preserve.
     let has_effective = result_obj
         .as_ref()
@@ -276,7 +274,7 @@ async fn run_acp(
     prompt: &str,
     result_file: &std::path::Path,
     env: &[(String, String)],
-) -> Result<(Option<Map<String, Value>>, String, bool)> {
+) -> Result<(Option<Map<String, Value>>, String)> {
     let mut agent = Agent::spawn(&cfg.hire.command, &cfg.hire.args, cwd, env)?;
     log(&format!(
         "job {key}: acp agent pid {} in {}",
@@ -289,8 +287,7 @@ async fn run_acp(
     // Prefer the result file, then a `::nano:result::` sentinel in the message text.
     let result_obj = result::read_result_file(result_file)
         .or_else(|| result::parse_result_from_stdout(&out.text));
-    let had_turns = out.updates > 0;
-    Ok((result_obj, out.text, had_turns))
+    Ok((result_obj, out.text))
 }
 
 /// Drive a pipe harness: feed it the JSON job payload on stdin and scrape its
@@ -303,7 +300,7 @@ async fn run_pipe(
     job: &ActivatedJobResult,
     result_file: &std::path::Path,
     agent_env: &[(String, String)],
-) -> Result<(Option<Map<String, Value>>, String, bool)> {
+) -> Result<(Option<Map<String, Value>>, String)> {
     let payload = build_pipe_payload(cfg, job, env);
     log(&format!("job {key}: pipe agent in {}", cwd.display()));
     let out = crate::pipe::run(
@@ -323,20 +320,35 @@ async fn run_pipe(
     }
     let result_obj = result::read_result_file(result_file)
         .or_else(|| result::parse_result_from_stdout(&out.stdout));
-    // A non-zero harness exit means the run failed. Only tolerate it when the
-    // agent still emitted an explicit structured result (result file or stdout
-    // sentinel) — otherwise diagnostic stdout must not be mistaken for real work
-    // and silently settle the job; fail it so it is retried instead.
-    if let Some(code) = out.exit_code.filter(|&c| c != 0) {
-        if result_obj.is_none() {
-            bail!("pipe agent exited with code {code} without writing a result");
+    // The harness must have exited cleanly (code 0) for its output to be trusted.
+    match out.exit_code {
+        // Clean exit: nothing to gate on here (empty-result is handled below).
+        Some(0) => {}
+        // A non-zero exit means the run failed. Only tolerate it when the agent
+        // still emitted an explicit structured result (result file or stdout
+        // sentinel) — otherwise diagnostic stdout must not be mistaken for real
+        // work and silently settle the job; fail it so it is retried instead.
+        Some(code) => {
+            if result_obj.is_none() {
+                bail!("pipe agent exited with code {code} without writing a result");
+            }
+            log(&format!(
+                "job {key}: pipe agent exited with code {code}; honoring the explicit result it wrote"
+            ));
         }
-        log(&format!(
-            "job {key}: pipe agent exited with code {code}; honoring the explicit result it wrote"
-        ));
+        // No exit code at all: the child was killed by a signal or the EOF wait
+        // timed out and we tore it down. The harness never exited successfully,
+        // so any result it wrote may be partial/untrustworthy — never honor it;
+        // fail the job so it is retried rather than settled on a broken run.
+        None => {
+            bail!(
+                "pipe agent did not exit cleanly (killed by a signal or the EOF wait timed out); \
+                 refusing to honor any result from a run that never terminated successfully"
+            );
+        }
     }
     // The pipe path has no "turns"; substantive stdout is the work signal.
-    Ok((result_obj, out.stdout, false))
+    Ok((result_obj, out.stdout))
 }
 
 /// The JSON payload a pipe harness reads on stdin (the Node plugin's

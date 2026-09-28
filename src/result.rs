@@ -195,13 +195,16 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
 }
 
 /// The empty-job detector. A run that produced NOTHING — no effective result
-/// vars, no substantive stdout, and (for ACP) no turns — did no work: completing
-/// it would silently drop whatever the job carried, so the caller FAILS the job
-/// (preserving retries) instead. Returns a reason when the run is empty.
+/// vars and no substantive stdout (after value-less result markers/fences are
+/// stripped) — did no work: completing it would silently drop whatever the job
+/// carried, so the caller FAILS the job (preserving retries) instead. Note that
+/// neither raw ACP `session/update` activity (tool-call/status notifications
+/// without any assistant text) nor a lone value-less `::nano:result::` marker
+/// counts as work — both leave nothing substantive behind and so are failed
+/// rather than settled empty. Returns a reason when the run is empty.
 pub fn detect_empty(
     result_vars: Option<&Map<String, Value>>,
     stdout: &str,
-    had_turns: bool,
 ) -> Option<String> {
     if result_vars.is_some_and(has_effective_result_vars) {
         return None;
@@ -209,13 +212,11 @@ pub fn detect_empty(
     if !stdout_stripped_of_empty_result(stdout).trim().is_empty() {
         return None;
     }
-    if had_turns {
-        return None;
-    }
     Some(
-        "agent produced nothing — no result vars, no output, no transcript turns. This is the \
-         signature of a protocol-mismatched or no-op harness; completing the job would silently \
-         drop what it carried, so it is failed (retries preserved) instead of completed."
+        "agent produced nothing — no result vars and no substantive output (only tool/status \
+         activity or a value-less result marker). This is the signature of a protocol-mismatched \
+         or no-op harness; completing the job would silently drop what it carried, so it is failed \
+         (retries preserved) instead of completed."
             .to_string(),
     )
 }
@@ -262,7 +263,7 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_sentinel() {
         let out = "::nano:result:: {}\n";
-        assert!(detect_empty(None, out, false).is_some());
+        assert!(detect_empty(None, out).is_some());
     }
 
     #[test]
@@ -273,7 +274,7 @@ mod tests {
         // at offset 0 and leave the fence residue behind.
         let out = "```json\n```\n";
         assert!(
-            detect_empty(None, out, false).is_some(),
+            detect_empty(None, out).is_some(),
             "empty fence should not count as work"
         );
     }
@@ -281,30 +282,34 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_fence() {
         let out = "```json\n{}\n```\n";
-        assert!(detect_empty(None, out, false).is_some());
+        assert!(detect_empty(None, out).is_some());
     }
 
     #[test]
     fn not_empty_with_prose_fence() {
         // A non-empty, non-result fenced block is genuine output and is kept.
         let out = "```\nsome code the agent wrote\n```\n";
-        assert!(detect_empty(None, out, false).is_none());
+        assert!(detect_empty(None, out).is_none());
     }
 
     #[test]
     fn not_empty_with_substantive_stdout() {
-        assert!(detect_empty(None, "did real work\n", false).is_none());
+        assert!(detect_empty(None, "did real work\n").is_none());
     }
 
     #[test]
-    fn not_empty_with_turns() {
-        assert!(detect_empty(None, "", true).is_none());
+    fn empty_when_no_substantive_output() {
+        // An ACP run that emitted only tool-call/status `session/update`s (no
+        // assistant text) and no structured result produced nothing to settle;
+        // with no substantive stdout it must be failed, not silently completed.
+        // (Finding: tool-only ACP updates must not bypass empty-run detection.)
+        assert!(detect_empty(None, "").is_some());
     }
 
     #[test]
     fn not_empty_with_effective_vars() {
         let o = obj(json!({"status":"done"}));
-        assert!(detect_empty(Some(&o), "", false).is_none());
+        assert!(detect_empty(Some(&o), "").is_none());
     }
 
     #[test]
