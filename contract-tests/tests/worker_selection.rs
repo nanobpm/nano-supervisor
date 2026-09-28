@@ -25,10 +25,13 @@ fn worker_takes_its_configured_job_type() {
         &[],
         &[],
     );
-    let logs = outcome.stderr();
-    assert!(
-        logs.contains(&outcome.job_type),
-        "the worker should activate its configured job type; stderr:\n{logs}"
+    let record = outcome.record();
+    assert_eq!(
+        record.first_prompt(),
+        Some("pick me"),
+        "the worker should activate its configured job type and prompt the agent \
+         with that job's `prompt`; worker stderr:\n{}",
+        outcome.stderr()
     );
 }
 

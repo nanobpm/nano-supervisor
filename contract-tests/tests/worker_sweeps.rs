@@ -66,4 +66,10 @@ fn min_free_mb_gates_work() {
         logs.to_lowercase().contains("free") || logs.to_lowercase().contains("disk"),
         "a too-high --min-free-mb should stop the worker taking work; stderr:\n{logs}"
     );
+    // Gating means the worker refuses the job *before* launching the agent, so
+    // the fake agent must never have run — no recording is produced.
+    assert!(
+        !outcome.record_exists(),
+        "a disk-gated worker must not run the agent, but a recording was produced; stderr:\n{logs}"
+    );
 }

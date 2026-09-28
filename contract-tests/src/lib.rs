@@ -252,17 +252,26 @@ impl Engine {
 }
 
 fn is_local(url: &str) -> bool {
-    let host = url
+    // The authority is everything after `://` and before the first `/`.
+    let authority = url
         .split("://")
         .nth(1)
         .unwrap_or(url)
         .split('/')
         .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
         .unwrap_or("");
-    host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
+    // Drop any `user:pass@` userinfo — the host is what follows the last `@`.
+    // Without this, `http://localhost:pw@merlin:8080` would parse its host as
+    // `localhost` and wrongly pass the guard while actually targeting merlin.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Extract the host, honouring bracketed IPv6 literals (`[::1]:8080`); a
+    // plain `split(':')` would yield `[` for those and reject loopback.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 fn sanitize(s: &str) -> String {
@@ -353,6 +362,13 @@ impl JobOutcome {
         fake::FakeRecord::read(&self.record_path)
     }
 
+    /// Whether the fake agent ran at all — its recording only exists if the
+    /// worker actually launched it. Used to prove the worker did **not** run the
+    /// agent (e.g. when work is gated by a disk-space floor).
+    pub fn record_exists(&self) -> bool {
+        self.record_path.exists()
+    }
+
     /// Whether the agent wrote `AGENT_RESULT_FILE`, and its parsed contents.
     pub fn result_file(&self) -> Option<serde_json::Value> {
         std::fs::read_to_string(&self.result_path)
@@ -407,7 +423,11 @@ pub fn run_worker_job(
     cmd.args(worker_flags);
     cmd.env("NS_FAKE_SCRIPT", &script_json)
         .env("NS_FAKE_RECORD", &record_path)
-        .env("AGENT_RESULT_FILE", &result_path);
+        .env("AGENT_RESULT_FILE", &result_path)
+        // Point the worker at the same engine the job was deployed to, so it
+        // polls the local test engine rather than an inherited CAMUNDA_* endpoint
+        // or an ambient c8ctl profile.
+        .env("CAMUNDA_REST_ADDRESS", engine.url());
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -433,4 +453,32 @@ fn which(program: &str) -> Option<PathBuf> {
             cand.is_file().then_some(cand)
         })
     })
+}
+
+#[cfg(test)]
+mod is_local_tests {
+    use super::is_local;
+
+    #[test]
+    fn plain_localhost_and_loopback_are_local() {
+        assert!(is_local("http://localhost:8080"));
+        assert!(is_local("http://127.0.0.1:8080"));
+        assert!(is_local("http://[::1]:8080"));
+        assert!(is_local("http://localhost/foo"));
+    }
+
+    #[test]
+    fn remote_hosts_are_not_local() {
+        assert!(!is_local("http://merlin:8080"));
+        assert!(!is_local("https://example.com/v2"));
+    }
+
+    #[test]
+    fn userinfo_does_not_spoof_the_host() {
+        // The real host is `merlin`, even though the userinfo mentions localhost.
+        assert!(!is_local("http://localhost:pw@merlin:8080"));
+        assert!(!is_local("http://127.0.0.1@merlin:8080"));
+        // Userinfo in front of a genuine loopback host stays local.
+        assert!(is_local("http://user:pass@127.0.0.1:8080"));
+    }
 }

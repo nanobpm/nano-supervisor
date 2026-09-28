@@ -117,8 +117,7 @@ impl FakeAgent {
         self
     }
 
-    /// Where the agent writes its recording. Also sets a default `AGENT_RESULT_FILE`
-    /// sibling if the caller has not set one.
+    /// Where the agent writes its recording (`NS_FAKE_RECORD`).
     pub fn record_to(mut self, path: impl Into<PathBuf>) -> Self {
         self.record = Some(path.into());
         self

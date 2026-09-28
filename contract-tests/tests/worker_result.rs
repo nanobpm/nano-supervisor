@@ -63,10 +63,11 @@ fn empty_result_fails_never_completes() {
         &engine,
         &target,
         "result-empty-fails",
-        // The agent goes silent without emitting text or writing a result.
-        &[json!({ "go_silent": 100 })],
+        // A clean `end_turn` with no text and no result file — the canonical
+        // empty result (c8ctl-plugin-nano#275), not an idle-timeout hang.
+        &[],
         json!({ "prompt": "produce nothing" }),
-        &["--idle-timeout", "2"],
+        &[],
         &[],
     );
     let logs = outcome.stderr();

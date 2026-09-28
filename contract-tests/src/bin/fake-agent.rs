@@ -141,6 +141,7 @@ fn run_steps(
     script: &[Value],
     mut emit: impl FnMut(&str),
     mut emit_tool_call: impl FnMut(&Value),
+    mut emit_marker: impl FnMut(&Value),
     mut on_permission: impl FnMut(&Value) -> Value,
 ) -> StepEnd {
     for step in script {
@@ -155,9 +156,11 @@ fn run_steps(
         } else if let Some(v) = obj.get("write_result") {
             write_result_file(v);
         } else if let Some(v) = obj.get("result_marker") {
-            // A single line the worker scrapes: `::nano:result::<compact-json>`.
-            println!("::nano:result::{}", serde_json::to_string(v).unwrap());
-            let _ = std::io::stdout().flush();
+            // A `::nano:result::<compact-json>` marker the worker scrapes.
+            // Delivered mode-appropriately: a stdout line in pipe mode, an ACP
+            // `agent_message_chunk` in ACP mode — never a raw non-JSON line onto
+            // the JSON-RPC stream, which would corrupt the protocol.
+            emit_marker(v);
         } else if let Some(ms) = obj.get("sleep_ms").and_then(Value::as_u64) {
             sleep_ms(ms);
         } else if let Some(ms) = obj.get("go_silent").and_then(Value::as_u64) {
@@ -210,6 +213,11 @@ fn run_pipe(record: &mut Record, argv: &[String], script: &[Value]) -> i32 {
         // Pipe mode has no tool-call channel; surface it as a line for visibility.
         |tc| {
             println!("[tool_call] {tc}");
+            let _ = std::io::stdout().flush();
+        },
+        // Pipe mode: the marker is a plain stdout line the worker scrapes.
+        |v| {
+            println!("::nano:result::{}", serde_json::to_string(v).unwrap());
             let _ = std::io::stdout().flush();
         },
         // Pipe mode has no permission channel; auto-"allow" and record it.
@@ -354,6 +362,22 @@ fn run_acp_turn<I: Iterator<Item = std::io::Result<String>>>(
                         "title": tc.get("title").cloned().unwrap_or_else(|| json!("fake tool")),
                         "kind": tc.get("kind").cloned().unwrap_or_else(|| json!("other")),
                         "status": "completed"
+                    }
+                }
+            }));
+        },
+        |v| {
+            // ACP mode: deliver the marker as agent-visible message text so it
+            // rides the JSON-RPC channel as a well-formed frame instead of a raw
+            // line that would corrupt the protocol stream.
+            let marker = format!("::nano:result::{}", serde_json::to_string(v).unwrap());
+            send(&json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": marker }
                     }
                 }
             }));
