@@ -1,9 +1,11 @@
-//! nano-supervisor — spike.
+//! nano-supervisor — job worker.
 //!
-//! `nano-supervisor spike` runs ONE worker slot: poll a job type through
-//! `camunda-orchestration-sdk`, keep each activation alive, drive an agent over
-//! ACP, and complete/fail the job. It exists to measure memory and to decide
-//! between the SDK's `JobWorker` and our own slot loop (see issue #1).
+//! `nano-supervisor work` (alias `spike`) runs ONE worker slot: poll a job type
+//! through `camunda-orchestration-sdk`, keep each activation alive, drive an
+//! agent over ACP, and complete/fail the job. It exists to measure memory and to
+//! decide between the SDK's `JobWorker` and our own slot loop (see issue #1), and
+//! is the Rust target the black-box contract-test suite drives (`NS_TARGET=rust`,
+//! issues #3/#4) alongside `c8 nano work` (Node).
 
 mod acp;
 mod jobs;
@@ -29,8 +31,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run one worker slot for a job type (spike).
-    Spike {
+    /// Run one worker slot for a job type.
+    #[command(visible_alias = "spike")]
+    Work {
         /// Job type to service.
         #[arg(long)]
         job_type: String,
@@ -61,6 +64,18 @@ enum Cmd {
         /// Exit after this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
+        /// Keep the N most recent per-job run directories; older ones are reaped.
+        #[arg(long)]
+        keep_runs: Option<usize>,
+        /// Refuse to take work when free disk under the run directory is below this (MiB).
+        #[arg(long)]
+        min_free_mb: Option<u64>,
+        /// Reap run directories older than this, on startup and each sweep (e.g. `30s`, `500ms`).
+        #[arg(long, value_parser = parse_duration)]
+        reap_age: Option<Duration>,
+        /// Sweep the run directory for stale directories on this cadence (e.g. `60s`).
+        #[arg(long, value_parser = parse_duration)]
+        reap_interval: Option<Duration>,
         /// Job command transport: `sdk`, `nano` (raw HTTP, Nano's `leaseToken`
         /// field), or `auto` (= `nano` with --with-lease, else `sdk`).
         #[arg(long, default_value = "auto")]
@@ -71,7 +86,7 @@ enum Cmd {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Spike {
+        Cmd::Work {
             job_type,
             profile,
             agent,
@@ -82,6 +97,10 @@ async fn main() -> Result<()> {
             runs_dir,
             with_lease,
             max_jobs,
+            keep_runs,
+            min_free_mb,
+            reap_age,
+            reap_interval,
             job_api,
         } => {
             let mut parts = agent.split_whitespace().map(String::from);
@@ -123,6 +142,10 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| std::env::temp_dir().join("nano-supervisor-runs")),
                 with_lease,
                 max_jobs,
+                keep_runs,
+                min_free_mb,
+                reap_age,
+                reap_interval,
             };
             tokio::select! {
                 r = worker::run(jobs, opts) => r,
@@ -142,4 +165,26 @@ fn default_name() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "host".into());
     format!("{host}-spike-{}", std::process::id())
+}
+
+/// Parse a duration flag: a bare number is milliseconds, or a `ms`/`s`/`m`/`h`
+/// suffix (e.g. `500ms`, `30s`, `5m`). Used for `--reap-age`/`--reap-interval`.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1_000)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?} (use e.g. `30s`, `500ms`, or a ms count)"))?;
+    Ok(Duration::from_millis(n * mult))
 }

@@ -30,6 +30,14 @@ pub struct WorkerOptions {
     pub runs_dir: PathBuf,
     pub with_lease: bool,
     pub max_jobs: Option<usize>,
+    /// Keep the N most recent run directories when sweeping; reap older ones.
+    pub keep_runs: Option<usize>,
+    /// Refuse to take work while free disk under `runs_dir` is below this (MiB).
+    pub min_free_mb: Option<u64>,
+    /// Reap run directories older than this, on startup and on each sweep.
+    pub reap_age: Option<Duration>,
+    /// Sweep `runs_dir` for stale directories on this cadence.
+    pub reap_interval: Option<Duration>,
 }
 
 pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
@@ -43,9 +51,43 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
         if opts.with_lease { "on" } else { "off" },
         jobs.backend()
     ));
+
+    // Housekeeping: make sure the run root exists, sweep stale run dirs on
+    // startup, then keep sweeping on the configured cadence.
+    let _ = std::fs::create_dir_all(&opts.runs_dir);
+    sweep_runs(&opts);
+    if let Some(interval) = opts.reap_interval.filter(|d| !d.is_zero()) {
+        let sweep_opts = opts.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                sweep_runs(&sweep_opts);
+            }
+        });
+    }
+
     loop {
         if opts.max_jobs.is_some_and(|m| done >= m) {
             return Ok(());
+        }
+        // Disk-space floor: refuse to take work when free space under the run
+        // directory is below the configured floor, before touching the engine.
+        if let Some(floor) = opts.min_free_mb {
+            if let Some(free) = free_mb(&opts.runs_dir) {
+                if free < floor {
+                    log(&format!(
+                        "free disk {free}MB under {} is below the floor of {floor}MB; refusing to take work",
+                        opts.runs_dir.display()
+                    ));
+                    return Ok(());
+                }
+            } else {
+                log(&format!(
+                    "could not determine free disk under {}; refusing to take work below the {floor}MB floor",
+                    opts.runs_dir.display()
+                ));
+                return Ok(());
+            }
         }
         let batch = match jobs
             .activate(
@@ -209,6 +251,72 @@ fn truncate(s: &str, max: usize) -> String {
     let mut t: String = s.chars().take(max).collect();
     t.push('…');
     t
+}
+
+/// Free space in MiB available under `path`, via POSIX `df -Pk` (portable across
+/// macOS and Linux). `None` if `df` is unavailable or its output can't be parsed.
+fn free_mb(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Data line: `Filesystem 1024-blocks Used Available Capacity Mounted-on`.
+    let avail_kib: u64 = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(avail_kib / 1024)
+}
+
+/// Reap stale per-job run directories: remove immediate subdirectories of
+/// `runs_dir` older than `reap_age`, always keeping the `keep_runs` most recent
+/// (default 1). A no-op unless `reap_age` is set.
+fn sweep_runs(opts: &WorkerOptions) {
+    let Some(age) = opts.reap_age else {
+        return;
+    };
+    let keep = opts.keep_runs.unwrap_or(1);
+    let now = std::time::SystemTime::now();
+
+    let Ok(entries) = std::fs::read_dir(&opts.runs_dir) else {
+        return;
+    };
+    // (path, modified) for each subdirectory, newest first.
+    let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((e.path(), modified))
+        })
+        .collect();
+    dirs.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+
+    let mut reaped = 0usize;
+    for (path, modified) in dirs.into_iter().skip(keep) {
+        let stale = now
+            .duration_since(modified)
+            .map(|d| d >= age)
+            .unwrap_or(false);
+        if stale && std::fs::remove_dir_all(&path).is_ok() {
+            reaped += 1;
+        }
+    }
+    if reaped > 0 {
+        log(&format!(
+            "sweep: reaped {reaped} stale run dir(s) under {} (keep {keep}, age {}s)",
+            opts.runs_dir.display(),
+            age.as_secs()
+        ));
+    }
 }
 
 pub fn log(msg: &str) {
