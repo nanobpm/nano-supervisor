@@ -277,6 +277,15 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
                 pending.clear();
                 continue;
             }
+            if pending.len() + line_bytes.len() > MAX_ACP_FRAME {
+                // A *complete* (newline-terminated) frame that overflows the cap
+                // must be dropped too, not just parsed because it happened to end
+                // within this chunk: buffering + parsing it would blow the
+                // `MAX_ACP_FRAME` memory bound the trailing-chunk check below
+                // enforces. Discard it and move on to the next frame.
+                pending.clear();
+                continue;
+            }
             pending.extend_from_slice(line_bytes);
             let line = String::from_utf8_lossy(&pending).into_owned();
             pending.clear();

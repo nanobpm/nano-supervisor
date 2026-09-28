@@ -250,9 +250,52 @@ fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run one job to completion: assemble the prompt, provision the repo, drive the
-/// agent over its protocol, and return the completion variables. An error means
-/// the job should be failed (including the empty-result case).
+/// Prepare a per-job run directory under `runs_dir` with the full symlink and
+/// permission hardening, wiping any stale prior-attempt contents. Shared by the
+/// daemon slot path ([`execute`]) and the `spike` worker path so both get
+/// identical protection: reject a symlinked leaf / ancestor before *and* after
+/// the non-atomic remove+create (a local process can swap the fresh dir for a
+/// link in between), then restrict both the runs root and the job dir to 0700 so
+/// the clone, prompt-derived files, and `result.json` are not readable by other
+/// local users regardless of umask — this still matters when `runs_dir` falls
+/// back to a shared system temp location.
+pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+    reject_symlink(runs_dir)?;
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors(run_dir)?;
+    if run_dir.exists() {
+        std::fs::remove_dir_all(run_dir)
+            .with_context(|| format!("clearing stale {}", run_dir.display()))?;
+    }
+    std::fs::create_dir_all(run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    reject_symlink(runs_dir)?;
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors(run_dir)?;
+    restrict_dir_mode(runs_dir)?;
+    restrict_dir_mode(run_dir)?;
+    Ok(())
+}
+
+/// Redact any embedded userinfo (`user:token@`) from a URL's authority before
+/// logging it. A repository URL from the task envelope may carry an HTTPS
+/// credential (`https://x-access-token:<pat>@host/...`); logging it verbatim
+/// would leak the secret into the daemon's stdout/journal. Non-URL or
+/// credential-free inputs are returned unchanged.
+pub(crate) fn redact_url(raw: &str) -> String {
+    let Some(scheme_end) = raw.find("://") else {
+        return raw.to_string();
+    };
+    let after = scheme_end + 3;
+    let rest = &raw[after..];
+    // The authority ends at the first '/', '?', or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    match authority.rfind('@') {
+        Some(at) => format!("{}{}{}", &raw[..after], &authority[at + 1..], &rest[auth_end..]),
+        None => raw.to_string(),
+    }
+}
+
 async fn execute(
     cfg: Arc<SlotConfig>,
     key: String,
@@ -279,37 +322,16 @@ async fn execute(
     // operate outside `runs_dir`.
     crate::jobs::validate_job_key(&key)?;
     let run_dir = cfg.runs_dir.join(&key);
-    // Reject a symlinked runs root / job dir before touching it: on a shared
-    // temp-based `runs_dir` another local user could pre-create either as a
-    // symlink, and `remove_dir_all` / `create_dir_all` would follow it.
-    reject_symlink(&cfg.runs_dir)?;
-    reject_symlink(&run_dir)?;
-    // Also reject a symlinked *ancestor* above the runs root: `create_dir_all`
-    // would otherwise follow it and plant the job dir outside the intended root
-    // while the leaf checks (which only inspect the final paths) see a real dir.
-    reject_symlinked_ancestors(&run_dir)?;
-    if run_dir.exists() {
-        std::fs::remove_dir_all(&run_dir)
-            .with_context(|| format!("clearing stale {}", run_dir.display()))?;
-    }
-    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    // Re-check after the non-atomic remove/create: a local process can swap the
-    // fresh numeric dir for a symlink in the window before we use it as the
-    // agent cwd, so confirm neither the root nor the job dir is now a link.
-    reject_symlink(&cfg.runs_dir)?;
-    reject_symlink(&run_dir)?;
-    reject_symlinked_ancestors(&run_dir)?;
-    // Restrict the runs root and this job dir to owner-only (0700) on Unix, so
-    // the cloned repo, prompt-derived files, and `result.json` are not
-    // readable/traversable by other local users regardless of umask. This still
-    // matters when `runs_dir` falls back to a shared system temp location.
-    restrict_dir_mode(&cfg.runs_dir)?;
-    restrict_dir_mode(&run_dir)?;
+    // Reject symlinked runs root / job dir / ancestors, wipe any stale prior
+    // attempt, (re-)create the dir, and lock it to owner-only 0700 — the full
+    // hardening lives in one shared helper (also used by the `spike` path).
+    prepare_run_dir(&cfg.runs_dir, &run_dir)?;
     let agent_cwd = match &env.repository {
         Some(repo) => {
             log(&format!(
                 "job {key}: cloning {} ({})",
-                repo.url, repo.provider
+                redact_url(&repo.url),
+                repo.provider
             ));
             crate::provision::provision(repo, &run_dir, cfg.clone_timeout)
                 .await
@@ -568,5 +590,23 @@ mod tests {
             .rfind(|(k, _)| k == "NANO_AGENTIC")
             .map(|(_, v)| v.as_str());
         assert_eq!(last, Some("off"));
+    }
+
+    #[test]
+    fn redact_url_strips_embedded_credentials() {
+        assert_eq!(
+            redact_url("https://x-access-token:ghp_secret@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_url("https://user:pw@host:8443/path?x=1"),
+            "https://host:8443/path?x=1"
+        );
+        // No credentials / non-URL inputs are returned unchanged.
+        assert_eq!(
+            redact_url("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(redact_url("git@github.com:o/r.git"), "git@github.com:o/r.git");
     }
 }

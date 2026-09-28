@@ -62,13 +62,42 @@ pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
     // actually read/allocate.
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
+    // Bind the parent inode, then open the leaf relative to it with no-follow.
+    // Leaf-only `O_NOFOLLOW` guards only the final `result.json` component; the
+    // kernel still *follows* the parent components during path lookup, so the
+    // agent (which owns its run dir) could rename `<runs_dir>/<key>` and drop a
+    // symlink in its place to redirect this read to an arbitrary `result.json`
+    // outside the validated run directory. Opening the parent directory itself
+    // no-follow and then `openat`-ing the leaf from that fd pins the directory
+    // inode, closing the parent-swap TOCTOU rather than trusting the path string.
     #[cfg(unix)]
-    {
+    let file = {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let parent = path.parent()?;
+        let name = path.file_name()?;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir = opts.open(parent).ok()?;
+        let cname = CString::new(name.as_bytes()).ok()?;
+        // SAFETY: `dir` owns a valid directory fd for the duration of this call
+        // and `cname` is a valid NUL-terminated C string.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` is a fresh, owned fd just returned by `openat`.
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    };
     #[cfg(windows)]
-    {
+    let file = {
         use std::os::windows::fs::OpenOptionsExt;
         // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point / symlink itself
         // rather than following it, the Windows analogue of `O_NOFOLLOW`. A
@@ -76,17 +105,18 @@ pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
         // its reparse-point attribute, so the daemon never reads through it.
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
+        opts.open(path).ok()?
+    };
     // No atomic no-follow open on other platforms: reject a symlink explicitly so
     // the documented no-symlink guarantee still holds (best-effort; such targets
     // are not supported daemon hosts).
     #[cfg(not(any(unix, windows)))]
-    {
+    let file = {
         if std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
             return None;
         }
-    }
-    let file = opts.open(path).ok()?;
+        opts.open(path).ok()?
+    };
     let meta = file.metadata().ok()?;
     #[cfg(windows)]
     {

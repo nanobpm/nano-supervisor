@@ -153,7 +153,11 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     // `create_dir_all` (and the agent's cwd) escape `runs_dir`.
     crate::jobs::validate_job_key(key)?;
     let cwd = opts.runs_dir.join(key);
-    std::fs::create_dir_all(&cwd).with_context(|| format!("creating {}", cwd.display()))?;
+    // Harden the run directory the same way the daemon slot path does — reject
+    // symlinked root/ancestors and enforce owner-only 0700 — via the shared
+    // helper, so `spike --runs-dir` cannot be redirected to an attacker-chosen
+    // location and the default root's mode does not depend on umask.
+    crate::slot::prepare_run_dir(&opts.runs_dir, &cwd)?;
     let env = vec![
         ("NANO_JOB_KEY".to_string(), key.to_string()),
         ("NANO_AGENT_NAME".to_string(), opts.worker_name.clone()),
