@@ -136,6 +136,12 @@ pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
     CamundaClient::new(opts).map_err(|e| anyhow::anyhow!("creating engine client: {e}"))
 }
 
+/// Whether this profile carries OAuth client-credentials (which the raw Nano
+/// job client cannot use — it only speaks none/basic).
+pub fn has_oauth(p: &Profile) -> bool {
+    p.client_id.is_some() && p.client_secret.is_some()
+}
+
 /// Engine address and basic-auth credentials for the raw Nano job client:
 /// the profile's settings, else the `CAMUNDA_*` environment, else localhost.
 /// (OAuth is not supported on this path; the spike only needs none/basic.)

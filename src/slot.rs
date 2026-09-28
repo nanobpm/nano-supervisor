@@ -124,16 +124,25 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
 
     // Run the job on its own task so a panic fails only THIS job (the slot loop
     // survives). Race it against activation loss so a superseded worker stops.
-    let exec = tokio::spawn(execute(cfg.clone(), key.clone(), job.clone()));
+    let mut exec = tokio::spawn(execute(cfg.clone(), key.clone(), job.clone()));
     let outcome = tokio::select! {
-        r = exec => Some(match r {
+        r = &mut exec => Some(match r {
             Ok(inner) => inner,
             Err(join) => Err(anyhow::anyhow!(
                 "slot task for job {key} panicked: {join}"
             )),
         }),
+        // Drop the watch guard immediately; the abort/await happens below.
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
+    if outcome.is_none() {
+        // We lost the activation: actually stop the agent instead of detaching
+        // the task. Aborting drops the execute future, whose child processes are
+        // spawned `kill_on_drop`, so the clone/agent tree is torn down before we
+        // return.
+        exec.abort();
+        let _ = exec.await;
+    }
     refresher.abort();
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
@@ -181,7 +190,15 @@ async fn execute(
         .context("job carries no prompt (task.prompt / prompt / task)")?;
 
     // Per-job working directory; the repo (when present) is cloned inside it.
+    // The dir is keyed by job key and so is reused across retries — wipe any
+    // prior attempt's checkout and stale `result.json` first, so a retry starts
+    // from a clean slate (a leftover clone would fail provisioning, and a stale
+    // result could be accepted as this attempt's result).
     let run_dir = cfg.runs_dir.join(&key);
+    if run_dir.exists() {
+        std::fs::remove_dir_all(&run_dir)
+            .with_context(|| format!("clearing stale {}", run_dir.display()))?;
+    }
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
     let agent_cwd = match &env.repository {
         Some(repo) => {

@@ -77,6 +77,7 @@ pub async fn run(
                     last_activity = Instant::now();
                     collected.push_str(&l);
                     collected.push('\n');
+                    bound_capture(&mut collected);
                 }
                 Ok(None) | Err(_) => {
                     // stdout closed: wait for the process to reap.
@@ -103,6 +104,29 @@ pub async fn run(
     })
 }
 
+/// Upper bound on captured stdout. The result is delivered out-of-band via
+/// `$AGENT_RESULT_FILE`; stdout is only a fallback channel for the trailing
+/// `::nano:result::` sentinel, so a noisy or adversarial agent must not be able
+/// to grow this `String` without limit and exhaust the daemon's memory.
+const MAX_STDOUT: usize = 1 << 20; // 1 MiB
+
+/// Keep `collected` within [`MAX_STDOUT`] by dropping from the front (oldest
+/// output) once it overflows. Retaining the tail preserves a trailing
+/// `::nano:result::` sentinel for result parsing.
+fn bound_capture(collected: &mut String) {
+    if collected.len() <= MAX_STDOUT {
+        return;
+    }
+    let overflow = collected.len() - MAX_STDOUT;
+    // Advance to a char boundary at or past the overflow so we never split a
+    // UTF-8 code point.
+    let mut cut = overflow;
+    while cut < collected.len() && !collected.is_char_boundary(cut) {
+        cut += 1;
+    }
+    collected.replace_range(..cut, "");
+}
+
 async fn kill_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -114,4 +138,26 @@ async fn kill_tree(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
     // Best-effort reap so we don't leak a zombie.
     let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bound_capture_keeps_tail_within_limit() {
+        let mut s = "x".repeat(MAX_STDOUT + 1000);
+        s.push_str("::nano:result:: {}\n");
+        bound_capture(&mut s);
+        assert!(s.len() <= MAX_STDOUT);
+        // The trailing sentinel (what result parsing needs) is retained.
+        assert!(s.ends_with("::nano:result:: {}\n"));
+    }
+
+    #[test]
+    fn bound_capture_leaves_small_output_untouched() {
+        let mut s = "hello\nworld\n".to_string();
+        bound_capture(&mut s);
+        assert_eq!(s, "hello\nworld\n");
+    }
 }

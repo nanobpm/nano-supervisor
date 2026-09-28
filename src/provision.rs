@@ -56,6 +56,10 @@ pub async fn provision(
         args.push("--branch".into());
         args.push(branch.clone());
     }
+    // `--` terminates git's option parsing so a job-supplied `repo.url` (or
+    // workspace path) beginning with `-` can never be mistaken for a clone
+    // option (e.g. `--upload-pack`).
+    args.push("--".into());
     args.push(repo.url.clone());
     args.push(workspace.to_string_lossy().into_owned());
 
@@ -113,6 +117,10 @@ fn is_hex_sha(s: &str) -> bool {
 async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.args(args);
+    // Kill (and reap) the git child if this future is dropped — e.g. when the
+    // timeout below fires — so a timed-out clone/fetch can't keep running and
+    // mutate the workspace while a retry starts.
+    cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
