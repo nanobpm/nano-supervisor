@@ -132,6 +132,7 @@ async fn main() -> Result<()> {
             };
             let opts = worker::WorkerOptions {
                 job_type,
+                name_generated: name.is_none(),
                 worker_name: name.unwrap_or_else(default_name),
                 agent_program: program,
                 agent_args: parts.collect(),
