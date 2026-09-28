@@ -1,0 +1,25 @@
+[package]
+name = "contract-tests"
+version = "0.0.1"
+edition = "2021"
+description = "Black-box contract tests for the Nano job worker (c8 nano work and nano-supervisor)"
+license = "Apache-2.0"
+repository = "https://github.com/nanobpm/nano-supervisor"
+publish = false
+
+# The suite is black-box: it drives the CLIs as subprocesses, reads and writes
+# the state files, and talks to the engine REST API. It never links to
+# nano-supervisor internals, so the same tests run against Node and Rust.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Engine REST calls in the worker/lease/finalize tests. Blocking so tests stay
+# plain `#[test]` functions; every engine test skips cleanly when none is up.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking", "multipart"] }
+# Per-test C8CTL_NANO_HOME, removed on drop.
+tempfile = "3"
+
+# The scripted stand-in for Copilot/nano-coder. Issue #4 owns it; #3 and #5 use it.
+[[bin]]
+name = "fake-agent"
+path = "src/bin/fake-agent.rs"

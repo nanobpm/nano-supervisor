@@ -1,3 +1,7 @@
+[workspace]
+# The root package plus the black-box contract-test suite (issues #3/#4/#5).
+members = [".", "contract-tests"]
+
 [package]
 name = "nano-supervisor"
 version = "0.0.1"
