@@ -170,7 +170,7 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     Ok(out)
 }
 
-async fn refresh_loop(
+pub(crate) async fn refresh_loop(
     jobs: Jobs,
     key: String,
     lease: Option<String>,

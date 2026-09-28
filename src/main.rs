@@ -6,8 +6,17 @@
 //! between the SDK's `JobWorker` and our own slot loop (see issue #1).
 
 mod acp;
+mod daemon;
+mod engine;
+mod envelope;
 mod jobs;
+mod pdeath;
+mod pipe;
 mod profile;
+mod provision;
+mod result;
+mod slot;
+mod state;
 mod worker;
 
 use std::path::PathBuf;
@@ -66,9 +75,56 @@ enum Cmd {
         #[arg(long, default_value = "auto")]
         job_api: String,
     },
+    /// Run the MVP daemon: N slots per hire (from config.json), one shared
+    /// engine connection, host sandbox only.
+    Daemon {
+        /// c8ctl connection profile (default: c8ctl's active profile, else CAMUNDA_* env).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Capacity-1 slots to run per hire.
+        #[arg(long, default_value_t = 1)]
+        slots: usize,
+        /// Only run these hires by name (repeatable); default = every hire.
+        #[arg(long = "hire")]
+        hire: Vec<String>,
+        /// Activation window in ms, refreshed every third while the agent runs.
+        #[arg(long, default_value_t = 300_000)]
+        recovery_window: u64,
+        /// Kill the agent after this many ms without output.
+        #[arg(long, default_value_t = 300_000)]
+        idle_timeout: u64,
+        /// Long-poll window for each activation request, in ms.
+        #[arg(long, default_value_t = 30_000)]
+        poll_timeout: u64,
+        /// Per-git-operation timeout while provisioning a repo, in ms.
+        #[arg(long, default_value_t = 120_000)]
+        clone_timeout: u64,
+        /// Directory for per-job working directories.
+        #[arg(long)]
+        runs_dir: Option<PathBuf>,
+        /// Override the config.json path (default: the c8ctl-nano state home).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Ask the engine for job leases (fails loudly if the engine doesn't issue them).
+        #[arg(long)]
+        with_lease: bool,
+        /// Job command transport: `sdk`, `nano`, or `auto` (= `nano` with
+        /// --with-lease, else `sdk`).
+        #[arg(long, default_value = "auto")]
+        job_api: String,
+    },
+    /// Internal: the macOS parent-death watchdog (kills an agent's process group
+    /// when the daemon dies). Not for direct use.
+    #[command(name = "__reap-watchdog", hide = true)]
+    ReapWatchdog {
+        #[arg(long)]
+        parent_pid: u32,
+        #[arg(long)]
+        pgid: u32,
+    },
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Spike {
@@ -88,29 +144,11 @@ async fn main() -> Result<()> {
             let Some(program) = parts.next() else {
                 bail!("--agent is empty")
             };
-            let resolved = profile::resolve(profile.as_deref())?;
-            match &resolved {
-                Some(p) => worker::log(&format!(
-                    "using c8ctl profile {:?} ({})",
-                    p.name,
-                    p.base_url.as_deref().unwrap_or("no baseUrl")
-                )),
-                None => worker::log("no c8ctl profile; using CAMUNDA_* environment"),
-            }
-            let client = profile::client(resolved.as_ref())?;
-            let job_api = match job_api.as_str() {
-                "auto" if with_lease => "nano",
-                "auto" => "sdk",
-                other => other,
-            };
-            let jobs = match job_api {
-                "sdk" => jobs::Jobs::Sdk(Box::new(client)),
-                "nano" => {
-                    let (address, basic) = profile::rest_address_and_basic(resolved.as_ref());
-                    jobs::Jobs::Nano(jobs::NanoHttp::new(&address, basic)?)
-                }
-                other => bail!("--job-api must be sdk, nano or auto (got {other:?})"),
-            };
+            let (_resolved, jobs) = engine::connect(
+                profile.as_deref(),
+                engine::JobApi::parse(&job_api)?,
+                with_lease,
+            )?;
             let opts = worker::WorkerOptions {
                 job_type,
                 worker_name: name.unwrap_or_else(default_name),
@@ -128,6 +166,41 @@ async fn main() -> Result<()> {
                 r = worker::run(jobs, opts) => r,
                 _ = tokio::signal::ctrl_c() => { worker::log("interrupted"); Ok(()) }
             }
+        }
+        Cmd::Daemon {
+            profile,
+            slots,
+            hire,
+            recovery_window,
+            idle_timeout,
+            poll_timeout,
+            clone_timeout,
+            runs_dir,
+            config,
+            with_lease,
+            job_api,
+        } => {
+            let opts = daemon::DaemonOptions {
+                profile,
+                job_api: engine::JobApi::parse(&job_api)?,
+                with_lease,
+                slots: slots.max(1),
+                only: hire,
+                recovery_window: Duration::from_millis(recovery_window),
+                idle_timeout: Duration::from_millis(idle_timeout),
+                poll_timeout: Duration::from_millis(poll_timeout),
+                clone_timeout: Duration::from_millis(clone_timeout),
+                runs_dir: runs_dir
+                    .unwrap_or_else(|| std::env::temp_dir().join("nano-supervisor-runs")),
+                config_path: config,
+            };
+            daemon::run(opts).await
+        }
+        Cmd::ReapWatchdog { parent_pid, pgid } => {
+            tokio::task::spawn_blocking(move || pdeath::reap_watchdog(parent_pid, pgid))
+                .await
+                .ok();
+            Ok(())
         }
     }
 }

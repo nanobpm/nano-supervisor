@@ -1,0 +1,117 @@
+//! Pipe-protocol agent runner: feed the agent a single JSON job payload on
+//! stdin, let it work in `cwd`, and capture its stdout/stderr. The agent
+//! reports its result by writing `$AGENT_RESULT_FILE` or by printing a
+//! `::nano:result:: {json}` sentinel line (parsed by [`crate::result`]).
+//!
+//! Like the ACP client, the agent runs in its own process group (so a timeout
+//! kills the whole tree) and dies with the daemon via [`crate::pdeath`].
+
+use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+
+/// What a pipe run produced.
+#[derive(Debug, Default)]
+pub struct PipeOutcome {
+    pub stdout: String,
+    pub exit_code: Option<i32>,
+    /// True when the run was cut short because the agent produced no output for
+    /// longer than the idle timeout.
+    pub idle_timed_out: bool,
+}
+
+/// Spawn `program args…` in `cwd` with `env`, write `stdin_json` to its stdin,
+/// and collect stdout until the agent exits or goes idle for `idle`.
+pub async fn run(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    stdin_json: &str,
+    idle: Duration,
+) -> Result<PipeOutcome> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(unix)]
+    crate::pdeath::arm(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("starting agent {program:?}"))?;
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        crate::pdeath::watch(pid);
+    }
+
+    // Deliver the whole payload, then close stdin so the agent sees EOF.
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = stdin_json.to_string();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(payload.as_bytes()).await;
+            let _ = stdin.write_all(b"\n").await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+
+    let stdout = child.stdout.take().context("agent stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut collected = String::new();
+    let mut last_activity = Instant::now();
+    let mut idle_timed_out = false;
+
+    let exit_code = loop {
+        tokio::select! {
+            line = lines.next_line() => match line {
+                Ok(Some(l)) => {
+                    last_activity = Instant::now();
+                    collected.push_str(&l);
+                    collected.push('\n');
+                }
+                Ok(None) | Err(_) => {
+                    // stdout closed: wait for the process to reap.
+                    let status = child.wait().await.ok();
+                    break status.and_then(|s| s.code());
+                }
+            },
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if last_activity.elapsed() > idle {
+                    idle_timed_out = true;
+                    break None;
+                }
+            }
+        }
+    };
+
+    // Kill the whole process group (agent + any tools it started), then reap.
+    kill_tree(&mut child).await;
+
+    Ok(PipeOutcome {
+        stdout: collected,
+        exit_code,
+        idle_timed_out,
+    })
+}
+
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Negative pid = the whole process group.
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .status();
+    }
+    let _ = child.start_kill();
+    // Best-effort reap so we don't leak a zombie.
+    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+}

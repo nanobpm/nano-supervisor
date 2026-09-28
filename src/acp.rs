@@ -66,9 +66,15 @@ impl Agent {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
+        #[cfg(unix)]
+        crate::pdeath::arm(&mut cmd);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting agent {program:?}"))?;
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            crate::pdeath::watch(pid);
+        }
         let stdin = child.stdin.take().context("agent stdin")?;
         let stdout = child.stdout.take().context("agent stdout")?;
 
