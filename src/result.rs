@@ -83,11 +83,19 @@ pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
         let cname = CString::new(name.as_bytes()).ok()?;
         // SAFETY: `dir` owns a valid directory fd for the duration of this call
         // and `cname` is a valid NUL-terminated C string.
+        //
+        // `O_NONBLOCK` is essential here: the leaf is agent-controlled, so it
+        // could be a FIFO. Opening a reader end of a FIFO that has no writer
+        // *blocks the open itself* indefinitely, which would wedge the Tokio
+        // worker thread on this synchronous call. Opening non-blocking returns
+        // immediately for any special file; the `meta.is_file()` guard below then
+        // rejects the non-regular file. On a regular file `O_NONBLOCK` has no
+        // effect on the subsequent `read`, so the happy path is unchanged.
         let fd = unsafe {
             libc::openat(
                 dir.as_raw_fd(),
                 cname.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -112,7 +120,11 @@ pub fn read_result_file(path: &std::path::Path) -> Option<Map<String, Value>> {
     // are not supported daemon hosts).
     #[cfg(not(any(unix, windows)))]
     let file = {
-        if std::fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        if std::fs::symlink_metadata(path)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
             return None;
         }
         opts.open(path).ok()?
@@ -162,7 +174,10 @@ pub fn parse_result_from_stdout(stdout: &str) -> Option<Map<String, Value>> {
 
 /// Collect the inner text of every ```` ``` ````-fenced block in `text`.
 fn fenced_blocks(text: &str) -> Vec<String> {
-    fenced_spans(text).into_iter().map(|(_, body)| body).collect()
+    fenced_spans(text)
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect()
 }
 
 /// Every ```` ``` ````-fenced block as `(full-fence byte range, inner body)`. The
@@ -263,10 +278,7 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
 /// without any assistant text) nor a lone value-less `::nano:result::` marker
 /// counts as work — both leave nothing substantive behind and so are failed
 /// rather than settled empty. Returns a reason when the run is empty.
-pub fn detect_empty(
-    result_vars: Option<&Map<String, Value>>,
-    stdout: &str,
-) -> Option<String> {
+pub fn detect_empty(result_vars: Option<&Map<String, Value>>, stdout: &str) -> Option<String> {
     if result_vars.is_some_and(has_effective_result_vars) {
         return None;
     }
@@ -386,5 +398,24 @@ mod tests {
         std::fs::write(&big, vec![b'x'; (MAX_RESULT_FILE_BYTES + 1) as usize]).unwrap();
         assert!(read_result_file(&big).is_none());
         let _ = std::fs::remove_file(&big);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn result_file_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir();
+        let fifo = dir.join(format!("nano-rf-fifo-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&fifo);
+        let cpath = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `cpath` is a valid NUL-terminated path; mkfifo takes ownership
+        // of nothing and only reads the pointer.
+        let rc = unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+        // A FIFO with no writer must be rejected as a non-regular file rather
+        // than blocking the open indefinitely (O_NONBLOCK path).
+        assert!(read_result_file(&fifo).is_none());
+        let _ = std::fs::remove_file(&fifo);
     }
 }

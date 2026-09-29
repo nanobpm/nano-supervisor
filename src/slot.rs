@@ -291,7 +291,12 @@ pub(crate) fn redact_url(raw: &str) -> String {
     let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..auth_end];
     match authority.rfind('@') {
-        Some(at) => format!("{}{}{}", &raw[..after], &authority[at + 1..], &rest[auth_end..]),
+        Some(at) => format!(
+            "{}{}{}",
+            &raw[..after],
+            &authority[at + 1..],
+            &rest[auth_end..]
+        ),
         None => raw.to_string(),
     }
 }
@@ -469,7 +474,7 @@ async fn run_pipe(
 fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope) -> String {
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
-    let payload = json!({
+    let mut payload = json!({
         "jobKey": job.job_key.value(),
         "jobType": job.r#type,
         "processInstanceKey": job.process_instance_key.value(),
@@ -487,7 +492,34 @@ fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope
             "capabilities": cfg.hire.capabilities,
         },
     });
+    // Strip clone-credential userinfo from any URL anywhere in the payload before
+    // it reaches the agent's stdin. The task envelope (and the raw
+    // variables/customHeaders it is assembled from) can carry a credential-bearing
+    // repository URL (`https://x-access-token:<pat>@host/...`) that `provision`
+    // deliberately supports for the clone. The agent already receives a checkout
+    // and never needs that token, so forwarding it verbatim would only expose the
+    // secret to the agent (and thus its result/exfiltration path). `redact_url`
+    // is a no-op on any string without `scheme://user:secret@` userinfo, so
+    // ordinary URLs, prose, and non-URL values pass through unchanged.
+    redact_credential_urls(&mut payload);
     payload.to_string()
+}
+
+/// Recursively rewrite every string in `value` through [`redact_url`], stripping
+/// embedded `user:secret@` userinfo from any credential-bearing URL while leaving
+/// all other strings untouched.
+fn redact_credential_urls(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            let redacted = redact_url(s);
+            if redacted != *s {
+                *s = redacted;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_credential_urls),
+        Value::Object(map) => map.values_mut().for_each(redact_credential_urls),
+        _ => {}
+    }
 }
 
 /// The daemon's own engine-connection credentials, read from its environment by
@@ -658,6 +690,31 @@ mod tests {
             redact_url("https://github.com/o/r.git"),
             "https://github.com/o/r.git"
         );
-        assert_eq!(redact_url("git@github.com:o/r.git"), "git@github.com:o/r.git");
+        assert_eq!(
+            redact_url("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn pipe_payload_redacts_repository_clone_credentials() {
+        let cfg = cfg();
+        let job = ActivatedJobResult::default();
+        // Build the credential-bearing URL at runtime so no credential-like
+        // literal is stored in source (mirrors the provision.rs tests).
+        let token = format!("{}-{}", "x-access", "token");
+        let secret = format!("pat{}value", 1234);
+        let cred_url = format!("https://{token}:{secret}@github.com/o/r.git");
+        let env = Envelope {
+            prompt: Some("do it".into()),
+            repository: None,
+            raw: json!({ "repository": { "url": cred_url } }),
+        };
+        let payload = build_pipe_payload(&cfg, &job, &env);
+        assert!(
+            !payload.contains(&secret),
+            "clone credential must not reach the agent payload: {payload}"
+        );
+        assert!(payload.contains("https://github.com/o/r.git"));
     }
 }
