@@ -10,6 +10,13 @@
 #
 # Connection settings come from the c8ctl profile (pass --profile <name>, or rely
 # on c8ctl's active profile / CAMUNDA_* env). Hires are read from config.json.
+#
+# IMPORTANT: scope the unit to the hire(s) you intend to run with `--hire <name>`.
+# Without `--hire`, the daemon starts a slot for EVERY hire in config.json — on a
+# host still running the Node supervisor that makes this daemon compete for the
+# whole existing fleet (duplicating or stealing jobs across all hires), not just
+# the intended trial hire. Replace `<hire-name>` below with a real hire before
+# enabling the unit (repeat `--hire` to run several).
 
 [Unit]
 Description=nano-supervisor daemon (Nano BPM coding-agent workers)
@@ -21,8 +28,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Edit the path / flags to taste: an absolute path if the binary isn't on PATH,
-# and e.g. `--profile omarchy --with-lease --slots 1`.
-ExecStart=%h/.local/bin/nano-supervisor daemon --with-lease
+# and e.g. `--profile omarchy --with-lease --slots 1`. The `--hire <hire-name>`
+# below is mandatory — replace `<hire-name>` with a real hire from config.json so
+# this daemon only runs the hire you intend (see the note above).
+ExecStart=%h/.local/bin/nano-supervisor daemon --with-lease --hire <hire-name>
 # The daemon drains on SIGTERM (stops leasing, finishes in-flight work) within
 # its own grace window; give systemd room before it escalates to SIGKILL.
 TimeoutStopSec=30

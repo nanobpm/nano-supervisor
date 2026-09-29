@@ -231,6 +231,12 @@ pub fn watch(agent_pid: u32) {
     if let Some(start) = parent_start {
         cmd.arg("--parent-start").arg(start.to_string());
     }
+    // Scrub the environment before spawning. The watchdog is a sibling of the
+    // agent's process group and needs nothing but its own executable and the CLI
+    // args above; inheriting the daemon's environment would expose the OAuth /
+    // basic-auth / NANO_AGENTIC_* secrets (the very ones the agent launch sites
+    // strip) to a same-user agent that reads `/proc/<watchdog-pid>/environ`.
+    cmd.env_clear();
     let _ = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
