@@ -171,9 +171,23 @@ fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
     tokens.extend(args.iter().map(String::as_str));
     for (i, tok) in tokens.iter().enumerate() {
         let name = tok.trim_matches(|c| c == '"' || c == '\'');
-        let opt = name.split('=').next().unwrap_or(name);
+        let (opt, inline_val) = match name.split_once('=') {
+            Some((o, v)) => (o, Some(v)),
+            None => (name, None),
+        };
         if matches!(opt, "acp" | "-acp" | "--acp") {
             return true;
+        }
+        // `--protocol acp` / `--protocol=acp` selects the ACP harness too: the
+        // value carries the selector, so inspect it (inline after `=`, else the
+        // following token) rather than only matching bare `acp` tokens.
+        if opt == "--protocol" {
+            let value = inline_val
+                .or_else(|| tokens.get(i + 1).map(|t| t.trim_matches(|c| c == '"' || c == '\'')))
+                .unwrap_or("");
+            if value.eq_ignore_ascii_case("acp") {
+                return true;
+            }
         }
         // The `*-acp` adapter suffix identifies the command token only.
         if i == 0 {
@@ -282,6 +296,16 @@ mod tests {
         assert!(command_has_acp_selector("nano-coder --acp", &[]));
         assert!(command_has_acp_selector("nano-coder", &["acp".into()]));
         assert!(command_has_acp_selector("claude-code-acp", &[]));
+        assert!(command_has_acp_selector("nano-coder", &["--protocol=acp".into()]));
+        assert!(command_has_acp_selector(
+            "nano-coder",
+            &["--protocol".into(), "acp".into()]
+        ));
+        assert!(command_has_acp_selector("nano-coder --protocol=ACP", &[]));
+        assert!(!command_has_acp_selector(
+            "nano-coder",
+            &["--protocol=pipe".into()]
+        ));
         assert!(!command_has_acp_selector(
             "copilot",
             &["--model=foo-acp".into()]

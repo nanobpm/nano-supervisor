@@ -626,6 +626,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn submodule_scrub_skips_symlinked_modules_root() {
         // A symlink planted at `.git/modules` must NOT be traversed: `exists()`
         // follows links, so the scrub would otherwise walk (and rewrite) a config

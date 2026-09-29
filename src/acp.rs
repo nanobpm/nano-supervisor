@@ -43,7 +43,10 @@ struct Shared {
 
 pub struct Agent {
     child: Child,
-    out: mpsc::UnboundedSender<Value>,
+    /// Bounded so a misbehaving agent that emits requests without draining its
+    /// stdin cannot make `read_loop` queue replies without limit (see
+    /// `OUT_CHANNEL_CAP`).
+    out: mpsc::Sender<Value>,
     /// Explicit stdin-close signal for `write_loop`. Dropping `out` alone does
     /// not close stdin: `read_loop` holds an `out.clone()` (to answer the
     /// agent's requests) that keeps the channel — and thus `write_loop`'s owned
@@ -110,7 +113,7 @@ impl Agent {
             last_activity: Some(Instant::now()),
             ..Default::default()
         }));
-        let (out, rx) = mpsc::unbounded_channel::<Value>();
+        let (out, rx) = mpsc::channel::<Value>(OUT_CHANNEL_CAP);
         let (close_stdin, close_rx) = oneshot::channel::<()>();
         tokio::spawn(write_loop(stdin, rx, close_rx));
         tokio::spawn(read_loop(
@@ -136,6 +139,7 @@ impl Agent {
         self.shared.lock().unwrap().pending.insert(id, tx);
         self.out
             .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await
             .map_err(|_| anyhow!("agent stdin closed"))?;
         let mut rx = rx;
         loop {
@@ -230,7 +234,7 @@ impl Agent {
 
 async fn write_loop(
     mut stdin: ChildStdin,
-    mut rx: mpsc::UnboundedReceiver<Value>,
+    mut rx: mpsc::Receiver<Value>,
     mut close: oneshot::Receiver<()>,
 ) {
     loop {
@@ -259,10 +263,18 @@ async fn write_loop(
 /// buffer per slot). Frames larger than this are dropped rather than accumulated.
 const MAX_ACP_FRAME: usize = 1 << 20; // 1 MiB
 
+/// Bound on outbound ACP frames (our requests plus replies to the agent's own
+/// requests) queued for `write_loop`. The channel is bounded so a misbehaving
+/// agent that emits requests without draining its stdin cannot make `read_loop`
+/// queue replies without limit and exhaust daemon memory: once the buffer fills
+/// (write_loop stalled on a blocked stdin), a further agent reply is treated as
+/// fatal backpressure and the read loop stops rather than accumulating.
+const OUT_CHANNEL_CAP: usize = 1024;
+
 async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     mut reader: BufReader<R>,
     shared: Arc<Mutex<Shared>>,
-    out: mpsc::UnboundedSender<Value>,
+    out: mpsc::Sender<Value>,
 ) {
     // Read fixed-size chunks and split them into newline-delimited frames here,
     // instead of `lines()` whose reader buffers a whole line unbounded before
@@ -271,7 +283,7 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     let mut buf = [0u8; 64 * 1024];
     let mut pending: Vec<u8> = Vec::new();
     let mut skipping = false; // discarding an oversized frame until its newline
-    loop {
+    'read: loop {
         let n = match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
@@ -298,7 +310,12 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
             pending.extend_from_slice(line_bytes);
             let line = String::from_utf8_lossy(&pending).into_owned();
             pending.clear();
-            handle_message(&line, &shared, &out);
+            // A `false` return means outbound backpressure (the agent is
+            // flooding requests without draining stdin): stop reading so replies
+            // cannot accumulate without bound.
+            if !handle_message(&line, &shared, &out) {
+                break 'read;
+            }
         }
         if skipping {
             continue; // still discarding until a newline arrives
@@ -319,9 +336,9 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
 
 /// Process one JSON-RPC line: a response to one of our requests, a notification,
 /// or a request from the agent (permission prompts are auto-answered).
-fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::UnboundedSender<Value>) {
+fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Value>) -> bool {
     let Ok(msg) = serde_json::from_str::<Value>(line) else {
-        return;
+        return true;
     };
     let mut s = shared.lock().unwrap();
     s.last_activity = Some(Instant::now());
@@ -336,6 +353,7 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Unbounded
                 };
                 let _ = tx.send(r);
             }
+            true
         }
         // Notification.
         (Some("session/update"), None) => {
@@ -356,8 +374,9 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Unbounded
                 Some("tool_call") => s.tool_calls += 1,
                 _ => {}
             }
+            true
         }
-        (Some(_), None) | (None, None) => {}
+        (Some(_), None) | (None, None) => true,
         // Request from the agent.
         (Some(m), Some(id)) => {
             let reply = if m == "session/request_permission" {
@@ -366,7 +385,11 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Unbounded
             } else {
                 json!({"jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("method not found: {m}") }})
             };
-            let _ = out.send(reply);
+            // `try_send` never blocks (we hold the shared lock here). A full
+            // channel means `write_loop` has stalled on a blocked stdin: report
+            // it as fatal backpressure so the read loop stops instead of queuing
+            // replies without bound.
+            out.try_send(reply).is_ok()
         }
     }
 }
