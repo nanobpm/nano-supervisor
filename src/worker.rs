@@ -786,7 +786,12 @@ fn marker_owner_alive_locked(dir: &Path) -> bool {
             Ok(pid) => pid_is_live(pid),
             Err(_) => true,
         },
-        Err(_) => false,
+        // Fail-safe: only a definitive `NotFound` proves the marker is gone and
+        // the run is not live. A transient permission/I/O error must NOT be read
+        // as "not live" — doing so would let the sweeper reap a directory whose
+        // liveness we could not actually determine, contrary to the fail-safe
+        // guarantee. Preserve the directory (treat as live) on any other error.
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
