@@ -113,6 +113,22 @@ pub async fn run(
     }
 }
 
+/// Decide whether a raced job outcome is still ours to settle.
+///
+/// [`handle`] races job execution against activation loss with `select!`. That
+/// macro can pick the completed-`exec` branch (`Some(..)`) even when the
+/// refresher set the loss watch to `true` in the same tick, so the raw outcome
+/// must be downgraded to "lost" (`None`) whenever the activation was fenced —
+/// otherwise a job would be `complete`/`fail`ed with a stale lease after a
+/// 404/409. Keyed only on the post-select watch value, so it is pure/testable.
+fn reconcile_lost<T>(outcome: Option<T>, lost: bool) -> Option<T> {
+    if lost {
+        None
+    } else {
+        outcome
+    }
+}
+
 async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
     let started = Instant::now();
@@ -150,7 +166,7 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
     // Run the job on its own task so a panic fails only THIS job (the slot loop
     // survives). Race it against activation loss so a superseded worker stops.
     let mut exec = tokio::spawn(execute(cfg.clone(), key.clone(), job.clone()));
-    let outcome = tokio::select! {
+    let raced = tokio::select! {
         r = &mut exec => Some(match r {
             Ok(inner) => inner,
             Err(join) => Err(anyhow::anyhow!(
@@ -160,6 +176,12 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         // Drop the watch guard immediately; the abort/await happens below.
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
+    // Re-check the activation-loss watch after the select. `select!` can pick the
+    // `exec` branch even when the refresher set `lost` to true in the same tick
+    // (both futures are ready), which would otherwise settle the job with a stale
+    // lease after a 404/409 fence. Downgrade an outcome to "lost" whenever the
+    // activation was fenced, so we never `complete`/`fail` a job we no longer own.
+    let outcome = reconcile_lost(raced, *lost_rx.borrow());
     if outcome.is_none() {
         // We lost the activation: actually stop the agent instead of detaching
         // the task. Aborting drops the execute future, whose child processes are
@@ -794,5 +816,29 @@ mod tests {
         );
         assert!(safe_prompt.contains("https://github.com/o/r.git"));
         assert!(safe_prompt.contains("and build"));
+    }
+
+    #[test]
+    fn reconcile_lost_downgrades_completed_outcome_when_activation_lost() {
+        // The core of the lease-loss/completion race fix: even a job whose
+        // `exec` future completed (an `Ok`/`Err` outcome) must NOT be settled
+        // once the activation-loss watch reads `true`, because `select!` can
+        // pick the completed branch in the same tick the refresher fences us out
+        // (404/409). Settling then would `complete`/`fail` with a stale lease.
+        let completed: Option<Result<()>> = Some(Ok(()));
+        assert!(
+            reconcile_lost(completed, true).is_none(),
+            "a completed outcome must be downgraded to lost when the activation was fenced"
+        );
+        let failed: Option<Result<()>> = Some(Err(anyhow::anyhow!("boom")));
+        assert!(
+            reconcile_lost(failed, true).is_none(),
+            "a failed outcome must also be downgraded to lost when the activation was fenced"
+        );
+        // Not lost: the outcome passes through unchanged so a genuine completion
+        // still settles.
+        assert!(matches!(reconcile_lost(Some(Ok::<(), anyhow::Error>(())), false), Some(Ok(()))));
+        // Already lost via the select's None branch stays lost.
+        assert!(reconcile_lost(None::<Result<()>>, false).is_none());
     }
 }
