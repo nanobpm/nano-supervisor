@@ -30,7 +30,11 @@ fn agent_reported_pr_is_forwarded() {
 }
 
 /// An agent that commits but opens no PR falls back to a `nano/agent-work/...`
-/// branch so the work is never lost.
+/// branch so the work is never lost. The agent provisions a real git repo with
+/// a commit and a reachable `origin` in its run dir, so the worker's finalize
+/// path genuinely creates **and pushes** the fallback branch (rather than
+/// short-circuiting on a non-repo cwd and logging the branch name from the
+/// "not created" path).
 #[test]
 fn no_pr_falls_back_to_nano_agent_work_branch() {
     let (engine, target) = match require_engine_and_target() {
@@ -41,14 +45,19 @@ fn no_pr_falls_back_to_nano_agent_work_branch() {
         &engine,
         &target,
         "finalize-fallback",
-        &[json!({ "emit": "committed but opened no PR" })],
+        &[
+            // Provision a repo with a commit and a local bare `origin` the
+            // fallback push can actually reach, all inside the run dir.
+            json!({ "shell": "git init -q && git init -q --bare origin.git && git remote add origin origin.git && git -c user.email=t@example.com -c user.name=tester commit -q --allow-empty -m 'agent work'" }),
+            json!({ "emit": "committed but opened no PR" }),
+        ],
         json!({ "prompt": "just commit" }),
         &[],
         &[],
     );
     let logs = outcome.stderr();
     assert!(
-        logs.contains("nano/agent-work/"),
-        "the worker should fall back to a nano/agent-work/ branch; stderr:\n{logs}"
+        logs.contains("pushed fallback branch nano/agent-work/"),
+        "the worker should create AND push a nano/agent-work/ fallback branch; stderr:\n{logs}"
     );
 }

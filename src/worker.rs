@@ -289,6 +289,14 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     let env = vec![
         ("NANO_JOB_KEY".to_string(), key.to_string()),
         ("NANO_AGENT_NAME".to_string(), opts.worker_name.clone()),
+        // The worker itself allocates the per-job result file and hands its path
+        // to the agent, so an agent that reports its PR only via a result file
+        // works in a real invocation — not only when a test harness happens to
+        // inject `AGENT_RESULT_FILE`. `finalize` reads back this same path.
+        (
+            "AGENT_RESULT_FILE".to_string(),
+            agent_result_file(&cwd).to_string_lossy().into_owned(),
+        ),
     ];
     let mut agent = Agent::spawn(&opts.agent_program, &opts.agent_args, &cwd, &env)?;
     log(&format!(
@@ -502,6 +510,27 @@ const ACTIVE_MARKER: &str = ".nano-active";
 /// serialize marker access and is not itself a liveness signal.
 const ACTIVE_LOCK: &str = ".nano-active.lock";
 
+/// Filename of the per-run *retention* sentinel. `finalize` writes it into a run
+/// directory whose committed work was captured on a local fallback branch that
+/// could **not** be pushed (offline / no remote). While it exists, [`sweep_runs`]
+/// must never reap the directory: it is the only surviving copy of that work
+/// until it is durably pushed. Unlike the liveness marker it is not PID-scoped —
+/// it is a durable "do not delete, unsaved work here" flag, cleared only when an
+/// operator has recovered the branch and removes the directory.
+const RETAIN_MARKER: &str = ".nano-retain";
+
+/// Filename of the per-run result file the worker allocates and hands to the
+/// agent via `AGENT_RESULT_FILE`; the agent writes its structured result
+/// (including any opened `pr`) here and [`finalize`] reads it back. Owning the
+/// path in the worker is what makes the result channel work in a real
+/// invocation rather than only when a harness injects the variable.
+const AGENT_RESULT_FILE: &str = ".nano-agent-result.json";
+
+/// The absolute path of a run directory's [`AGENT_RESULT_FILE`].
+fn agent_result_file(cwd: &Path) -> PathBuf {
+    cwd.join(AGENT_RESULT_FILE)
+}
+
 /// Serialize a marker read/modify/write through an exclusive advisory lock on
 /// the run's stable [`ACTIVE_LOCK`] file, so a completing worker's
 /// ownership-check-then-unlink and a reactivating worker's marker write are
@@ -549,16 +578,26 @@ fn write_active_marker(cwd: &Path) {
 /// never be reaped, even by a foreign worker whose in-process active set can't
 /// see it. Fail-safe: a present-but-unparseable marker is treated as live so a
 /// possibly-active cwd is never deleted; a missing marker means "not live".
+///
+/// This lock-taking wrapper is exercised by the unit tests; production callers
+/// that already hold the marker lock use [`marker_owner_alive_locked`] directly
+/// so a check and its subsequent removal stay atomic under one lock.
+#[cfg(test)]
 fn marker_owner_alive(dir: &Path) -> bool {
-    with_marker_lock(dir, || {
-        match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
-            Ok(contents) => match contents.trim().parse::<u32>() {
-                Ok(pid) => pid_is_live(pid),
-                Err(_) => true,
-            },
-            Err(_) => false,
-        }
-    })
+    with_marker_lock(dir, || marker_owner_alive_locked(dir))
+}
+
+/// The liveness read of [`marker_owner_alive`] **without** taking the marker
+/// lock — for callers that already hold it (so the check and a subsequent
+/// removal can be made atomic under one lock; see [`sweep_runs`]).
+fn marker_owner_alive_locked(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
+        Ok(contents) => match contents.trim().parse::<u32>() {
+            Ok(pid) => pid_is_live(pid),
+            Err(_) => true,
+        },
+        Err(_) => false,
+    }
 }
 
 /// Best-effort liveness check for a PID on the local host (run roots are
@@ -638,18 +677,36 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
             if active.contains(&path) {
                 continue;
             }
-            // Cross-process guard: another worker sharing this stable run root
-            // may be running a job here. If its liveness marker names a live
-            // PID, skip — only this in-process set sees *our* runs, so without
-            // this check we could `remove_dir_all` a foreign worker's live cwd.
-            if marker_owner_alive(&path) {
+            // Durable retention flag: a run whose committed work is only on an
+            // unpushed local fallback branch must never be reaped — it is the
+            // sole surviving copy until an operator saves it. Cheap to check
+            // before taking any lock.
+            if path.join(RETAIN_MARKER).exists() {
                 continue;
             }
             let stale = now
                 .duration_since(modified)
                 .map(|d| d >= age)
                 .unwrap_or(false);
-            if stale && std::fs::remove_dir_all(&path).is_ok() {
+            if !stale {
+                continue;
+            }
+            // Cross-process guard, made atomic against reactivation: hold the
+            // per-run marker lock across BOTH the liveness check and the
+            // removal. Without the shared lock a foreign worker could reactivate
+            // this dir (write a live marker under that same lock) in the window
+            // between our check returning "not live" and `remove_dir_all`,
+            // leaving us to delete a now-live cwd (TOCTOU). Holding the lock for
+            // the whole check-then-delete closes that gap; the lock file lives
+            // inside the dir but is only unlinked here by the removal itself,
+            // and flock is released when its fd is dropped.
+            let removed = with_marker_lock(&path, || {
+                if marker_owner_alive_locked(&path) {
+                    return false;
+                }
+                std::fs::remove_dir_all(&path).is_ok()
+            });
+            if removed {
                 // Keep the set tidy if a path was reaped while (somehow) still
                 // present; removal is idempotent.
                 active.remove(&path);
@@ -673,7 +730,7 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
 /// never fails the already-successful job.
 fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
     let cwd = opts.runs_dir.join(key);
-    if let Some(pr) = reported_pr(out) {
+    if let Some(pr) = reported_pr(out, &agent_result_file(&cwd)) {
         log(&format!(
             "job {key}: agent reported PR {pr}; forwarding it (no fallback branch)"
         ));
@@ -681,10 +738,20 @@ fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
     }
     let branch = format!("nano/agent-work/{key}");
     match push_fallback_branch(&cwd, &branch) {
-        Ok(true) => log(&format!(
+        Ok(Fallback::Pushed) => log(&format!(
             "job {key}: agent reported no PR; pushed fallback branch {branch} to preserve committed work"
         )),
-        Ok(false) => log(&format!(
+        Ok(Fallback::LocalOnly) => {
+            // The branch exists locally but the push failed (offline / no
+            // remote): the run dir now holds the only copy of this work, so
+            // retain it against the reaper until it can be saved durably.
+            retain_run_dir(&cwd);
+            log(&format!(
+                "job {key}: agent reported no PR; created local fallback branch {branch} but could not push it — retaining run dir {} so the work is not lost",
+                cwd.display()
+            ));
+        }
+        Ok(Fallback::Nothing) => log(&format!(
             "job {key}: agent reported no PR and no committed work to save; fallback branch {branch} not created"
         )),
         Err(e) => log(&format!(
@@ -694,9 +761,18 @@ fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
     None
 }
 
+/// Flag a run directory as holding unsaved work the reaper must not delete.
+fn retain_run_dir(cwd: &Path) {
+    let _ = std::fs::write(
+        cwd.join(RETAIN_MARKER),
+        b"unpushed agent-work fallback branch; retained until durably saved\n",
+    );
+}
+
 /// Extract a PR reference the agent announced, from its `::nano:result::`
-/// output marker (the last one wins) or the `AGENT_RESULT_FILE` it was handed.
-fn reported_pr(out: &Outcome) -> Option<String> {
+/// output marker (the last one wins) or the `result_file` the worker handed it
+/// via `AGENT_RESULT_FILE`.
+fn reported_pr(out: &Outcome, result_file: &Path) -> Option<String> {
     const MARKER: &str = "::nano:result::";
     if let Some(pr) = out
         .text
@@ -713,11 +789,9 @@ fn reported_pr(out: &Outcome) -> Option<String> {
     {
         return Some(pr);
     }
-    if let Ok(path) = std::env::var("AGENT_RESULT_FILE") {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                return pr_of(&v);
-            }
+    if let Ok(text) = std::fs::read_to_string(result_file) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            return pr_of(&v);
         }
     }
     None
@@ -728,37 +802,57 @@ fn pr_of(v: &Value) -> Option<String> {
     v.get("pr").and_then(Value::as_str).map(str::to_string)
 }
 
+/// Outcome of an attempted fallback-branch capture.
+enum Fallback {
+    /// A branch was created and pushed to `origin`.
+    Pushed,
+    /// A branch was created locally but could not be pushed (offline / no
+    /// remote); the run directory holds the only copy and must be retained.
+    LocalOnly,
+    /// Nothing to save — `cwd` is not a git repo or has no commit.
+    Nothing,
+}
+
 /// Point a `nano/agent-work/<key>` branch at whatever the agent committed in
 /// `cwd` and push it, so unpushed work survives the run dir being reaped.
-/// `Ok(true)` when a branch was created, `Ok(false)` when `cwd` is not a git
-/// repo or has no commit to save. Best-effort — a missing remote or an offline
-/// push is not fatal to the (already successful) job.
-fn push_fallback_branch(cwd: &Path, branch: &str) -> Result<bool> {
+/// Best-effort — a missing remote or an offline push is not fatal to the
+/// (already successful) job, but it is reported as [`Fallback::LocalOnly`] so
+/// the caller can retain the directory.
+fn push_fallback_branch(cwd: &Path, branch: &str) -> Result<Fallback> {
     let is_repo = git(cwd, &["rev-parse", "--git-dir"])
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !is_repo {
-        return Ok(false);
+        return Ok(Fallback::Nothing);
     }
     let has_head = git(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"])
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !has_head {
-        return Ok(false);
+        return Ok(Fallback::Nothing);
     }
     git(cwd, &["branch", "-f", branch, "HEAD"])?;
-    let pushed = git(cwd, &["push", "--force-with-lease", "origin", branch])
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !pushed {
-        // The branch exists locally even if the push failed (no remote / offline);
-        // the work is still recoverable from the run dir until it is reaped.
-        log(&format!(
-            "finalize: created local branch {branch} but could not push it (no reachable remote?)"
-        ));
+    // The push runs with a bounded timeout (and terminal prompts disabled) so a
+    // missing remote, credential prompt, or unreachable server cannot block the
+    // worker indefinitely before it settles the job.
+    let pushed = git_with_timeout(
+        cwd,
+        &["push", "--force-with-lease", "origin", branch],
+        FALLBACK_PUSH_TIMEOUT,
+    )
+    .map(|o| o.map(|o| o.status.success()).unwrap_or(false))
+    .unwrap_or(false);
+    if pushed {
+        Ok(Fallback::Pushed)
+    } else {
+        Ok(Fallback::LocalOnly)
     }
-    Ok(true)
 }
+
+/// Wall-clock budget for the fallback `git push`. Generous enough for a real
+/// push over a slow link, bounded enough that a hung/prompting push cannot wedge
+/// the async worker before it settles the job.
+const FALLBACK_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Run `git <args>` in `cwd`, capturing its output.
 fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -767,6 +861,43 @@ fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
         .current_dir(cwd)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))
+}
+
+/// Run `git <args>` in `cwd` with a wall-clock `timeout`, killing the child (and
+/// returning `Ok(None)`) if it overruns. Terminal credential prompts are
+/// disabled so an auth challenge fails fast instead of blocking on stdin.
+fn git_with_timeout(
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Option<std::process::Output>> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(Some(child.wait_with_output()?));
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            log(&format!(
+                "finalize: git {} exceeded {}s; terminated",
+                args.join(" "),
+                timeout.as_secs()
+            ));
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn log(msg: &str) {
@@ -948,16 +1079,34 @@ mod tests {
         let out = outcome_with(
             "opened a PR::nano:result::{\"status\":\"opened\",\"pr\":\"nanobpm/x#7\"} done",
         );
-        assert_eq!(reported_pr(&out).as_deref(), Some("nanobpm/x#7"));
+        let missing = std::env::temp_dir().join("ns-no-such-result.json");
+        assert_eq!(reported_pr(&out, &missing).as_deref(), Some("nanobpm/x#7"));
     }
 
     #[test]
     fn reported_pr_is_none_without_a_pr() {
         // Plain chatter with no marker and no `pr` field reports no PR, so the
         // worker falls back to a `nano/agent-work/` branch.
-        assert!(reported_pr(&outcome_with("committed but opened no PR")).is_none());
+        let missing = std::env::temp_dir().join("ns-no-such-result.json");
+        assert!(reported_pr(&outcome_with("committed but opened no PR"), &missing).is_none());
         let out = outcome_with("::nano:result::{\"status\":\"opened\"}");
-        assert!(reported_pr(&out).is_none());
+        assert!(reported_pr(&out, &missing).is_none());
+    }
+
+    #[test]
+    fn reported_pr_reads_the_worker_allocated_result_file() {
+        // With no `::nano:result::` marker, the PR is read from the result file
+        // the worker handed the agent via `AGENT_RESULT_FILE` — proving the
+        // channel works without any harness-injected environment.
+        let dir = std::env::temp_dir().join(format!("ns-rf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rf = agent_result_file(&dir);
+        std::fs::write(&rf, r#"{"status":"opened","pr":"nanobpm/y#9"}"#).unwrap();
+        assert_eq!(
+            reported_pr(&outcome_with("did some work"), &rf).as_deref(),
+            Some("nanobpm/y#9")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -967,8 +1116,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ns-nofb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
-            !push_fallback_branch(&dir, "nano/agent-work/k").unwrap(),
+            matches!(
+                push_fallback_branch(&dir, "nano/agent-work/k").unwrap(),
+                Fallback::Nothing
+            ),
             "a non-repo cwd yields no fallback branch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retained_run_dir_is_never_reaped() {
+        // A run dir flagged as retaining unsaved work (an unpushed fallback
+        // branch) carries the retention sentinel and must survive the sweeper.
+        let dir = std::env::temp_dir().join(format!("ns-retain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        retain_run_dir(&dir);
+        assert!(
+            dir.join(RETAIN_MARKER).exists(),
+            "retain sets the do-not-reap sentinel"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

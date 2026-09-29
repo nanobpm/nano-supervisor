@@ -108,6 +108,19 @@ fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
+/// Run a shell command in the agent's current directory (the worker's per-job
+/// run dir), inheriting stdio to the agent's stderr. Test-only: it lets a test
+/// provision real filesystem/git state the worker will act on after the turn.
+fn run_shell_step(cmd: &str) {
+    match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
+        Ok(status) if !status.success() => {
+            eprintln!("fake-agent: shell step exited {status}: {cmd}")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("fake-agent: shell step failed to run ({e}): {cmd}"),
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let acp = argv.iter().any(|a| a == "--acp");
@@ -155,6 +168,12 @@ fn run_steps(
             emit_tool_call(tc);
         } else if let Some(v) = obj.get("write_result") {
             write_result_file(v);
+        } else if let Some(cmd) = obj.get("shell").and_then(Value::as_str) {
+            // Test-only escape hatch: run a shell command in the agent's cwd
+            // (the worker's per-job run dir). Used to provision a real git repo
+            // + commit + origin so the worker's finalize fallback-branch path is
+            // exercised end-to-end rather than short-circuiting on a non-repo.
+            run_shell_step(cmd);
         } else if let Some(v) = obj.get("result_marker") {
             // A `::nano:result::<compact-json>` marker the worker scrapes.
             // Delivered mode-appropriately: a stdout line in pipe mode, an ACP

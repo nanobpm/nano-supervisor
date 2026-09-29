@@ -372,7 +372,6 @@ pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
 pub struct JobOutcome {
     pub job_type: String,
     record_path: PathBuf,
-    result_path: PathBuf,
     pub output: std::process::Output,
     _home: TempHome,
     _work: tempfile::TempDir,
@@ -391,9 +390,15 @@ impl JobOutcome {
         self.record_path.exists()
     }
 
-    /// Whether the agent wrote `AGENT_RESULT_FILE`, and its parsed contents.
+    /// Whether the agent wrote its result file, and its parsed contents. The
+    /// worker allocates `AGENT_RESULT_FILE` inside its per-job run directory and
+    /// hands the path to the agent, so we discover that *worker-generated* path
+    /// from the agent's recorded environment and read the file it wrote there.
+    /// This asserts the worker's own result channel — the harness never injects
+    /// the variable itself.
     pub fn result_file(&self) -> Option<serde_json::Value> {
-        std::fs::read_to_string(&self.result_path)
+        let path = self.record().env.get("AGENT_RESULT_FILE")?.clone();
+        std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
     }
@@ -436,16 +441,18 @@ pub fn run_worker_job(
         .tempdir()
         .unwrap();
     let record_path = work.path().join("record.json");
-    let result_path = work.path().join("result.json");
     let script_json = serde_json::to_string(&serde_json::Value::Array(script.to_vec())).unwrap();
 
     let agent = fake_agent_acp_arg();
     let mut cmd = target.worker(&job_type, &agent, 1);
     home.apply(&mut cmd);
     cmd.args(worker_flags);
+    // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
+    // allocates it inside the per-job run dir and hands it to the agent. The
+    // harness must not provide the very behavior these tests verify; read the
+    // worker-generated file via `JobOutcome::result_file()` instead.
     cmd.env("NS_FAKE_SCRIPT", &script_json)
         .env("NS_FAKE_RECORD", &record_path)
-        .env("AGENT_RESULT_FILE", &result_path)
         // Point the worker at the same engine the job was deployed to, so it
         // polls the local test engine rather than an inherited CAMUNDA_* endpoint
         // or an ambient c8ctl profile.
@@ -457,7 +464,6 @@ pub fn run_worker_job(
     JobOutcome {
         job_type,
         record_path,
-        result_path,
         output,
         _home: home,
         _work: work,
