@@ -869,8 +869,10 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
             }
             // Durable retention flag: a run whose committed work is only on an
             // unpushed local fallback branch must never be reaped — it is the
-            // sole surviving copy until an operator saves it. Cheap to check
-            // before taking any lock.
+            // sole surviving copy until an operator saves it. This unlocked read
+            // is only a cheap fast-path skip; the authoritative, race-free
+            // re-check happens UNDER the run-root lock in the reap closure below
+            // (paired with `retain_run_dir`'s locked write).
             if path.join(RETAIN_MARKER).exists() {
                 continue;
             }
@@ -895,6 +897,17 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
             // skip this reap (`removed` stays false) rather than delete unlocked
             // — a fail-safe that keeps a possibly-live cwd.
             let removed = with_marker_lock(&path, || {
+                // Authoritative retention re-check UNDER the lock. The cheap
+                // pre-check above is only a fast-path skip; `retain_run_dir`
+                // writes this marker while holding this same run-root lock, so
+                // re-reading it here makes retention-write and
+                // check-then-remove mutually exclusive. Without it a foreign
+                // worker could pass the unlocked pre-check, take the lock, and
+                // reap the dir in the window in which `finalize` is retaining
+                // an unpushed fallback branch — losing the only copy.
+                if path.join(RETAIN_MARKER).exists() {
+                    return false;
+                }
                 if marker_owner_alive_locked(&path) {
                     return false;
                 }
@@ -973,10 +986,25 @@ fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
 /// caller must report that the work is at risk instead of claiming retention
 /// succeeded.
 fn retain_run_dir(cwd: &Path) -> std::io::Result<()> {
-    std::fs::write(
-        cwd.join(RETAIN_MARKER),
-        b"unpushed agent-work fallback branch; retained until durably saved\n",
-    )
+    // Write the sentinel while holding the shared run-root lock so it is ordered
+    // against the reaper's locked check-then-remove (see the reap loop): either
+    // the reaper observes the marker under the lock and skips, or it removes the
+    // dir before we acquire the lock and our write fails loudly — never a silent
+    // write into a dir a foreign worker is concurrently removing. A `None`
+    // (lock unavailable) is surfaced as an error for the same reason: retention
+    // is the sole cross-process protection for the unpushed branch, so the
+    // caller must know it did not take effect.
+    with_marker_lock(cwd, || {
+        std::fs::write(
+            cwd.join(RETAIN_MARKER),
+            b"unpushed agent-work fallback branch; retained until durably saved\n",
+        )
+    })
+    .unwrap_or_else(|| {
+        Err(std::io::Error::other(
+            "could not acquire run-root lock to write retention marker",
+        ))
+    })
 }
 
 /// Extract a PR reference the agent announced, from its `::nano:result::`
@@ -1089,6 +1117,13 @@ fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
 /// Run `git <args>` in `cwd` with a wall-clock `timeout`, killing the child (and
 /// returning `Ok(None)`) if it overruns. Terminal credential prompts are
 /// disabled so an auth challenge fails fast instead of blocking on stdin.
+///
+/// stdout/stderr are sent to `/dev/null` rather than captured: the sole caller
+/// (the fallback push) inspects only `status.success()` and discards the bytes,
+/// and this polling loop never drains a pipe while waiting for the child to
+/// exit. Piping them would let a push (or a chatty server-side hook) that emits
+/// more than the OS pipe buffer holds block on a full pipe until the timeout —
+/// misclassifying an otherwise-successful push as `LocalOnly`.
 fn git_with_timeout(
     cwd: &Path,
     args: &[&str],
@@ -1100,8 +1135,8 @@ fn git_with_timeout(
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("running git {}", args.join(" ")))?;
     let start = Instant::now();

@@ -41,13 +41,23 @@ pub fn fixtures_dir() -> PathBuf {
 
 /// Environment-variable prefixes that identify the caller's real fleet
 /// configuration (base URL, agentic hub, supervisor, entry point, and the
-/// harness's own `NS_*` selectors). Any inherited variable under one of these
-/// is cleared before a subprocess runs so a test can never contact or mutate
+/// harness's own `NS_*` selectors) plus the ambient engine endpoint and
+/// credentials (`CAMUNDA_*`/`ZEEBE_*`: address, auth strategy, OAuth, and basic
+/// credentials). Any inherited variable under one of these is cleared before a
+/// subprocess runs so a test can never contact, authenticate against, or mutate
 /// the caller's configured fleet — the harness's hermetic, no-real-fleet
-/// guarantee. Callers may still re-add a specific variable with `.env(...)`
-/// after `TempHome::cmd`, since a later set on the same key wins.
+/// guarantee. Clearing the `CAMUNDA_*`/`ZEEBE_*` set is what stops a developer
+/// or CI shell that exports `CAMUNDA_AUTH_STRATEGY`/OAuth/basic credentials from
+/// leaking them into a supposedly local, unauthenticated test engine. Callers
+/// may still re-add a specific variable with `.env(...)` after `TempHome::cmd`
+/// (e.g. the local `CAMUNDA_REST_ADDRESS`), since a later set on the same key
+/// wins.
 fn is_fleet_var(key: &str) -> bool {
-    key.starts_with("NANO_") || key.starts_with("C8CTL_NANO_") || key.starts_with("NS_")
+    key.starts_with("NANO_")
+        || key.starts_with("C8CTL_NANO_")
+        || key.starts_with("NS_")
+        || key.starts_with("CAMUNDA_")
+        || key.starts_with("ZEEBE_")
 }
 
 /// Apply the standard hermetic environment to `c`: drop every inherited
