@@ -62,8 +62,14 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
     // per-job active markers + the synchronized sweeper below, not by the path.
     let opts = {
         let mut opts = opts;
+        // Canonicalize the run root so every derived path (the per-job cwd, the
+        // AGENT_RESULT_FILE path handed to the agent, and the path `finalize`
+        // reads back) is absolute. A relative `--runs-dir` would otherwise make
+        // the agent resolve its result file under `cwd/cwd/...` while the worker
+        // reads a different (relative) path.
+        let canonical = std::fs::canonicalize(&opts.runs_dir).unwrap_or_else(|_| opts.runs_dir.clone());
         let ns = stable_namespace(&opts.worker_name, &opts.job_type, opts.name_generated);
-        opts.runs_dir = opts.runs_dir.join(ns);
+        opts.runs_dir = canonical.join(ns);
         opts
     };
     let mut done = 0usize;
@@ -202,8 +208,37 @@ async fn handle(
     // here, so our own sweeper task cannot interleave; the sweeper's re-read of
     // the marker under its lock, immediately before `remove_dir_all`, bounds the
     // residual foreign-sweeper race to the two adjacent create/write syscalls.
-    write_active_marker(&cwd);
+    //
+    // The claim is MANDATORY: if the marker cannot be written the worker must
+    // not run the agent, because a foreign sweeper would interpret the missing
+    // marker as a dead run and could delete this live cwd. Fail the job for
+    // retry rather than proceed unprotected.
+    if let Err(e) = write_active_marker(&cwd) {
+        let msg = format!(
+            "cannot claim run dir {} (write liveness marker): {e:#}",
+            cwd.display()
+        );
+        log(&format!("job {key}: {msg}; failing for retry"));
+        if let Err(e2) = jobs
+            .fail(
+                &key,
+                (job.retries - 1).max(0),
+                &truncate(&msg, 2000),
+                &lease,
+            )
+            .await
+        {
+            log(&format!(
+                "job {key}: fail failed: {e2:#} (original error: {msg})"
+            ));
+        }
+        return;
+    }
     active.lock().unwrap().insert(cwd.clone());
+    // Clear any stale result file from a prior activation of this same run dir,
+    // so a later attempt that writes no result cannot forward the previous
+    // attempt's PR metadata.
+    let _ = std::fs::remove_file(agent_result_file(&cwd));
     let _guard = ActiveGuard {
         active: active.clone(),
         path: cwd,
@@ -231,20 +266,23 @@ async fn handle(
         r = run_agent(opts, &key, &job) => Some(r),
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
-    refresher.abort();
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
 
     match result {
-        None => log(&format!(
-            "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will hand it out again)"
-        )),
+        None => {
+            refresher.abort();
+            log(&format!(
+                "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will hand it out again)"
+            ));
+        }
         Some(Ok(out)) => {
-            // Finalize before settling: forward an agent-reported PR, or when the
-            // agent opened none, fall back to a `nano/agent-work/<key>` branch so
-            // any committed work is preserved rather than stranded in the
-            // (reapable) run directory.
+            // Keep the lease refresh alive through finalization: a fallback push
+            // may block for up to FALLBACK_PUSH_TIMEOUT, and if the refresh task
+            // were already aborted the activation could expire mid-finalize,
+            // fencing the subsequent completion even though the agent succeeded.
             let pr = finalize(opts, &key, &out);
+            refresher.abort();
             let mut vars: HashMap<String, Value> = [
                 ("agentResult".to_string(), json!(out.text)),
                 ("agentStopReason".to_string(), json!(out.stop_reason)),
@@ -268,6 +306,7 @@ async fn handle(
             }
         }
         Some(Err(e)) => {
+            refresher.abort();
             let msg = format!("{e:#}");
             match jobs.fail(&key, (job.retries - 1).max(0), &truncate(&msg, 2000), &lease).await {
                 Ok(()) => log(&format!("job {key} failed after {elapsed:.1}s (refreshes={n}): {msg}")),
@@ -308,8 +347,14 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     agent.shutdown().await;
     let out = out?;
     if out.text.trim().is_empty() {
-        // Never complete a job with nothing to show for it (c8ctl-plugin-nano#275).
-        anyhow::bail!("agent finished ({}) without any output", out.stop_reason);
+        // A file-only result is valid: the agent wrote its structured result to
+        // AGENT_RESULT_FILE without emitting chat text. Only fail when there is
+        // truly nothing — no text AND no result file (c8ctl-plugin-nano#275).
+        let rf = agent_result_file(&cwd);
+        let has_file = std::fs::metadata(&rf).map(|m| m.len() > 0).unwrap_or(false);
+        if !has_file {
+            anyhow::bail!("agent finished ({}) without any output", out.stop_reason);
+        }
     }
     Ok(out)
 }
@@ -386,17 +431,19 @@ fn stable_namespace(worker_name: &str, job_type: &str, name_generated: bool) -> 
 
 /// A short, deterministic hex digest of a worker's raw `(base, job_type)`
 /// identity. Used to disambiguate run-root namespaces whose readable form is
-/// lossy (see `stable_namespace`). `DefaultHasher` uses fixed keys, so this is
-/// stable across restarts and processes for a given std version — all that
-/// restart-stable, per-role isolation requires. A domain separator between the
-/// two fields prevents `("a-b", "c")` from colliding with `("a", "b-c")`.
+/// lossy (see `stable_namespace`). Uses FNV-1a, a simple non-cryptographic hash
+/// with a fully specified, stable output across Rust versions and platforms —
+/// unlike `DefaultHasher`, whose keys/algorithm may change between releases and
+/// would silently move run roots on upgrade. A domain separator between the two
+/// fields prevents `("a-b", "c")` from colliding with `("a", "b-c")`.
 fn identity_digest(base: &str, job_type: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    base.hash(&mut h);
-    0u8.hash(&mut h);
-    job_type.hash(&mut h);
-    format!("{:016x}", h.finish())
+    // FNV-1a 64-bit: offset basis 14695981039346656037, prime 1099511628211.
+    let mut h: u64 = 14695981039346656037;
+    for byte in base.bytes().chain(std::iter::once(0u8)).chain(job_type.bytes()) {
+        h ^= byte as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{h:016x}")
 }
 
 /// Strip the default `-spike-<pid>` PID suffix from a worker name, reducing
@@ -564,13 +611,17 @@ fn with_marker_lock<T>(_dir: &Path, f: impl FnOnce() -> T) -> T {
 }
 
 /// Record this process as the live owner of `cwd` by writing its PID into the
-/// run's liveness marker. Best-effort: the in-process active set still guards
-/// same-process runs if the marker can't be written. The write runs under the
-/// marker lock so it is atomic against a completing worker's check-then-unlink.
-fn write_active_marker(cwd: &Path) {
+/// run's liveness marker. The write runs under the marker lock so it is atomic
+/// against a completing worker's check-then-unlink. Returns an error if the
+/// marker cannot be written — the caller must treat this as fatal for the job
+/// (fail for retry) rather than proceed unprotected, because a foreign sweeper
+/// would interpret the missing marker as a dead run and could delete the live
+/// cwd.
+fn write_active_marker(cwd: &Path) -> Result<()> {
     with_marker_lock(cwd, || {
-        let _ = std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string());
-    });
+        std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string())
+            .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
+    })
 }
 
 /// Whether `dir` is a *live* run owned by some still-running worker — i.e. its
@@ -1009,7 +1060,7 @@ mod tests {
         // once removed, the directory reads as not-live (reapable).
         let dir = std::env::temp_dir().join(format!("ns-marker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        write_active_marker(&dir);
+        write_active_marker(&dir).unwrap();
         assert!(marker_owner_alive(&dir), "own PID must read as live");
         std::fs::remove_file(dir.join(ACTIVE_MARKER)).unwrap();
         assert!(!marker_owner_alive(&dir), "no marker means not live");
@@ -1050,7 +1101,7 @@ mod tests {
             "a foreign owner's marker must survive our guard drop"
         );
         // Our own marker, by contrast, is cleaned up.
-        write_active_marker(&dir);
+        write_active_marker(&dir).unwrap();
         drop(ActiveGuard {
             active: Arc::new(Mutex::new(HashSet::new())),
             path: dir.clone(),
@@ -1148,7 +1199,7 @@ mod tests {
         // `write_active_marker` takes the lock internally; the guarded closure
         // returns its value. (These calls are never nested in production — doing
         // so would self-deadlock, since flock treats each open fd independently.)
-        write_active_marker(&dir);
+        write_active_marker(&dir).unwrap();
         let ran = with_marker_lock(&dir, || 42);
         assert_eq!(ran, 42, "the guarded closure runs and returns its value");
         assert!(
@@ -1160,6 +1211,34 @@ mod tests {
             dir.join(ACTIVE_LOCK).exists(),
             "the lock file persists (never unlinked) for stable, race-free locking"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_digest_is_stable_across_rust_versions() {
+        // FNV-1a has a fully specified, version-independent output. These
+        // expected values were computed once and must never change — if they do,
+        // the digest algorithm changed and run-root namespaces would silently
+        // move on upgrade, breaking resume/sweeping.
+        assert_eq!(identity_digest("host-spike", "my-job"), "92de5acbe0c2795c");
+        assert_eq!(identity_digest("a-b", "c"), "bbb579af31626ace");
+        assert_eq!(identity_digest("a", "b-c"), "3f6e36fc8463a48a");
+        // Domain separator: ("a-b", "c") and ("a", "b-c") must differ.
+        assert_ne!(identity_digest("a-b", "c"), identity_digest("a", "b-c"));
+    }
+
+    #[test]
+    fn stale_result_file_is_cleared_before_activation() {
+        // A prior activation's result file must not leak into a later attempt:
+        // handle() removes it before running the agent.
+        let dir = std::env::temp_dir().join(format!("ns-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rf = agent_result_file(&dir);
+        std::fs::write(&rf, r#"{"status":"opened","pr":"nanobpm/z#1"}"#).unwrap();
+        assert!(rf.exists(), "stale result file written");
+        // Simulate the pre-activation cleanup handle() performs.
+        let _ = std::fs::remove_file(agent_result_file(&dir));
+        assert!(!rf.exists(), "stale result file cleared before activation");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
