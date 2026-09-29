@@ -174,50 +174,25 @@ async fn handle(
     // live cwd. So we also drop a cross-process liveness marker recording our
     // PID: a foreign sweeper reads it, sees the owner process is alive, and
     // skips the directory.
-    if let Err(e) = std::fs::create_dir_all(&cwd) {
-        // The job is already activated (leased). Bailing out with a bare
-        // `return` would leave it neither completed nor failed, so it would
-        // stay leased until its timeout before the engine could hand it out
-        // again. Route this through the same `jobs.fail`/retry path as a
-        // `run_agent` error so a transient run-dir failure is retried promptly.
-        let msg = format!("cannot create run dir {}: {e:#}", cwd.display());
-        log(&format!("job {key}: {msg}; failing for retry"));
-        if let Err(e2) = jobs
-            .fail(
-                &key,
-                (job.retries - 1).max(0),
-                &truncate(&msg, 2000),
-                &lease,
-            )
-            .await
-        {
-            log(&format!(
-                "job {key}: fail failed: {e2:#} (original error: {msg})"
-            ));
-        }
-        return;
-    }
-    // Establish the cross-process claim *first*, before anything else: write the
-    // liveness marker immediately after creating (or reactivating) the dir so a
-    // foreign worker's sweeper cannot observe a marker-less directory and reap
-    // it. This matters most on reactivation, where the dir already exists with
-    // an old mtime and no marker (its previous owner removed it on completion),
-    // so it would otherwise be immediately eligible for reaping. Writing the
-    // marker also bumps the dir's mtime, keeping it out of the stale set on
-    // every subsequent sweep. There is no `.await` between `create_dir_all` and
-    // here, so our own sweeper task cannot interleave; the sweeper's re-read of
-    // the marker under its lock, immediately before `remove_dir_all`, bounds the
-    // residual foreign-sweeper race to the two adjacent create/write syscalls.
     //
-    // The claim is MANDATORY: if the marker cannot be written the worker must
-    // not run the agent, because a foreign sweeper would interpret the missing
-    // marker as a dead run and could delete this live cwd. Fail the job for
-    // retry rather than proceed unprotected.
-    if let Err(e) = write_active_marker(&cwd) {
-        let msg = format!(
-            "cannot claim run dir {} (write liveness marker): {e:#}",
-            cwd.display()
-        );
+    // Atomically claim this cwd against foreign sweepers before anything else:
+    // (re)create the run dir AND stamp our liveness marker *under the same per-run
+    // marker lock the sweeper must hold to delete*, so a foreign sweeper's locked
+    // check-then-remove cannot interleave between the directory becoming claimable
+    // and the marker appearing. This closes the reactivation race, where the dir
+    // already exists with an old mtime and no marker (its previous owner removed
+    // it on completion) and would otherwise be immediately eligible for reaping in
+    // the window between the create and the marker write. Writing the marker also
+    // bumps the dir's mtime, keeping it out of the stale set on every later sweep.
+    //
+    // The claim is MANDATORY: if it cannot be established the worker must not run
+    // the agent, because a foreign sweeper would interpret the missing marker as a
+    // dead run and could delete this live cwd. The job is already activated
+    // (leased), so a bare `return` would strand it leased until its timeout; route
+    // the failure through the same `jobs.fail`/retry path as a `run_agent` error
+    // so a transient run-dir failure is retried promptly.
+    if let Err(e) = claim_run_dir(&cwd) {
+        let msg = format!("cannot claim run dir {}: {e:#}", cwd.display());
         log(&format!("job {key}: {msg}; failing for retry"));
         if let Err(e2) = jobs
             .fail(
@@ -660,6 +635,35 @@ fn write_active_marker(cwd: &Path) -> Result<()> {
     })
 }
 
+/// Atomically claim `cwd` for this worker against foreign sweepers: (re)create
+/// the run directory and stamp our liveness marker *under the per-run marker
+/// lock the sweeper must also hold to delete*, so a foreign sweeper's locked
+/// check-then-remove cannot interleave between the directory becoming claimable
+/// and the marker appearing (the reactivation race — a pre-existing dir with an
+/// old mtime and no marker).
+///
+/// The directory is (re)created a second time *inside* the lock: if a sweeper
+/// reaped a stale reactivated dir in the narrow window before we acquired the
+/// lock, we re-establish it and stamp a live marker under the same lock, so the
+/// claim and any concurrent removal are mutually exclusive. (In the residual
+/// case where the dir *and* its lock file were both reaped before the lock could
+/// be opened, `with_marker_lock` degrades to running unlocked and we recreate a
+/// fresh dir whose current mtime keeps it out of the sweeper's stale set.)
+///
+/// Fail-loud: any error means the claim did not take, and the caller MUST fail
+/// the job for retry rather than run the agent in an unprotected cwd.
+fn claim_run_dir(cwd: &Path) -> Result<()> {
+    // Ensure the dir (and thus the lock file's parent) exists before locking;
+    // on reactivation this is a no-op that leaves the possibly-stale dir in place.
+    std::fs::create_dir_all(cwd).with_context(|| format!("creating run dir {}", cwd.display()))?;
+    with_marker_lock(cwd, || {
+        std::fs::create_dir_all(cwd)
+            .with_context(|| format!("creating run dir {}", cwd.display()))?;
+        std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string())
+            .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
+    })
+}
+
 /// Whether `dir` is a *live* run owned by some still-running worker — i.e. its
 /// liveness marker names a PID that is currently alive. Such a directory must
 /// never be reaped, even by a foreign worker whose in-process active set can't
@@ -831,12 +835,22 @@ fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
         Ok(Fallback::LocalOnly) => {
             // The branch exists locally but the push failed (offline / no
             // remote): the run dir now holds the only copy of this work, so
-            // retain it against the reaper until it can be saved durably.
-            retain_run_dir(&cwd);
-            log(&format!(
-                "job {key}: agent reported no PR; created local fallback branch {branch} but could not push it — retaining run dir {} so the work is not lost",
-                cwd.display()
-            ));
+            // retain it against the reaper until it can be saved durably. The
+            // retention sentinel is the *sole* cross-process protection for that
+            // work once the in-process active guard drops, so if it cannot be
+            // written (e.g. disk full / unwritable dir) do NOT silently claim
+            // retention succeeded — report it loudly so an operator can rescue
+            // the branch before a sweep can reap the now-unprotected dir.
+            match retain_run_dir(&cwd) {
+                Ok(()) => log(&format!(
+                    "job {key}: agent reported no PR; created local fallback branch {branch} but could not push it — retaining run dir {} so the work is not lost",
+                    cwd.display()
+                )),
+                Err(e) => log(&format!(
+                    "job {key}: WARNING agent reported no PR and created local fallback branch {branch} but could not push it, AND could not write the retention marker in {}: {e:#} — the run dir is NOT protected against reaping; rescue branch {branch} before it is swept",
+                    cwd.display()
+                )),
+            }
         }
         Ok(Fallback::Nothing) => log(&format!(
             "job {key}: agent reported no PR and no committed work to save; fallback branch {branch} not created"
@@ -849,11 +863,16 @@ fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
 }
 
 /// Flag a run directory as holding unsaved work the reaper must not delete.
-fn retain_run_dir(cwd: &Path) {
-    let _ = std::fs::write(
+/// Returns the write result so the caller can surface a failure rather than
+/// silently swallow it: the retention sentinel is the only cross-process
+/// protection for a local-only fallback branch, so if it cannot be written the
+/// caller must report that the work is at risk instead of claiming retention
+/// succeeded.
+fn retain_run_dir(cwd: &Path) -> std::io::Result<()> {
+    std::fs::write(
         cwd.join(RETAIN_MARKER),
         b"unpushed agent-work fallback branch; retained until durably saved\n",
-    );
+    )
 }
 
 /// Extract a PR reference the agent announced, from its `::nano:result::`
@@ -918,7 +937,18 @@ fn push_fallback_branch(cwd: &Path, branch: &str) -> Result<Fallback> {
     if !has_head {
         return Ok(Fallback::Nothing);
     }
-    git(cwd, &["branch", "-f", branch, "HEAD"])?;
+    // Check the exit status, not merely whether git launched: `git(...)` reports
+    // only that the process ran, not that branch creation succeeded. If
+    // `git branch -f` fails (the branch is checked out, the ref is invalid, or
+    // the update is rejected) we must NOT push a stale/wrong ref and misreport it
+    // as `Pushed`. Signal LocalOnly so the caller retains the run dir — the work
+    // is still only in `cwd`.
+    let created = git(cwd, &["branch", "-f", branch, "HEAD"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !created {
+        return Ok(Fallback::LocalOnly);
+    }
     // The push runs with a bounded timeout (and terminal prompts disabled) so a
     // missing remote, credential prompt, or unreachable server cannot block the
     // worker indefinitely before it settles the job.
@@ -1218,7 +1248,7 @@ mod tests {
         // branch) carries the retention sentinel and must survive the sweeper.
         let dir = std::env::temp_dir().join(format!("ns-retain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        retain_run_dir(&dir);
+        retain_run_dir(&dir).unwrap();
         assert!(
             dir.join(RETAIN_MARKER).exists(),
             "retain sets the do-not-reap sentinel"
