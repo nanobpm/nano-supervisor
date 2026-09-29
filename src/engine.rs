@@ -58,6 +58,19 @@ pub fn connect(
 /// Build the shared job client from an already-resolved profile.
 pub fn build(profile: Option<&Profile>, job_api: JobApi, with_lease: bool) -> Result<Jobs> {
     Ok(match job_api.resolve(with_lease) {
+        JobApi::Sdk if with_lease => {
+            // The SDK speaks the Camunda spec's `jobLeaseToken`, but the Nano
+            // engine names the token `leaseToken`, so the SDK drops it on
+            // activation and never sends it back. A leased job activated this
+            // way therefore can't be refreshed or completed (409) and would be
+            // redelivered indefinitely. Refuse the combination rather than
+            // silently activate a job we can never settle.
+            bail!(
+                "--job-api sdk cannot settle leased jobs (the SDK drops Nano's \
+                 leaseToken on activation); use --job-api nano with --with-lease, \
+                 or drop --with-lease"
+            );
+        }
         JobApi::Sdk => Jobs::Sdk(Box::new(profile::client(profile)?)),
         JobApi::Nano => {
             // The raw Nano client only speaks none/basic. OAuth — whether from a

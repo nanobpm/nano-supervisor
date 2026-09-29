@@ -83,7 +83,11 @@ impl Agent {
         cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Discard the agent's stderr rather than inheriting the daemon's:
+            // stdout is the structured ACP channel (and is bounded), while an
+            // untrusted or misbehaving agent could otherwise stream unbounded
+            // diagnostics into the daemon's journal/disk and exhaust it.
+            .stderr(Stdio::null())
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);

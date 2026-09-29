@@ -1,5 +1,6 @@
 //! Pipe-protocol agent runner: feed the agent a single JSON job payload on
-//! stdin, let it work in `cwd`, and capture its stdout/stderr. The agent
+//! stdin, let it work in `cwd`, and capture its stdout (stderr is discarded).
+//! The agent
 //! reports its result by writing `$AGENT_RESULT_FILE` or by printing a
 //! `::nano:result:: {json}` sentinel line (parsed by [`crate::result`]).
 //!
@@ -45,7 +46,11 @@ pub async fn run(
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        // Discard the agent's stderr rather than inheriting the daemon's:
+        // stdout is the captured, bounded result channel, while an untrusted or
+        // misbehaving agent could otherwise stream unbounded diagnostics into
+        // the daemon's journal/disk and exhaust it.
+        .stderr(Stdio::null())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
