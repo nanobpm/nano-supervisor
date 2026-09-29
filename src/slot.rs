@@ -441,6 +441,19 @@ async fn execute(
         vars.insert("agentResult".into(), json!(detect_stdout));
     }
     vars.insert("agentWorker".into(), json!(cfg.worker_name));
+    // Reap this job's run directory now that its result has been fully captured
+    // (result vars are already parsed into memory above). Without this, a
+    // long-running daemon would accumulate one per-job clone per completed job —
+    // job keys are unique, so nothing else ever removes them — until the runs
+    // filesystem fills. Only *successful* runs are reaped here: a failing run
+    // bails earlier via `?`, leaving its directory in place for post-mortem
+    // inspection. Best-effort: a reap failure must not fail an otherwise-good job.
+    if let Err(e) = std::fs::remove_dir_all(&run_dir) {
+        log(&format!(
+            "job {key}: failed to reap run dir {}: {e:#}",
+            run_dir.display()
+        ));
+    }
     Ok(vars)
 }
 
@@ -504,12 +517,18 @@ async fn run_pipe(
         // Clean exit: nothing to gate on here (empty-result is handled below).
         Some(0) => {}
         // A non-zero exit means the run failed. Only tolerate it when the agent
-        // still emitted an explicit structured result (result file or stdout
-        // sentinel) — otherwise diagnostic stdout must not be mistaken for real
-        // work and silently settle the job; fail it so it is retried instead.
+        // still emitted an *effective* structured result (a real result var in
+        // the result file or stdout sentinel) — a reserved-only/null object such
+        // as `::nano:result:: {}` carries no result, so honoring it would let
+        // `detect_empty` mistake diagnostic stdout for real work and silently
+        // settle a failed job. Require an effective result; otherwise fail so the
+        // job is retried instead.
         Some(code) => {
-            if result_obj.is_none() {
-                bail!("pipe agent exited with code {code} without writing a result");
+            if !result_obj
+                .as_ref()
+                .is_some_and(result::has_effective_result_vars)
+            {
+                bail!("pipe agent exited with code {code} without writing an effective result");
             }
             log(&format!(
                 "job {key}: pipe agent exited with code {code}; honoring the explicit result it wrote"
