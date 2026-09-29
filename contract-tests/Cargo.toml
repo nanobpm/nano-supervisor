@@ -2,25 +2,35 @@
 name = "contract-tests"
 version = "0.0.1"
 edition = "2021"
-description = "Black-box contract tests for the Nano job worker (c8 nano work and nano-supervisor)"
+description = "Black-box contract tests for the nano fleet (CLI, state, control socket, agentic hub) and the job worker"
 license = "Apache-2.0"
 repository = "https://github.com/nanobpm/nano-supervisor"
 publish = false
 
-# The suite is black-box: it drives the CLIs as subprocesses, reads and writes
-# the state files, and talks to the engine REST API. It never links to
-# nano-supervisor internals, so the same tests run against Node and Rust.
+# Black-box only: the suite runs the CLIs as subprocesses, reads/writes the state
+# files, talks to `supervisor.sock` and the engine REST API. It never links
+# nano-supervisor internals, so the very same test runs against the Node plugin
+# (`NS_TARGET=node`) and the Rust binary (`NS_TARGET=rust`).
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps JSON object key order through decode -> re-encode, so a
+# frame's payload bytes round-trip identically to the golden hex.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha1 = "0.10"
+# Per-test C8CTL_NANO_HOME, removed on drop.
+tempfile = "3"
 # Engine REST calls in the worker/lease/finalize tests. Blocking so tests stay
 # plain `#[test]` functions; every engine test skips cleanly when none is up.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking", "multipart"] }
-# Per-test C8CTL_NANO_HOME, removed on drop.
-tempfile = "3"
 # Shell-quote the fake-agent path in the `--agent` string so a checkout path
 # containing spaces survives the CLI's shell-style `--agent` parsing.
 shlex = "1"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json", "redactions", "filters"] }
 
 # The scripted stand-in for Copilot/nano-coder. Issue #4 owns it; #3 and #5 use it.
 [[bin]]

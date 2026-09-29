@@ -1,0 +1,8 @@
+---
+source: contract-tests/tests/cli.rs
+expression: human.stdout
+---
+Hired agent profiles:
+  coder  [senior]  nano-coder  (model: gpt5; caps: feature, pr-review; protocol: acp)
+
+Put one to work with: c8ctl nano work <name>

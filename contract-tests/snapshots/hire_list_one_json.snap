@@ -1,0 +1,8 @@
+---
+source: contract-tests/tests/cli.rs
+expression: json.stderr
+---
+{"status":"info","message":"Hired agent profiles:"}
+{"status":"info","message":"  coder  [senior]  nano-coder  (model: gpt5; caps: feature, pr-review; protocol: acp)"}
+{"status":"info","message":""}
+{"status":"info","message":"Put one to work with: c8ctl nano work <name>"}
