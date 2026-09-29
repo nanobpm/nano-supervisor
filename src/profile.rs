@@ -163,6 +163,24 @@ pub fn env_has_oauth() -> bool {
         || (set("ZEEBE_CLIENT_ID") && set("ZEEBE_CLIENT_SECRET"))
 }
 
+/// Whether the ambient `CAMUNDA_*`/`ZEEBE_*` environment explicitly selects the
+/// `NONE` auth strategy. The `CAMUNDA_*` variable wins when both are set (SDK
+/// precedence); `None`/empty means "unspecified" (not `NONE`), so a bare set of
+/// basic-auth vars still authenticates. Used by [`rest_address_and_basic`] to
+/// honour an explicit `AUTH_STRATEGY=NONE` on the no-profile path, exactly as a
+/// profile that resolves to `NONE` is honoured.
+fn env_auth_strategy_is_none() -> bool {
+    ["CAMUNDA_AUTH_STRATEGY", "ZEEBE_AUTH_STRATEGY"]
+        .iter()
+        .find_map(|k| {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .is_some_and(|s| s.eq_ignore_ascii_case("none"))
+}
+
 /// Engine address and basic-auth credentials for the raw Nano job client.
 ///
 /// The **address** comes from the profile's settings, else the
@@ -174,8 +192,11 @@ pub fn env_has_oauth() -> bool {
 /// only and never fall back to the ambient `CAMUNDA_*`/`ZEEBE_*` basic-auth
 /// variables, so a `--profile` connection to a `NONE`/`OAUTH` engine cannot be
 /// silently authenticated with unrelated environment credentials. Ambient
-/// basic-auth is consulted only when no profile is selected. The `ZEEBE_*`
-/// aliases are honoured on both paths.
+/// basic-auth is consulted only when no profile is selected — and even then
+/// only when the ambient configuration does not explicitly select
+/// `AUTH_STRATEGY=NONE`, so an environment that disables auth is honoured just
+/// as a profile-derived `NONE` mode is. The `ZEEBE_*` aliases are honoured on
+/// both paths.
 /// (OAuth is not supported on this path; the spike only needs none/basic.)
 pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(String, String)>) {
     let settings = profile.map(sdk_settings).unwrap_or_default();
@@ -195,10 +216,16 @@ pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(Str
     // carries no basic credentials (e.g. it maps to `CAMUNDA_AUTH_STRATEGY=NONE`
     // or `OAUTH`) would be silently authenticated with unrelated environment
     // credentials, unlike the SDK path and the profile's explicit auth setting.
-    // Ambient basic-auth is consulted only when no profile is selected.
+    // Ambient basic-auth is consulted only when no profile is selected — and
+    // even then an explicit ambient `AUTH_STRATEGY=NONE` disables it, so an
+    // environment that turns auth off is not silently re-authenticated by stray
+    // basic-auth vars (the profile path honours its `NONE` mode the same way).
+    let ambient_auth_disabled = profile.is_none() && env_auth_strategy_is_none();
     let basic_get = |k: &str| -> Option<String> {
         if profile.is_some() {
             settings.get(k).cloned()
+        } else if ambient_auth_disabled {
+            None
         } else {
             std::env::var(k).ok().filter(|v| !v.is_empty())
         }
@@ -337,6 +364,47 @@ mod tests {
             profile(r#"{"name":"prod","baseUrl":"http://engine:8080","username":"pu","password":"pp"}"#);
         let (_addr, basic) = rest_address_and_basic(Some(&basic_profile));
         assert_eq!(basic, Some(("pu".to_string(), "pp".to_string())));
+        // Restore prior environment so parallel tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_auth_strategy_none_suppresses_basic() {
+        // On the no-profile path, an explicit ambient `AUTH_STRATEGY=NONE` must
+        // disable basic-auth even when stray `*_BASIC_AUTH_*` vars are present —
+        // otherwise an environment that deliberately turns auth off is silently
+        // re-authenticated with leftover credentials.
+        let keys = [
+            "CAMUNDA_AUTH_STRATEGY",
+            "ZEEBE_AUTH_STRATEGY",
+            "CAMUNDA_BASIC_AUTH_USERNAME",
+            "CAMUNDA_BASIC_AUTH_PASSWORD",
+            "ZEEBE_BASIC_AUTH_USERNAME",
+            "ZEEBE_BASIC_AUTH_PASSWORD",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("CAMUNDA_BASIC_AUTH_USERNAME", "ambient");
+        std::env::set_var("CAMUNDA_BASIC_AUTH_PASSWORD", "secret");
+        // Without a strategy, ambient basic-auth is honoured (unchanged).
+        let (_addr, basic) = rest_address_and_basic(None);
+        assert_eq!(basic, Some(("ambient".to_string(), "secret".to_string())));
+        // An explicit NONE disables it (case-insensitive), even on the ZEEBE alias.
+        std::env::set_var("ZEEBE_AUTH_STRATEGY", "none");
+        let (_addr, basic) = rest_address_and_basic(None);
+        assert_eq!(basic, None, "explicit ambient NONE must suppress basic-auth");
+        // A non-NONE strategy still authenticates.
+        std::env::remove_var("ZEEBE_AUTH_STRATEGY");
+        std::env::set_var("CAMUNDA_AUTH_STRATEGY", "BASIC");
+        let (_addr, basic) = rest_address_and_basic(None);
+        assert_eq!(basic, Some(("ambient".to_string(), "secret".to_string())));
         // Restore prior environment so parallel tests are unaffected.
         for (k, v) in saved {
             match v {

@@ -11,10 +11,10 @@
 //! fails only that job — the slot loop catches the join error, fails the job
 //! (preserving retries), and carries on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -344,14 +344,62 @@ pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
 /// deleted once they age past this window (3 days).
 pub(crate) const FAILED_RUN_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
+/// Process-global set of run directories currently being serviced by a slot.
+///
+/// [`sweep_stale_runs`] reaps aged directories purely from their mtime, but an
+/// in-flight agent can legitimately run *longer* than [`FAILED_RUN_RETENTION`]
+/// without ever writing to its run dir (so its mtime ages out) — and a
+/// *different* slot runs the sweep at the start of every job. Without this
+/// guard, that concurrent sweep could delete a live checkout out from under a
+/// still-running agent, corrupting its work or losing its result. Every slot
+/// registers its run dir here for the duration of the job (see
+/// [`ActiveRunGuard`]) and the sweep skips any registered path, so only genuinely
+/// abandoned (failed, post-mortem) directories are ever removed.
+fn active_runs() -> &'static Mutex<HashSet<PathBuf>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII registration of an in-flight run directory in [`active_runs`]. The dir
+/// is protected from the sweep from construction until this guard drops, which
+/// covers every exit path of [`execute`] — normal return, an early `?` bail, or
+/// a panic — so a registration can never leak and permanently pin a dir.
+struct ActiveRunGuard(PathBuf);
+
+impl ActiveRunGuard {
+    fn new(run_dir: &Path) -> Self {
+        if let Ok(mut set) = active_runs().lock() {
+            set.insert(run_dir.to_path_buf());
+        }
+        ActiveRunGuard(run_dir.to_path_buf())
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = active_runs().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Whether `path` is a currently in-flight run dir that must not be swept.
+fn is_active_run(path: &Path) -> bool {
+    active_runs()
+        .lock()
+        .map(|set| set.contains(path))
+        .unwrap_or(false)
+}
+
 /// Best-effort sweep of stale retained run directories under `runs_dir`.
 ///
 /// Successful runs are reaped the instant their result is captured, so the only
 /// directories that linger here are *failed* runs kept for post-mortem. This
 /// bounds that retention: any entry whose last modification is older than
-/// [`FAILED_RUN_RETENTION`] is removed. The threshold is age-based, so the
-/// run dir this slot is about to (re)create — freshly stamped "now" — and any
-/// other slot's in-flight run are never touched. Entirely best-effort: a
+/// [`FAILED_RUN_RETENTION`] is removed — **unless** it is a currently in-flight
+/// run (registered in [`active_runs`]), which is skipped no matter how stale its
+/// mtime looks, so a long-running agent's live checkout is never reaped by a
+/// concurrent slot's sweep. Entirely best-effort: a
 /// `read_dir`/`metadata`/`remove` failure is logged and skipped, never fatal,
 /// because reaping old debris must not block servicing a new job.
 pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
@@ -371,6 +419,14 @@ pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
             Err(_) => continue,
         };
         if !meta.is_dir() {
+            continue;
+        }
+        // Never reap a live run, however old its mtime. `execute` registers the
+        // run dir as its absolute path, so match against that (a relative
+        // `runs_dir` would otherwise yield a relative entry path that never
+        // compares equal to the stored absolute one).
+        let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        if is_active_run(&abs) {
             continue;
         }
         // Age from the directory's own mtime. If the platform withholds a
@@ -468,10 +524,16 @@ async fn execute(
     // hardening in `prepare_run_dir` still inspects the real on-disk structure.
     let run_dir = std::path::absolute(cfg.runs_dir.join(&key))
         .with_context(|| format!("resolving absolute run dir under {}", cfg.runs_dir.display()))?;
+    // Register this run dir as in-flight for the whole job so a concurrent
+    // slot's retention sweep can never reap it, even if the agent runs longer
+    // than `FAILED_RUN_RETENTION` without touching the dir. The guard drops on
+    // every exit path (return, `?` bail, panic), after which a *failed* run is
+    // left to age out normally and a *successful* one is reaped just below.
+    let _active = ActiveRunGuard::new(&run_dir);
     // Best-effort: reap any *failed* runs left for post-mortem that have now
     // aged past the retention window, so a long-lived daemon's `runs_dir` stays
-    // bounded. Age-based, so it never touches this fresh run or a concurrent
-    // slot's in-flight one.
+    // bounded. Age-based, and it skips any in-flight run registered above, so it
+    // never touches this fresh run or a concurrent slot's live one.
     sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION);
     // Reject symlinked runs root / job dir / ancestors, wipe any stale prior
     // attempt, (re-)create the dir, and lock it to owner-only 0700 — the full
@@ -997,6 +1059,40 @@ mod tests {
 
         // A missing runs_dir is a no-op (must not panic).
         sweep_stale_runs(&root.join("does-not-exist"), Duration::ZERO);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_skips_active_run_however_aged() {
+        // A long-running agent's dir can age past the retention window without
+        // being touched; while it is registered as in-flight the sweep must
+        // never reap it, even with max_age = 0.
+        let root = std::env::temp_dir().join(format!(
+            "nano-active-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let live = root.join("live-run");
+        std::fs::create_dir_all(&live).unwrap();
+        // Registered as absolute, exactly as `execute` does.
+        let live_abs = std::path::absolute(&live).unwrap();
+        let _guard = ActiveRunGuard::new(&live_abs);
+        assert!(is_active_run(&live_abs));
+
+        sweep_stale_runs(&root, Duration::ZERO);
+        assert!(live.exists(), "an in-flight run must not be swept, however aged");
+
+        // Once the guard drops, the same dir becomes eligible again.
+        drop(_guard);
+        assert!(!is_active_run(&live_abs));
+        sweep_stale_runs(&root, Duration::ZERO);
+        assert!(!live.exists(), "a deregistered aged dir is swept normally");
 
         std::fs::remove_dir_all(&root).ok();
     }

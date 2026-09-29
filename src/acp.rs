@@ -289,6 +289,19 @@ const MAX_ACP_FRAME: usize = 1 << 20; // 1 MiB
 /// fatal backpressure and the read loop stops rather than accumulating.
 const OUT_CHANNEL_CAP: usize = 1024;
 
+/// Per-frame byte budget for a reply we queue back to the agent. The count cap
+/// [`OUT_CHANNEL_CAP`] alone does not bound *memory*: a reply echoes the agent's
+/// own request `id` (and, for a permission prompt, an outcome derived from its
+/// params) verbatim, and a single frame may be up to [`MAX_ACP_FRAME`] (1 MiB).
+/// A hostile agent could therefore send requests carrying a multi-hundred-KB
+/// `id` and, with `OUT_CHANNEL_CAP` such replies queued while `write_loop` is
+/// wedged on a stdin it stopped draining, amplify them into ~1 GiB of buffered
+/// frames. A well-formed JSON-RPC id/outcome serialises to far under this, so a
+/// reply exceeding it means an abusive payload: it is dropped rather than queued
+/// (see [`handle_message`]), capping queued outbound memory at
+/// `OUT_CHANNEL_CAP * MAX_ACP_REPLY`.
+const MAX_ACP_REPLY: usize = 64 * 1024; // 64 KiB
+
 async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     mut reader: BufReader<R>,
     shared: Arc<Mutex<Shared>>,
@@ -407,6 +420,17 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
             // channel means `write_loop` has stalled on a blocked stdin: report
             // it as fatal backpressure so the read loop stops instead of queuing
             // replies without bound.
+            //
+            // Bound the frame by *bytes* too, not only by count: the reply echoes
+            // the agent-supplied `id`/outcome verbatim, so an abusive payload
+            // could make a single queued frame enormous. A reply over
+            // `MAX_ACP_REPLY` means such a payload — drop it (do not enqueue an
+            // oversized frame) rather than answer it. Not replying to a request
+            // that violated the protocol is safe; the idle timeout tears down a
+            // genuinely wedged agent.
+            if reply.to_string().len() > MAX_ACP_REPLY {
+                return true;
+            }
             out.try_send(reply).is_ok()
         }
     }
@@ -441,5 +465,48 @@ mod tests {
             permission_choice(&json!({"options": []}))["outcome"],
             "cancelled"
         );
+    }
+
+    #[test]
+    fn oversized_request_id_is_not_enqueued() {
+        // A hostile agent sends a permission request whose `id` is a huge string.
+        // The reply must NOT be queued (it would echo the id verbatim, and
+        // OUT_CHANNEL_CAP such frames could exhaust memory); the read loop should
+        // simply ignore the abusive request and keep going.
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (out, mut rx) = mpsc::channel::<Value>(OUT_CHANNEL_CAP);
+        let huge_id = "x".repeat(MAX_ACP_REPLY + 1);
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": huge_id,
+            "method": "session/request_permission",
+            "params": {"options": [{"optionId": "ok", "kind": "allow_always"}]}
+        })
+        .to_string();
+        assert!(
+            handle_message(&line, &shared, &out),
+            "an oversized request must not be treated as fatal backpressure"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no oversized reply frame may be enqueued"
+        );
+    }
+
+    #[test]
+    fn normal_request_reply_is_enqueued() {
+        // A well-formed permission request is answered and its reply queued.
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (out, mut rx) = mpsc::channel::<Value>(OUT_CHANNEL_CAP);
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {"options": [{"optionId": "ok", "kind": "allow_always"}]}
+        })
+        .to_string();
+        assert!(handle_message(&line, &shared, &out));
+        let reply = rx.try_recv().expect("a normal reply must be enqueued");
+        assert_eq!(reply["id"], 7);
     }
 }
