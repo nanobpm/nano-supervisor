@@ -399,10 +399,28 @@ fn is_active_run(path: &Path) -> bool {
 /// [`FAILED_RUN_RETENTION`] is removed — **unless** it is a currently in-flight
 /// run (registered in [`active_runs`]), which is skipped no matter how stale its
 /// mtime looks, so a long-running agent's live checkout is never reaped by a
-/// concurrent slot's sweep. Entirely best-effort: a
+/// concurrent slot's sweep. A symlinked root (or one reached through a symlinked
+/// ancestor) is refused up front — `read_dir`/`remove_dir_all` follow such a
+/// link, so a symlinked `runs_dir` could otherwise redirect the sweep to delete
+/// aged directories outside the configured workspace. Entirely best-effort: a
 /// `read_dir`/`metadata`/`remove` failure is logged and skipped, never fatal,
 /// because reaping old debris must not block servicing a new job.
 pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
+    // Refuse to traverse a symlinked root, or one reached through a symlinked
+    // ancestor, before touching it: `read_dir` (and the `remove_dir_all` below)
+    // follow such a link, so a symlinked `--runs-dir` — or an attacker-planted
+    // symlinked ancestor under a world-writable parent — could redirect the
+    // sweep to delete aged directories *outside* the configured workspace.
+    // `prepare_run_dir` validates the same root, but only when a job is later
+    // provisioned — after this sweep has already read and deleted — so the
+    // check has to be repeated here, before the very first `read_dir`.
+    if reject_symlink(runs_dir).is_err() || reject_symlinked_ancestors(runs_dir).is_err() {
+        log(&format!(
+            "skipping stale-run sweep of {}: symlinked root or ancestor (possible local symlink attack)",
+            runs_dir.display()
+        ));
+        return;
+    }
     let entries = match std::fs::read_dir(runs_dir) {
         Ok(e) => e,
         // A missing runs_dir (first job) or an unreadable one is nothing to
@@ -1095,5 +1113,42 @@ mod tests {
         assert!(!live.exists(), "a deregistered aged dir is swept normally");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_refuses_symlinked_root() {
+        // A symlinked `runs_dir` must never be traversed: `read_dir`/
+        // `remove_dir_all` would follow the link and delete aged directories in
+        // the *real* target, outside the configured workspace. The sweep must
+        // refuse the symlinked root and leave the target untouched.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("nano-symlink-sweep-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The real target holds an aged dir that a followed sweep would delete.
+        let real_root = base.join("real-root");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let aged = real_root.join("aged-run");
+        std::fs::create_dir_all(&aged).unwrap();
+
+        // A symlink standing in for a malicious `--runs-dir`.
+        let link_root = base.join("link-root");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        sweep_stale_runs(&link_root, Duration::ZERO);
+        assert!(
+            aged.exists(),
+            "sweep of a symlinked root must not follow it and delete the target's contents"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

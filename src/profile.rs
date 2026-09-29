@@ -243,6 +243,23 @@ pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize tests that mutate process-global environment variables. Rust
+    /// runs unit tests in parallel threads that share one process environment,
+    /// so without this lock the env-mutating auth tests race over the same
+    /// `*_AUTH_*` / `*_BASIC_AUTH_*` keys and observe (or clobber) each other's
+    /// writes. Every such test holds this lock for its whole body, so the
+    /// save/restore each test already performs nests safely inside the
+    /// serialized section. A panicking test poisons the mutex; we recover the
+    /// guard (`into_inner`) so one failure does not cascade into the rest.
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn profile(json: &str) -> Profile {
         serde_json::from_str(json).unwrap()
@@ -288,6 +305,7 @@ mod tests {
         // *either* the CAMUNDA_* or ZEEBE_* strategy variable must be detected —
         // previously only CAMUNDA_AUTH_STRATEGY was checked, so a
         // ZEEBE_AUTH_STRATEGY=OAUTH connection slipped through unauthenticated.
+        let _env = env_guard();
         let keys = [
             "CAMUNDA_AUTH_STRATEGY",
             "ZEEBE_AUTH_STRATEGY",
@@ -317,6 +335,7 @@ mod tests {
         // The raw Nano client honours the ZEEBE_* basic-auth aliases the same way
         // it honours ZEEBE_REST_ADDRESS: a ZEEBE_BASIC_AUTH_* setup must still send
         // an Authorization header instead of going out unauthenticated.
+        let _env = env_guard();
         let keys = [
             "CAMUNDA_BASIC_AUTH_USERNAME",
             "CAMUNDA_BASIC_AUTH_PASSWORD",
@@ -347,6 +366,7 @@ mod tests {
         // client must go out unauthenticated even when ambient CAMUNDA_*/ZEEBE_*
         // basic-auth variables are set — otherwise a `--profile` connection would
         // authenticate with unrelated environment credentials.
+        let _env = env_guard();
         let keys = [
             "CAMUNDA_BASIC_AUTH_USERNAME",
             "CAMUNDA_BASIC_AUTH_PASSWORD",
@@ -379,6 +399,7 @@ mod tests {
         // disable basic-auth even when stray `*_BASIC_AUTH_*` vars are present —
         // otherwise an environment that deliberately turns auth off is silently
         // re-authenticated with leftover credentials.
+        let _env = env_guard();
         let keys = [
             "CAMUNDA_AUTH_STRATEGY",
             "ZEEBE_AUTH_STRATEGY",
