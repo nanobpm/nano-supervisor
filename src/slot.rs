@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use camunda_orchestration_sdk::models::ActivatedJobResult;
@@ -336,6 +336,67 @@ pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How long a *failed* run directory is retained under `runs_dir` for
+/// post-mortem inspection before it is swept. Successful runs are reaped
+/// immediately on completion (see [`execute`]); only failed runs — which bail
+/// via `?` and are deliberately left in place — accumulate. On a long-lived
+/// daemon that retention is otherwise unbounded, so leftover failed runs are
+/// deleted once they age past this window (3 days).
+pub(crate) const FAILED_RUN_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Best-effort sweep of stale retained run directories under `runs_dir`.
+///
+/// Successful runs are reaped the instant their result is captured, so the only
+/// directories that linger here are *failed* runs kept for post-mortem. This
+/// bounds that retention: any entry whose last modification is older than
+/// [`FAILED_RUN_RETENTION`] is removed. The threshold is age-based, so the
+/// run dir this slot is about to (re)create — freshly stamped "now" — and any
+/// other slot's in-flight run are never touched. Entirely best-effort: a
+/// `read_dir`/`metadata`/`remove` failure is logged and skipped, never fatal,
+/// because reaping old debris must not block servicing a new job.
+pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
+    let entries = match std::fs::read_dir(runs_dir) {
+        Ok(e) => e,
+        // A missing runs_dir (first job) or an unreadable one is nothing to
+        // sweep — the normal prepare path will (re)create/validate it.
+        Err(_) => return,
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only sweep directories (real ones — never follow a symlink, which
+        // could point outside runs_dir); leave any stray files be.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        // Age from the directory's own mtime. If the platform withholds a
+        // modified time, keep the dir rather than risk deleting a fresh run.
+        let aged_out = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if !aged_out {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => log(&format!(
+                "swept stale run dir {} (older than {}d)",
+                path.display(),
+                max_age.as_secs() / 86_400
+            )),
+            Err(e) => log(&format!(
+                "failed to sweep stale run dir {}: {e:#}",
+                path.display()
+            )),
+        }
+    }
+}
+
 /// Redact any embedded userinfo (`user:token@`) from a URL's authority before
 /// logging it. A repository URL from the task envelope may carry an HTTPS
 /// credential (`https://x-access-token:<pat>@host/...`); logging it verbatim
@@ -407,6 +468,11 @@ async fn execute(
     // hardening in `prepare_run_dir` still inspects the real on-disk structure.
     let run_dir = std::path::absolute(cfg.runs_dir.join(&key))
         .with_context(|| format!("resolving absolute run dir under {}", cfg.runs_dir.display()))?;
+    // Best-effort: reap any *failed* runs left for post-mortem that have now
+    // aged past the retention window, so a long-lived daemon's `runs_dir` stays
+    // bounded. Age-based, so it never touches this fresh run or a concurrent
+    // slot's in-flight one.
+    sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION);
     // Reject symlinked runs root / job dir / ancestors, wipe any stale prior
     // attempt, (re-)create the dir, and lock it to owner-only 0700 — the full
     // hardening lives in one shared helper (also used by the `spike` path).
@@ -474,7 +540,9 @@ async fn execute(
     // job keys are unique, so nothing else ever removes them — until the runs
     // filesystem fills. Only *successful* runs are reaped here: a failing run
     // bails earlier via `?`, leaving its directory in place for post-mortem
-    // inspection. Best-effort: a reap failure must not fail an otherwise-good job.
+    // inspection (bounded: aged-out failed runs are swept by `sweep_stale_runs`
+    // on a later job, see `FAILED_RUN_RETENTION`). Best-effort: a reap failure
+    // must not fail an otherwise-good job.
     if let Err(e) = std::fs::remove_dir_all(&run_dir) {
         log(&format!(
             "job {key}: failed to reap run dir {}: {e:#}",
@@ -894,5 +962,42 @@ mod tests {
         assert!(matches!(reconcile_lost(Some(Ok::<(), anyhow::Error>(())), false), Some(Ok(()))));
         // Already lost via the select's None branch stays lost.
         assert!(reconcile_lost(None::<Result<()>>, false).is_none());
+    }
+
+    #[test]
+    fn sweep_stale_runs_removes_only_aged_dirs() {
+        // Unique per-test root under the system temp dir (no tempfile dep here).
+        let root = std::env::temp_dir().join(format!(
+            "nano-sweep-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let aged = root.join("failed-run");
+        std::fs::create_dir_all(&aged).unwrap();
+        std::fs::write(aged.join("result.json"), b"{}").unwrap();
+        let stray = root.join("stray.txt");
+        std::fs::write(&stray, b"x").unwrap();
+
+        // max_age = 0 → every existing dir is at/over the threshold and swept,
+        // but stray files are left untouched.
+        sweep_stale_runs(&root, Duration::ZERO);
+        assert!(!aged.exists(), "aged-out run dir should be swept");
+        assert!(stray.exists(), "stray files must be left alone");
+
+        // A fresh dir with a long retention window is kept.
+        let fresh = root.join("in-flight-run");
+        std::fs::create_dir_all(&fresh).unwrap();
+        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60));
+        assert!(fresh.exists(), "a fresh run dir must not be swept");
+
+        // A missing runs_dir is a no-op (must not panic).
+        sweep_stale_runs(&root.join("does-not-exist"), Duration::ZERO);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
