@@ -349,20 +349,23 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     if out.text.trim().is_empty() {
         // A file-only result is valid: the agent wrote its structured result to
         // AGENT_RESULT_FILE without emitting chat text. Only accept it when the
-        // file actually holds a parseable JSON result — a present-but-malformed
-        // file is not usable output (`finalize` cannot extract a PR from it), so
-        // it must not bypass the empty-result failure rule. Fail when there is
-        // truly nothing usable — no text AND no valid result file
-        // (c8ctl-plugin-nano#275).
+        // file actually holds a parseable JSON result *object* — a
+        // present-but-malformed file is not usable output (`finalize` cannot
+        // extract a PR from it), so it must not bypass the empty-result failure
+        // rule. A scalar JSON value (`null`, `true`, `0`, `"x"`) parses fine but
+        // is likewise unusable — `finalize` reads `v.get("pr")`, which only ever
+        // matches an object — so require an object here and reject scalars.
+        // Fail when there is truly nothing usable — no text AND no valid result
+        // object (c8ctl-plugin-nano#275).
         let rf = agent_result_file(&cwd);
         let has_valid_file = std::fs::read_to_string(&rf)
             .ok()
             .filter(|s| !s.trim().is_empty())
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .is_some();
+            .is_some_and(|v| v.is_object());
         if !has_valid_file {
             anyhow::bail!(
-                "agent finished ({}) without any usable output (no chat text and no valid JSON result file)",
+                "agent finished ({}) without any usable output (no chat text and no valid JSON result object)",
                 out.stop_reason
             );
         }
@@ -538,11 +541,14 @@ impl Drop for ActiveGuard {
         //
         // The "is this marker mine? then unlink" read-modify-write runs under
         // the per-run marker lock so it is atomic against a reactivating
-        // worker's `write_active_marker`: the two can no longer interleave such
+        // worker's `claim_run_dir`: the two can no longer interleave such
         // that we read our own PID, a new owner overwrites the marker, and we
-        // then delete the new owner's marker (the cross-process TOCTOU).
+        // then delete the new owner's marker (the cross-process TOCTOU). If the
+        // lock cannot be acquired (`None`), skip the unlink: leaving our marker
+        // is fail-safe (the dir stays protected) whereas an unlocked delete
+        // could race a reactivating owner.
         let marker = self.path.join(ACTIVE_MARKER);
-        with_marker_lock(&self.path, || {
+        let _ = with_marker_lock(&self.path, || {
             if let Ok(contents) = std::fs::read_to_string(&marker) {
                 if contents.trim() == std::process::id().to_string() {
                     let _ = std::fs::remove_file(&marker);
@@ -592,46 +598,68 @@ fn agent_result_file(cwd: &Path) -> PathBuf {
 /// Serialize a marker read/modify/write through an exclusive advisory lock on
 /// the run's stable [`ACTIVE_LOCK`] file, so a completing worker's
 /// ownership-check-then-unlink and a reactivating worker's marker write are
-/// mutually exclusive (closing the read-then-unlink TOCTOU). Best-effort: if
-/// the lock file can't be opened, or on non-unix where there is no portable
-/// advisory lock, the closure still runs and degrades to the prior
-/// read-then-unlink behavior. Dropping the file closes its fd, releasing the
-/// lock.
+/// mutually exclusive (closing the read-then-unlink TOCTOU). Dropping the file
+/// closes its fd, releasing the lock.
+///
+/// Returns `Some(f())` only when the lock was actually held for the whole
+/// closure; returns `None` — running the closure NOT at all — when the lock
+/// could not be acquired (the lock file can't be opened, or `flock` fails for a
+/// reason other than a retryable `EINTR`). Callers must treat `None` as "the
+/// operation was not serialized" and act fail-safe: a claim fails the job, a
+/// sweep skips the reap. This avoids silently running the closure unlocked,
+/// which would let a foreign sweeper delete a live cwd (issue: flock failures
+/// were previously ignored). On non-unix there is no portable advisory lock, so
+/// the closure runs and `Some` is returned unconditionally (documented
+/// platform limitation; run roots are host-local).
 #[cfg(unix)]
-fn with_marker_lock<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+fn with_marker_lock<T>(dir: &Path, f: impl FnOnce() -> T) -> Option<T> {
     use std::os::unix::io::AsRawFd;
-    let lock = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(dir.join(ACTIVE_LOCK))
-        .ok();
-    if let Some(file) = &lock {
-        // LOCK_EX blocks until the lock is ours; a crashed holder's lock is
-        // auto-released by the kernel, so this cannot wedge on a dead worker.
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        .ok()?;
+    // LOCK_EX blocks until the lock is ours; a crashed holder's lock is
+    // auto-released by the kernel, so this cannot wedge on a dead worker. Retry
+    // on EINTR (a signal interrupted the blocking wait); any other error means
+    // we could not serialize, so report failure (`None`) instead of running the
+    // closure unlocked and racing a concurrent sweeper.
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return None;
+        }
     }
     let result = f();
-    drop(lock);
-    result
+    drop(file);
+    Some(result)
 }
 
 #[cfg(not(unix))]
-fn with_marker_lock<T>(_dir: &Path, f: impl FnOnce() -> T) -> T {
-    f()
+fn with_marker_lock<T>(_dir: &Path, f: impl FnOnce() -> T) -> Option<T> {
+    Some(f())
 }
 
 /// Record this process as the live owner of `cwd` by writing its PID into the
-/// run's liveness marker. The write runs under the marker lock so it is atomic
-/// against a completing worker's check-then-unlink. Returns an error if the
-/// marker cannot be written — the caller must treat this as fatal for the job
-/// (fail for retry) rather than proceed unprotected, because a foreign sweeper
-/// would interpret the missing marker as a dead run and could delete the live
-/// cwd.
+/// run's liveness marker, under the marker lock. **Test-only**: production
+/// reactivation goes through [`claim_run_dir`], which stamps the same marker
+/// under the lock *together with* the directory (re)creation. The unit tests
+/// use this to simulate a prior/foreign owner having claimed a run dir. Returns
+/// an error if the marker cannot be written or the lock cannot be acquired.
+#[cfg(test)]
 fn write_active_marker(cwd: &Path) -> Result<()> {
     with_marker_lock(cwd, || {
         std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string())
             .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
+    })
+    .unwrap_or_else(|| {
+        Err(anyhow::anyhow!(
+            "could not acquire marker lock for {}",
+            cwd.display()
+        ))
     })
 }
 
@@ -645,13 +673,14 @@ fn write_active_marker(cwd: &Path) -> Result<()> {
 /// The directory is (re)created a second time *inside* the lock: if a sweeper
 /// reaped a stale reactivated dir in the narrow window before we acquired the
 /// lock, we re-establish it and stamp a live marker under the same lock, so the
-/// claim and any concurrent removal are mutually exclusive. (In the residual
+/// claim and any concurrent removal are mutually exclusive. In the residual
 /// case where the dir *and* its lock file were both reaped before the lock could
-/// be opened, `with_marker_lock` degrades to running unlocked and we recreate a
-/// fresh dir whose current mtime keeps it out of the sweeper's stale set.)
+/// even be opened — or `flock` otherwise fails — `with_marker_lock` returns
+/// `None` and we fail the claim rather than proceed unlocked.
 ///
-/// Fail-loud: any error means the claim did not take, and the caller MUST fail
-/// the job for retry rather than run the agent in an unprotected cwd.
+/// Fail-loud: any error (including an unacquirable lock) means the claim did not
+/// take, and the caller MUST fail the job for retry rather than run the agent in
+/// an unprotected cwd.
 fn claim_run_dir(cwd: &Path) -> Result<()> {
     // Ensure the dir (and thus the lock file's parent) exists before locking;
     // on reactivation this is a no-op that leaves the possibly-stale dir in place.
@@ -661,6 +690,12 @@ fn claim_run_dir(cwd: &Path) -> Result<()> {
             .with_context(|| format!("creating run dir {}", cwd.display()))?;
         std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string())
             .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
+    })
+    .unwrap_or_else(|| {
+        Err(anyhow::anyhow!(
+            "could not acquire marker lock to claim run dir {}",
+            cwd.display()
+        ))
     })
 }
 
@@ -675,7 +710,9 @@ fn claim_run_dir(cwd: &Path) -> Result<()> {
 /// so a check and its subsequent removal stay atomic under one lock.
 #[cfg(test)]
 fn marker_owner_alive(dir: &Path) -> bool {
-    with_marker_lock(dir, || marker_owner_alive_locked(dir))
+    // Fail-safe on an unacquirable lock: treat as live so a possibly-active cwd
+    // is never reaped.
+    with_marker_lock(dir, || marker_owner_alive_locked(dir)).unwrap_or(true)
 }
 
 /// The liveness read of [`marker_owner_alive`] **without** taking the marker
@@ -790,13 +827,16 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
             // leaving us to delete a now-live cwd (TOCTOU). Holding the lock for
             // the whole check-then-delete closes that gap; the lock file lives
             // inside the dir but is only unlinked here by the removal itself,
-            // and flock is released when its fd is dropped.
+            // and flock is released when its fd is dropped. If the lock cannot
+            // be acquired (`None`), skip this reap (`removed` stays false) rather
+            // than delete unlocked — a fail-safe that keeps a possibly-live cwd.
             let removed = with_marker_lock(&path, || {
                 if marker_owner_alive_locked(&path) {
                     return false;
                 }
                 std::fs::remove_dir_all(&path).is_ok()
-            });
+            })
+            .unwrap_or(false);
             if removed {
                 // Keep the set tidy if a path was reaped while (somehow) still
                 // present; removal is idempotent.
@@ -1267,7 +1307,11 @@ mod tests {
         // so would self-deadlock, since flock treats each open fd independently.)
         write_active_marker(&dir).unwrap();
         let ran = with_marker_lock(&dir, || 42);
-        assert_eq!(ran, 42, "the guarded closure runs and returns its value");
+        assert_eq!(
+            ran,
+            Some(42),
+            "the guarded closure runs under the lock and returns its value"
+        );
         assert!(
             marker_owner_alive(&dir),
             "marker written under the lock reads live"
