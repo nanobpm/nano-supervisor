@@ -290,12 +290,15 @@ async fn handle(
             ));
         }
         Some(Ok(out)) => {
-            // Keep the lease refresh alive through finalization: a fallback push
-            // may block for up to FALLBACK_PUSH_TIMEOUT, and if the refresh task
-            // were already aborted the activation could expire mid-finalize,
-            // fencing the subsequent completion even though the agent succeeded.
+            // Keep the lease refresh alive through finalization AND completion:
+            // a fallback push may block for up to FALLBACK_PUSH_TIMEOUT, and the
+            // completion HTTP call has its own timeout and can outlive the
+            // remaining activation window (especially with a small
+            // `--recovery-window`). If the refresh task were aborted before
+            // `jobs.complete` returns, the activation could expire mid-complete,
+            // fencing a successful run. Abort it only once the settle command
+            // has returned.
             let pr = finalize(opts, &key, &out);
-            refresher.abort();
             let mut vars: HashMap<String, Value> = [
                 ("agentResult".to_string(), json!(out.text)),
                 ("agentStopReason".to_string(), json!(out.stop_reason)),
@@ -317,6 +320,7 @@ async fn handle(
                 )),
                 Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
             }
+            refresher.abort();
         }
         Some(Err(e)) => {
             refresher.abort();
@@ -584,9 +588,12 @@ impl Drop for ActiveGuard {
 const ACTIVE_MARKER: &str = ".nano-active";
 
 /// Filename of the per-run advisory lock guarding all read/modify/write of the
-/// active marker. Unlike the marker, this file is **never unlinked** (only its
-/// advisory lock is taken and released), so there is no open-vs-unlink inode
-/// race; it is reaped only when the whole run directory is. It exists solely to
+/// active marker. In production the lock is placed by [`lock_path_for`] as a
+/// sidecar *beside* the run dir (in the run root the sweeper never removes), so
+/// its inode survives the run dir's removal/recreation; this constant is the
+/// in-dir fallback name used only when a run dir has no parent. The lock file is
+/// **never unlinked** (only its advisory lock is taken and released), so there is
+/// no open-vs-unlink inode race on the lock itself. It exists solely to
 /// serialize marker access and is not itself a liveness signal.
 const ACTIVE_LOCK: &str = ".nano-active.lock";
 
@@ -611,11 +618,38 @@ fn agent_result_file(cwd: &Path) -> PathBuf {
     cwd.join(AGENT_RESULT_FILE)
 }
 
+/// The path of the advisory lock serializing access to a run directory's
+/// liveness marker. The lock lives **outside** the reapable run directory — as
+/// a sidecar in the parent run root, keyed by the run dir's file name — so its
+/// inode is stable across the directory's removal and recreation.
+///
+/// If the lock lived inside the run dir, a worker blocked in `flock` on the old
+/// `.nano-active.lock` could be holding an inode the sweeper's `remove_dir_all`
+/// has already unlinked; on resuming it would recreate the dir and stamp a live
+/// marker while still holding that unreachable inode, and a later sweep opening
+/// a *fresh* lock inode would reap the now-live cwd. Placing the lock beside the
+/// dir (in the run root, which the sweeper never removes) keeps the cross-process
+/// check-then-delete atomic. The sidecar is never unlinked, so there is no
+/// open-vs-unlink inode race on the lock itself.
+fn lock_path_for(dir: &Path) -> PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "run".to_string());
+    match dir.parent() {
+        Some(parent) => parent.join(format!(".{name}.lock")),
+        // A run dir with no parent (filesystem root) cannot be reaped by the
+        // sweeper anyway; fall back to an in-dir lock.
+        None => dir.join(ACTIVE_LOCK),
+    }
+}
+
 /// Serialize a marker read/modify/write through an exclusive advisory lock on
-/// the run's stable [`ACTIVE_LOCK`] file, so a completing worker's
-/// ownership-check-then-unlink and a reactivating worker's marker write are
-/// mutually exclusive (closing the read-then-unlink TOCTOU). Dropping the file
-/// closes its fd, releasing the lock.
+/// the run's stable [`lock_path_for`] file (a sidecar beside the run dir, not
+/// inside it), so a completing worker's ownership-check-then-unlink and a
+/// reactivating worker's marker write are mutually exclusive (closing the
+/// read-then-unlink TOCTOU). Dropping the file closes its fd, releasing the
+/// lock.
 ///
 /// Returns `Some(f())` only when the lock was actually held for the whole
 /// closure; returns `None` — running the closure NOT at all — when the lock
@@ -634,7 +668,7 @@ fn with_marker_lock<T>(dir: &Path, f: impl FnOnce() -> T) -> Option<T> {
         .create(true)
         .write(true)
         .truncate(false)
-        .open(dir.join(ACTIVE_LOCK))
+        .open(lock_path_for(dir))
         .ok()?;
     // LOCK_EX blocks until the lock is ours; a crashed holder's lock is
     // auto-released by the kernel, so this cannot wedge on a dead worker. Retry
@@ -841,11 +875,13 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
             // this dir (write a live marker under that same lock) in the window
             // between our check returning "not live" and `remove_dir_all`,
             // leaving us to delete a now-live cwd (TOCTOU). Holding the lock for
-            // the whole check-then-delete closes that gap; the lock file lives
-            // inside the dir but is only unlinked here by the removal itself,
-            // and flock is released when its fd is dropped. If the lock cannot
-            // be acquired (`None`), skip this reap (`removed` stays false) rather
-            // than delete unlocked — a fail-safe that keeps a possibly-live cwd.
+            // the whole check-then-delete closes that gap. The lock file is a
+            // sidecar BESIDE the run dir (see `lock_path_for`), in the run root
+            // the sweeper never removes, so `remove_dir_all` cannot unlink the
+            // lock inode out from under a worker blocked on it; flock is released
+            // when its fd is dropped. If the lock cannot be acquired (`None`),
+            // skip this reap (`removed` stays false) rather than delete unlocked
+            // — a fail-safe that keeps a possibly-live cwd.
             let removed = with_marker_lock(&path, || {
                 if marker_owner_alive_locked(&path) {
                     return false;
@@ -936,20 +972,22 @@ fn retain_run_dir(cwd: &Path) -> std::io::Result<()> {
 /// via `AGENT_RESULT_FILE`.
 fn reported_pr(out: &Outcome, result_file: &Path) -> Option<String> {
     const MARKER: &str = "::nano:result::";
-    if let Some(pr) = out
-        .text
-        .rmatch_indices(MARKER)
-        .find_map(|(i, m)| {
-            let rest = out.text[i + m.len()..].lines().next()?.trim();
-            // Tolerate trailing text after the JSON object on the same line.
-            serde_json::Deserializer::from_str(rest)
-                .into_iter::<Value>()
-                .next()?
-                .ok()
-        })
-        .and_then(|v| pr_of(&v))
-    {
-        return Some(pr);
+    // Only the FINAL marker is authoritative. Iterating last-to-first with
+    // `find_map` would skip a trailing marker that is malformed or carries no
+    // `pr` and silently accept an *earlier* one — forwarding stale PR metadata
+    // from a previous turn. Take the last marker alone; if it yields no `pr`,
+    // fall back to the result file rather than to an earlier marker.
+    if let Some((i, m)) = out.text.rmatch_indices(MARKER).next() {
+        let rest = out.text[i + m.len()..].lines().next().unwrap_or("").trim();
+        // Tolerate trailing text after the JSON object on the same line.
+        let pr = serde_json::Deserializer::from_str(rest)
+            .into_iter::<Value>()
+            .next()
+            .and_then(Result::ok)
+            .and_then(|v| pr_of(&v));
+        if pr.is_some() {
+            return pr;
+        }
     }
     if let Ok(text) = std::fs::read_to_string(result_file) {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
@@ -1257,6 +1295,34 @@ mod tests {
     }
 
     #[test]
+    fn reported_pr_ignores_an_earlier_marker_when_the_last_has_no_pr() {
+        // Only the FINAL marker is authoritative: a later result that carries no
+        // `pr` must not fall back to an earlier marker's stale PR metadata from a
+        // previous turn. With no usable `pr` in the last marker and no result
+        // file, the worker reports no PR (and falls back to a nano/agent-work
+        // branch) rather than forwarding a stale PR.
+        let missing = std::env::temp_dir().join("ns-no-such-result.json");
+        let out = outcome_with(
+            "::nano:result::{\"status\":\"opened\",\"pr\":\"nanobpm/x#7\"}\n\
+             later turn::nano:result::{\"status\":\"opened\"}",
+        );
+        assert!(
+            reported_pr(&out, &missing).is_none(),
+            "a trailing marker without a pr must not resurrect an earlier marker's PR"
+        );
+        // A malformed trailing marker likewise must not fall back to an earlier
+        // well-formed one.
+        let out = outcome_with(
+            "::nano:result::{\"status\":\"opened\",\"pr\":\"nanobpm/x#7\"}\n\
+             later turn::nano:result::{not json",
+        );
+        assert!(
+            reported_pr(&out, &missing).is_none(),
+            "a malformed trailing marker must not resurrect an earlier marker's PR"
+        );
+    }
+
+    #[test]
     fn reported_pr_is_none_without_a_pr() {
         // Plain chatter with no marker and no `pr` field reports no PR, so the
         // worker falls back to a `nano/agent-work/` branch.
@@ -1314,8 +1380,9 @@ mod tests {
 
     #[test]
     fn marker_lock_serializes_and_never_unlinks_the_lock_file() {
-        // The stable lock file guards marker access and is itself never removed
-        // (only the run dir reaps it), so there is no open-vs-unlink inode race.
+        // The stable lock file guards marker access and lives OUTSIDE the
+        // reapable run dir (a sidecar in the parent run root), so removing the
+        // run dir never unlinks the lock inode out from under a blocked worker.
         let dir = std::env::temp_dir().join(format!("ns-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // `write_active_marker` takes the lock internally; the guarded closure
@@ -1333,10 +1400,25 @@ mod tests {
             "marker written under the lock reads live"
         );
         #[cfg(unix)]
-        assert!(
-            dir.join(ACTIVE_LOCK).exists(),
-            "the lock file persists (never unlinked) for stable, race-free locking"
-        );
+        {
+            let lock = lock_path_for(&dir);
+            assert!(
+                lock.exists(),
+                "the lock file persists (never unlinked) for stable, race-free locking"
+            );
+            assert!(
+                !dir.join(ACTIVE_LOCK).exists(),
+                "the lock lives beside the run dir, not inside the reapable directory"
+            );
+            // Reaping the run dir must not remove the sidecar lock.
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                lock.exists(),
+                "removing the run dir leaves the sidecar lock in place"
+            );
+            let _ = std::fs::remove_file(&lock);
+        }
+        #[cfg(not(unix))]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
