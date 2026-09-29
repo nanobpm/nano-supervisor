@@ -237,11 +237,25 @@ pub fn watch(agent_pid: u32) {
     // basic-auth / NANO_AGENTIC_* secrets (the very ones the agent launch sites
     // strip) to a same-user agent that reads `/proc/<watchdog-pid>/environ`.
     cmd.env_clear();
-    let _ = cmd
+    // The parent-death watchdog is a best-effort backstop, so a transient spawn
+    // failure (e.g. `fork`/exec hitting a resource limit) must not abort the
+    // agent launch — on Linux `PR_SET_PDEATHSIG` ([`arm`]) still tears down the
+    // direct agent, and failing every job on a watchdog fork error under memory
+    // pressure would be worse than the residual orphan-descendants risk. But the
+    // failure must not be *silent*: surface it so an agent tree left orphaned
+    // after a daemon `kill -9` is diagnosable instead of mysterious (on macOS,
+    // where this watchdog is the only parent-death mechanism, that log is the
+    // sole signal the gap opened).
+    if let Err(e) = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        crate::worker::log(&format!(
+            "warning: parent-death watchdog failed to spawn for pid {agent_pid}: {e}"
+        ));
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

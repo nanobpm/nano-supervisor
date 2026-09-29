@@ -36,6 +36,13 @@ pub async fn provision(
         .unwrap_or(default_timeout);
 
     let workspace = workdir.join("repo");
+    // Lift any `user:token@` credential out of the URL so it is delivered to git
+    // out of band (via the credential helper in `git()`) instead of embedded in
+    // argv, where it would sit in world-readable `/proc/<git-pid>/cmdline` for
+    // the life of every clone/fetch. `fetch_url` (credential-free) is what goes
+    // on the command line; the same handle authenticates the clone and both
+    // fetches below.
+    let (fetch_url, cred) = split_url_credential(&repo.url);
     let mut args: Vec<String> = vec!["clone".into(), "--no-tags".into()];
     if let Some(depth) = repo.depth.filter(|&d| d > 0) {
         args.push("--depth".into());
@@ -60,10 +67,10 @@ pub async fn provision(
     // workspace path) beginning with `-` can never be mistaken for a clone
     // option (e.g. `--upload-pack`).
     args.push("--".into());
-    args.push(repo.url.clone());
+    args.push(fetch_url.clone());
     args.push(workspace.to_string_lossy().into_owned());
 
-    if let Err(e) = git(&args, None, timeout).await {
+    if let Err(e) = git(&args, None, timeout, cred.as_ref()).await {
         // A failed clone can still leave a *partially populated* checkout — most
         // notably a `--recurse-submodules` clone whose submodule step failed
         // after the superproject was created — with the credential-bearing URL
@@ -75,16 +82,15 @@ pub async fn provision(
         return Err(e).context("git clone failed");
     }
 
-    // `git clone` persists the *full* remote URL — including any `user:token@`
-    // userinfo — into `<workspace>/.git/config`. The agent then runs with read
-    // access to that checkout, so a credential-bearing clone URL would leave the
-    // PAT on disk (exfiltratable in the job result) even though it is redacted
-    // from logs. Rewrite the persisted origin to a credential-free URL right
-    // after the clone — *before* any later step can fail or return — so no
-    // failure path leaves the token behind (a no-op when the URL carried no
-    // credentials). The subsequent fetches below authenticate against the
-    // credential-bearing URL held only in memory (never `origin`), so the token
-    // is never written back to config.
+    // `git clone` now runs with a credential-free `fetch_url` in argv, so the
+    // persisted `<workspace>/.git/config` origin already carries no `user:token@`
+    // userinfo. This rewrite is kept as defense in depth — it re-canonicalises
+    // the origin to the scrubbed URL right after the clone (a no-op when the URL
+    // carried no credentials), so even if a future change reintroduced a
+    // credential-bearing clone URL the agent could never read the PAT from the
+    // persisted config. The clone and both fetches below authenticate via the
+    // out-of-band credential helper (see `git()`), so the token is never written
+    // to config or placed in argv.
     let scrubbed_origin = scrub_url_credentials(&repo.url);
     if let Err(e) = git(
         &[
@@ -96,6 +102,7 @@ pub async fn provision(
         ],
         Some(&workspace),
         timeout,
+        None,
     )
     .await
     {
@@ -121,27 +128,27 @@ pub async fn provision(
 
     if let Some(sha) = &repo.sha {
         // The commit may be absent under a shallow clone: fetch it, then check
-        // it out detached. Fetch against the in-memory (possibly
-        // credential-bearing) clone URL rather than `origin` — whose persisted
-        // config we just stripped of credentials — so private-repo fetches still
-        // authenticate without re-persisting the token. `--` terminates option
-        // parsing so neither the URL nor the sha can be read as a git option.
+        // it out detached. Fetch against the credential-free `fetch_url` and let
+        // the out-of-band credential helper (see `git()`) authenticate — so the
+        // token never lands in argv or in the scrubbed-`origin` config. `--`
+        // terminates option parsing so neither the URL nor the sha can be read
+        // as a git option.
         let _ = git(
             &[
                 "fetch".into(),
                 "--no-tags".into(),
                 "--".into(),
-                repo.url.clone(),
+                fetch_url.clone(),
                 sha.clone(),
             ],
             Some(&workspace),
             timeout,
+            cred.as_ref(),
         )
         .await;
-        // `git fetch <credential-URL>` records the source URL — including its
-        // `user:token@` userinfo — in `<workspace>/.git/FETCH_HEAD`, so the PAT
-        // is left readable in the checkout even though `origin` is scrubbed.
-        // Strip it before the (fallible) checkout below can return.
+        // `git fetch` still records the (now credential-free) source URL in
+        // `<workspace>/.git/FETCH_HEAD`; the scrub is retained as defense in
+        // depth before the (fallible) checkout below can return.
         if let Err(e) = scrub_fetch_head(&workspace) {
             remove_partial_checkout(&workspace).await;
             return Err(e).context("scrubbing fetch metadata credentials failed");
@@ -150,6 +157,7 @@ pub async fn provision(
             &["checkout".into(), "--detach".into(), sha.clone()],
             Some(&workspace),
             timeout,
+            None,
         )
         .await
         .with_context(|| format!("git checkout {sha} failed"))?;
@@ -162,25 +170,29 @@ pub async fn provision(
             &[
                 "fetch".into(),
                 "--no-tags".into(),
-                // Fetch against the in-memory clone URL (not the
-                // credential-stripped `origin`) so a private base still
-                // authenticates without re-persisting the token. `--` terminates
-                // option parsing so neither the URL nor a job-supplied base ref
-                // beginning with `-` (e.g. `--upload-pack=…`) can be read as a
-                // `git fetch` option, mirroring the `git clone` URL guard.
+                // Fetch against the credential-free `fetch_url`; the out-of-band
+                // credential helper (see `git()`) supplies the token so a private
+                // base still authenticates without the secret ever reaching argv
+                // (world-readable `/proc/<pid>/cmdline`) or the scrubbed origin.
+                // `--` terminates option parsing so neither the URL nor a
+                // job-supplied base ref beginning with `-` (e.g.
+                // `--upload-pack=…`) can be read as a `git fetch` option,
+                // mirroring the `git clone` URL guard.
                 "--".into(),
-                repo.url.clone(),
+                fetch_url.clone(),
                 base.clone(),
             ],
             Some(&workspace),
             timeout,
+            cred.as_ref(),
         )
         .await;
     }
 
-    // The base fetch above (like the sha fetch) records its credential-bearing
-    // source URL in `.git/FETCH_HEAD`. Scrub it once more before handing the
-    // workspace to the agent so no fetch path leaves a token on disk.
+    // The base fetch above (like the sha fetch) records its source URL in
+    // `.git/FETCH_HEAD`. It is credential-free now that the token is delivered
+    // out of band, but the scrub is kept as defense in depth before handing the
+    // workspace to the agent so no fetch path can ever leave a token on disk.
     if let Err(e) = scrub_fetch_head(&workspace) {
         remove_partial_checkout(&workspace).await;
         return Err(e).context("scrubbing fetch metadata credentials failed");
@@ -346,6 +358,74 @@ fn is_hex_sha(s: &str) -> bool {
     (7..=40).contains(&n) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Credentials lifted out of a remote URL so they are handed to git *out of
+/// band* rather than embedded in its argv. A `user:token@` URL passed on the
+/// command line leaves the token in `/proc/<git-pid>/cmdline`, which is
+/// world-readable on a default Linux host, so any local process can read the
+/// PAT for the lifetime of the clone/fetch — scrubbing the on-disk
+/// `origin`/`FETCH_HEAD` afterward does not close that live exposure. Supplying
+/// the secret through git's credential-helper protocol keeps it in the child's
+/// environment (`/proc/<pid>/environ`, readable only by the owning user)
+/// instead.
+struct GitCredential {
+    /// Host (without port) the credential is scoped to, so the helper never
+    /// hands the token to a differently-hosted submodule remote.
+    host: String,
+    username: String,
+    password: String,
+}
+
+/// Split a remote URL into `(url_for_argv, credential)`: the returned URL has
+/// any `user:secret@` userinfo removed (safe to place in argv), and the
+/// credential — when the URL carried one — is returned separately for
+/// out-of-band delivery via [`git`]'s credential helper.
+///
+/// The userinfo is split on its first `:` into username/password; a userinfo
+/// with no `:` (the `https://<token>@host` token-as-username form) becomes the
+/// username with an empty password, mirroring how git itself would interpret
+/// the original URL. A credential-free URL yields `(url, None)` and is returned
+/// byte-for-byte unchanged.
+fn split_url_credential(url: &str) -> (String, Option<GitCredential>) {
+    let sanitized = scrub_url_credentials(url);
+    // Only the `scheme://[userinfo@]authority…` form carries an embeddable
+    // credential; anything else (or a URL the scrub left untouched) has none.
+    let Some(pos) = url.find("://") else {
+        return (sanitized, None);
+    };
+    let after = pos + 3;
+    let tail = &url[after..];
+    let auth_end = tail
+        .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+        .unwrap_or(tail.len());
+    let authority = &tail[..auth_end];
+    let Some(at) = authority.rfind('@') else {
+        return (sanitized, None);
+    };
+    let userinfo = &authority[..at];
+    let hostport = &authority[at + 1..];
+    // `hostport` is already past the last `@`, so it is `host[:port]`; scope the
+    // credential on the bare host (git's `host` request field omits a default
+    // port, and we strip any explicit `:port` before comparing).
+    let host = hostport.split(':').next().unwrap_or(hostport).to_string();
+    let (username, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => (userinfo.to_string(), String::new()),
+    };
+    if host.is_empty() || username.is_empty() {
+        // Nothing usable to scope/authenticate with — fall back to the sanitized
+        // URL alone (git will consult its own credential machinery as before).
+        return (sanitized, None);
+    }
+    (
+        sanitized,
+        Some(GitCredential {
+            host,
+            username,
+            password,
+        }),
+    )
+}
+
 /// Strip `user:secret@` userinfo from every `scheme://…@authority` occurrence in
 /// arbitrary text (such as a git stderr tail). Git can echo a credential-bearing
 /// remote URL in its diagnostics, and that text is propagated into job-failure
@@ -378,9 +458,37 @@ fn scrub_url_credentials(text: &str) -> String {
     out
 }
 
-async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
+async fn git(
+    args: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    cred: Option<&GitCredential>,
+) -> Result<()> {
     use std::process::Stdio;
     let mut cmd = Command::new("git");
+    // A credential is delivered out of band via git's credential-helper
+    // protocol so the secret never reaches argv (world-readable
+    // `/proc/<pid>/cmdline`). The helper snippet itself is not secret — it only
+    // names env vars — and is host-scoped so a `--recurse-submodules` fetch to a
+    // different host is never handed this repo's token. The empty
+    // `credential.helper=` first resets any host/global helper so ours is the
+    // only one consulted. These `-c` flags must precede the git subcommand.
+    if let Some(c) = cred {
+        // Read the request on stdin (draining it), emit the credential only for
+        // a `get` on the matching host, and ignore `store`/`erase`.
+        let helper = "!f() { \
+            test \"$1\" = get || exit 0; \
+            h=; \
+            while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
+            test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
+            printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$NANO_GIT_CRED_PASS\"; \
+        }; f";
+        cmd.arg("-c").arg("credential.helper=");
+        cmd.arg("-c").arg(format!("credential.helper={helper}"));
+        cmd.env("NANO_GIT_CRED_HOST", &c.host);
+        cmd.env("NANO_GIT_CRED_USER", &c.username);
+        cmd.env("NANO_GIT_CRED_PASS", &c.password);
+    }
     cmd.args(args);
     // Kill (and reap) the git child if this future is dropped — e.g. when the
     // timeout below fires — so a timed-out clone/fetch can't keep running and
@@ -587,6 +695,49 @@ mod tests {
             scrub_url_credentials("https://github.com/org/repo.git"),
             "https://github.com/org/repo.git"
         );
+    }
+
+    #[test]
+    fn split_url_credential_lifts_secret_out_of_argv() {
+        // A `user:token@` URL yields a credential-free URL for argv plus the
+        // credential (host-scoped) for out-of-band delivery. Build the userinfo
+        // at runtime so no credential-like literal is stored in source.
+        let (user, pass) = ("x-access-token", "s3cr3tPAT");
+        let url = format!("https://{user}:{pass}@github.com/org/repo.git");
+        let (argv_url, cred) = split_url_credential(&url);
+        assert_eq!(argv_url, "https://github.com/org/repo.git");
+        assert!(!argv_url.contains(pass) && !argv_url.contains('@'));
+        let cred = cred.expect("credential lifted from userinfo URL");
+        assert_eq!(cred.host, "github.com");
+        assert_eq!(cred.username, user);
+        assert_eq!(cred.password, pass);
+
+        // Token-as-username form (`https://<token>@host`) becomes username with
+        // an empty password, mirroring git's own interpretation.
+        let url = format!("https://{pass}@github.com/org/repo.git");
+        let (argv_url, cred) = split_url_credential(&url);
+        assert_eq!(argv_url, "https://github.com/org/repo.git");
+        let cred = cred.expect("token-as-username credential lifted");
+        assert_eq!(cred.username, pass);
+        assert!(cred.password.is_empty());
+        assert_eq!(cred.host, "github.com");
+
+        // An explicit port is stripped from the scoped host (git sends `host`
+        // without the default-port suffix; scope on the bare host).
+        let url = format!("https://{user}:{pass}@example.com:8443/o/r.git");
+        let cred = split_url_credential(&url).1.expect("credential expected");
+        assert_eq!(cred.host, "example.com");
+
+        // A credential-free URL is returned byte-for-byte with no credential.
+        let plain = "https://github.com/org/repo.git";
+        let (argv_url, cred) = split_url_credential(plain);
+        assert_eq!(argv_url, plain);
+        assert!(cred.is_none());
+
+        // A non-URL (e.g. a local path) is passed through with no credential.
+        let (argv_url, cred) = split_url_credential("/tmp/local/repo");
+        assert_eq!(argv_url, "/tmp/local/repo");
+        assert!(cred.is_none());
     }
 
     #[test]
