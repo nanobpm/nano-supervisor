@@ -1,3 +1,10 @@
+[workspace]
+# The root package plus the black-box contract-test suite (issues #3/#4/#5).
+# Keeping them in one workspace means `cargo test --workspace` and the pinned
+# toolchain / `Cargo.lock` cover both, and the Rust target of the suite resolves
+# `target/debug/nano-supervisor` from the same build.
+members = ["contract-tests"]
+
 [package]
 name = "nano-supervisor"
 version = "0.0.1"
@@ -9,7 +16,7 @@ publish = false
 
 [dependencies]
 # 0.3.0 is the first release with job leases (`with_lease`, `job_lease_token`).
-camunda-orchestration-sdk = { version = "0.3", default-features = false, features = ["rustls"] }
+camunda-orchestration-sdk = { version = "0.3.1", default-features = false, features = ["rustls"] }
 anyhow = "1"
 # Raw job commands in the Nano engine's dialect (src/jobs.rs); same reqwest as the SDK.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

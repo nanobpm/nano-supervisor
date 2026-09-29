@@ -1,0 +1,26 @@
+[package]
+name = "contract-tests"
+version = "0.0.1"
+edition = "2021"
+description = "Black-box contract tests for the nano fleet (CLI, state, control socket, agentic hub)"
+license = "Apache-2.0"
+repository = "https://github.com/nanobpm/nano-supervisor"
+publish = false
+
+# Black-box only: the suite runs the CLIs as subprocesses, reads/writes the state
+# files and talks to `supervisor.sock`. It never links nano-supervisor internals,
+# so the very same test runs against the Node plugin (`NS_TARGET=node`) and the
+# Rust binary (`NS_TARGET=rust`).
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# `preserve_order` keeps JSON object key order through decode -> re-encode, so a
+# frame's payload bytes round-trip identically to the golden hex.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json", "redactions", "filters"] }

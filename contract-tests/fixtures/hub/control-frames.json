@@ -1,0 +1,103 @@
+[
+  {
+    "name": "prompt-structured",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"prompt\",\"text\":\"run the tests\"}",
+    "frame": {
+      "kind": "prompt",
+      "text": "run the tests"
+    },
+    "structured": true,
+    "roundTrips": true
+  },
+  {
+    "name": "prompt-structured-empty-text",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"prompt\",\"text\":\"\"}",
+    "frame": {
+      "kind": "prompt",
+      "text": ""
+    },
+    "structured": true,
+    "roundTrips": true
+  },
+  {
+    "name": "cancel-structured",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"cancel\"}",
+    "frame": {
+      "kind": "cancel"
+    },
+    "structured": true,
+    "roundTrips": true
+  },
+  {
+    "name": "cancel-structured-with-reason",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"cancel\",\"reason\":\"operator interrupt\"}",
+    "frame": {
+      "kind": "cancel",
+      "reason": "operator interrupt"
+    },
+    "structured": true,
+    "roundTrips": true
+  },
+  {
+    "name": "permission-granted",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"permission\",\"requestId\":\"req-7\",\"outcome\":\"granted\"}",
+    "frame": {
+      "kind": "permission",
+      "requestId": "req-7",
+      "outcome": "granted"
+    },
+    "structured": true,
+    "roundTrips": true
+  },
+  {
+    "name": "permission-denied",
+    "chunk": "{\"nanoControlFrame\":1,\"kind\":\"permission\",\"requestId\":\"req-8\",\"outcome\":\"denied\"}",
+    "frame": {
+      "kind": "permission",
+      "requestId": "req-8",
+      "outcome": "denied"
+    },
+    "structured": true,
+    "roundTrips": true
+  },
+  {
+    "name": "legacy-keystroke-line",
+    "chunk": "ls -la\n",
+    "frame": {
+      "kind": "prompt",
+      "text": "ls -la\n"
+    },
+    "structured": false,
+    "roundTrips": false
+  },
+  {
+    "name": "legacy-control-c",
+    "chunk": "\u0003",
+    "frame": {
+      "kind": "prompt",
+      "text": "\u0003"
+    },
+    "structured": false,
+    "roundTrips": false
+  },
+  {
+    "name": "legacy-json-number-is-not-a-frame",
+    "chunk": "42",
+    "frame": {
+      "kind": "prompt",
+      "text": "42"
+    },
+    "structured": false,
+    "roundTrips": false
+  },
+  {
+    "name": "legacy-untagged-json-object",
+    "chunk": "{\"kind\":\"prompt\",\"text\":\"not tagged\"}",
+    "frame": {
+      "kind": "prompt",
+      "text": "{\"kind\":\"prompt\",\"text\":\"not tagged\"}"
+    },
+    "structured": false,
+    "roundTrips": false
+  }
+]

@@ -1,0 +1,5 @@
+---
+source: contract-tests/tests/cli.rs
+expression: out.stderr
+---
+{"status":"info","message":"No hires yet. Create one with: c8ctl nano hire"}
