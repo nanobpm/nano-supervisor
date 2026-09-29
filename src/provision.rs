@@ -209,11 +209,13 @@ async fn remove_partial_checkout(workspace: &Path) {
 /// `config` file under `.git/modules` and rewrite any embedded credential URL to
 /// its credential-free form, so no token is left on disk for the agent to read.
 ///
-/// Directory recursion and file rewrites use `file_type()` (which does not follow
-/// symlinks), so a symlinked entry is never traversed into or written through —
-/// a local process cannot redirect the scrub via a planted link. Errors are
-/// propagated so the caller can remove the whole checkout rather than return one
-/// that may still hold a token.
+/// Directory recursion uses `file_type()` (which does not follow symlinks), so a
+/// symlinked entry is never traversed into, and each `config` rewrite goes
+/// through an atomic no-follow open (`scrub_file_credentials_in_place`) so a
+/// symlink planted at the leaf between the `file_type()` check and the write
+/// cannot redirect the scrub outside the checkout. Errors are propagated so the
+/// caller can remove the whole checkout rather than return one that may still
+/// hold a token.
 fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     let modules = workspace.join(".git").join("modules");
     // Resolve the root with `symlink_metadata` (which does NOT follow symlinks):
@@ -243,13 +245,7 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
             if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() && entry.file_name() == "config" {
-                let contents = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                let scrubbed = scrub_url_credentials(&contents);
-                if scrubbed != contents {
-                    std::fs::write(&path, scrubbed)
-                        .with_context(|| format!("rewriting {}", path.display()))?;
-                }
+                scrub_file_credentials_in_place(&path)?;
             }
         }
     }
@@ -262,23 +258,85 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
 /// would leave the PAT readable in the checkout the agent receives. Rewrite any
 /// embedded credential URL to its credential-free form in place.
 ///
-/// Symlink-safe: the file is resolved with `symlink_metadata` and only rewritten
-/// when it is a real regular file, so a planted symlink at `.git/FETCH_HEAD`
-/// cannot redirect the write outside the checkout. A missing file is a no-op.
+/// Symlink-safe: the rewrite goes through an atomic no-follow open
+/// (`scrub_file_credentials_in_place`), so a symlink planted at `.git/FETCH_HEAD`
+/// between any check and the write is never followed and cannot redirect the
+/// write outside the checkout. A missing or non-regular file is a no-op.
 fn scrub_fetch_head(workspace: &Path) -> Result<()> {
     let fetch_head = workspace.join(".git").join("FETCH_HEAD");
-    match std::fs::symlink_metadata(&fetch_head) {
-        Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", fetch_head.display())),
+    scrub_file_credentials_in_place(&fetch_head)
+}
+
+/// Rewrite `path` in place with any embedded git credentials scrubbed, holding
+/// the checked inode open for the whole read-modify-write so a symlink planted at
+/// `path` between an earlier `file_type()`/`symlink_metadata` check and this
+/// rewrite cannot redirect the write outside the checkout (a TOCTOU that a
+/// separate `symlink_metadata`-then-`std::fs::write` pair leaves open).
+///
+/// On unix the leaf is opened `O_NOFOLLOW` (a swapped-in symlink fails the open
+/// with `ELOOP`) and `O_NONBLOCK` (the leaf is attacker-plantable, so it could be
+/// a FIFO whose open would otherwise block the worker thread — special files are
+/// then rejected by the regular-file guard). On other platforms a symlink is
+/// rejected explicitly (best-effort; such targets are not supported daemon
+/// hosts). A missing or non-regular file is a no-op.
+fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        match opts.open(path) {
+            Ok(f) => f,
+            // ENOENT: nothing to scrub. ELOOP: the leaf is a symlink (someone
+            // planted one) — skip it rather than follow it outside the checkout.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        }
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        // No atomic no-follow open here: reject a symlink explicitly so the
+        // documented no-symlink guarantee still holds.
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?
+    };
+
+    // Only rewrite a real regular file; a FIFO/device/dir opened above is skipped
+    // so the read below can never block or misbehave on a special file.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Ok(());
     }
-    let contents = std::fs::read_to_string(&fetch_head)
-        .with_context(|| format!("reading {}", fetch_head.display()))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("reading {}", path.display()))?;
     let scrubbed = scrub_url_credentials(&contents);
     if scrubbed != contents {
-        std::fs::write(&fetch_head, scrubbed)
-            .with_context(|| format!("rewriting {}", fetch_head.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking {}", path.display()))?;
+        file.set_len(0)
+            .with_context(|| format!("truncating {}", path.display()))?;
+        file.write_all(scrubbed.as_bytes())
+            .with_context(|| format!("rewriting {}", path.display()))?;
     }
     Ok(())
 }

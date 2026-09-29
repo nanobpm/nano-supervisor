@@ -164,7 +164,11 @@ pub fn env_has_oauth() -> bool {
 }
 
 /// Engine address and basic-auth credentials for the raw Nano job client:
-/// the profile's settings, else the `CAMUNDA_*` environment, else localhost.
+/// the profile's settings, else the `CAMUNDA_*`/`ZEEBE_*` environment, else
+/// localhost. Both the address and the basic-auth username/password honour the
+/// `ZEEBE_*` aliases (the SDK accepts either prefix), so a connection configured
+/// with `ZEEBE_REST_ADDRESS` + `ZEEBE_BASIC_AUTH_*` still sends an Authorization
+/// header instead of silently going out unauthenticated.
 /// (OAuth is not supported on this path; the spike only needs none/basic.)
 pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(String, String)>) {
     let settings = profile.map(sdk_settings).unwrap_or_default();
@@ -178,8 +182,8 @@ pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(Str
         .or_else(|| get("ZEEBE_REST_ADDRESS"))
         .unwrap_or_else(|| "http://localhost:8080".into());
     let basic = match (
-        get("CAMUNDA_BASIC_AUTH_USERNAME"),
-        get("CAMUNDA_BASIC_AUTH_PASSWORD"),
+        get("CAMUNDA_BASIC_AUTH_USERNAME").or_else(|| get("ZEEBE_BASIC_AUTH_USERNAME")),
+        get("CAMUNDA_BASIC_AUTH_PASSWORD").or_else(|| get("ZEEBE_BASIC_AUTH_PASSWORD")),
     ) {
         (Some(u), Some(p)) => Some((u, p)),
         _ => None,
@@ -250,6 +254,34 @@ mod tests {
         assert!(!env_has_oauth());
         std::env::set_var("ZEEBE_AUTH_STRATEGY", "OAUTH");
         assert!(env_has_oauth());
+        // Restore prior environment so parallel tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn nano_client_reads_zeebe_basic_auth_aliases() {
+        // The raw Nano client honours the ZEEBE_* basic-auth aliases the same way
+        // it honours ZEEBE_REST_ADDRESS: a ZEEBE_BASIC_AUTH_* setup must still send
+        // an Authorization header instead of going out unauthenticated.
+        let keys = [
+            "CAMUNDA_BASIC_AUTH_USERNAME",
+            "CAMUNDA_BASIC_AUTH_PASSWORD",
+            "ZEEBE_BASIC_AUTH_USERNAME",
+            "ZEEBE_BASIC_AUTH_PASSWORD",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("ZEEBE_BASIC_AUTH_USERNAME", "zuser");
+        std::env::set_var("ZEEBE_BASIC_AUTH_PASSWORD", "zpass");
+        let (_addr, basic) = rest_address_and_basic(None);
+        assert_eq!(basic, Some(("zuser".to_string(), "zpass".to_string())));
         // Restore prior environment so parallel tests are unaffected.
         for (k, v) in saved {
             match v {

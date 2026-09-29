@@ -52,7 +52,8 @@ enum Cmd {
         /// Worker name reported to the engine (default ‹host›-spike-‹pid›).
         #[arg(long)]
         name: Option<String>,
-        /// Activation window in ms, refreshed every third while the agent runs.
+        /// Activation window in ms, refreshed every third while the agent runs (floored
+        /// at a safe minimum so a zero/tiny window cannot drive rapid refreshes).
         #[arg(long, default_value_t = 300_000)]
         recovery_window: u64,
         /// Kill the agent after this many ms without output.
@@ -87,7 +88,8 @@ enum Cmd {
         /// Only run these hires by name (repeatable); default = every hire.
         #[arg(long = "hire")]
         hire: Vec<String>,
-        /// Activation window in ms, refreshed every third while the agent runs.
+        /// Activation window in ms, refreshed every third while the agent runs (floored
+        /// at a safe minimum so a zero/tiny window cannot drive rapid refreshes).
         #[arg(long, default_value_t = 300_000)]
         recovery_window: u64,
         /// Kill the agent after this many ms without output.
@@ -130,6 +132,18 @@ enum Cmd {
     },
 }
 
+/// Floor for `--recovery-window`: the activation window doubles as the refresher's
+/// cadence source (it extends every third of the window). A zero or 1–2 ms window
+/// expires immediately and drives the refresher to issue extend requests as fast
+/// as the loop can run, hammering the engine for an activation that is already
+/// expiring. Clamp any CLI value up to a meaningful minimum so a degenerate input
+/// can never produce an unsafe refresh cadence.
+const MIN_RECOVERY_WINDOW: Duration = Duration::from_millis(1000);
+
+fn clamp_recovery_window(ms: u64) -> Duration {
+    Duration::from_millis(ms).max(MIN_RECOVERY_WINDOW)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -160,7 +174,7 @@ async fn main() -> Result<()> {
                 worker_name: name.unwrap_or_else(default_name),
                 agent_program: program,
                 agent_args: parts.collect(),
-                recovery_window: Duration::from_millis(recovery_window),
+                recovery_window: clamp_recovery_window(recovery_window),
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
@@ -191,7 +205,7 @@ async fn main() -> Result<()> {
                 with_lease,
                 slots: slots.max(1),
                 only: hire,
-                recovery_window: Duration::from_millis(recovery_window),
+                recovery_window: clamp_recovery_window(recovery_window),
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 clone_timeout: Duration::from_millis(clone_timeout),
@@ -256,4 +270,21 @@ fn default_name() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "host".into());
     format!("{host}-spike-{}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_recovery_window, MIN_RECOVERY_WINDOW};
+    use std::time::Duration;
+
+    #[test]
+    fn clamp_recovery_window_floors_degenerate_values() {
+        // A zero or 1–2 ms window would expire immediately and drive rapid
+        // refreshes; the clamp must lift any sub-minimum value to the floor.
+        assert_eq!(clamp_recovery_window(0), MIN_RECOVERY_WINDOW);
+        assert_eq!(clamp_recovery_window(1), MIN_RECOVERY_WINDOW);
+        assert_eq!(clamp_recovery_window(999), MIN_RECOVERY_WINDOW);
+        // A comfortably large window passes through unchanged.
+        assert_eq!(clamp_recovery_window(300_000), Duration::from_millis(300_000));
+    }
 }
