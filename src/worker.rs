@@ -495,23 +495,30 @@ fn stable_namespace(worker_name: &str, job_type: &str, name_generated: bool) -> 
     // readable, restart-stable prefix but append a short deterministic digest
     // of the *raw* (base, job_type) identity so distinct roles never collide.
     let readable = sanitize_component(&format!("{base}-{job_type}"));
-    format!("{readable}-{}", identity_digest(base, job_type))
+    format!("{readable}-{}", identity_digest(base, job_type, name_generated))
 }
 
-/// A short, deterministic hex digest of a worker's raw `(base, job_type)`
-/// identity. Used to disambiguate run-root namespaces whose readable form is
-/// lossy (see `stable_namespace`). Uses FNV-1a, a simple non-cryptographic hash
-/// with a fully specified, stable output across Rust versions and platforms —
-/// unlike `DefaultHasher`, whose keys/algorithm may change between releases and
-/// would silently move run roots on upgrade. A domain separator between the two
-/// fields prevents `("a-b", "c")` from colliding with `("a", "b-c")`.
-fn identity_digest(base: &str, job_type: &str) -> String {
+/// A short, deterministic hex digest of a worker's raw `(base, job_type,
+/// name_generated)` identity. Used to disambiguate run-root namespaces whose
+/// readable form is lossy (see `stable_namespace`). Uses FNV-1a, a simple
+/// non-cryptographic hash with a fully specified, stable output across Rust
+/// versions and platforms — unlike `DefaultHasher`, whose keys/algorithm may
+/// change between releases and would silently move run roots on upgrade. A
+/// domain separator between the fields prevents `("a-b", "c")` from colliding
+/// with `("a", "b-c")`. `name_generated` is folded in as a trailing
+/// domain-separated discriminator so an explicit `--name` equal to the *stripped*
+/// default (`host-spike`) does not share a namespace with a generated
+/// `host-spike-<pid>` that strips to the same base — both yield `base =
+/// "host-spike"`, so only this flag tells them apart.
+fn identity_digest(base: &str, job_type: &str, name_generated: bool) -> String {
     // FNV-1a 64-bit: offset basis 14695981039346656037, prime 1099511628211.
     let mut h: u64 = 14695981039346656037;
     for byte in base
         .bytes()
         .chain(std::iter::once(0u8))
         .chain(job_type.bytes())
+        .chain(std::iter::once(0u8))
+        .chain(std::iter::once(u8::from(name_generated)))
     {
         h ^= byte as u64;
         h = h.wrapping_mul(1099511628211);
@@ -1274,13 +1281,26 @@ fn git_with_timeout(
     timeout: Duration,
 ) -> Result<Option<std::process::Output>> {
     use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // Put git in its OWN process group so a timeout can terminate the whole
+    // group, not just the direct `git` process. `git push` forks a transport
+    // (e.g. ssh) and may run hooks; `Child::kill()` signals only the direct
+    // child, so a hung transport/hook is reparented to init and runs past the
+    // deadline — breaking the bounded-push guarantee and leaking processes
+    // across jobs. As group leader (pgid == child pid) the whole group can be
+    // reaped on timeout (see `terminate_process_group`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("running git {}", args.join(" ")))?;
     let start = Instant::now();
@@ -1289,7 +1309,7 @@ fn git_with_timeout(
             return Ok(Some(child.wait_with_output()?));
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_process_group(&mut child);
             let _ = child.wait();
             log(&format!(
                 "finalize: git {} exceeded {}s; terminated",
@@ -1300,6 +1320,23 @@ fn git_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// SIGKILL the child's entire process group so a `git push`'s transport (ssh)
+/// and any hooks it spawned are reaped, not just the direct `git` process. git
+/// is spawned as its own group leader (pgid == child pid), so the negated pid
+/// addresses the whole group. Best-effort: a race where the group already exited
+/// (ESRCH) is fine. The direct child is also killed as a portable fallback (and
+/// on non-Unix platforms, the only action).
+fn terminate_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 pub fn log(msg: &str) {
@@ -1376,6 +1413,22 @@ mod tests {
             "generated default is PID-stripped for restart-stability"
         );
         assert_ne!(a, g1, "explicit and generated forms are not conflated");
+    }
+
+    #[test]
+    fn namespace_distinguishes_explicit_name_equal_to_stripped_default() {
+        // Regression: an explicit `--name host-spike` (already the *stripped*
+        // default form) yields `base = "host-spike"`, exactly like a generated
+        // `host-spike-<pid>` after its `-<pid>` suffix is stripped. Both share
+        // the same readable prefix AND the same (base, job_type), so only the
+        // `name_generated` flag distinguishes them — it must, or the two workers
+        // would share one run root and reap each other's runs.
+        let explicit = stable_namespace("host-spike", "job", false);
+        let generated = stable_namespace("host-spike-123", "job", true);
+        assert_ne!(
+            explicit, generated,
+            "explicit name equal to the stripped default must not collide with the generated default"
+        );
     }
 
     #[test]
@@ -1689,11 +1742,23 @@ mod tests {
         // expected values were computed once and must never change — if they do,
         // the digest algorithm changed and run-root namespaces would silently
         // move on upgrade, breaking resume/sweeping.
-        assert_eq!(identity_digest("host-spike", "my-job"), "92de5acbe0c2795c");
-        assert_eq!(identity_digest("a-b", "c"), "bbb579af31626ace");
-        assert_eq!(identity_digest("a", "b-c"), "3f6e36fc8463a48a");
+        assert_eq!(
+            identity_digest("host-spike", "my-job", true),
+            "4e25bd78637a056f"
+        );
+        assert_eq!(identity_digest("a-b", "c", true), "654d4d9e0313c6b1");
+        assert_eq!(identity_digest("a", "b-c", true), "f28ebd9cd7efb9cd");
         // Domain separator: ("a-b", "c") and ("a", "b-c") must differ.
-        assert_ne!(identity_digest("a-b", "c"), identity_digest("a", "b-c"));
+        assert_ne!(
+            identity_digest("a-b", "c", true),
+            identity_digest("a", "b-c", true)
+        );
+        // The `name_generated` flag is part of the identity: the same
+        // (base, job_type) with a different flag must yield a different digest.
+        assert_ne!(
+            identity_digest("host-spike", "my-job", true),
+            identity_digest("host-spike", "my-job", false)
+        );
     }
 
     #[test]
