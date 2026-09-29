@@ -222,6 +222,14 @@ async fn git(args: &[String], cwd: Option<&Path>, timeout: Duration) -> Result<(
     }
     // Never prompt for credentials interactively (would hang the slot).
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Strip the daemon's own engine-connection secrets from the inherited
+    // environment before spawning git, exactly as the ACP/pipe launch sites do:
+    // git runs job-controlled remote URLs and credential/remote helpers, so a
+    // hostile repo config or helper could otherwise read `CAMUNDA_*`/`ZEEBE_*`
+    // client secrets and basic-auth passwords straight out of the environment.
+    for k in crate::slot::SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
     cmd.stdin(Stdio::null())
         // stdout is never consumed (git() returns `()`); discard it so a
         // job-controlled remote can't exhaust memory by flooding it.

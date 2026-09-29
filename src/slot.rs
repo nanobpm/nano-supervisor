@@ -505,6 +505,8 @@ pub(crate) const SENSITIVE_DAEMON_ENV: &[&str] = &[
     "CAMUNDA_BASIC_AUTH_PASSWORD",
     "ZEEBE_CLIENT_ID",
     "ZEEBE_CLIENT_SECRET",
+    "ZEEBE_BASIC_AUTH_USERNAME",
+    "ZEEBE_BASIC_AUTH_PASSWORD",
 ];
 
 /// The environment every harness gets: the reserved `AGENT_*`/`NANO_*` vars, the
@@ -605,6 +607,11 @@ mod tests {
             "CAMUNDA_CLIENT_SECRET",
             "ZEEBE_CLIENT_SECRET",
             "CAMUNDA_BASIC_AUTH_PASSWORD",
+            // The SDK also accepts the `ZEEBE_*` aliases as an ambient
+            // connection source (see `profile::env_has_oauth`), so basic-auth
+            // credentials supplied that way must be stripped too.
+            "ZEEBE_BASIC_AUTH_USERNAME",
+            "ZEEBE_BASIC_AUTH_PASSWORD",
         ] {
             assert!(
                 SENSITIVE_DAEMON_ENV.contains(&k),
