@@ -872,8 +872,17 @@ fn marker_pid(token: &str) -> Option<u32> {
 /// Fail-safe throughout: an unparseable PID, or an inability to read the current
 /// start time, is treated as live so a possibly-active cwd is never reaped.
 fn marker_token_is_live(token: &str) -> bool {
+    // A blank recorded start token (e.g. the partial marker write `"<pid>:"`,
+    // where a crash interrupted the worker between emitting the PID and its
+    // start token) is NOT a real token: comparing a live PID's true `ps` start
+    // time against `""` can never match, which would wrongly report the run as
+    // not live and reap a possibly-active cwd. Treat an empty/blank start token
+    // as absent so we fall back to the PID-only fail-safe path below.
     let (pid_str, recorded_start) = match token.split_once(':') {
-        Some((pid, start)) => (pid, Some(start.trim())),
+        Some((pid, start)) => {
+            let start = start.trim();
+            (pid, if start.is_empty() { None } else { Some(start) })
+        }
         None => (token, None),
     };
     let Ok(pid) = pid_str.trim().parse::<u32>() else {
@@ -1421,6 +1430,29 @@ mod tests {
         assert!(
             !marker_owner_alive(&dir),
             "a dead PID must read as not live"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_with_blank_start_token_reads_live() {
+        // A partial marker write `"<live-pid>:"` (a crash between emitting the
+        // PID and its start token) leaves an empty start token. It must NOT be
+        // compared against the live PID's real `ps` start time — that can never
+        // match `""` and would wrongly reap a still-live run dir. An empty start
+        // token falls back to the PID-only fail-safe, so our own live PID reads
+        // as live.
+        let dir = std::env::temp_dir().join(format!("ns-blank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(ACTIVE_MARKER),
+            format!("{}:", std::process::id()),
+        )
+        .unwrap();
+        assert!(
+            marker_owner_alive(&dir),
+            "a live PID with a blank start token must read as live (fail-safe)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
