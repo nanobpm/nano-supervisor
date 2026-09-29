@@ -176,6 +176,15 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         // Drop the watch guard immediately; the abort/await happens below.
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
+    // Stop the refresher and wait for it to fully exit BEFORE sampling the
+    // activation-loss watch, so the watch value cannot change under us. If we
+    // sampled first and aborted afterwards, the refresher could publish a
+    // 404/409 loss in the window between our `borrow()` and `refresher.abort()`,
+    // and we would then settle the job with a stale lease — violating the
+    // no-settle-after-fencing guarantee. Once the task is joined no further
+    // writes to the watch can happen, so the value we read below is final.
+    refresher.abort();
+    let _ = refresher.await;
     // Re-check the activation-loss watch after the select. `select!` can pick the
     // `exec` branch even when the refresher set `lost` to true in the same tick
     // (both futures are ready), which would otherwise settle the job with a stale
@@ -190,7 +199,6 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         exec.abort();
         let _ = exec.await;
     }
-    refresher.abort();
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
 
