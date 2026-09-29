@@ -372,7 +372,15 @@ async fn execute(
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
 
     let (result_obj, detect_stdout) = match cfg.hire.protocol {
-        Protocol::Acp => run_acp(&cfg, &key, &agent_cwd, &prompt, &result_file, &agent_env).await?,
+        Protocol::Acp => {
+            // The pipe payload is recursively credential-scrubbed in
+            // `build_pipe_payload`, but the ACP branch forwards the prompt
+            // verbatim. A prompt carrying a `user:token@` clone URL would
+            // otherwise leak the PAT to the ACP agent (and its tools/results),
+            // so scrub the prompt with the same URL redactor before `run_acp`.
+            let safe_prompt = redact_url(&prompt);
+            run_acp(&cfg, &key, &agent_cwd, &safe_prompt, &result_file, &agent_env).await?
+        }
         Protocol::Pipe => {
             run_pipe(&cfg, &key, &agent_cwd, &env, &job, &result_file, &agent_env).await?
         }
@@ -768,5 +776,23 @@ mod tests {
             "clone credential must not reach the agent payload: {payload}"
         );
         assert!(payload.contains("https://github.com/o/r.git"));
+    }
+
+    #[test]
+    fn acp_prompt_is_redacted_of_clone_credentials() {
+        // The ACP branch forwards the prompt verbatim, so a credential URL
+        // embedded in a task prompt must be scrubbed by the same `redact_url`
+        // path the pipe payload uses before it reaches the ACP agent. Build the
+        // userinfo at runtime so no credential-like literal is stored in source.
+        let token = format!("{}-{}", "x-access", "token");
+        let secret = format!("pat{}value", 1234);
+        let prompt = format!("clone https://{token}:{secret}@github.com/o/r.git and build");
+        let safe_prompt = redact_url(&prompt);
+        assert!(
+            !safe_prompt.contains(&secret),
+            "clone credential must not reach the ACP agent prompt: {safe_prompt}"
+        );
+        assert!(safe_prompt.contains("https://github.com/o/r.git"));
+        assert!(safe_prompt.contains("and build"));
     }
 }

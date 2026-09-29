@@ -138,6 +138,14 @@ pub async fn provision(
             timeout,
         )
         .await;
+        // `git fetch <credential-URL>` records the source URL — including its
+        // `user:token@` userinfo — in `<workspace>/.git/FETCH_HEAD`, so the PAT
+        // is left readable in the checkout even though `origin` is scrubbed.
+        // Strip it before the (fallible) checkout below can return.
+        if let Err(e) = scrub_fetch_head(&workspace) {
+            remove_partial_checkout(&workspace).await;
+            return Err(e).context("scrubbing fetch metadata credentials failed");
+        }
         git(
             &["checkout".into(), "--detach".into(), sha.clone()],
             Some(&workspace),
@@ -170,6 +178,14 @@ pub async fn provision(
         .await;
     }
 
+    // The base fetch above (like the sha fetch) records its credential-bearing
+    // source URL in `.git/FETCH_HEAD`. Scrub it once more before handing the
+    // workspace to the agent so no fetch path leaves a token on disk.
+    if let Err(e) = scrub_fetch_head(&workspace) {
+        remove_partial_checkout(&workspace).await;
+        return Err(e).context("scrubbing fetch metadata credentials failed");
+    }
+
     Ok(workspace)
 }
 
@@ -200,8 +216,19 @@ async fn remove_partial_checkout(workspace: &Path) {
 /// that may still hold a token.
 fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     let modules = workspace.join(".git").join("modules");
-    if !modules.exists() {
-        return Ok(());
+    // Resolve the root with `symlink_metadata` (which does NOT follow symlinks):
+    // `exists()` follows links, so a symlink planted at `.git/modules` would be
+    // traversed into and `read_dir` could walk — and rewrite — files outside the
+    // checkout. A genuine `--recurse-submodules` clone always creates
+    // `.git/modules` as a real directory, so treat anything else (a symlink, a
+    // regular file, or an absent path) as "nothing to scrub" and never traverse
+    // it. Descendants are already guarded by the per-entry `file_type()` checks
+    // below, which are likewise symlink-safe.
+    match std::fs::symlink_metadata(&modules) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", modules.display())),
     }
     let mut stack = vec![modules];
     while let Some(dir) = stack.pop() {
@@ -225,6 +252,33 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Strip `user:token@` credentials from `<workspace>/.git/FETCH_HEAD`, which git
+/// populates with the (credential-bearing) source URL of every `git fetch`. The
+/// top-level `origin` scrub leaves that file untouched, so a private-repo fetch
+/// would leave the PAT readable in the checkout the agent receives. Rewrite any
+/// embedded credential URL to its credential-free form in place.
+///
+/// Symlink-safe: the file is resolved with `symlink_metadata` and only rewritten
+/// when it is a real regular file, so a planted symlink at `.git/FETCH_HEAD`
+/// cannot redirect the write outside the checkout. A missing file is a no-op.
+fn scrub_fetch_head(workspace: &Path) -> Result<()> {
+    let fetch_head = workspace.join(".git").join("FETCH_HEAD");
+    match std::fs::symlink_metadata(&fetch_head) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", fetch_head.display())),
+    }
+    let contents = std::fs::read_to_string(&fetch_head)
+        .with_context(|| format!("reading {}", fetch_head.display()))?;
+    let scrubbed = scrub_url_credentials(&contents);
+    if scrubbed != contents {
+        std::fs::write(&fetch_head, scrubbed)
+            .with_context(|| format!("rewriting {}", fetch_head.display()))?;
     }
     Ok(())
 }
@@ -510,6 +564,61 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("nano-sub-none-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
         scrub_submodule_config_credentials(&tmp).expect("no-op when no submodules");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn submodule_scrub_skips_symlinked_modules_root() {
+        // A symlink planted at `.git/modules` must NOT be traversed: `exists()`
+        // follows links, so the scrub would otherwise walk (and rewrite) a config
+        // OUTSIDE the checkout. The `symlink_metadata` root guard treats the link
+        // as "nothing to scrub" and leaves the target untouched.
+        let tmp = std::env::temp_dir().join(format!("nano-sub-link-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("nano-sub-out-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
+        let outside_cfg = outside.join("config");
+        std::fs::write(
+            &outside_cfg,
+            format!("[remote \"origin\"]\n\turl = https://{token}@h/o/r.git\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.join(".git").join("modules")).unwrap();
+
+        scrub_submodule_config_credentials(&tmp).expect("symlinked root is a no-op");
+
+        // The out-of-checkout config was left byte-for-byte untouched.
+        let got = std::fs::read_to_string(&outside_cfg).unwrap();
+        assert!(got.contains("s3cr3tPAT"), "scrub must not follow the symlinked root");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn fetch_head_scrub_strips_credentials() {
+        // `git fetch <credential-URL>` records the source URL in
+        // `.git/FETCH_HEAD`; the scrub must strip the PAT while leaving the rest
+        // of the line intact. A missing file is a clean no-op.
+        let tmp = std::env::temp_dir().join(format!("nano-fetchhead-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        // No FETCH_HEAD yet: no-op.
+        scrub_fetch_head(&tmp).expect("no-op when FETCH_HEAD absent");
+
+        let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
+        let fetch_head = tmp.join(".git").join("FETCH_HEAD");
+        std::fs::write(
+            &fetch_head,
+            format!("deadbeef\t\tbranch 'main' of https://{token}@github.com/o/r.git\n"),
+        )
+        .unwrap();
+
+        scrub_fetch_head(&tmp).expect("scrub FETCH_HEAD");
+
+        let got = std::fs::read_to_string(&fetch_head).unwrap();
+        assert!(!got.contains("s3cr3tPAT"), "credential left in FETCH_HEAD: {got}");
+        assert!(got.contains("https://github.com/o/r.git"));
+        assert!(got.contains("branch 'main' of"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
