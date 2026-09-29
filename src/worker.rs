@@ -121,6 +121,15 @@ async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
     // instead of cancelling the request that detects the fence.
     let _ = stop_tx.send(true);
     let _ = refresher.await;
+    // Reconcile the raced outcome with the FINAL activation-loss watch value,
+    // exactly as `slot::handle` does. `select!` can pick the `run_agent` branch
+    // even when the refresher published a 404/409 loss in the same tick (both
+    // futures ready), which would otherwise `complete`/`fail` the job with a
+    // stale lease after the activation was fenced. Once the refresher is joined
+    // no further writes to the watch can happen, so this value is final: downgrade
+    // any outcome to "lost" (`None`) whenever the activation was fenced, so we
+    // never settle a job we no longer own.
+    let result = if *lost_rx.borrow() { None } else { result };
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
 

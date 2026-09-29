@@ -146,21 +146,34 @@ pub fn has_oauth(p: &Profile) -> bool {
 /// when no c8ctl profile resolved and the connection comes from the environment
 /// instead — the raw Nano client would otherwise send unauthenticated requests.
 pub fn env_has_oauth() -> bool {
-    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
-    let strategy_is_oauth = |k: &str| {
-        std::env::var(k)
-            .map(|s| s.eq_ignore_ascii_case("oauth"))
-            .unwrap_or(false)
-    };
-    // Honour *both* the `CAMUNDA_*` and `ZEEBE_*` strategy variables: the SDK
-    // accepts either, so a connection configured with `ZEEBE_AUTH_STRATEGY=OAUTH`
-    // must be refused here too rather than falling through to unauthenticated
-    // none/basic requests.
-    if strategy_is_oauth("CAMUNDA_AUTH_STRATEGY") || strategy_is_oauth("ZEEBE_AUTH_STRATEGY") {
-        return true;
+    // Resolve the *effective* auth strategy first (see `env_auth_strategy`, which
+    // honours `CAMUNDA_*` precedence over `ZEEBE_*`). An explicitly configured
+    // strategy is authoritative: only `OAUTH` means OAuth, and an explicit
+    // `NONE`/`BASIC` disables it even when stale OAuth client credentials linger
+    // in the environment — otherwise `--job-api nano --with-lease` would be
+    // wrongly rejected against an engine the operator explicitly configured for
+    // none/basic. Only when NO strategy is set do we infer OAuth from the mere
+    // presence of a client-id/secret pair.
+    if let Some(strategy) = env_auth_strategy() {
+        return strategy.eq_ignore_ascii_case("oauth");
     }
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
     (set("CAMUNDA_CLIENT_ID") && set("CAMUNDA_CLIENT_SECRET"))
         || (set("ZEEBE_CLIENT_ID") && set("ZEEBE_CLIENT_SECRET"))
+}
+
+/// The effective ambient auth strategy, honouring `CAMUNDA_*` precedence over
+/// `ZEEBE_*` (the SDK prefers the `CAMUNDA_*` variable when both are set).
+/// `None`/empty means "unspecified" (not any particular strategy).
+fn env_auth_strategy() -> Option<String> {
+    ["CAMUNDA_AUTH_STRATEGY", "ZEEBE_AUTH_STRATEGY"]
+        .iter()
+        .find_map(|k| {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
 }
 
 /// Whether the ambient `CAMUNDA_*`/`ZEEBE_*` environment explicitly selects the
@@ -170,15 +183,7 @@ pub fn env_has_oauth() -> bool {
 /// honour an explicit `AUTH_STRATEGY=NONE` on the no-profile path, exactly as a
 /// profile that resolves to `NONE` is honoured.
 fn env_auth_strategy_is_none() -> bool {
-    ["CAMUNDA_AUTH_STRATEGY", "ZEEBE_AUTH_STRATEGY"]
-        .iter()
-        .find_map(|k| {
-            std::env::var(k)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        })
-        .is_some_and(|s| s.eq_ignore_ascii_case("none"))
+    env_auth_strategy().is_some_and(|s| s.eq_ignore_ascii_case("none"))
 }
 
 /// Engine address and basic-auth credentials for the raw Nano job client.
@@ -321,6 +326,46 @@ mod tests {
         assert!(!env_has_oauth());
         std::env::set_var("ZEEBE_AUTH_STRATEGY", "OAUTH");
         assert!(env_has_oauth());
+        // Restore prior environment so parallel tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_non_oauth_strategy_overrides_stale_oauth_credentials() {
+        // An explicitly configured strategy is authoritative: stale OAuth
+        // client-id/secret vars left in the environment must NOT make a
+        // `NONE`/`BASIC` connection look like OAuth (which would wrongly reject
+        // `--job-api nano --with-lease`). And `CAMUNDA_*` wins over `ZEEBE_*`.
+        let _env = env_guard();
+        let keys = [
+            "CAMUNDA_AUTH_STRATEGY",
+            "ZEEBE_AUTH_STRATEGY",
+            "CAMUNDA_CLIENT_ID",
+            "CAMUNDA_CLIENT_SECRET",
+            "ZEEBE_CLIENT_ID",
+            "ZEEBE_CLIENT_SECRET",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        // Stale OAuth credentials present, but the strategy explicitly disables OAuth.
+        std::env::set_var("CAMUNDA_CLIENT_ID", "id");
+        std::env::set_var("CAMUNDA_CLIENT_SECRET", "secret");
+        assert!(env_has_oauth(), "credentials with no strategy infer OAuth");
+        std::env::set_var("CAMUNDA_AUTH_STRATEGY", "NONE");
+        assert!(!env_has_oauth(), "explicit NONE overrides stale OAuth creds");
+        std::env::set_var("CAMUNDA_AUTH_STRATEGY", "BASIC");
+        assert!(!env_has_oauth(), "explicit BASIC overrides stale OAuth creds");
+        // CAMUNDA_* precedence: CAMUNDA=NONE wins over ZEEBE=OAUTH.
+        std::env::set_var("CAMUNDA_AUTH_STRATEGY", "NONE");
+        std::env::set_var("ZEEBE_AUTH_STRATEGY", "OAUTH");
+        assert!(!env_has_oauth(), "CAMUNDA_* strategy wins over ZEEBE_*");
         // Restore prior environment so parallel tests are unaffected.
         for (k, v) in saved {
             match v {
