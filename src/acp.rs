@@ -137,10 +137,28 @@ impl Agent {
         self.next_id += 1;
         let (tx, rx) = oneshot::channel();
         self.shared.lock().unwrap().pending.insert(id, tx);
-        self.out
-            .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await
-            .map_err(|_| anyhow!("agent stdin closed"))?;
+        // Bound the enqueue with the same idle budget the wait loop below uses.
+        // `out` is a *bounded* channel, so this `send` blocks while it is full —
+        // and it stays full when `write_loop` is wedged on a stdin the agent has
+        // stopped draining (the agent floods requests, `read_loop` stops on the
+        // full channel). Awaiting it unbounded would hang here *before* we ever
+        // reach the idle-timeout arms, so a wedged agent could occupy the slot
+        // forever and `Agent::run` could never tear the child down. On timeout,
+        // drop the pending entry and fail so the caller shuts the agent down.
+        let send = self
+            .out
+            .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        match tokio::time::timeout(idle, send).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.shared.lock().unwrap().pending.remove(&id);
+                bail!("agent stdin closed");
+            }
+            Err(_) => {
+                self.shared.lock().unwrap().pending.remove(&id);
+                bail!("agent stdin blocked for {}s during {method} (idle timeout)", idle.as_secs());
+            }
+        }
         let mut rx = rx;
         loop {
             tokio::select! {
