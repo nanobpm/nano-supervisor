@@ -341,11 +341,28 @@ async fn handle(
             refresher.abort();
         }
         Some(Err(e)) => {
-            refresher.abort();
             let msg = format!("{e:#}");
-            match jobs.fail(&key, (job.retries - 1).max(0), &truncate(&msg, 2000), &lease).await {
-                Ok(()) => log(&format!("job {key} failed after {elapsed:.1}s (refreshes={n}): {msg}")),
-                Err(e2) => log(&format!("job {key}: fail failed: {e2:#} (original error: {msg})")),
+            // Keep the lease refresher alive until `jobs.fail` returns, exactly
+            // as the completion path above does. Aborting it first can let the
+            // lease expire before the failure is submitted, so a `fail` issued
+            // near the end of the activation window gets fenced — leaving the
+            // job active until it times out instead of retrying it promptly.
+            let fail_result = jobs
+                .fail(
+                    &key,
+                    (job.retries - 1).max(0),
+                    &truncate(&msg, 2000),
+                    &lease,
+                )
+                .await;
+            refresher.abort();
+            match fail_result {
+                Ok(()) => log(&format!(
+                    "job {key} failed after {elapsed:.1}s (refreshes={n}): {msg}"
+                )),
+                Err(e2) => log(&format!(
+                    "job {key}: fail failed: {e2:#} (original error: {msg})"
+                )),
             }
         }
     }
@@ -491,7 +508,11 @@ fn stable_namespace(worker_name: &str, job_type: &str, name_generated: bool) -> 
 fn identity_digest(base: &str, job_type: &str) -> String {
     // FNV-1a 64-bit: offset basis 14695981039346656037, prime 1099511628211.
     let mut h: u64 = 14695981039346656037;
-    for byte in base.bytes().chain(std::iter::once(0u8)).chain(job_type.bytes()) {
+    for byte in base
+        .bytes()
+        .chain(std::iter::once(0u8))
+        .chain(job_type.bytes())
+    {
         h ^= byte as u64;
         h = h.wrapping_mul(1099511628211);
     }
@@ -588,7 +609,10 @@ impl Drop for ActiveGuard {
         let marker = self.path.join(ACTIVE_MARKER);
         let _ = with_marker_lock(&self.path, || {
             if let Ok(contents) = std::fs::read_to_string(&marker) {
-                if contents.trim() == std::process::id().to_string() {
+                // While *this* process is alive no other process can hold our
+                // PID, so the PID recorded in the marker uniquely identifies us
+                // — compare only that, ignoring any start-time token suffix.
+                if marker_pid(contents.trim()) == Some(std::process::id()) {
                     let _ = std::fs::remove_file(&marker);
                 }
             }
@@ -600,9 +624,11 @@ impl Drop for ActiveGuard {
 }
 
 /// Filename of the cross-process liveness marker written inside each *active*
-/// run directory. It records the owning worker's PID so a sweeper in a
-/// different process (sharing the same stable run root) can distinguish a live
-/// run from an orphaned one.
+/// run directory. It records the owning worker's PID together with a
+/// PID-reuse-resistant start-time token (`"<pid>:<start>"`; see
+/// [`own_marker_token`]) so a sweeper in a different process (sharing the same
+/// stable run root) can distinguish a live run from an orphaned one — even after
+/// a crashed worker's PID has been recycled by an unrelated process.
 const ACTIVE_MARKER: &str = ".nano-active";
 
 /// Filename of the **single, run-root-wide** advisory lock guarding all
@@ -731,8 +757,9 @@ fn with_marker_lock<T>(_dir: &Path, f: impl FnOnce() -> T) -> Option<T> {
 /// an error if the marker cannot be written or the lock cannot be acquired.
 #[cfg(test)]
 fn write_active_marker(cwd: &Path) -> Result<()> {
+    let token = own_marker_token();
     with_marker_lock(cwd, || {
-        std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string())
+        std::fs::write(cwd.join(ACTIVE_MARKER), &token)
             .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
     })
     .unwrap_or_else(|| {
@@ -765,10 +792,11 @@ fn claim_run_dir(cwd: &Path) -> Result<()> {
     // Ensure the dir (and thus the lock file's parent) exists before locking;
     // on reactivation this is a no-op that leaves the possibly-stale dir in place.
     std::fs::create_dir_all(cwd).with_context(|| format!("creating run dir {}", cwd.display()))?;
+    let token = own_marker_token();
     with_marker_lock(cwd, || {
         std::fs::create_dir_all(cwd)
             .with_context(|| format!("creating run dir {}", cwd.display()))?;
-        std::fs::write(cwd.join(ACTIVE_MARKER), std::process::id().to_string())
+        std::fs::write(cwd.join(ACTIVE_MARKER), &token)
             .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
     })
     .unwrap_or_else(|| {
@@ -800,16 +828,94 @@ fn marker_owner_alive(dir: &Path) -> bool {
 /// removal can be made atomic under one lock; see [`sweep_runs`]).
 fn marker_owner_alive_locked(dir: &Path) -> bool {
     match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
-        Ok(contents) => match contents.trim().parse::<u32>() {
-            Ok(pid) => pid_is_live(pid),
-            Err(_) => true,
-        },
+        Ok(contents) => marker_token_is_live(contents.trim()),
         // Fail-safe: only a definitive `NotFound` proves the marker is gone and
         // the run is not live. A transient permission/I/O error must NOT be read
         // as "not live" — doing so would let the sweeper reap a directory whose
         // liveness we could not actually determine, contrary to the fail-safe
         // guarantee. Preserve the directory (treat as live) on any other error.
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The liveness-marker payload for *this* worker: `"<pid>:<start-token>"` when a
+/// PID-reuse-resistant start token is available, else the legacy bare `"<pid>"`.
+/// Pairing the PID with the process's start time lets a foreign sweeper tell a
+/// still-running owner from an unrelated process that merely inherited the
+/// recycled PID after this worker crashed (see [`process_start_token`]).
+fn own_marker_token() -> String {
+    let pid = std::process::id();
+    match process_start_token(pid) {
+        Some(tok) => format!("{pid}:{tok}"),
+        None => pid.to_string(),
+    }
+}
+
+/// The PID recorded in a marker payload, accepting both the current
+/// `"<pid>:<start-token>"` form and the legacy bare `"<pid>"`.
+fn marker_pid(token: &str) -> Option<u32> {
+    token
+        .split_once(':')
+        .map_or(token, |(pid, _)| pid)
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether a marker payload names a process that is still the *same* live owner
+/// that wrote it. A live PID alone is not proof: after a crash left the marker
+/// behind, that PID can be recycled by an unrelated process, which — under a
+/// bare PID check — would protect the stale dir indefinitely (until the
+/// unrelated process exits), defeating `--reap-age`/`--keep-runs`. When the
+/// marker carries a start-time token we additionally require the live PID's
+/// current start time to match, so a recycled PID no longer masks a stale run.
+/// Fail-safe throughout: an unparseable PID, or an inability to read the current
+/// start time, is treated as live so a possibly-active cwd is never reaped.
+fn marker_token_is_live(token: &str) -> bool {
+    let (pid_str, recorded_start) = match token.split_once(':') {
+        Some((pid, start)) => (pid, Some(start.trim())),
+        None => (token, None),
+    };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
+        return true;
+    };
+    if !pid_is_live(pid) {
+        return false;
+    }
+    match recorded_start {
+        Some(recorded) => match process_start_token(pid) {
+            Some(current) => current == recorded,
+            None => true,
+        },
+        None => true,
+    }
+}
+
+/// A PID-reuse-resistant identity token for `pid`: its wall-clock start time as
+/// reported by `ps -o lstart`. Two processes that reuse the same PID over time
+/// necessarily have different start times, so comparing this token distinguishes
+/// the original owner from an unrelated process that inherited the recycled PID.
+/// Portable across Linux and macOS (both ship a `ps` supporting `lstart`), with
+/// no platform-specific `/proc` or `sysctl` code — the platform-appropriate
+/// fallback is simply `None`, which returns callers to the fail-safe PID-only
+/// behaviour. Returns `None` when the start time cannot be determined (no `ps`,
+/// an unknown/dead PID, or unexpected output).
+fn process_start_token(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let start = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if start.is_empty() {
+        None
+    } else {
+        Some(start)
     }
 }
 
@@ -1316,6 +1422,34 @@ mod tests {
             !marker_owner_alive(&dir),
             "a dead PID must read as not live"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_with_reused_pid_reads_not_live() {
+        // A marker naming a *live* PID but a start-time token that cannot match
+        // reality models PID reuse: the original owner crashed (its marker was
+        // never cleaned up) and an unrelated process later inherited the PID.
+        // The start-time mismatch must expose the run as not live so the stale
+        // dir stays reapable, instead of being protected until that unrelated
+        // process happens to exit.
+        let dir = std::env::temp_dir().join(format!("ns-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(ACTIVE_MARKER),
+            format!("{}:Thu Jan  1 00:00:00 1970", std::process::id()),
+        )
+        .unwrap();
+        // Only meaningful where a real start token is obtainable; if `ps` cannot
+        // provide one on this host the check fail-safes to "live" by design, so
+        // skip the assertion there rather than assert the fallback path.
+        if process_start_token(std::process::id()).is_some() {
+            assert!(
+                !marker_owner_alive(&dir),
+                "a live PID with a mismatched start token must read as not live (PID reuse)"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

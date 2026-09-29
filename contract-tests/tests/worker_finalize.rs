@@ -27,6 +27,21 @@ fn agent_reported_pr_is_forwarded() {
         &[],
     );
     assert_eq!(outcome.result_file().unwrap()["pr"], "nanobpm/x#7");
+    // The agent's own result file is necessary but not sufficient: a worker that
+    // ignored the reported PR would still leave that file intact. Assert the
+    // *worker's* behaviour from its log — it forwarded the reported PR (which is
+    // exactly the branch that sets the `agentPr` completion variable) and took
+    // the "no fallback branch" path, so no `nano/agent-work/...` fallback was
+    // created.
+    let logs = outcome.stderr();
+    assert!(
+        logs.contains("agent reported PR nanobpm/x#7; forwarding it (no fallback branch)"),
+        "worker must forward the agent-reported PR (setting agentPr), not invent a fallback: {logs}"
+    );
+    assert!(
+        !logs.contains("nano/agent-work/"),
+        "worker must not create a fallback branch when the agent reported a PR: {logs}"
+    );
 }
 
 /// An agent that commits but opens no PR falls back to a `nano/agent-work/...`

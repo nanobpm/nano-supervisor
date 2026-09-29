@@ -504,6 +504,12 @@ impl Engine {
     /// Number of jobs of `job_type` the engine will hand out right now (capped
     /// at one). Tests use this as a black-box probe that an unrelated job is
     /// still *waiting* — i.e. was never activated by a worker under test.
+    ///
+    /// Activation is **not** read-only: `POST /v2/jobs/activation` leases each
+    /// job it returns. So any job this probe claims is immediately restored to
+    /// the waiting state (retries preserved, no backoff) before returning —
+    /// otherwise the probe would itself strand the unrelated job's activation
+    /// for a later test, the very state it is trying to observe.
     pub fn activatable_count(&self, job_type: &str) -> usize {
         let v: serde_json::Value = self
             .http
@@ -519,7 +525,27 @@ impl Engine {
             .and_then(|r| r.error_for_status())
             .and_then(|r| r.json())
             .unwrap_or_else(|_| serde_json::json!({ "jobs": [] }));
-        v["jobs"].as_array().map(Vec::len).unwrap_or(0)
+        let jobs = v["jobs"].as_array().cloned().unwrap_or_default();
+        for job in &jobs {
+            // Release the lease we just took so the job returns to waiting.
+            // Preserve its retries and use zero backoff so it is immediately
+            // activatable again — the probe must observe engine state without
+            // mutating it.
+            if let Some(key) = job["jobKey"].as_str().or_else(|| job["key"].as_str()) {
+                let retries = job["retries"].as_i64().unwrap_or(1).max(1);
+                let _ = self
+                    .http
+                    .post(format!("{}/v2/jobs/{key}/failure", self.url))
+                    .json(&serde_json::json!({
+                        "retries": retries,
+                        "retryBackOff": 0,
+                        "errorMessage": "contract-test probe: releasing activation",
+                    }))
+                    .send()
+                    .and_then(|r| r.error_for_status());
+            }
+        }
+        jobs.len()
     }
 }
 
