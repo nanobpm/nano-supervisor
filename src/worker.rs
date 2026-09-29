@@ -67,7 +67,20 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
         // reads back) is absolute. A relative `--runs-dir` would otherwise make
         // the agent resolve its result file under `cwd/cwd/...` while the worker
         // reads a different (relative) path.
-        let canonical = std::fs::canonicalize(&opts.runs_dir).unwrap_or_else(|_| opts.runs_dir.clone());
+        // `canonicalize` fails when the run root does not exist yet. Falling
+        // back to the raw value would leave a relative `--runs-dir` relative,
+        // so the agent (whose cwd is already the per-job dir) would resolve its
+        // result file under a duplicated `cwd/cwd/...` path that `finalize`
+        // cannot read. Anchor the fallback to an absolute path instead.
+        let canonical = std::fs::canonicalize(&opts.runs_dir).unwrap_or_else(|_| {
+            if opts.runs_dir.is_absolute() {
+                opts.runs_dir.clone()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&opts.runs_dir))
+                    .unwrap_or_else(|_| opts.runs_dir.clone())
+            }
+        });
         let ns = stable_namespace(&opts.worker_name, &opts.job_type, opts.name_generated);
         opts.runs_dir = canonical.join(ns);
         opts
@@ -355,6 +368,9 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
         // rule. A scalar JSON value (`null`, `true`, `0`, `"x"`) parses fine but
         // is likewise unusable — `finalize` reads `v.get("pr")`, which only ever
         // matches an object — so require an object here and reject scalars.
+        // An *empty* object (`{}`) is likewise unusable: it carries no `pr`
+        // (nor any other required field), so treat it the same as a scalar and
+        // reject it. Require a non-empty object.
         // Fail when there is truly nothing usable — no text AND no valid result
         // object (c8ctl-plugin-nano#275).
         let rf = agent_result_file(&cwd);
@@ -362,7 +378,7 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
             .ok()
             .filter(|s| !s.trim().is_empty())
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .is_some_and(|v| v.is_object());
+            .is_some_and(|v| v.as_object().is_some_and(|o| !o.is_empty()));
         if !has_valid_file {
             anyhow::bail!(
                 "agent finished ({}) without any usable output (no chat text and no valid JSON result object)",
