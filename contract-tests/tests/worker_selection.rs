@@ -75,4 +75,13 @@ fn worker_ignores_other_job_types() {
         Some("mine only"),
         "the worker took the wrong job; it must only take its own job type"
     );
+    // The worker taking only its own job is necessary but not sufficient: a
+    // worker that activated *every* job type would still record its own job.
+    // Prove the unrelated instance was never touched by confirming its job is
+    // still activatable now that the worker has exited.
+    assert_eq!(
+        engine.activatable_count(&other),
+        1,
+        "the unrelated `{other}` job must remain waiting — the worker must not activate other job types"
+    );
 }

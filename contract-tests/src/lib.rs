@@ -500,6 +500,27 @@ impl Engine {
     pub fn http(&self) -> &reqwest::blocking::Client {
         &self.http
     }
+
+    /// Number of jobs of `job_type` the engine will hand out right now (capped
+    /// at one). Tests use this as a black-box probe that an unrelated job is
+    /// still *waiting* — i.e. was never activated by a worker under test.
+    pub fn activatable_count(&self, job_type: &str) -> usize {
+        let v: serde_json::Value = self
+            .http
+            .post(format!("{}/v2/jobs/activation", self.url))
+            .json(&serde_json::json!({
+                "type": job_type,
+                "timeout": 5000,
+                "maxJobsToActivate": 1,
+                "worker": "contract-test-probe",
+                "requestTimeout": 0,
+            }))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .unwrap_or_else(|_| serde_json::json!({ "jobs": [] }));
+        v["jobs"].as_array().map(Vec::len).unwrap_or(0)
+    }
 }
 
 impl Default for Engine {
@@ -768,8 +789,8 @@ const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// The worker spawns agents in their *own* process groups, so signalling only
 /// the worker's group leaves those agents alive holding the worker's inherited
 /// stderr open — which wedges the reader-thread joins the watchdog depends on.
-/// Walking the descendant tree (via `/proc` on Linux) reaps them regardless of
-/// their group. Off Linux, fall back to a best-effort worker process-group kill.
+/// Walking the descendant tree (via `/proc` on Linux, or `ps` off Linux) reaps
+/// them regardless of their group.
 /// Shells out to `kill(1)` so no libc dependency is needed; failures are ignored
 /// (a process may already be gone).
 #[cfg(target_os = "linux")]
@@ -817,11 +838,41 @@ fn read_ppid(pid: u32) -> Option<u32> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn kill_process_tree(pid: u32) {
-    // No portable /proc on non-Linux unix; signal the worker's process group.
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{pid}"))
-        .status();
+    use std::collections::HashMap;
+    // No /proc on macOS/BSD, so reconstruct the tree from `ps`. A plain
+    // group-kill of the worker is NOT enough: the worker runs agents in their
+    // *own* process groups (`acp::Agent::spawn` calls `process_group(0)`), so
+    // signalling only `-pid` leaves a `go_silent` agent alive holding the
+    // worker's inherited stderr open — the reader-thread joins in
+    // `output_within` would then block forever, defeating the watchdog. Map
+    // pid -> ppid across all processes and kill every descendant individually
+    // so no agent survives regardless of its group.
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(out) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(c), Some(p)) = (fields.next(), fields.next()) {
+                if let (Ok(c), Ok(p)) = (c.parse::<u32>(), p.parse::<u32>()) {
+                    children.entry(p).or_default().push(c);
+                }
+            }
+        }
+    }
+    // Depth-first collect the worker and every descendant.
+    let mut stack = vec![pid];
+    let mut victims = Vec::new();
+    while let Some(p) = stack.pop() {
+        victims.push(p);
+        if let Some(kids) = children.get(&p) {
+            stack.extend(kids);
+        }
+    }
+    for p in victims {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(p.to_string())
+            .status();
+    }
 }
 
 /// Run `cmd` to completion, but kill it and panic if it outstays `timeout`,

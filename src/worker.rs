@@ -298,7 +298,25 @@ async fn handle(
             // `jobs.complete` returns, the activation could expire mid-complete,
             // fencing a successful run. Abort it only once the settle command
             // has returned.
-            let pr = finalize(opts, &key, &out);
+            // `finalize` runs blocking git subprocesses and a `sleep`-based
+            // timeout loop (a fallback push may take up to
+            // FALLBACK_PUSH_TIMEOUT). Running that inline would occupy a Tokio
+            // worker thread; with a small runtime the lease `refresher` above
+            // could then be starved and the activation expire before
+            // `complete`, fencing a successful job. Offload it to a blocking
+            // thread so the runtime stays free to refresh the lease.
+            let pr = {
+                let runs_dir = opts.runs_dir.clone();
+                let key_c = key.clone();
+                let out = out.clone();
+                match tokio::task::spawn_blocking(move || finalize(&runs_dir, &key_c, &out)).await {
+                    Ok(pr) => pr,
+                    Err(e) => {
+                        log(&format!("job {key}: finalize task failed: {e}"));
+                        None
+                    }
+                }
+            };
             let mut vars: HashMap<String, Value> = [
                 ("agentResult".to_string(), json!(out.text)),
                 ("agentStopReason".to_string(), json!(out.stop_reason)),
@@ -941,8 +959,8 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
 /// committed work is preserved instead of being stranded in the (reapable) run
 /// directory. Returns the reported PR reference, if any. Best-effort: finalize
 /// never fails the already-successful job.
-fn finalize(opts: &WorkerOptions, key: &str, out: &Outcome) -> Option<String> {
-    let cwd = opts.runs_dir.join(key);
+fn finalize(runs_dir: &Path, key: &str, out: &Outcome) -> Option<String> {
+    let cwd = runs_dir.join(key);
     if let Some(pr) = reported_pr(out, &agent_result_file(&cwd)) {
         log(&format!(
             "job {key}: agent reported PR {pr}; forwarding it (no fallback branch)"
@@ -1042,9 +1060,15 @@ fn reported_pr(out: &Outcome, result_file: &Path) -> Option<String> {
     None
 }
 
-/// The `pr` field of a result object, if present and a string.
+/// The `pr` field of a result object, if present, a string, and non-blank.
+/// A blank `pr` (`{ "pr": "" }`) is treated as *no* PR so `finalize` still
+/// takes the fallback-branch path instead of completing with `agentPr: ""`.
 fn pr_of(v: &Value) -> Option<String> {
-    v.get("pr").and_then(Value::as_str).map(str::to_string)
+    v.get("pr")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Outcome of an attempted fallback-branch capture.
@@ -1382,6 +1406,13 @@ mod tests {
         assert!(reported_pr(&outcome_with("committed but opened no PR"), &missing).is_none());
         let out = outcome_with("::nano:result::{\"status\":\"opened\"}");
         assert!(reported_pr(&out, &missing).is_none());
+        // A blank/whitespace `pr` is NOT a reported PR: it must take the no-PR
+        // (fallback-branch) path rather than complete with `agentPr: ""`.
+        let out = outcome_with("::nano:result::{\"status\":\"opened\",\"pr\":\"   \"}");
+        assert!(
+            reported_pr(&out, &missing).is_none(),
+            "a blank `pr` must be treated as no PR"
+        );
     }
 
     #[test]
