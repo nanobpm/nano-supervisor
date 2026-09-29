@@ -803,6 +803,23 @@ fn claim_run_dir(cwd: &Path) -> Result<()> {
     with_marker_lock(cwd, || {
         std::fs::create_dir_all(cwd)
             .with_context(|| format!("creating run dir {}", cwd.display()))?;
+        // Refuse to steal a run dir from a *live foreign* owner. A normal
+        // reactivation finds no marker — the previous owner removed it on
+        // completion (see `ActiveGuard::drop`) — so this never blocks the common
+        // path. But if our activation raced a still-running owner (e.g. our lease
+        // was reissued for the same job before that owner's refresh loop observed
+        // the loss), overwriting its live marker here would let both workers share
+        // this cwd — concurrent result/git mutation — and hide the first owner
+        // from the sweeper behind our PID. Fail-loud instead: the caller fails the
+        // job for retry, by which point the old owner has usually dropped its
+        // marker. Under the same lock the sweeper holds, this check-then-stamp is
+        // atomic against that owner's `ActiveGuard` unlink.
+        if foreign_owner_alive_locked(cwd) {
+            return Err(anyhow::anyhow!(
+                "run dir {} is already held by a live worker; refusing to overwrite its marker",
+                cwd.display()
+            ));
+        }
         std::fs::write(cwd.join(ACTIVE_MARKER), &token)
             .with_context(|| format!("writing {}", cwd.join(ACTIVE_MARKER).display()))
     })
@@ -812,6 +829,34 @@ fn claim_run_dir(cwd: &Path) -> Result<()> {
             cwd.display()
         ))
     })
+}
+
+/// Whether `dir` currently holds a live liveness marker owned by a *different*
+/// worker process — the guard [`claim_run_dir`] uses to avoid stealing a run dir
+/// from a still-running owner. Must be called while holding the marker lock.
+///
+/// A marker naming *our own* live PID is a self-claim, not a foreign owner, so it
+/// never blocks us (while this process runs, no other process can hold our PID —
+/// the same reasoning `ActiveGuard::drop` relies on). A missing marker means the
+/// cwd is claimable. Mirrors [`marker_owner_alive_locked`]'s fail-safe: a
+/// present-but-unreadable/unparseable marker counts as a live foreign owner, so a
+/// cwd whose liveness we cannot determine is never overwritten (the caller fails
+/// the job for retry rather than risk a double claim).
+fn foreign_owner_alive_locked(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join(ACTIVE_MARKER)) {
+        Ok(contents) => {
+            let token = contents.trim();
+            if marker_pid(token) == Some(std::process::id()) {
+                return false;
+            }
+            marker_token_is_live(token)
+        }
+        // Fail-safe: only a definitive `NotFound` proves the cwd is unclaimed. A
+        // transient permission/I/O error must NOT be read as "claimable" — that
+        // could overwrite a live owner's marker. Treat it as a live foreign owner
+        // so the claim fails loudly and the job is retried.
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Whether `dir` is a *live* run owned by some still-running worker — i.e. its
@@ -1566,6 +1611,58 @@ mod tests {
             "our own marker must be removed on guard drop"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_run_dir_refuses_a_live_foreign_owner() {
+        // A run dir already carrying a *live foreign* owner's marker must not be
+        // claimed out from under it: overwriting the marker would let two workers
+        // share this cwd (concurrent result/git mutation) and hide the first
+        // owner from the sweeper. PID 1 is always alive and never us, so it
+        // models a live foreign owner.
+        let root = std::env::temp_dir().join(format!("ns-claim-live-{}", std::process::id()));
+        let dir = root.join("job-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ACTIVE_MARKER), "1").unwrap();
+        assert!(
+            claim_run_dir(&dir).is_err(),
+            "claiming a dir held by a live foreign owner must fail loudly"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(ACTIVE_MARKER))
+                .unwrap()
+                .trim(),
+            "1",
+            "a rejected claim must not overwrite the live owner's marker"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_run_dir_takes_an_unclaimed_or_dead_dir() {
+        // Both the common reactivation case (the previous owner removed its
+        // marker on completion, so none is present) and a dead-owner marker leave
+        // the cwd claimable; the claim stamps *our* live marker either way.
+        let root = std::env::temp_dir().join(format!("ns-claim-free-{}", std::process::id()));
+        // Unclaimed: the dir does not yet exist.
+        let fresh = root.join("job-fresh");
+        claim_run_dir(&fresh).expect("an unclaimed run dir must be claimable");
+        assert!(
+            marker_owner_alive(&fresh),
+            "claiming an unclaimed dir stamps our live marker"
+        );
+        // Dead owner: a PID-0 marker is orphaned and must not block reclaiming.
+        let stale = root.join("job-stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(ACTIVE_MARKER), "0").unwrap();
+        claim_run_dir(&stale).expect("a dead owner's dir must be re-claimable");
+        assert!(
+            marker_owner_alive(&stale),
+            "reclaiming a dead owner's dir stamps our live marker"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn outcome_with(text: &str) -> Outcome {
