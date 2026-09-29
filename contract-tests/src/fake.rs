@@ -325,18 +325,24 @@ impl AcpClient {
                         .flatten()
                 })
             };
-            let option_id = pick("allow_always")
-                .or_else(|| pick("allow_once"))
-                .or_else(|| {
-                    options
-                        .and_then(|o| o.first())
-                        .and_then(|o| o["optionId"].as_str().map(str::to_string))
-                })
-                .unwrap_or_else(|| "allow".to_string());
-            let reply = json!({
-                "jsonrpc": "2.0", "id": id,
-                "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
+            let option_id = pick("allow_always").or_else(|| pick("allow_once")).or_else(|| {
+                options
+                    .and_then(|o| o.first())
+                    .and_then(|o| o["optionId"].as_str().map(str::to_string))
             });
+            // Mirror the worker's `permission_choice` (src/acp.rs): with no
+            // offered options there is nothing to select, so report `cancelled`
+            // rather than a synthetic `allow` id that no request offered.
+            let reply = match option_id {
+                Some(opt) => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "outcome": { "outcome": "selected", "optionId": opt } }
+                }),
+                None => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "outcome": { "outcome": "cancelled" } }
+                }),
+            };
             self.send(&reply)
         } else {
             self.send(&json!({

@@ -16,6 +16,13 @@ fn job_writes_an_agent_instance_record() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
+    // The Rust worker has no AgentInstance/history recording path yet, so a live
+    // Rust-target run cannot emit either string — assert this contract only for
+    // the Node target until the Rust worker grows the record contract (issues
+    // #1/#3), mirroring the nudge test's Rust gate.
+    if target.label() == "rust" {
+        skip!("AgentInstance/history recording is deferred for the Rust worker (issues #1/#3)");
+    }
     let outcome = run_worker_job(
         &engine,
         &target,

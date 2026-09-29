@@ -235,14 +235,39 @@ async fn handle(
         return;
     }
     active.lock().unwrap().insert(cwd.clone());
-    // Clear any stale result file from a prior activation of this same run dir,
-    // so a later attempt that writes no result cannot forward the previous
-    // attempt's PR metadata.
-    let _ = std::fs::remove_file(agent_result_file(&cwd));
     let _guard = ActiveGuard {
         active: active.clone(),
-        path: cwd,
+        path: cwd.clone(),
     };
+    // Clear any stale result file from a prior activation of this same run dir,
+    // so a later attempt that writes no result cannot forward the previous
+    // attempt's PR metadata. A removal failure other than "not found" means a
+    // nonempty stale file may survive and be mistaken for this attempt's result,
+    // so treat it as a failed activation rather than proceeding with an
+    // untrusted result file.
+    if let Err(e) = std::fs::remove_file(agent_result_file(&cwd)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            let msg = format!(
+                "cannot clear stale result file in run dir {}: {e:#}",
+                cwd.display()
+            );
+            log(&format!("job {key}: {msg}; failing for retry"));
+            if let Err(e2) = jobs
+                .fail(
+                    &key,
+                    (job.retries - 1).max(0),
+                    &truncate(&msg, 2000),
+                    &lease,
+                )
+                .await
+            {
+                log(&format!(
+                    "job {key}: fail failed: {e2:#} (original error: {msg})"
+                ));
+            }
+            return;
+        }
+    }
     let started = Instant::now();
     log(&format!(
         "job {key} activated (type {}, retries {}, lease {})",
@@ -348,12 +373,23 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     let out = out?;
     if out.text.trim().is_empty() {
         // A file-only result is valid: the agent wrote its structured result to
-        // AGENT_RESULT_FILE without emitting chat text. Only fail when there is
-        // truly nothing — no text AND no result file (c8ctl-plugin-nano#275).
+        // AGENT_RESULT_FILE without emitting chat text. Only accept it when the
+        // file actually holds a parseable JSON result — a present-but-malformed
+        // file is not usable output (`finalize` cannot extract a PR from it), so
+        // it must not bypass the empty-result failure rule. Fail when there is
+        // truly nothing usable — no text AND no valid result file
+        // (c8ctl-plugin-nano#275).
         let rf = agent_result_file(&cwd);
-        let has_file = std::fs::metadata(&rf).map(|m| m.len() > 0).unwrap_or(false);
-        if !has_file {
-            anyhow::bail!("agent finished ({}) without any output", out.stop_reason);
+        let has_valid_file = std::fs::read_to_string(&rf)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .is_some();
+        if !has_valid_file {
+            anyhow::bail!(
+                "agent finished ({}) without any usable output (no chat text and no valid JSON result file)",
+                out.stop_reason
+            );
         }
     }
     Ok(out)
