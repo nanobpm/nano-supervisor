@@ -171,6 +171,11 @@ impl Jobs {
 
     /// Extend the activation timeout (the lease refresh).
     pub async fn extend(&self, key: &str, timeout: Duration, lease: &Option<String>) -> Result<()> {
+        // The Nano backend interpolates `key` straight into `/jobs/{key}`, so a
+        // malformed (non-numeric) engine key must never reach the request. Guard
+        // at the request boundary so no caller ordering can settle/refresh with
+        // an unvalidated key.
+        validate_job_key(key)?;
         match self {
             Jobs::Sdk(c) => {
                 let mut changeset = JobChangeset::new();
@@ -204,6 +209,8 @@ impl Jobs {
         vars: HashMap<String, Value>,
         lease: &Option<String>,
     ) -> Result<()> {
+        // Guard the interpolated `/jobs/{key}/completion` path (Nano backend).
+        validate_job_key(key)?;
         match self {
             Jobs::Sdk(c) => {
                 let mut req = JobCompletionRequest::new();
@@ -234,6 +241,8 @@ impl Jobs {
         message: &str,
         lease: &Option<String>,
     ) -> Result<()> {
+        // Guard the interpolated `/jobs/{key}/failure` path (Nano backend).
+        validate_job_key(key)?;
         match self {
             Jobs::Sdk(c) => {
                 let mut req = JobFailRequest::new();

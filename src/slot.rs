@@ -116,6 +116,17 @@ pub async fn run(
 async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
     let started = Instant::now();
+    // Validate the engine-supplied key BEFORE it is used to build any request
+    // path. The refresher below (`extend`) and the `complete`/`fail` settle all
+    // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
+    // must be rejected up front — and an activation we cannot even address must
+    // not be settled. Drop it and let the engine redeliver.
+    if let Err(e) = crate::jobs::validate_job_key(&key) {
+        log(&format!(
+            "job {key}: refusing malformed engine key ({e:#}); not spawning refresher and not settling"
+        ));
+        return;
+    }
     log(&format!(
         "job {key} activated on {} (type {}, retries {}, lease {})",
         cfg.worker_name,
@@ -279,26 +290,38 @@ pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
 /// Redact any embedded userinfo (`user:token@`) from a URL's authority before
 /// logging it. A repository URL from the task envelope may carry an HTTPS
 /// credential (`https://x-access-token:<pat>@host/...`); logging it verbatim
-/// would leak the secret into the daemon's stdout/journal. Non-URL or
-/// credential-free inputs are returned unchanged.
+/// would leak the secret into the daemon's stdout/journal. Every `scheme://…`
+/// occurrence in the string is stripped — not just the first — so a value
+/// carrying two credential-bearing URLs (e.g. a prompt or task field) never
+/// forwards the second token. Non-URL or credential-free inputs are returned
+/// unchanged.
 pub(crate) fn redact_url(raw: &str) -> String {
-    let Some(scheme_end) = raw.find("://") else {
-        return raw.to_string();
-    };
-    let after = scheme_end + 3;
-    let rest = &raw[after..];
-    // The authority ends at the first '/', '?', or '#'.
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end];
-    match authority.rfind('@') {
-        Some(at) => format!(
-            "{}{}{}",
-            &raw[..after],
-            &authority[at + 1..],
-            &rest[auth_end..]
-        ),
-        None => raw.to_string(),
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("://") {
+        let after = pos + 3;
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        // The authority runs until the first character that cannot be part of it
+        // (path/query/fragment separators, or any whitespace/quoting that ends
+        // the URL inside surrounding prose).
+        let auth_end = tail
+            .find(|c: char| {
+                matches!(
+                    c,
+                    '/' | '?' | '#' | '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '|' | '\\' | '`'
+                ) || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..auth_end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &tail[auth_end..];
     }
+    out.push_str(rest);
+    out
 }
 
 async fn execute(
@@ -527,9 +550,13 @@ fn redact_credential_urls(value: &mut Value) {
 /// from the inherited environment at every agent launch (`acp` and `pipe`) —
 /// otherwise a daemon configured via ambient `CAMUNDA_*`/`ZEEBE_*` OAuth or
 /// basic-auth secrets would expose those secrets to the agent, which could read
-/// and exfiltrate them even with `NANO_AGENTIC=off`. Deployment secrets the
-/// agent legitimately needs (e.g. its own GitHub credentials for push) are
-/// delivered through the deliberate `hire.env` channel and are unaffected.
+/// and exfiltrate them even with `NANO_AGENTIC=off`. The `NANO_AGENTIC_*`
+/// credentials are stripped for the same reason: `NANO_AGENTIC=off` disables the
+/// visibility channel but does not stop a host agent from reading an inherited
+/// agentic token/secret out of its environment. Deployment secrets the agent
+/// legitimately needs (e.g. its own GitHub credentials for push) are delivered
+/// through the deliberate `hire.env` channel and are re-applied after this strip,
+/// so an explicitly hired value is unaffected.
 pub(crate) const SENSITIVE_DAEMON_ENV: &[&str] = &[
     "CAMUNDA_CLIENT_ID",
     "CAMUNDA_CLIENT_SECRET",
@@ -539,6 +566,9 @@ pub(crate) const SENSITIVE_DAEMON_ENV: &[&str] = &[
     "ZEEBE_CLIENT_SECRET",
     "ZEEBE_BASIC_AUTH_USERNAME",
     "ZEEBE_BASIC_AUTH_PASSWORD",
+    "NANO_AGENTIC_TOKEN",
+    "NANO_AGENTIC_SECRET",
+    "NANO_AGENTIC_CREDENTIAL",
 ];
 
 /// The environment every harness gets: the reserved `AGENT_*`/`NANO_*` vars, the
@@ -644,6 +674,12 @@ mod tests {
             // credentials supplied that way must be stripped too.
             "ZEEBE_BASIC_AUTH_USERNAME",
             "ZEEBE_BASIC_AUTH_PASSWORD",
+            // `NANO_AGENTIC=off` disables the channel but does not stop a host
+            // agent reading an inherited agentic credential, so these must be
+            // stripped too.
+            "NANO_AGENTIC_TOKEN",
+            "NANO_AGENTIC_SECRET",
+            "NANO_AGENTIC_CREDENTIAL",
         ] {
             assert!(
                 SENSITIVE_DAEMON_ENV.contains(&k),
@@ -694,6 +730,22 @@ mod tests {
             redact_url("git@github.com:o/r.git"),
             "git@github.com:o/r.git"
         );
+    }
+
+    #[test]
+    fn redact_url_strips_every_occurrence() {
+        // A single string carrying two credential-bearing URLs must have BOTH
+        // tokens stripped, not just the first (the field could be a prompt or a
+        // task value forwarded to a pipe agent). Build the userinfo at runtime so
+        // no credential-like literal is stored in source.
+        let a = format!("{}:{}", "x-access-token", "tokenA1");
+        let b = format!("{}:{}", "x-access-token", "tokenB2");
+        let s = format!("clone https://{a}@h1/x.git then https://{b}@h2/y.git done");
+        let out = redact_url(&s);
+        assert!(!out.contains("tokenA1"), "first credential leaked: {out}");
+        assert!(!out.contains("tokenB2"), "second credential leaked: {out}");
+        assert!(out.contains("https://h1/x.git"));
+        assert!(out.contains("https://h2/y.git"));
     }
 
     #[test]

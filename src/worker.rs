@@ -81,6 +81,17 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
 async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
     let started = Instant::now();
+    // Validate the engine-supplied key BEFORE it is used to build any request
+    // path. The refresher below (`extend`) and the `complete`/`fail` settle all
+    // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
+    // must be rejected up front — and an activation we cannot even address must
+    // not be settled. Drop it and let the engine redeliver.
+    if let Err(e) = crate::jobs::validate_job_key(&key) {
+        log(&format!(
+            "job {key}: refusing malformed engine key ({e:#}); not spawning refresher and not settling"
+        ));
+        return;
+    }
     log(&format!(
         "job {key} activated (type {}, retries {}, lease {})",
         job.r#type,

@@ -349,6 +349,29 @@ fn parent_start_time(pid: u32) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// True when the parent pid exists but is a **zombie** (`Z`) or **dead** (`X`/`x`)
+/// process — the daemon has exited but its own parent has not yet reaped it. Such
+/// a process still answers `kill(pid, 0)` with success and keeps its start time,
+/// so [`wait_parent_or_group_gone`]'s liveness + PID-reuse checks both miss it
+/// and the watchdog would wait forever instead of reaping the agent's orphaned
+/// group. Read field 3 (state) of `/proc/<pid>/stat` — the first token after the
+/// final `')'` that closes the (space-containing) `comm` field.
+#[cfg(target_os = "linux")]
+fn parent_is_dead_or_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // Unreadable /proc entry: treat as "not observably dead" here — the
+        // caller's `kill(_, 0)` probe remains the primary liveness signal.
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    matches!(
+        stat[rparen + 1..].split_whitespace().next(),
+        Some("Z") | Some("X") | Some("x")
+    )
+}
+
 /// Poll until either the parent (daemon) exits or the agent's process group has
 /// already gone away. Returns `true` when the parent died (the caller should
 /// reap the group), `false` when the group vanished on its own (nothing to do).
@@ -368,6 +391,14 @@ unsafe fn wait_parent_or_group_gone(parent_pid: u32, pgid: u32, expected_start: 
             if parent_start_time(parent_pid) != Some(start) {
                 return true;
             }
+        }
+        // A zombie / dead-but-unreaped daemon still answers `kill(_, 0)` and
+        // keeps its start time, so the two checks above miss it; detect that
+        // terminal state explicitly so the watchdog reaps the orphaned group
+        // instead of waiting forever on a process that can never come back.
+        #[cfg(target_os = "linux")]
+        if parent_is_dead_or_zombie(parent_pid) {
+            return true;
         }
         if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
             return false; // process group already gone -> nothing to reap
@@ -395,5 +426,15 @@ mod tests {
         let b = parent_start_time(me).expect("own start time readable");
         assert_eq!(a, b);
         assert!(a > 0);
+    }
+
+    #[test]
+    fn own_process_is_not_dead_or_zombie() {
+        // Our own live, running process must not be classified as dead/zombie —
+        // otherwise the watchdog would spuriously reap a live daemon's group.
+        assert!(!parent_is_dead_or_zombie(std::process::id()));
+        // A pid that cannot exist yields a false (unreadable /proc) — the
+        // caller's `kill(_, 0)` probe is the authority for a truly-gone pid.
+        assert!(!parent_is_dead_or_zombie(u32::MAX));
     }
 }

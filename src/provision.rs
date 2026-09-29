@@ -106,6 +106,19 @@ pub async fn provision(
         return Err(e).context("scrubbing persisted clone credentials failed");
     }
 
+    // A `--recurse-submodules` clone also persists each submodule's
+    // (possibly credential-bearing) remote URL into `<workspace>/.git/modules/**/config`.
+    // The top-level `origin` scrub above does not touch those nested configs, so
+    // an agent with read access to the checkout could exfiltrate the PAT from
+    // them even though `origin` is clean. Scrub every nested submodule config
+    // before returning the workspace.
+    if repo.submodules {
+        if let Err(e) = scrub_submodule_config_credentials(&workspace) {
+            remove_partial_checkout(&workspace).await;
+            return Err(e).context("scrubbing submodule clone credentials failed");
+        }
+    }
+
     if let Some(sha) = &repo.sha {
         // The commit may be absent under a shallow clone: fetch it, then check
         // it out detached. Fetch against the in-memory (possibly
@@ -170,6 +183,50 @@ async fn remove_partial_checkout(workspace: &Path) {
     if tokio::fs::try_exists(workspace).await.unwrap_or(false) {
         let _ = tokio::fs::remove_dir_all(workspace).await;
     }
+}
+
+/// Strip `user:token@` credentials from every submodule's persisted remote
+/// config after a `--recurse-submodules` clone. Git writes each submodule's
+/// remote URL (which, for a credential-bearing superproject, resolves to a
+/// credential-bearing URL) into `<workspace>/.git/modules/**/config`; the
+/// top-level `origin` scrub does not reach those nested configs. Walk every
+/// `config` file under `.git/modules` and rewrite any embedded credential URL to
+/// its credential-free form, so no token is left on disk for the agent to read.
+///
+/// Directory recursion and file rewrites use `file_type()` (which does not follow
+/// symlinks), so a symlinked entry is never traversed into or written through —
+/// a local process cannot redirect the scrub via a planted link. Errors are
+/// propagated so the caller can remove the whole checkout rather than return one
+/// that may still hold a token.
+fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
+    let modules = workspace.join(".git").join("modules");
+    if !modules.exists() {
+        return Ok(());
+    }
+    let mut stack = vec![modules];
+    while let Some(dir) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading an entry in {}", dir.display()))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("stat {}", path.display()))?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && entry.file_name() == "config" {
+                let contents = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let scrubbed = scrub_url_credentials(&contents);
+                if scrubbed != contents {
+                    std::fs::write(&path, scrubbed)
+                        .with_context(|| format!("rewriting {}", path.display()))?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_hex_sha(s: &str) -> bool {
@@ -418,5 +475,41 @@ mod tests {
             scrub_url_credentials("https://github.com/org/repo.git"),
             "https://github.com/org/repo.git"
         );
+    }
+
+    #[test]
+    fn submodule_configs_are_scrubbed_of_credentials() {
+        // A `--recurse-submodules` clone writes each submodule's remote URL into
+        // `.git/modules/**/config`; the scrub must strip credentials from those
+        // nested configs (recursively), leaving credential-free URLs behind.
+        let tmp = std::env::temp_dir().join(format!("nano-sub-scrub-{}", std::process::id()));
+        let nested = tmp.join(".git").join("modules").join("sub").join("modules").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
+        let outer_cfg = tmp.join(".git").join("modules").join("sub").join("config");
+        let inner_cfg = nested.join("config");
+        let body = |host: &str| {
+            format!("[remote \"origin\"]\n\turl = https://{token}@{host}/o/r.git\n")
+        };
+        std::fs::write(&outer_cfg, body("h1")).unwrap();
+        std::fs::write(&inner_cfg, body("h2")).unwrap();
+
+        scrub_submodule_config_credentials(&tmp).expect("scrub submodule configs");
+
+        for (cfg, host) in [(&outer_cfg, "h1"), (&inner_cfg, "h2")] {
+            let got = std::fs::read_to_string(cfg).unwrap();
+            assert!(!got.contains("s3cr3tPAT"), "credential left in {}: {got}", cfg.display());
+            assert!(got.contains(&format!("https://{host}/o/r.git")));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn submodule_scrub_is_noop_without_modules_dir() {
+        // No `.git/modules` (the common no-submodules clone) is a clean no-op.
+        let tmp = std::env::temp_dir().join(format!("nano-sub-none-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        scrub_submodule_config_credentials(&tmp).expect("no-op when no submodules");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
