@@ -14,6 +14,13 @@ use tokio::process::Command;
 
 use crate::envelope::Repository;
 
+/// Upper bound on the size of a git metadata file (`config`, `FETCH_HEAD`, …)
+/// the credential scrubber will read into memory. These files are influenced by
+/// the remote repository, so an unbounded read is a remote/job-controlled
+/// memory-exhaustion vector; 8 MiB is orders of magnitude above any legitimate
+/// git config/FETCH_HEAD while still bounding a hostile one.
+const MAX_SCRUB_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Clone `repo` into `<workdir>/repo` and return the checkout path. `default_timeout`
 /// caps each git invocation (overridden per-repo by `cloneTimeoutMs`).
 pub async fn provision(
@@ -348,9 +355,27 @@ fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
     if !meta.file_type().is_file() {
         return Ok(());
     }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    // These files (`config`, `FETCH_HEAD`, …) are influenced by the remote repo
+    // and by `git fetch`, so their size is ultimately attacker/job-controlled.
+    // An unbounded `read_to_string` would let a hostile repo (a giant
+    // `FETCH_HEAD` or a pathologically nested config) make each slot buffer the
+    // whole file, exhausting the daemon's memory. Read at most `MAX_SCRUB_BYTES`
+    // and fail the checkout if the scrub input is larger — a credential-bearing
+    // git metadata file this big is not legitimate.
+    let mut raw = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_SCRUB_BYTES + 1)
+        .read_to_end(&mut raw)
         .with_context(|| format!("reading {}", path.display()))?;
+    if raw.len() as u64 > MAX_SCRUB_BYTES {
+        bail!(
+            "{} exceeds the {}-byte credential-scrub cap — refusing to load it",
+            path.display(),
+            MAX_SCRUB_BYTES
+        );
+    }
+    let contents =
+        String::from_utf8(raw).with_context(|| format!("reading {}", path.display()))?;
     let scrubbed = scrub_url_credentials(&contents);
     if scrubbed != contents {
         file.seek(SeekFrom::Start(0))
@@ -446,6 +471,14 @@ fn scrub_url_credentials(text: &str) -> String {
     let mut rest = text;
     while let Some(pos) = rest.find("://") {
         let after = pos + 3;
+        // Credentials are only lifted/scrubbed for the schemes where git's
+        // credential helper injects a secret: http and https. Other schemes —
+        // notably `ssh://git@host` — carry a *username* in the userinfo, not a
+        // secret, so stripping it would corrupt an otherwise valid remote
+        // (dropping the SSH login and silently breaking the fetch). Leave those
+        // authorities untouched.
+        let scheme = scheme_of(&rest[..pos]);
+        let scrub = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
         out.push_str(&rest[..after]);
         let tail = &rest[after..];
         // The authority runs until the first character that cannot be part of it
@@ -459,13 +492,28 @@ fn scrub_url_credentials(text: &str) -> String {
             .unwrap_or(tail.len());
         let authority = &tail[..auth_end];
         match authority.rfind('@') {
-            Some(at) => out.push_str(&authority[at + 1..]),
-            None => out.push_str(authority),
+            Some(at) if scrub => out.push_str(&authority[at + 1..]),
+            _ => out.push_str(authority),
         }
         rest = &tail[auth_end..];
     }
     out.push_str(rest);
     out
+}
+
+/// The URL scheme = the trailing run of scheme characters (`[A-Za-z0-9+.-]`)
+/// immediately preceding `"://"`. Returns `""` when no valid scheme precedes it
+/// (e.g. a bare `://` embedded in prose), which leaves that authority untouched.
+fn scheme_of(prefix: &str) -> &str {
+    let mut start = prefix.len();
+    for (i, c) in prefix.char_indices().rev() {
+        if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    &prefix[start..]
 }
 
 async fn git(
@@ -687,6 +735,29 @@ mod tests {
             "cloning https://github.com/org/repo.git now"
         );
         assert_eq!(scrub_url_credentials("no url here"), "no url here");
+    }
+
+    #[test]
+    fn scrub_preserves_ssh_username() {
+        // ssh:// userinfo is a login name, not a secret git delivers via a
+        // credential helper — stripping it would corrupt the remote and break
+        // the fetch, so it must be left intact.
+        assert_eq!(
+            scrub_url_credentials("ssh://git@example.com/org/repo.git"),
+            "ssh://git@example.com/org/repo.git"
+        );
+        // git:// likewise carries no credential-helper secret in its userinfo.
+        assert_eq!(
+            scrub_url_credentials("git://user@host/org/repo.git"),
+            "git://user@host/org/repo.git"
+        );
+        // …while an http(s) PAT is still scrubbed.
+        let token = "x-access-token:s3cr3t";
+        let with_creds = format!("https://{token}@github.com/org/repo.git");
+        assert_eq!(
+            scrub_url_credentials(&with_creds),
+            "https://github.com/org/repo.git"
+        );
     }
 
     #[test]
