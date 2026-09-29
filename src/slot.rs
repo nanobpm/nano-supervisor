@@ -371,7 +371,15 @@ async fn execute(
     // absolute key would otherwise make `remove_dir_all` / `create_dir_all`
     // operate outside `runs_dir`.
     crate::jobs::validate_job_key(&key)?;
-    let run_dir = cfg.runs_dir.join(&key);
+    // Resolve to an absolute path so a relative `--runs-dir` cannot break the
+    // daemon↔agent result-file contract: the child runs with `cwd` set inside
+    // `run_dir`, so a relative `AGENT_RESULT_FILE` would resolve against the
+    // child's cwd while the daemon reads it against its own — the completion
+    // would be silently missed. `std::path::absolute` is purely lexical (it does
+    // not touch the filesystem or resolve symlinks), so the symlink-rejection
+    // hardening in `prepare_run_dir` still inspects the real on-disk structure.
+    let run_dir = std::path::absolute(cfg.runs_dir.join(&key))
+        .with_context(|| format!("resolving absolute run dir under {}", cfg.runs_dir.display()))?;
     // Reject symlinked runs root / job dir / ancestors, wipe any stale prior
     // attempt, (re-)create the dir, and lock it to owner-only 0700 — the full
     // hardening lives in one shared helper (also used by the `spike` path).

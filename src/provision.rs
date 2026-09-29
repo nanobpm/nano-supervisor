@@ -220,6 +220,9 @@ async fn remove_partial_checkout(workspace: &Path) {
 /// top-level `origin` scrub does not reach those nested configs. Walk every
 /// `config` file under `.git/modules` and rewrite any embedded credential URL to
 /// its credential-free form, so no token is left on disk for the agent to read.
+/// The superproject's own top-level `<workspace>/.git/config` is scrubbed too,
+/// since `submodule init` copies each submodule URL into a `submodule.<name>.url`
+/// entry there that the `origin` scrub does not reach.
 ///
 /// Directory recursion uses `file_type()` (which does not follow symlinks), so a
 /// symlinked entry is never traversed into, and each `config` rewrite goes
@@ -244,6 +247,13 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("stat {}", modules.display())),
     }
+    // `git submodule init` (run by `--recurse-submodules`) also copies each
+    // submodule's remote URL into a top-level `submodule.<name>.url` entry in the
+    // superproject's own `<workspace>/.git/config`, which the `origin` set-url
+    // scrub does not touch. Scrub it too so no persisted submodule URL source is
+    // left behind (defense in depth — the token is supplied out of band and is
+    // never written here, symmetric with the origin and nested-module scrubs).
+    scrub_file_credentials_in_place(&workspace.join(".git").join("config"))?;
     let mut stack = vec![modules];
     while let Some(dir) = stack.pop() {
         let entries =
@@ -757,9 +767,19 @@ mod tests {
         std::fs::write(&outer_cfg, body("h1")).unwrap();
         std::fs::write(&inner_cfg, body("h2")).unwrap();
 
+        // The superproject's own top-level `.git/config` holds a
+        // `submodule.<name>.url` entry that `submodule init` copied; it must be
+        // scrubbed too.
+        let top_cfg = tmp.join(".git").join("config");
+        std::fs::write(
+            &top_cfg,
+            format!("[submodule \"sub\"]\n\turl = https://{token}@h3/o/r.git\n"),
+        )
+        .unwrap();
+
         scrub_submodule_config_credentials(&tmp).expect("scrub submodule configs");
 
-        for (cfg, host) in [(&outer_cfg, "h1"), (&inner_cfg, "h2")] {
+        for (cfg, host) in [(&outer_cfg, "h1"), (&inner_cfg, "h2"), (&top_cfg, "h3")] {
             let got = std::fs::read_to_string(cfg).unwrap();
             assert!(!got.contains("s3cr3tPAT"), "credential left in {}: {got}", cfg.display());
             assert!(got.contains(&format!("https://{host}/o/r.git")));
