@@ -75,8 +75,13 @@ pub async fn run(
         next = next.wrapping_add(1);
 
         let batch = tokio::select! {
-            b = jobs.activate(job_type, &cfg.worker_name, cfg.recovery_window, cfg.poll_timeout, cfg.with_lease) => b,
+            // Bias the drain watch ahead of activation: if SIGTERM makes
+            // `shutdown` ready in the same tick an activation response arrives,
+            // the shutdown arm must win so the slot does not lease/start newly
+            // returned work while draining was requested.
+            biased;
             _ = shutdown.changed() => continue,
+            b = jobs.activate(job_type, &cfg.worker_name, cfg.recovery_window, cfg.poll_timeout, cfg.with_lease) => b,
         };
         let batch = match batch {
             Ok(b) => b,
@@ -89,6 +94,15 @@ pub async fn run(
                 continue;
             }
         };
+        // Re-check the drain watch before touching the returned batch: `select!`
+        // resolves the activation the instant it is ready, but a SIGTERM may have
+        // set `shutdown` while `activate` was in flight. Starting these jobs now
+        // would lease/run work after draining was requested, so drop the batch
+        // (the activations simply expire and are redelivered) and stop the slot.
+        if *shutdown.borrow() {
+            log(&format!("slot {} draining", cfg.worker_name));
+            return;
+        }
         for job in batch {
             if cfg.with_lease && job.lease.is_none() {
                 // The CLI's `--with-lease` contract is to fail LOUDLY when the
