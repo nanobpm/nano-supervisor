@@ -587,15 +587,22 @@ impl Drop for ActiveGuard {
 /// run from an orphaned one.
 const ACTIVE_MARKER: &str = ".nano-active";
 
-/// Filename of the per-run advisory lock guarding all read/modify/write of the
-/// active marker. In production the lock is placed by [`lock_path_for`] as a
-/// sidecar *beside* the run dir (in the run root the sweeper never removes), so
-/// its inode survives the run dir's removal/recreation; this constant is the
-/// in-dir fallback name used only when a run dir has no parent. The lock file is
-/// **never unlinked** (only its advisory lock is taken and released), so there is
-/// no open-vs-unlink inode race on the lock itself. It exists solely to
-/// serialize marker access and is not itself a liveness signal.
-const ACTIVE_LOCK: &str = ".nano-active.lock";
+/// Filename of the **single, run-root-wide** advisory lock guarding all
+/// read/modify/write of any run's active marker and every reap-vs-reactivation.
+/// [`lock_path_for`] places exactly *one* such lock in the run root (which the
+/// sweeper never removes) and shares it across every run directory under that
+/// root — rather than one lock file per run dir. This keeps the lock inode
+/// stable forever and **bounds lock files to one per run root**, so distinct
+/// job keys can no longer leave a permanent `.<key>.lock` sidecar each and grow
+/// the run root without bound (which would undermine `--reap-age`/`--keep-runs`
+/// and the disk-space guard). The lock file is **never unlinked** (only its
+/// advisory lock is taken and released), so there is no open-vs-unlink inode
+/// race on the lock itself. Serializing all run dirs under a root against each
+/// other is strictly stronger than per-dir locking and adds no meaningful
+/// contention: the sweep already holds the in-process active-set lock for its
+/// whole pass, and claims/completions take the lock only briefly. It exists
+/// solely to serialize marker access and is not itself a liveness signal.
+const RUN_ROOT_LOCK: &str = ".nano-runs.lock";
 
 /// Filename of the per-run *retention* sentinel. `finalize` writes it into a run
 /// directory whose committed work was captured on a local fallback branch that
@@ -618,36 +625,41 @@ fn agent_result_file(cwd: &Path) -> PathBuf {
     cwd.join(AGENT_RESULT_FILE)
 }
 
-/// The path of the advisory lock serializing access to a run directory's
-/// liveness marker. The lock lives **outside** the reapable run directory — as
-/// a sidecar in the parent run root, keyed by the run dir's file name — so its
-/// inode is stable across the directory's removal and recreation.
+/// The path of the advisory lock serializing access to run-directory liveness
+/// markers. A **single** lock is shared by every run directory under the same
+/// run root: it lives in the run root itself — the parent the sweeper never
+/// removes — so its inode is stable across any run dir's removal and
+/// recreation, and, crucially, there is exactly **one** lock file per run root
+/// instead of one accumulating per job key.
 ///
-/// If the lock lived inside the run dir, a worker blocked in `flock` on the old
-/// `.nano-active.lock` could be holding an inode the sweeper's `remove_dir_all`
-/// has already unlinked; on resuming it would recreate the dir and stamp a live
+/// A per-run sidecar lock (one `.<name>.lock` beside each run dir) would also be
+/// safe against the inode race, but the sweep only ever removes run
+/// *directories*, never these sidecars, so with distinct job keys over time they
+/// would pile up one-per-job forever — unbounded metadata/disk growth that
+/// defeats `--reap-age`/`--keep-runs` and the disk-space guard. Unlinking them
+/// is not an option either: a worker blocked in `flock` on a sidecar the sweeper
+/// then unlinks would hold an orphaned inode while a later opener creates a fresh
+/// one, splitting the lock and reintroducing the reap-vs-reactivation race. A
+/// single, never-unlinked run-root lock sidesteps both problems at once.
+///
+/// If the lock instead lived *inside* the run dir, a worker blocked in `flock`
+/// on the old lock could be holding an inode the sweeper's `remove_dir_all` has
+/// already unlinked; on resuming it would recreate the dir and stamp a live
 /// marker while still holding that unreachable inode, and a later sweep opening
-/// a *fresh* lock inode would reap the now-live cwd. Placing the lock beside the
-/// dir (in the run root, which the sweeper never removes) keeps the cross-process
-/// check-then-delete atomic. The sidecar is never unlinked, so there is no
-/// open-vs-unlink inode race on the lock itself.
+/// a *fresh* lock inode would reap the now-live cwd.
 fn lock_path_for(dir: &Path) -> PathBuf {
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "run".to_string());
     match dir.parent() {
-        Some(parent) => parent.join(format!(".{name}.lock")),
+        Some(parent) => parent.join(RUN_ROOT_LOCK),
         // A run dir with no parent (filesystem root) cannot be reaped by the
         // sweeper anyway; fall back to an in-dir lock.
-        None => dir.join(ACTIVE_LOCK),
+        None => dir.join(RUN_ROOT_LOCK),
     }
 }
 
 /// Serialize a marker read/modify/write through an exclusive advisory lock on
-/// the run's stable [`lock_path_for`] file (a sidecar beside the run dir, not
-/// inside it), so a completing worker's ownership-check-then-unlink and a
-/// reactivating worker's marker write are mutually exclusive (closing the
+/// the stable, run-root-wide [`lock_path_for`] file (in the run root, not inside
+/// any reapable run dir), so a completing worker's ownership-check-then-unlink
+/// and a reactivating worker's marker write are mutually exclusive (closing the
 /// read-then-unlink TOCTOU). Dropping the file closes its fd, releasing the
 /// lock.
 ///
@@ -870,16 +882,16 @@ fn sweep_runs(opts: &WorkerOptions, active: &Arc<Mutex<HashSet<PathBuf>>>) {
                 continue;
             }
             // Cross-process guard, made atomic against reactivation: hold the
-            // per-run marker lock across BOTH the liveness check and the
+            // shared run-root marker lock across BOTH the liveness check and the
             // removal. Without the shared lock a foreign worker could reactivate
             // this dir (write a live marker under that same lock) in the window
             // between our check returning "not live" and `remove_dir_all`,
             // leaving us to delete a now-live cwd (TOCTOU). Holding the lock for
-            // the whole check-then-delete closes that gap. The lock file is a
-            // sidecar BESIDE the run dir (see `lock_path_for`), in the run root
-            // the sweeper never removes, so `remove_dir_all` cannot unlink the
-            // lock inode out from under a worker blocked on it; flock is released
-            // when its fd is dropped. If the lock cannot be acquired (`None`),
+            // the whole check-then-delete closes that gap. The lock file lives in
+            // the run root (see `lock_path_for`), which the sweeper never
+            // removes, so `remove_dir_all` cannot unlink the lock inode out from
+            // under a worker blocked on it; flock is released when its fd is
+            // dropped. If the lock cannot be acquired (`None`),
             // skip this reap (`removed` stays false) rather than delete unlocked
             // — a fail-safe that keeps a possibly-live cwd.
             let removed = with_marker_lock(&path, || {
@@ -1380,10 +1392,15 @@ mod tests {
 
     #[test]
     fn marker_lock_serializes_and_never_unlinks_the_lock_file() {
-        // The stable lock file guards marker access and lives OUTSIDE the
-        // reapable run dir (a sidecar in the parent run root), so removing the
-        // run dir never unlinks the lock inode out from under a blocked worker.
-        let dir = std::env::temp_dir().join(format!("ns-lock-{}", std::process::id()));
+        // The stable lock file guards marker access and lives in the RUN ROOT
+        // (never inside a reapable run dir), so removing a run dir never unlinks
+        // the lock inode out from under a blocked worker. A single lock is shared
+        // by every run dir under the root, so lock files cannot accumulate one
+        // per job key. Use a dedicated run root so the shared lock is isolated
+        // from other tests/processes that also live under `temp_dir`.
+        let root = std::env::temp_dir().join(format!("ns-lock-root-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("run-a");
         std::fs::create_dir_all(&dir).unwrap();
         // `write_active_marker` takes the lock internally; the guarded closure
         // returns its value. (These calls are never nested in production — doing
@@ -1407,19 +1424,26 @@ mod tests {
                 "the lock file persists (never unlinked) for stable, race-free locking"
             );
             assert!(
-                !dir.join(ACTIVE_LOCK).exists(),
-                "the lock lives beside the run dir, not inside the reapable directory"
+                !dir.join(RUN_ROOT_LOCK).exists(),
+                "the lock lives in the run root, not inside the reapable run dir"
             );
-            // Reaping the run dir must not remove the sidecar lock.
+            // A sibling run dir under the same root shares the SAME lock file —
+            // lock files are bounded to one per run root, not one per job key.
+            let sibling = root.join("run-b");
+            std::fs::create_dir_all(&sibling).unwrap();
+            assert_eq!(
+                lock_path_for(&sibling),
+                lock,
+                "sibling run dirs share one run-root lock (no per-job accumulation)"
+            );
+            // Reaping a run dir must not remove the run-root lock.
             let _ = std::fs::remove_dir_all(&dir);
             assert!(
                 lock.exists(),
-                "removing the run dir leaves the sidecar lock in place"
+                "removing a run dir leaves the shared run-root lock in place"
             );
-            let _ = std::fs::remove_file(&lock);
         }
-        #[cfg(not(unix))]
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
