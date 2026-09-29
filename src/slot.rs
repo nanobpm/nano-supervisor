@@ -320,6 +320,61 @@ fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
 /// local users regardless of umask — this still matters when `runs_dir` falls
 /// back to a shared system temp location.
 pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match prepare_run_dir_pinned(runs_dir, run_dir) {
+            Ok(()) => return Ok(()),
+            // Kernel too old for `openat2` (pre-5.6): fall through to the
+            // best-effort path-based checks below.
+            Err(crate::saferoot::PinError::Unsupported) => {}
+            // A refused symlinked component (ELOOP) or any other error is a
+            // real, security-relevant outcome — surface it, never retry the
+            // weaker path-based version.
+            Err(crate::saferoot::PinError::Io(e)) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("preparing run dir {}", run_dir.display())));
+            }
+        }
+    }
+    prepare_run_dir_path_based(runs_dir, run_dir)
+}
+
+/// `prepare_run_dir` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
+/// runs root: the stale-wipe, create, and 0700 chmod of both the root and the
+/// job dir all happen *relative to that pinned handle*, so a same-UID actor
+/// cannot swap `runs_dir` (or an ancestor) for a symlink between a check and the
+/// operation and redirect the remove/create outside the workspace. This is the
+/// atomic fix the path-based `reject_symlink` re-checks can only approximate.
+/// `run_dir` is always `<runs_dir>/<key>` (a single, engine-validated numeric
+/// component), so its `file_name()` is the child directory to prepare.
+#[cfg(target_os = "linux")]
+fn prepare_run_dir_pinned(
+    runs_dir: &Path,
+    run_dir: &Path,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::{DirHandle, PinError};
+    let name = run_dir.file_name().ok_or_else(|| {
+        PinError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("run dir {} has no final component", run_dir.display()),
+        ))
+    })?;
+    // Bootstrap: the runs root must exist before it can be opened no-follow. A
+    // symlinked component is still caught the instant we open it (openat2
+    // refuses it), so this only ever materialises real directories under an
+    // honest root; a planted symlink ancestor fails the open rather than being
+    // silently followed.
+    std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
+    let root = DirHandle::open_root_nofollow(runs_dir)?;
+    root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
+    Ok(())
+}
+
+/// Path-based `prepare_run_dir`: the pre-`openat2` fallback (non-Linux, or a
+/// Linux kernel older than 5.6). Rejects a symlinked leaf / ancestor before
+/// *and* after the non-atomic remove+create — a best-effort approximation of
+/// the pinned-handle guarantee that cannot fully close the TOCTOU window.
+fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
     reject_symlink(runs_dir)?;
     reject_symlink(run_dir)?;
     reject_symlinked_ancestors(run_dir)?;
@@ -406,6 +461,99 @@ fn is_active_run(path: &Path) -> bool {
 /// `read_dir`/`metadata`/`remove` failure is logged and skipped, never fatal,
 /// because reaping old debris must not block servicing a new job.
 pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
+    #[cfg(target_os = "linux")]
+    {
+        match sweep_stale_runs_pinned(runs_dir, max_age) {
+            Ok(()) => return,
+            // Kernel too old for `openat2` (pre-5.6): fall through to the
+            // best-effort path-based sweep below.
+            Err(crate::saferoot::PinError::Unsupported) => {}
+            // A refused symlinked root (ELOOP) or any other error: skip the
+            // sweep entirely rather than risk traversing a redirected root —
+            // exactly the behaviour the path-based version's up-front reject
+            // provided, now enforced atomically at open time.
+            Err(crate::saferoot::PinError::Io(e)) => {
+                log(&format!(
+                    "skipping stale-run sweep of {}: {e} (possible local symlink attack)",
+                    runs_dir.display()
+                ));
+                return;
+            }
+        }
+    }
+    sweep_stale_runs_path_based(runs_dir, max_age);
+}
+
+/// `sweep_stale_runs` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
+/// runs root: `read_dir`, the per-entry `lstat`, and every `remove` run
+/// *relative to that pinned handle* with the `*at` syscalls, never re-resolving
+/// the path. A same-UID actor can therefore not swap `runs_dir` (or an
+/// ancestor) for a symlink between the check and the traversal to redirect the
+/// sweep's deletions outside the workspace — the race path-based re-checks
+/// cannot atomically close. Descent into an aged run dir is likewise no-follow,
+/// so a symlink *inside* a swept dir deletes the link, never its target.
+#[cfg(target_os = "linux")]
+fn sweep_stale_runs_pinned(
+    runs_dir: &Path,
+    max_age: Duration,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::{DirHandle, PinError};
+    let root = match DirHandle::open_root_nofollow(runs_dir) {
+        Ok(h) => h,
+        // A missing runs_dir (first job) is nothing to sweep — not an error;
+        // the prepare path will (re)create and validate it.
+        Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // `execute` registers each in-flight run by its ABSOLUTE path, so resolve
+    // the root once to compare entries against the active set correctly even
+    // when `runs_dir` is relative.
+    let runs_abs = std::path::absolute(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
+    let now = SystemTime::now();
+    for name in root.entry_names().map_err(PinError::Io)? {
+        let meta = match root.symlink_metadata(&name) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Only sweep real directories — never follow a symlink (which could
+        // point outside runs_dir), and leave stray files be.
+        if !meta.is_dir || meta.is_symlink {
+            continue;
+        }
+        // Never reap a live run, however old its mtime.
+        if is_active_run(&runs_abs.join(&name)) {
+            continue;
+        }
+        // Age from the directory's own mtime; keep it when the platform
+        // withholds a modified time rather than risk deleting a fresh run.
+        let aged_out = meta
+            .modified
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if !aged_out {
+            continue;
+        }
+        let path = runs_dir.join(&name);
+        match root.remove_tree(&name) {
+            Ok(()) => log(&format!(
+                "swept stale run dir {} (older than {}d)",
+                path.display(),
+                max_age.as_secs() / 86_400
+            )),
+            Err(e) => log(&format!(
+                "failed to sweep stale run dir {}: {e:#}",
+                path.display()
+            )),
+        }
+    }
+    Ok(())
+}
+
+/// Path-based `sweep_stale_runs`: the pre-`openat2` fallback (non-Linux, or a
+/// Linux kernel older than 5.6). Rejects a symlinked root/ancestor up front,
+/// then reads and removes by path — a best-effort approximation that cannot
+/// fully close the check/traverse TOCTOU the pinned version does.
+fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
     // Refuse to traverse a symlinked root, or one reached through a symlinked
     // ancestor, before touching it: `read_dir` (and the `remove_dir_all` below)
     // follow such a link, so a symlinked `--runs-dir` — or an attacker-planted
@@ -540,8 +688,12 @@ async fn execute(
     // would be silently missed. `std::path::absolute` is purely lexical (it does
     // not touch the filesystem or resolve symlinks), so the symlink-rejection
     // hardening in `prepare_run_dir` still inspects the real on-disk structure.
-    let run_dir = std::path::absolute(cfg.runs_dir.join(&key))
-        .with_context(|| format!("resolving absolute run dir under {}", cfg.runs_dir.display()))?;
+    let run_dir = std::path::absolute(cfg.runs_dir.join(&key)).with_context(|| {
+        format!(
+            "resolving absolute run dir under {}",
+            cfg.runs_dir.display()
+        )
+    })?;
     // Register this run dir as in-flight for the whole job so a concurrent
     // slot's retention sweep can never reap it, even if the agent runs longer
     // than `FAILED_RUN_RETENTION` without touching the dir. The guard drops on
@@ -582,7 +734,15 @@ async fn execute(
             // otherwise leak the PAT to the ACP agent (and its tools/results),
             // so scrub the prompt with the same URL redactor before `run_acp`.
             let safe_prompt = redact_url(&prompt);
-            run_acp(&cfg, &key, &agent_cwd, &safe_prompt, &result_file, &agent_env).await?
+            run_acp(
+                &cfg,
+                &key,
+                &agent_cwd,
+                &safe_prompt,
+                &result_file,
+                &agent_env,
+            )
+            .await?
         }
         Protocol::Pipe => {
             run_pipe(&cfg, &key, &agent_cwd, &env, &job, &result_file, &agent_env).await?
@@ -1039,7 +1199,10 @@ mod tests {
         );
         // Not lost: the outcome passes through unchanged so a genuine completion
         // still settles.
-        assert!(matches!(reconcile_lost(Some(Ok::<(), anyhow::Error>(())), false), Some(Ok(()))));
+        assert!(matches!(
+            reconcile_lost(Some(Ok::<(), anyhow::Error>(())), false),
+            Some(Ok(()))
+        ));
         // Already lost via the select's None branch stays lost.
         assert!(reconcile_lost(None::<Result<()>>, false).is_none());
     }
@@ -1104,7 +1267,10 @@ mod tests {
         assert!(is_active_run(&live_abs));
 
         sweep_stale_runs(&root, Duration::ZERO);
-        assert!(live.exists(), "an in-flight run must not be swept, however aged");
+        assert!(
+            live.exists(),
+            "an in-flight run must not be swept, however aged"
+        );
 
         // Once the guard drops, the same dir becomes eligible again.
         drop(_guard);
@@ -1147,6 +1313,105 @@ mod tests {
         assert!(
             aged.exists(),
             "sweep of a symlinked root must not follow it and delete the target's contents"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A unique scratch dir under the system temp root (no tempfile dep here).
+    #[cfg(target_os = "linux")]
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nano-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_run_dir_pinned_creates_owner_only_and_wipes_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let runs = unique_tmp("prep-pinned");
+        let run = runs.join("42");
+
+        // A stale prior attempt with a leftover file must be wiped.
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("stale.json"), b"old").unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "run dir must exist after prepare");
+        assert!(
+            !run.join("stale.json").exists(),
+            "a stale prior attempt must be wiped"
+        );
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "job dir must be locked to owner-only 0700");
+        let root_mode = std::fs::metadata(&runs).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            root_mode, 0o700,
+            "runs root must be locked to owner-only 0700"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_run_dir_pinned_refuses_symlinked_root() {
+        // A symlinked runs root must be refused by the pinned open (ELOOP),
+        // surfaced as an error — never silently followed to prepare a job dir
+        // in the real target.
+        let base = unique_tmp("prep-symlink");
+        let real_root = base.join("real-runs");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let link_root = base.join("link-runs");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let run = link_root.join("7");
+        let err = prepare_run_dir(&link_root, &run).unwrap_err();
+        assert!(
+            !real_root.join("7").exists(),
+            "a symlinked root must not be followed to create the job dir in the target"
+        );
+        let _ = err;
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sweep_pinned_does_not_follow_symlinked_entry_inside_aged_dir() {
+        // An aged run dir containing a symlink to an outside directory must be
+        // removed WITHOUT following the link: the link is deleted, its target
+        // (and the target's contents) survive.
+        let base = unique_tmp("sweep-nofollow");
+        let runs = base.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), b"keep me").unwrap();
+
+        let aged = runs.join("aged-run");
+        std::fs::create_dir_all(&aged).unwrap();
+        std::os::unix::fs::symlink(&outside, aged.join("evil-link")).unwrap();
+
+        sweep_stale_runs(&runs, Duration::ZERO);
+
+        assert!(
+            !aged.exists(),
+            "aged run dir (and its symlink child) must be swept"
+        );
+        assert!(
+            outside.join("precious.txt").exists(),
+            "sweep must not follow the inner symlink and delete its target's contents"
         );
 
         std::fs::remove_dir_all(&base).ok();

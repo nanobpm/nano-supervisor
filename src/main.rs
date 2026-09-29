@@ -15,6 +15,10 @@ mod pipe;
 mod profile;
 mod provision;
 mod result;
+// Linux-only: `openat2(RESOLVE_NO_SYMLINKS)` pinned-handle hardening for the
+// run-dir sweep/provision paths. Other Unix platforms use the path-based checks.
+#[cfg(target_os = "linux")]
+mod saferoot;
 mod slot;
 mod state;
 mod worker;
@@ -214,7 +218,11 @@ async fn main() -> Result<()> {
             };
             daemon::run(opts).await
         }
-        Cmd::ReapWatchdog { parent_pid, pgid, parent_start } => {
+        Cmd::ReapWatchdog {
+            parent_pid,
+            pgid,
+            parent_start,
+        } => {
             tokio::task::spawn_blocking(move || {
                 pdeath::reap_watchdog(parent_pid, pgid, parent_start)
             })
@@ -285,6 +293,9 @@ mod tests {
         assert_eq!(clamp_recovery_window(1), MIN_RECOVERY_WINDOW);
         assert_eq!(clamp_recovery_window(999), MIN_RECOVERY_WINDOW);
         // A comfortably large window passes through unchanged.
-        assert_eq!(clamp_recovery_window(300_000), Duration::from_millis(300_000));
+        assert_eq!(
+            clamp_recovery_window(300_000),
+            Duration::from_millis(300_000)
+        );
     }
 }
