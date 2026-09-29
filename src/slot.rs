@@ -154,6 +154,7 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
     // Keep the activation alive while the agent works; a 404/409 fences us out.
     let refreshes = Arc::new(AtomicUsize::new(0));
     let (lost_tx, mut lost_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let refresher = tokio::spawn(refresh_loop(
         jobs.clone(),
         key.clone(),
@@ -161,6 +162,7 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         cfg.recovery_window,
         refreshes.clone(),
         lost_tx,
+        stop_rx,
     ));
 
     // Run the job on its own task so a panic fails only THIS job (the slot loop
@@ -177,13 +179,16 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
     // Stop the refresher and wait for it to fully exit BEFORE sampling the
-    // activation-loss watch, so the watch value cannot change under us. If we
-    // sampled first and aborted afterwards, the refresher could publish a
-    // 404/409 loss in the window between our `borrow()` and `refresher.abort()`,
-    // and we would then settle the job with a stale lease — violating the
-    // no-settle-after-fencing guarantee. Once the task is joined no further
-    // writes to the watch can happen, so the value we read below is final.
-    refresher.abort();
+    // activation-loss watch, so the watch value cannot change under us. Signal a
+    // graceful stop and AWAIT the task — never `abort()`: aborting could cancel
+    // an in-flight `extend` in the window between our exec completing and the
+    // stop, dropping the very request that would report a 404/409 fence. The
+    // refresher would then never publish the loss, and we would settle the job
+    // with a stale lease — violating the no-settle-after-fencing guarantee. A
+    // graceful stop lets any in-flight extend run to completion and publish its
+    // result first; once the task is joined no further writes to the watch can
+    // happen, so the value we read below is final.
+    let _ = stop_tx.send(true);
     let _ = refresher.await;
     // Re-check the activation-loss watch after the select. `select!` can pick the
     // `exec` branch even when the refresher set `lost` to true in the same tick

@@ -32,6 +32,14 @@ const RESERVED_RESULT_KEYS: &[&str] = &[
     "branchMismatch",
     "scanError",
     "worldMarker",
+    // Host-stamped completion vars (set by the harness in `slot::execute` /
+    // `worker::run` AFTER the effectiveness check). They must be reserved so an
+    // agent cannot return e.g. `{"agentWorker":"x"}` — a value the host would
+    // overwrite anyway — to make `has_effective_result_vars` return true and slip
+    // an otherwise-empty result past the empty-result guard.
+    "agentResult",
+    "agentWorker",
+    "agentStopReason",
 ];
 
 const PROTO_POLLUTION_KEYS: &[&str] = &["__proto__", "constructor", "prototype"];

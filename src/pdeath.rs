@@ -70,6 +70,26 @@ pub(crate) fn sigkill_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn sigkill_group(_pid: u32) {}
 
+/// `SIGTERM` a process group by its leader pid, via a direct libc `kill(2)`.
+/// Preferred over spawning an external `kill(1)`: a spawned process would
+/// inherit the daemon's environment (including `CAMUNDA_*`/`ZEEBE_*` credentials)
+/// for the lifetime of that child, exposing them via `/proc/<pid>/environ` to a
+/// same-user host agent during shutdown — defeating the env scrubbing applied to
+/// the agent/git children. The libc call touches no Rust state and delivers the
+/// same group signal without leaking the daemon environment. Harmless if the
+/// group is already gone (`ESRCH`).
+#[cfg(unix)]
+pub(crate) fn sigterm_group(pid: u32) {
+    // SAFETY: a plain libc kill of a process group; no Rust state is touched and
+    // an already-dead group simply yields ESRCH.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sigterm_group(_pid: u32) {}
+
 /// True while at least one process in the group led by `pid` is still alive.
 /// `kill(-pid, 0)` probes the group without delivering a signal: `0` means a
 /// member still exists, an error (`ESRCH`) means the group is gone. Used to poll
@@ -114,9 +134,12 @@ pub(crate) async fn terminate_group_and_reap(
         // hitting an unrelated group.
         if group_alive(pid) {
             // Negative pid = the whole process group (agent + tools it started).
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &format!("-{pid}")])
-                .status();
+            // Signal via a direct libc `kill(-pgid, SIGTERM)` rather than
+            // spawning `kill(1)`: a spawned child would inherit the daemon's
+            // scrubbed-from-the-agent `CAMUNDA_*`/`ZEEBE_*` credentials and expose
+            // them via `/proc/<pid>/environ` to a same-user host agent for the
+            // duration of that child.
+            sigterm_group(pid);
             let deadline = std::time::Instant::now() + grace;
             loop {
                 // Reap the leader the instant it exits. Otherwise its unreaped

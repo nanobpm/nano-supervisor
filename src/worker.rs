@@ -101,6 +101,7 @@ async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
 
     let refreshes = Arc::new(AtomicUsize::new(0));
     let (lost_tx, mut lost_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let refresher = tokio::spawn(refresh_loop(
         jobs.clone(),
         key.clone(),
@@ -108,13 +109,18 @@ async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
         opts.recovery_window,
         refreshes.clone(),
         lost_tx,
+        stop_rx,
     ));
 
     let result = tokio::select! {
         r = run_agent(opts, &key, &job) => Some(r),
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
-    refresher.abort();
+    // Graceful stop + await (never `abort()`): let any in-flight `extend` run to
+    // completion and publish its 404/409 fence before the refresher exits,
+    // instead of cancelling the request that detects the fence.
+    let _ = stop_tx.send(true);
+    let _ = refresher.await;
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
 
@@ -196,6 +202,7 @@ pub(crate) async fn refresh_loop(
     window: Duration,
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,
+    mut stop: watch::Receiver<bool>,
 ) {
     // Refresh at a third of the window, but never a zero-length interval: a
     // sub-3ms window divides to `Duration::ZERO`, which would spin this loop and
@@ -204,7 +211,24 @@ pub(crate) async fn refresh_loop(
     let every = (window / 3).max(Duration::from_millis(1));
     let mut failures = 0;
     loop {
-        tokio::time::sleep(every).await;
+        tokio::select! {
+            // A stop request during the idle interval ends the loop at once:
+            // there is no in-flight extend to lose, so the loss watch already
+            // holds its final value.
+            _ = stop.changed() => return,
+            _ = tokio::time::sleep(every) => {}
+        }
+        // Honour a stop that landed exactly as the interval elapsed before
+        // issuing another extend.
+        if *stop.borrow() {
+            return;
+        }
+        // Deliberately NOT wrapped in a cancellable select against `stop`: the
+        // caller stops us by signalling `stop` and awaiting our JoinHandle (never
+        // `abort()`), so an in-flight extend always runs to completion and
+        // publishes a 404/409 fence on `lost` before we return. Cancelling
+        // mid-extend would drop the very request that detects the fence, letting
+        // the caller settle a job whose activation was already revoked.
         match jobs.extend(&key, window, &lease).await {
             Ok(()) => {
                 failures = 0;
@@ -221,6 +245,12 @@ pub(crate) async fn refresh_loop(
                     return;
                 }
             }
+        }
+        // A stop that arrived while this extend was in flight: we have now
+        // published its result (success or fence) on the watch, so it is safe to
+        // exit.
+        if *stop.borrow() {
+            return;
         }
     }
 }
