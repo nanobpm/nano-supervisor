@@ -43,73 +43,122 @@ fn non_empty_result_completes_the_job() {
         &[],
         &[],
     );
-    assert_eq!(outcome.result_file().unwrap()["status"], "opened");
-    let logs = outcome.stderr();
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "stderr:\n{}",
+        outcome.stderr()
+    );
+    // Completion variables: the result's keys spread at the top level, plus the
+    // worker's run metadata and the versioned result envelope.
+    let vars = outcome.variables();
+    assert_eq!(vars["status"], "opened", "{vars:#?}");
+    assert_eq!(vars["summary"], "did it", "{vars:#?}");
+    assert_eq!(vars["output"], "done", "{vars:#?}");
+    assert_eq!(vars["exitCode"], 0, "{vars:#?}");
+    assert_eq!(vars["truncated"], false, "{vars:#?}");
     assert!(
-        logs.contains("completed") || outcome.output.status.success(),
-        "job should complete; worker stderr:\n{logs}"
+        vars["agent"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("ctfake")),
+        "{vars:#?}"
+    );
+    let env = &vars["io.nanobpm.agentResult"];
+    assert_eq!(env["schemaVersion"], 1, "{env:#}");
+    assert_eq!(env["status"], "completed", "{env:#}");
+    assert_eq!(env["output"], "done", "{env:#}");
+    assert_eq!(env["result"]["status"], "opened", "{env:#}");
+    assert_eq!(
+        outcome.record().runs,
+        1,
+        "a job with a result is never nudged"
     );
 }
 
-/// End-to-end: an agent that produces nothing must make the worker **fail** the
-/// job, never complete it (c8ctl-plugin-nano#275).
 #[test]
 fn empty_result_fails_never_completes() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
+    if target == contract_tests::Target::Node {
+        // c8ctl-plugin-nano ≤1.69.4 crashes settling an agent job with no
+        // transcript turns (`preGuardDrainTimedOut` is read outside the block
+        // that declares it → ReferenceError), so the job is never failed. The
+        // plugin's settle code fails it with retries-1, which Rust mirrors.
+        skip!("node plugin bug: empty-result settle throws ReferenceError (preGuardDrainTimedOut)");
+    }
     let outcome = run_worker_job(
         &engine,
         &target,
         "result-empty-fails",
-        // A clean `end_turn` with no text and no result file — the canonical
-        // empty result (c8ctl-plugin-nano#275), not an idle-timeout hang.
         &[],
         json!({ "prompt": "produce nothing" }),
         &[],
         &[],
     );
-    let logs = outcome.stderr();
-    assert!(
-        !logs.contains("completed in"),
-        "an empty result must never complete the job; worker stderr:\n{logs}"
+    let job = outcome.settled_job();
+    assert_ne!(
+        job["state"], "COMPLETED",
+        "an empty result must never complete: {job:#}"
     );
+    assert_eq!(
+        job["retries"],
+        2,
+        "an empty result fails the job, consuming one retry: {job:#}\nstderr:\n{}",
+        outcome.stderr()
+    );
+    // Engine 0.0.24 records neither the `errorMessage` nor the variables sent
+    // with a job failure (verified by failing a job by hand), so the reason and
+    // the failure's `io.nanobpm.agentResult` envelope are not observable here;
+    // when the engine does surface the message, it carries the reason.
+    if let Some(msg) = job["errorMessage"].as_str() {
+        assert!(
+            msg.starts_with("agent \"ctfake") && msg.contains("produced an empty result"),
+            "{job:#}"
+        );
+    }
+    let vars = outcome.variables();
     assert!(
-        logs.contains("fail") || logs.contains("without any output"),
-        "an empty result must fail the job; worker stderr:\n{logs}"
+        !vars.contains_key("output"),
+        "no completion variables: {vars:#?}"
     );
 }
 
-/// End-to-end: an agent that stops without a result gets a **nudge** before the
-/// worker gives up on it.
 #[test]
 fn stop_without_result_is_nudged() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    // The Rust worker is a skeleton (issue #1) that treats any non-empty ACP
-    // text as a completed result and has no nudge branch yet, so this scenario
-    // is not a shared contract for `NS_TARGET=rust`. Gate it to the Node target
-    // until the Rust worker grows nudge/result-marker behavior (issue #3, live
-    // harness) rather than asserting a contract it does not yet meet.
-    if target.label() == "rust" {
-        skip!("nudge-on-missing-result is deferred for the Rust worker (issues #1/#3)");
-    }
+    // The agent answers but never emits a result: the worker re-invokes it once
+    // with the re-emit nudge (a fresh process, prompted with the prior output),
+    // then settles on what it has — the agent did work, so the job completes.
     let outcome = run_worker_job(
         &engine,
         &target,
         "result-nudge",
-        // Emit chatter but never write the result file / marker.
         &[json!({ "emit": "still thinking" })],
         json!({ "prompt": "forget to finish" }),
         &[],
         &[],
     );
-    let logs = outcome.stderr();
+    let record = outcome.record();
+    assert_eq!(
+        record.runs,
+        2,
+        "exactly one nudge run; stderr:\n{}",
+        outcome.stderr()
+    );
+    let nudge = record.prompts.get(1).cloned().unwrap_or_default();
     assert!(
-        logs.to_lowercase().contains("nudge"),
-        "worker should nudge an agent that stops without a result; stderr:\n{logs}"
+        nudge.starts_with("You already completed the task in your previous turn")
+            && nudge.ends_with("still thinking"),
+        "the nudge prompt carries the prior output tail: {nudge:?}"
+    );
+    assert_eq!(outcome.job_state(), "COMPLETED");
+    assert_eq!(
+        outcome.variables()["output"],
+        "still thinking\nstill thinking"
     );
 }

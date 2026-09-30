@@ -7,8 +7,11 @@ use anyhow::{bail, Result};
 use crate::jobs::{Jobs, NanoHttp};
 use crate::profile::{self, Profile};
 
-/// Which job-command transport to use. `Auto` resolves to `Nano` (raw HTTP in
-/// Nano's `leaseToken` dialect) when leases are requested, else the SDK.
+/// Which job-command transport to use. `Auto` resolves to the SDK — the same
+/// transport the Node plugin uses. Nano ≥ 0.0.24 returns the spec's
+/// `jobLeaseToken` (alongside its legacy `leaseToken`), so the SDK round-trips
+/// leases. `Nano` (raw HTTP in the legacy `leaseToken` dialect) remains as an
+/// explicit fallback for older engines.
 #[derive(Debug, Clone, Copy)]
 pub enum JobApi {
     Sdk,
@@ -26,9 +29,8 @@ impl JobApi {
         }
     }
 
-    fn resolve(self, with_lease: bool) -> JobApi {
+    fn resolve(self) -> JobApi {
         match self {
-            JobApi::Auto if with_lease => JobApi::Nano,
             JobApi::Auto => JobApi::Sdk,
             other => other,
         }
@@ -37,40 +39,23 @@ impl JobApi {
 
 /// Resolve a profile, log which connection it picked, and build the shared job
 /// client for the chosen transport.
-pub fn connect(
-    profile_name: Option<&str>,
-    job_api: JobApi,
-    with_lease: bool,
-) -> Result<(Option<Profile>, Jobs)> {
+pub fn connect(profile_name: Option<&str>, job_api: JobApi) -> Result<(Option<Profile>, Jobs)> {
     let resolved = profile::resolve(profile_name)?;
     match &resolved {
-        Some(p) => crate::worker::log(&format!(
+        Some(p) => crate::runtime::log(&format!(
             "using c8ctl profile {:?} ({})",
             p.name,
             p.base_url.as_deref().unwrap_or("no baseUrl")
         )),
-        None => crate::worker::log("no c8ctl profile; using CAMUNDA_* environment"),
+        None => crate::runtime::log("no c8ctl profile; using CAMUNDA_* environment"),
     }
-    let jobs = build(resolved.as_ref(), job_api, with_lease)?;
+    let jobs = build(resolved.as_ref(), job_api)?;
     Ok((resolved, jobs))
 }
 
 /// Build the shared job client from an already-resolved profile.
-pub fn build(profile: Option<&Profile>, job_api: JobApi, with_lease: bool) -> Result<Jobs> {
-    Ok(match job_api.resolve(with_lease) {
-        JobApi::Sdk if with_lease => {
-            // The SDK speaks the Camunda spec's `jobLeaseToken`, but the Nano
-            // engine names the token `leaseToken`, so the SDK drops it on
-            // activation and never sends it back. A leased job activated this
-            // way therefore can't be refreshed or completed (409) and would be
-            // redelivered indefinitely. Refuse the combination rather than
-            // silently activate a job we can never settle.
-            bail!(
-                "--job-api sdk cannot settle leased jobs (the SDK drops Nano's \
-                 leaseToken on activation); use --job-api nano with --with-lease, \
-                 or drop --with-lease"
-            );
-        }
+pub fn build(profile: Option<&Profile>, job_api: JobApi) -> Result<Jobs> {
+    Ok(match job_api.resolve() {
         JobApi::Sdk => Jobs::Sdk(Box::new(profile::client(profile)?)),
         JobApi::Nano => {
             // The raw Nano client only speaks none/basic. OAuth — whether from a
@@ -86,7 +71,7 @@ pub fn build(profile: Option<&Profile>, job_api: JobApi, with_lease: bool) -> Re
             if let Some(src) = oauth_source {
                 bail!(
                     "{src} uses OAuth, which the nano/lease job transport does not support; \
-                     use --job-api sdk (drop --with-lease) or none/basic credentials"
+                     use --job-api sdk or none/basic credentials"
                 );
             }
             let (address, basic) = profile::rest_address_and_basic(profile);

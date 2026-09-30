@@ -202,7 +202,7 @@ fn env_auth_strategy_is_none() -> bool {
 /// `AUTH_STRATEGY=NONE`, so an environment that disables auth is honoured just
 /// as a profile-derived `NONE` mode is. The `ZEEBE_*` aliases are honoured on
 /// both paths.
-/// (OAuth is not supported on this path; the spike only needs none/basic.)
+/// (OAuth is not supported on this path; the local engine needs none/basic.)
 pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(String, String)>) {
     let settings = profile.map(sdk_settings).unwrap_or_default();
     let get = |k: &str| {

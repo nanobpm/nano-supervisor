@@ -1,11 +1,12 @@
-//! A daemon slot: one capacity-1 worker that services a hire's whole
-//! rank×capability job-type matrix, one job at a time.
+//! A worker slot: one capacity-1 worker that services a hire's whole
+//! rank×capability job-type matrix, one job at a time — the job core shared by
+//! `daemon` (N slots) and `work` (one slot), mirroring the Node plugin's worker.
 //!
 //! A slot is a single tokio task that round-robins its job types (so capacity is
-//! naturally one — while it runs an agent it polls nothing). It reuses the
-//! spike's leased activation + lease-refresh fencing ([`crate::jobs`],
-//! [`crate::worker::refresh_loop`]) and adds the MVP job handling the daemon
-//! needs: prompt assembly, repo clone, ACP/pipe execution, and result parsing.
+//! naturally one — while it runs an agent it polls nothing). It uses leased
+//! activation + lease-refresh fencing ([`crate::jobs`],
+//! [`crate::runtime::refresh_loop`]) and handles each job: payload assembly,
+//! repo clone, ACP/pipe execution, the re-emit nudge, and result settlement.
 //!
 //! The per-job execution runs on its own spawned task so a panic in one slot
 //! fails only that job — the slot loop catches the join error, fails the job
@@ -26,8 +27,11 @@ use crate::acp::Agent;
 use crate::envelope::{self, Envelope};
 use crate::jobs::{Job, Jobs};
 use crate::result;
+use crate::runtime::{log, refresh_loop};
 use crate::state::{Hire, Protocol};
-use crate::worker::{log, refresh_loop};
+
+/// Per-type long-poll cap when a slot round-robins several job types.
+const MULTI_TYPE_POLL_CAP: Duration = Duration::from_secs(1);
 
 /// Everything a slot needs, shared (via `Arc`) across its per-job tasks.
 #[derive(Debug, Clone)]
@@ -43,7 +47,16 @@ pub struct SlotConfig {
     pub poll_timeout: Duration,
     pub clone_timeout: Duration,
     pub runs_dir: PathBuf,
+    /// Ask the engine for a lease on each activation.
     pub with_lease: bool,
+    /// Refuse to run unfenced: an unleased activation shuts the process down
+    /// (the daemon's `--with-lease`). `work` requests leases but, like the Node
+    /// plugin, runs unfenced when the engine does not issue one.
+    pub require_lease: bool,
+    /// Stop after handling this many jobs (`work --max-jobs`); `None` = forever.
+    pub max_jobs: Option<usize>,
+    /// Keep per-job run directories instead of reaping them (`--keep-runs`).
+    pub keep_runs: bool,
 }
 
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
@@ -66,13 +79,29 @@ pub async fn run(
         cfg.hire.protocol,
     ));
     let mut next = 0usize;
+    let mut handled = 0usize;
     loop {
+        if cfg.max_jobs.is_some_and(|max| handled >= max) {
+            log(&format!(
+                "slot {} handled {handled} job(s) (--max-jobs); stopping",
+                cfg.worker_name
+            ));
+            return;
+        }
         if *shutdown.borrow() {
             log(&format!("slot {} draining", cfg.worker_name));
             return;
         }
         let job_type = &cfg.job_types[next % cfg.job_types.len()];
         next = next.wrapping_add(1);
+        // One long-poll per type, round-robin: with several types a full-length
+        // poll on an idle type would hold a waiting job on another type for the
+        // whole window, so cap each poll to keep pickup latency ~one cycle.
+        let poll = if cfg.job_types.len() > 1 {
+            cfg.poll_timeout.min(MULTI_TYPE_POLL_CAP)
+        } else {
+            cfg.poll_timeout
+        };
 
         let batch = tokio::select! {
             // Bias the drain watch ahead of activation: if SIGTERM makes
@@ -81,7 +110,7 @@ pub async fn run(
             // returned work while draining was requested.
             biased;
             _ = shutdown.changed() => continue,
-            b = jobs.activate(job_type, &cfg.worker_name, cfg.recovery_window, cfg.poll_timeout, cfg.with_lease) => b,
+            b = jobs.activate(job_type, &cfg.worker_name, cfg.recovery_window, poll, cfg.with_lease) => b,
         };
         let batch = match batch {
             Ok(b) => b,
@@ -104,7 +133,7 @@ pub async fn run(
             return;
         }
         for job in batch {
-            if cfg.with_lease && job.lease.is_none() {
+            if cfg.require_lease && job.lease.is_none() {
                 // The CLI's `--with-lease` contract is to fail LOUDLY when the
                 // engine does not issue leases (see the flag's help). Merely
                 // skipping would leave the activation to expire and be
@@ -123,6 +152,7 @@ pub async fn run(
                 return;
             }
             handle(&jobs, &cfg, job).await;
+            handled += 1;
         }
     }
 }
@@ -225,16 +255,23 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         None => log(&format!(
             "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will redeliver it)"
         )),
-        Some(Ok(vars)) => match jobs.complete(&key, vars, &lease).await {
+        Some(Ok(Settle::Complete(vars))) => match jobs.complete(&key, vars, &lease).await {
             Ok(()) => log(&format!(
                 "job {key} completed in {elapsed:.1}s (refreshes={n})"
             )),
             Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
         },
-        Some(Err(e)) => {
-            let msg = format!("{e:#}");
+        Some(outcome) => {
+            let (msg, vars) = match outcome {
+                Ok(Settle::Fail { message, vars }) => (message, vars),
+                // An infrastructure error (provisioning, run-dir setup, a
+                // panic) before the agent could run.
+                Err(e) => (format!("agent \"{}\" failed: {e:#}", cfg.hire.name), None),
+                Ok(Settle::Complete(_)) => unreachable!("handled above"),
+            };
             let retries = (job.retries - 1).max(0);
-            match jobs.fail(&key, retries, &truncate(&msg, 2000), &lease).await {
+            let msg = truncate(&msg, 2000);
+            match jobs.fail(&key, retries, &msg, vars, &lease).await {
                 Ok(()) => log(&format!(
                     "job {key} failed after {elapsed:.1}s (refreshes={n}, retries left {retries}): {msg}"
                 )),
@@ -312,7 +349,7 @@ fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
 
 /// Prepare a per-job run directory under `runs_dir` with the full symlink and
 /// permission hardening, wiping any stale prior-attempt contents. Shared by the
-/// daemon slot path ([`execute`]) and the `spike` worker path so both get
+/// `daemon` and `work` (both run jobs through [`execute`]) so every run gets
 /// identical protection: reject a symlinked leaf / ancestor before *and* after
 /// the non-atomic remove+create (a local process can swap the fresh dir for a
 /// link in between), then restrict both the runs root and the job dir to 0700 so
@@ -734,37 +771,57 @@ fn url_scheme_before(prefix: &str) -> &str {
     &prefix[start..]
 }
 
-async fn execute(
-    cfg: Arc<SlotConfig>,
-    key: String,
-    job: ActivatedJobResult,
-) -> Result<HashMap<String, Value>> {
+/// How a finished job is settled — mirrors the Node plugin's settle block.
+#[derive(Debug)]
+pub(crate) enum Settle {
+    /// Complete with these variables.
+    Complete(HashMap<String, Value>),
+    /// Fail (retries decremented) with this message and optional variables.
+    Fail {
+        message: String,
+        vars: Option<HashMap<String, Value>>,
+    },
+}
+
+/// The job-variable key the Node plugin stores its result envelope under.
+pub(crate) const AGENT_RESULT_KEY: &str = "io.nanobpm.agentResult";
+
+/// The Node plugin's per-stream capture cap (`MAX_CAPTURE_BYTES`, 1 MiB).
+const MAX_CAPTURE_BYTES: usize = 1_048_576;
+
+/// The Node plugin's cap on the prior output echoed into the re-emit nudge.
+const NUDGE_CONTEXT_CAP_CHARS: usize = 24_000;
+
+/// What one agent invocation produced (the Node plugin's `result` object).
+#[derive(Debug, Default)]
+struct RunResult {
+    ok: bool,
+    stdout: String,
+    truncated: bool,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    timed_out: bool,
+    /// ACP `session/update` activity (the transcript turns Node counts).
+    has_turns: bool,
+}
+
+async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
     let env = envelope::assemble(&custom_headers, &variables);
-    let prompt = env
-        .prompt
-        .clone()
-        .filter(|p| !p.trim().is_empty())
-        .context("job carries no prompt (task.prompt / prompt / task)")?;
+    if env.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
+        bail!("job carries no prompt (task.prompt / prompt / task)");
+    }
 
     // Per-job working directory; the repo (when present) is cloned inside it.
     // The dir is keyed by job key and so is reused across retries — wipe any
     // prior attempt's checkout and stale `result.json` first, so a retry starts
-    // from a clean slate (a leftover clone would fail provisioning, and a stale
-    // result could be accepted as this attempt's result).
-    //
-    // Validate the key against the engine's numeric format *before* joining it to
-    // a path: `key` originates from the engine response, and a malformed `../` or
-    // absolute key would otherwise make `remove_dir_all` / `create_dir_all`
-    // operate outside `runs_dir`.
+    // from a clean slate. Validate the key against the engine's numeric format
+    // *before* joining it to a path (a malformed `../` key must never make
+    // `remove_dir_all` / `create_dir_all` operate outside `runs_dir`).
     crate::jobs::validate_job_key(&key)?;
-    // Resolve to an absolute path so a relative `--runs-dir` cannot break the
-    // daemon↔agent result-file contract: the child runs with `cwd` set inside
-    // `run_dir`, so a relative `AGENT_RESULT_FILE` would resolve against the
-    // child's cwd while the daemon reads it against its own — the completion
-    // would be silently missed. `std::path::absolute` is purely lexical (it does
-    // not touch the filesystem or resolve symlinks), so the symlink-rejection
+    // Absolute, so the agent (whose cwd is inside `run_dir`) and the worker
+    // resolve `AGENT_RESULT_FILE` identically. Purely lexical — the symlink
     // hardening in `prepare_run_dir` still inspects the real on-disk structure.
     let run_dir = std::path::absolute(cfg.runs_dir.join(&key)).with_context(|| {
         format!(
@@ -773,19 +830,9 @@ async fn execute(
         )
     })?;
     // Register this run dir as in-flight for the whole job so a concurrent
-    // slot's retention sweep can never reap it, even if the agent runs longer
-    // than `FAILED_RUN_RETENTION` without touching the dir. The guard drops on
-    // every exit path (return, `?` bail, panic), after which a *failed* run is
-    // left to age out normally and a *successful* one is reaped just below.
+    // slot's retention sweep can never reap it.
     let _active = ActiveRunGuard::new(&run_dir);
-    // Best-effort: reap any *failed* runs left for post-mortem that have now
-    // aged past the retention window, so a long-lived daemon's `runs_dir` stays
-    // bounded. Age-based, and it skips any in-flight run registered above, so it
-    // never touches this fresh run or a concurrent slot's live one.
     sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION);
-    // Reject symlinked runs root / job dir / ancestors, wipe any stale prior
-    // attempt, (re-)create the dir, and lock it to owner-only 0700 — the full
-    // hardening lives in one shared helper (also used by the `spike` path).
     prepare_run_dir(&cfg.runs_dir, &run_dir)?;
     let agent_cwd = match &env.repository {
         Some(repo) => {
@@ -803,170 +850,299 @@ async fn execute(
 
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
+    let payload = build_agent_payload(&cfg, &job, &env);
+    let acp = cfg.hire.protocol == Protocol::Acp;
 
-    let (result_obj, detect_stdout) = match cfg.hire.protocol {
-        Protocol::Acp => {
-            // The pipe payload is recursively credential-scrubbed in
-            // `build_pipe_payload`, but the ACP branch forwards the prompt
-            // verbatim. A prompt carrying a `user:token@` clone URL would
-            // otherwise leak the PAT to the ACP agent (and its tools/results),
-            // so scrub the prompt with the same URL redactor before `run_acp`.
-            let safe_prompt = redact_url(&prompt);
-            run_acp(
-                &cfg,
-                &key,
-                &agent_cwd,
-                &safe_prompt,
-                &result_file,
-                &agent_env,
-            )
-            .await?
+    // First turn: every protocol receives the JSON job payload (Node's
+    // `buildAgentStdin` — ACP delivers it verbatim as the `session/prompt` text).
+    let first = run_agent(&cfg, &key, &agent_cwd, &payload.to_string(), &agent_env).await;
+
+    // Result-nudge (Node #678): a clean run that produced output but no usable
+    // result gets exactly ONE bounded "emit your result now" turn, in a fresh
+    // agent process in the same workspace, writing to the same result file.
+    let already = result::read_result_file(&result_file)
+        .or_else(|| result::parse_result_from_stdout(&first.stdout));
+    let mut run = first;
+    if run.ok
+        && !run.stdout.trim().is_empty()
+        && !already
+            .as_ref()
+            .is_some_and(result::has_effective_result_vars)
+    {
+        let nudge_text = build_result_nudge_prompt(&run.stdout);
+        let stdin = if acp {
+            nudge_text
+        } else {
+            nudge_payload(&payload, &nudge_text).to_string()
+        };
+        let nudge = run_agent(&cfg, &key, &agent_cwd, &stdin, &agent_env).await;
+        if let Some(e) = &nudge.error {
+            log(&format!("job {key}: re-emit nudge rerun failed — {e}"));
         }
-        Protocol::Pipe => {
-            run_pipe(&cfg, &key, &agent_cwd, &env, &job, &result_file, &agent_env).await?
-        }
-    };
-
-    // A run that produced nothing did no work — fail it (retries preserved)
-    // rather than silently complete and drop what the job carried.
-    if let Some(reason) = result::detect_empty(result_obj.as_ref(), &detect_stdout) {
-        bail!(reason);
-    }
-
-    // Build the completion variables: the agent's sanitized result vars plus the
-    // host-owned bookkeeping the harness always stamps.
-    let mut vars: HashMap<String, Value> = result_obj
-        .as_ref()
-        .map(result::sanitize_result_vars)
-        .unwrap_or_default();
-    // If the agent returned no effective structured result but still produced
-    // substantive output, surface that output as `agentResult` (as the spike
-    // worker does) instead of silently completing with only bookkeeping and
-    // dropping the agent's response. This applies to BOTH protocols. The
-    // empty-result guard above already failed runs that did NOTHING, so
-    // reaching here with non-empty `detect_stdout` means real work to preserve.
-    let has_effective = result_obj
-        .as_ref()
-        .is_some_and(result::has_effective_result_vars);
-    if !has_effective && !detect_stdout.trim().is_empty() {
-        vars.insert("agentResult".into(), json!(detect_stdout));
-    }
-    vars.insert("agentWorker".into(), json!(cfg.worker_name));
-    // Reap this job's run directory now that its result has been fully captured
-    // (result vars are already parsed into memory above). Without this, a
-    // long-running daemon would accumulate one per-job clone per completed job —
-    // job keys are unique, so nothing else ever removes them — until the runs
-    // filesystem fills. Only *successful* runs are reaped here: a failing run
-    // bails earlier via `?`, leaving its directory in place for post-mortem
-    // inspection (bounded: aged-out failed runs are swept by `sweep_stale_runs`
-    // on a later job, see `FAILED_RUN_RETENTION`). Best-effort: a reap failure
-    // must not fail an otherwise-good job. The removal is pinned no-follow (see
-    // `reap_run_dir`) so it cannot be redirected outside the workspace by a
-    // symlink swapped in between the job finishing and this cleanup.
-    if let Err(e) = reap_run_dir(&cfg.runs_dir, &run_dir) {
+        let joined = if nudge.stdout.is_empty() {
+            std::mem::take(&mut run.stdout)
+        } else {
+            format!("{}\n{}", run.stdout, nudge.stdout)
+        };
+        let (text, capped) = cap_stdout_tail(joined);
+        run.stdout = text;
+        run.truncated = run.truncated || capped;
+        run.has_turns = run.has_turns || nudge.has_turns;
+        let recovered = result::read_result_file(&result_file)
+            .or_else(|| result::parse_result_from_stdout(&run.stdout))
+            .is_some_and(|r| result::has_effective_result_vars(&r));
         log(&format!(
-            "job {key}: failed to reap run dir {}: {e:#}",
-            run_dir.display()
+            "job {key}: no result on the first turn — {}",
+            if recovered {
+                "recovered it via one re-emit nudge"
+            } else {
+                "re-emit nudge did not recover one"
+            }
         ));
     }
-    Ok(vars)
-}
 
-/// Drive an ACP harness: send the prompt, collect the message text, and read any
-/// structured result the agent also wrote/printed.
-async fn run_acp(
-    cfg: &SlotConfig,
-    key: &str,
-    cwd: &std::path::Path,
-    prompt: &str,
-    result_file: &std::path::Path,
-    env: &[(String, String)],
-) -> Result<(Option<Map<String, Value>>, String)> {
-    let mut agent = Agent::spawn(&cfg.hire.command, &cfg.hire.args, cwd, env)?;
-    log(&format!(
-        "job {key}: acp agent pid {} in {}",
-        agent.pid().unwrap_or(0),
-        cwd.display()
-    ));
-    let out = agent.run(cwd, prompt, cfg.idle_timeout).await;
-    agent.shutdown().await;
-    let out = out?;
-    // Prefer the result file, then a `::nano:result::` sentinel in the message text.
-    let result_obj = result::read_result_file(result_file)
-        .or_else(|| result::parse_result_from_stdout(&out.text));
-    Ok((result_obj, out.text))
-}
+    // Read the agent's structured result (the file, else a stdout sentinel) and
+    // remove the result channel, as the Node plugin does.
+    let raw_result = result::read_result_file(&result_file)
+        .or_else(|| result::parse_result_from_stdout(&run.stdout));
+    let _ = std::fs::remove_file(&result_file);
+    let envelope = build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref());
+    let name = &cfg.hire.name;
+    let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
 
-/// Drive a pipe harness: feed it the JSON job payload on stdin and scrape its
-/// stdout / result file for a structured result.
-async fn run_pipe(
-    cfg: &SlotConfig,
-    key: &str,
-    cwd: &std::path::Path,
-    env: &Envelope,
-    job: &ActivatedJobResult,
-    result_file: &std::path::Path,
-    agent_env: &[(String, String)],
-) -> Result<(Option<Map<String, Value>>, String)> {
-    let payload = build_pipe_payload(cfg, job, env);
-    log(&format!("job {key}: pipe agent in {}", cwd.display()));
-    let out = crate::pipe::run(
-        &cfg.hire.command,
-        &cfg.hire.args,
-        cwd,
-        agent_env,
-        &payload,
-        cfg.idle_timeout,
-    )
-    .await?;
-    if out.idle_timed_out {
-        bail!(
-            "agent produced no output for {}s (idle timeout)",
-            cfg.idle_timeout.as_secs()
-        );
-    }
-    let result_obj = result::read_result_file(result_file)
-        .or_else(|| result::parse_result_from_stdout(&out.stdout));
-    // The harness must have exited cleanly (code 0) for its output to be trusted.
-    match out.exit_code {
-        // Clean exit: nothing to gate on here (empty-result is handled below).
-        Some(0) => {}
-        // A non-zero exit means the run failed. Only tolerate it when the agent
-        // still emitted an *effective* structured result (a real result var in
-        // the result file or stdout sentinel) — a reserved-only/null object such
-        // as `::nano:result:: {}` carries no result, so honoring it would let
-        // `detect_empty` mistake diagnostic stdout for real work and silently
-        // settle a failed job. Require an effective result; otherwise fail so the
-        // job is retried instead.
-        Some(code) => {
-            if !result_obj
-                .as_ref()
-                .is_some_and(result::has_effective_result_vars)
-            {
-                bail!("pipe agent exited with code {code} without writing an effective result");
-            }
+    let settle = if !run.ok {
+        let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {
+            Some(c) => format!("exit code {c}"),
+            None => "terminated by signal".to_string(),
+        });
+        Settle::Fail {
+            message: format!("agent \"{name}\" failed: {detail}"),
+            vars: Some(envelope_vars()),
+        }
+    } else if let Some(reason) =
+        result::detect_empty(raw_result.as_ref(), &run.stdout, run.has_turns)
+    {
+        Settle::Fail {
+            message: format!("agent \"{name}\" produced an empty result: {reason}"),
+            vars: Some(envelope_vars()),
+        }
+    } else {
+        let mut vars: HashMap<String, Value> = raw_result
+            .as_ref()
+            .map(result::sanitize_result_vars)
+            .unwrap_or_default();
+        if vars.is_empty() {
             log(&format!(
-                "job {key}: pipe agent exited with code {code}; honoring the explicit result it wrote"
+                "job {key}: agent returned no usable result vars — write a JSON object of result \
+                 variables to $AGENT_RESULT_FILE (or print a \"::nano:result:: {{…}}\" line)"
             ));
         }
-        // No exit code at all: the child was killed by a signal or the EOF wait
-        // timed out and we tore it down. The harness never exited successfully,
-        // so any result it wrote may be partial/untrustworthy — never honor it;
-        // fail the job so it is retried rather than settled on a broken run.
-        None => {
-            bail!(
-                "pipe agent did not exit cleanly (killed by a signal or the EOF wait timed out); \
-                 refusing to honor any result from a run that never terminated successfully"
-            );
+        vars.insert(AGENT_RESULT_KEY.into(), envelope.clone());
+        vars.insert("output".into(), json!(run.stdout));
+        vars.insert("exitCode".into(), json!(0));
+        vars.insert("agent".into(), json!(name));
+        vars.insert("truncated".into(), json!(run.truncated));
+        Settle::Complete(vars)
+    };
+
+    // Reap the run directory unless `--keep-runs`. Only successful runs are
+    // reaped here; a failed run is left for post-mortem and aged out by
+    // `sweep_stale_runs`. Best-effort, pinned no-follow (see `reap_run_dir`).
+    if matches!(settle, Settle::Complete(_)) && !cfg.keep_runs {
+        if let Err(e) = reap_run_dir(&cfg.runs_dir, &run_dir) {
+            log(&format!(
+                "job {key}: failed to reap run dir {}: {e:#}",
+                run_dir.display()
+            ));
         }
     }
-    // The pipe path has no "turns"; substantive stdout is the work signal.
-    Ok((result_obj, out.stdout))
+    Ok(settle)
 }
 
-/// The JSON payload a pipe harness reads on stdin (the Node plugin's
-/// `buildAgentPayload` shape).
-fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope) -> String {
+/// Run the hired agent once with `stdin` (the ACP prompt text, or the pipe
+/// harness's stdin) and report what happened. Never errors: a harness failure is
+/// a failed [`RunResult`], settled by the caller.
+async fn run_agent(
+    cfg: &SlotConfig,
+    key: &str,
+    cwd: &Path,
+    stdin: &str,
+    env: &[(String, String)],
+) -> RunResult {
+    match cfg.hire.protocol {
+        Protocol::Acp => {
+            let mut agent = match Agent::spawn(&cfg.hire.command, &cfg.hire.args, cwd, env) {
+                Ok(a) => a,
+                Err(e) => {
+                    return RunResult {
+                        error: Some(format!("{e:#}")),
+                        ..RunResult::default()
+                    }
+                }
+            };
+            log(&format!(
+                "job {key}: acp agent pid {} in {}",
+                agent.pid().unwrap_or(0),
+                cwd.display()
+            ));
+            let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
+            agent.shutdown().await;
+            match out {
+                Ok(o) => {
+                    log(&format!(
+                        "job {key}: acp turn ended ({}; {} update(s), {} tool call(s), {} permission(s) granted)",
+                        o.stop_reason, o.updates, o.tool_calls, o.permissions_granted
+                    ));
+                    let (stdout, truncated) = cap_stdout_tail(o.text);
+                    RunResult {
+                        ok: true,
+                        stdout,
+                        truncated,
+                        exit_code: Some(0),
+                        has_turns: o.updates > 0,
+                        ..RunResult::default()
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    RunResult {
+                        timed_out: msg.contains("idle"),
+                        error: Some(msg),
+                        ..RunResult::default()
+                    }
+                }
+            }
+        }
+        Protocol::Pipe => {
+            log(&format!("job {key}: pipe agent in {}", cwd.display()));
+            match crate::pipe::run(
+                &cfg.hire.command,
+                &cfg.hire.args,
+                cwd,
+                env,
+                stdin,
+                cfg.idle_timeout,
+            )
+            .await
+            {
+                Ok(o) => {
+                    let (stdout, truncated) = cap_stdout_tail(o.stdout);
+                    let error = o.idle_timed_out.then(|| {
+                        format!(
+                            "agent produced no output for {}s (idle timeout)",
+                            cfg.idle_timeout.as_secs()
+                        )
+                    });
+                    RunResult {
+                        ok: o.exit_code == Some(0) && !o.idle_timed_out,
+                        stdout,
+                        truncated,
+                        exit_code: o.exit_code,
+                        timed_out: o.idle_timed_out,
+                        error,
+                        has_turns: false,
+                    }
+                }
+                Err(e) => RunResult {
+                    error: Some(format!("{e:#}")),
+                    ..RunResult::default()
+                },
+            }
+        }
+    }
+}
+
+/// Cap a string to [`MAX_CAPTURE_BYTES`] of UTF-8, keeping the TAIL (so a
+/// trailing `::nano:result::` sentinel survives) on a char boundary — the Node
+/// plugin's `capStdoutTail`. Returns `(text, truncated)`.
+fn cap_stdout_tail(s: String) -> (String, bool) {
+    if s.len() <= MAX_CAPTURE_BYTES {
+        return (s, false);
+    }
+    let mut start = s.len() - MAX_CAPTURE_BYTES;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    (s[start..].to_string(), true)
+}
+
+/// The re-emit nudge prompt — the Node plugin's `buildResultNudgePrompt` (with a
+/// result file, which this worker always provides).
+fn build_result_nudge_prompt(prior_stdout: &str) -> String {
+    let chars: Vec<char> = prior_stdout.chars().collect();
+    let ctx: String = chars[chars.len().saturating_sub(NUDGE_CONTEXT_CAP_CHARS)..]
+        .iter()
+        .collect();
+    [
+        "You already completed the task in your previous turn, but you did NOT emit a",
+        "machine-readable result, so the orchestrator cannot read your status and the",
+        "run cannot advance.",
+        "",
+        "Do NOT redo the work, re-run tools, edit files, push, or open/modify a PR. Just",
+        "emit the result for the work you already did: a single flat JSON object of your",
+        "result variables (at minimum {\"status\":\"...\"}).",
+        "",
+        "Write it to the file named by the AGENT_RESULT_FILE environment variable, e.g.:",
+        "",
+        "    printf '%s' '{\"status\":\"...\",\"summary\":\"...\"}' > \"$AGENT_RESULT_FILE\"",
+        "",
+        "If you truly cannot write that file, print exactly one line: ::nano:result:: {json}",
+        "",
+        "Your previous output (reference — derive the status/summary from it):",
+        "-----",
+        &ctx,
+    ]
+    .join("\n")
+}
+
+/// The non-ACP nudge stdin: the JSON job payload with its prompt fields (the
+/// top-level `prompt` and `task.task.prompt`) replaced by the nudge text.
+fn nudge_payload(payload: &Value, nudge: &str) -> Value {
+    let mut p = payload.clone();
+    p["prompt"] = json!(nudge);
+    if let Some(task) = p.get_mut("task").and_then(|t| t.get_mut("task")) {
+        if task.is_object() {
+            task["prompt"] = json!(nudge);
+        }
+    }
+    p
+}
+
+/// The audit envelope stored under `io.nanobpm.agentResult` — the Node plugin's
+/// `buildResultEnvelope` for a host (`sandbox: none`) run without git.
+fn build_result_envelope(
+    run: &RunResult,
+    sandbox: &str,
+    agent_result: Option<&Map<String, Value>>,
+) -> Value {
+    let status = if run.ok {
+        "completed"
+    } else if run.timed_out {
+        "timedOut"
+    } else {
+        "failed"
+    };
+    let mut env = json!({
+        "schemaVersion": 1,
+        "status": status,
+        "sandbox": sandbox,
+        "image": null,
+        "output": run.stdout,
+        "truncated": run.truncated,
+        "stderrTruncated": false,
+        "exitCode": run.exit_code,
+        "signal": null,
+        "error": run.error,
+    });
+    if let Some(r) = agent_result {
+        env["result"] = Value::Object(r.clone());
+    }
+    env
+}
+
+/// The JSON job payload every harness receives — the Node plugin's
+/// `buildAgentPayload`, with clone credentials scrubbed from every string.
+fn build_agent_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope) -> Value {
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let mut payload = json!({
@@ -977,7 +1153,7 @@ fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope
         "elementId": job.element_id.value(),
         "bpmnProcessId": job.process_definition_id.value(),
         "prompt": env.prompt,
-        "task": if env.raw.is_null() { Value::Null } else { env.raw.clone() },
+        "task": env.normalized,
         "variables": variables,
         "customHeaders": custom_headers,
         "profile": {
@@ -988,16 +1164,12 @@ fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope
         },
     });
     // Strip clone-credential userinfo from any URL anywhere in the payload before
-    // it reaches the agent's stdin. The task envelope (and the raw
-    // variables/customHeaders it is assembled from) can carry a credential-bearing
-    // repository URL (`https://x-access-token:<pat>@host/...`) that `provision`
-    // deliberately supports for the clone. The agent already receives a checkout
-    // and never needs that token, so forwarding it verbatim would only expose the
-    // secret to the agent (and thus its result/exfiltration path). `redact_url`
-    // is a no-op on any string without `scheme://user:secret@` userinfo, so
-    // ordinary URLs, prose, and non-URL values pass through unchanged.
+    // it reaches the agent: the envelope can carry a credential-bearing
+    // repository URL that `provision` supports for the clone, but the agent
+    // already receives a checkout and never needs that token. `redact_url` is a
+    // no-op on strings without `scheme://user:secret@` userinfo.
     redact_credential_urls(&mut payload);
-    payload.to_string()
+    payload
 }
 
 /// Recursively rewrite every string in `value` through [`redact_url`], stripping
@@ -1083,9 +1255,8 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut t: String = s.chars().take(max).collect();
-    t.push('…');
-    t
+    // Hard cut, no ellipsis — the Node plugin's `.slice(0, 2000)`.
+    s.chars().take(max).collect()
 }
 
 #[cfg(test)]
@@ -1117,6 +1288,9 @@ mod tests {
             clone_timeout: Duration::from_secs(120),
             runs_dir: std::env::temp_dir(),
             with_lease: true,
+            require_lease: true,
+            max_jobs: None,
+            keep_runs: false,
         }
     }
 
@@ -1254,14 +1428,81 @@ mod tests {
         let env = Envelope {
             prompt: Some("do it".into()),
             repository: None,
-            raw: json!({ "repository": { "url": cred_url } }),
+            normalized: json!({ "repository": { "url": cred_url } }),
         };
-        let payload = build_pipe_payload(&cfg, &job, &env);
+        let payload = build_agent_payload(&cfg, &job, &env).to_string();
         assert!(
             !payload.contains(&secret),
             "clone credential must not reach the agent payload: {payload}"
         );
         assert!(payload.contains("https://github.com/o/r.git"));
+    }
+
+    #[test]
+    fn nudge_payload_overrides_both_prompt_fields() {
+        let payload = json!({
+            "prompt": "orig",
+            "task": { "schemaVersion": 1, "task": { "prompt": "orig", "allowPr": false } },
+            "jobKey": "1",
+        });
+        let p = nudge_payload(&payload, "emit it");
+        assert_eq!(p["prompt"], "emit it");
+        assert_eq!(p["task"]["task"]["prompt"], "emit it");
+        assert_eq!(p["task"]["task"]["allowPr"], false);
+        assert_eq!(p["jobKey"], "1");
+        // The original payload is never mutated.
+        assert_eq!(payload["prompt"], "orig");
+    }
+
+    #[test]
+    fn nudge_prompt_echoes_the_prior_output_tail() {
+        let p = build_result_nudge_prompt("did the work");
+        assert!(p.starts_with("You already completed the task in your previous turn"));
+        assert!(p.ends_with("-----\ndid the work"));
+        let long = "x".repeat(NUDGE_CONTEXT_CAP_CHARS + 10);
+        let p = build_result_nudge_prompt(&long);
+        assert!(p.ends_with(&"x".repeat(NUDGE_CONTEXT_CAP_CHARS)));
+        assert!(!p.contains(&"x".repeat(NUDGE_CONTEXT_CAP_CHARS + 1)));
+    }
+
+    #[test]
+    fn stdout_cap_keeps_the_tail_on_a_char_boundary() {
+        let (t, cut) = cap_stdout_tail("short".into());
+        assert_eq!((t.as_str(), cut), ("short", false));
+        let s = format!("é{}", "a".repeat(MAX_CAPTURE_BYTES));
+        let (t, cut) = cap_stdout_tail(s);
+        assert!(cut);
+        assert_eq!(t.len(), MAX_CAPTURE_BYTES);
+    }
+
+    #[test]
+    fn result_envelope_matches_the_node_shape() {
+        let run = RunResult {
+            ok: true,
+            stdout: "out".into(),
+            exit_code: Some(0),
+            ..RunResult::default()
+        };
+        let mut r = Map::new();
+        r.insert("status".into(), json!("done"));
+        let env = build_result_envelope(&run, "none", Some(&r));
+        assert_eq!(
+            env,
+            json!({
+                "schemaVersion": 1, "status": "completed", "sandbox": "none", "image": null,
+                "output": "out", "truncated": false, "stderrTruncated": false,
+                "exitCode": 0, "signal": null, "error": null, "result": { "status": "done" },
+            })
+        );
+        let failed = RunResult {
+            timed_out: true,
+            error: Some("idle".into()),
+            ..RunResult::default()
+        };
+        assert_eq!(
+            build_result_envelope(&failed, "none", None)["status"],
+            "timedOut"
+        );
     }
 
     #[test]

@@ -16,9 +16,9 @@ use anyhow::{bail, Result};
 use tokio::sync::watch;
 
 use crate::engine::{self, JobApi};
+use crate::runtime::log;
 use crate::slot::{self, SlotConfig};
 use crate::state::{self, Hire, Protocol};
-use crate::worker::log;
 
 /// Host sandbox is the only mode the MVP daemon runs.
 const HOST_SANDBOX: &str = "none";
@@ -70,7 +70,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         bail!("no hires matched --hire {:?}", opts.only);
     }
 
-    let (_profile, jobs) = engine::connect(opts.profile.as_deref(), opts.job_api, opts.with_lease)?;
+    let (_profile, jobs) = engine::connect(opts.profile.as_deref(), opts.job_api)?;
     let host = short_hostname();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -98,6 +98,9 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 clone_timeout: opts.clone_timeout,
                 runs_dir: opts.runs_dir.clone(),
                 with_lease: opts.with_lease,
+                require_lease: opts.with_lease,
+                max_jobs: None,
+                keep_runs: false,
             });
             handles.push(tokio::spawn(slot::run(
                 jobs.clone(),
@@ -142,7 +145,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 /// Reject a hire the MVP daemon cannot run. Only the host sandbox is supported,
 /// the command must be present, and a `pipe` hire whose command actually selects
 /// ACP is refused (issue #275 — it would feed plain JSON to an ACP harness).
-fn validate(hire: &Hire) -> Result<()> {
+pub(crate) fn validate(hire: &Hire) -> Result<()> {
     if hire.command.trim().is_empty() {
         bail!("no command to run");
     }
@@ -205,7 +208,7 @@ fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
 }
 
 /// This machine's short hostname (first dot-label, lowercased), for worker names.
-fn short_hostname() -> String {
+pub(crate) fn short_hostname() -> String {
     let host = std::process::Command::new("hostname")
         .output()
         .ok()
@@ -220,7 +223,7 @@ fn short_hostname() -> String {
 }
 
 /// Resolve when the daemon should shut down: Ctrl-C or (on Unix) SIGTERM.
-async fn wait_for_signal(fatal: &watch::Sender<bool>) {
+pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) {
     // Also wake if a slot flips the shutdown watch (a fatal misconfiguration,
     // e.g. an unleased activation under --with-lease), so the daemon exits loudly
     // rather than lingering with the offending slot stopped.

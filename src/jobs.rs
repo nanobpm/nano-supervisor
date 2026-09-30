@@ -107,13 +107,6 @@ fn token_of(lease: &Option<String>) -> Option<Option<JobLeaseToken>> {
 }
 
 impl Jobs {
-    pub fn backend(&self) -> &'static str {
-        match self {
-            Jobs::Sdk(_) => "sdk",
-            Jobs::Nano(_) => "nano-http",
-        }
-    }
-
     pub async fn activate(
         &self,
         job_type: &str,
@@ -239,6 +232,7 @@ impl Jobs {
         key: &str,
         retries: i32,
         message: &str,
+        vars: Option<HashMap<String, Value>>,
         lease: &Option<String>,
     ) -> Result<()> {
         // Guard the interpolated `/jobs/{key}/failure` path (Nano backend).
@@ -249,13 +243,17 @@ impl Jobs {
                 req.retries = Some(retries);
                 req.error_message = Some(message.to_string());
                 req.retry_back_off = Some(0);
+                req.variables = vars;
                 req.job_lease_token = token_of(lease);
                 c.fail_job(key, Some(req))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))
             }
             Jobs::Nano(n) => {
-                let body = json!({ "retries": retries, "errorMessage": message, "retryBackOff": 0, "leaseToken": lease });
+                let mut body = json!({ "retries": retries, "errorMessage": message, "retryBackOff": 0, "leaseToken": lease });
+                if let Some(v) = vars {
+                    body["variables"] = json!(v);
+                }
                 n.send(
                     reqwest::Method::POST,
                     &format!("/jobs/{key}/failure"),

@@ -32,9 +32,10 @@ pub struct Repository {
 pub struct Envelope {
     pub prompt: Option<String>,
     pub repository: Option<Repository>,
-    /// The raw merged `io.nanobpm.agentTask` object, forwarded verbatim to the
-    /// pipe agent as `task` so it sees the full envelope.
-    pub raw: Value,
+    /// The schema-v1 normalized envelope — exactly the Node plugin's
+    /// `normalizeTaskEnvelope` output — forwarded to the agent as the payload's
+    /// `task`.
+    pub normalized: Value,
 }
 
 fn as_str(v: &Value) -> Option<String> {
@@ -154,11 +155,147 @@ pub fn assemble(custom_headers: &Map<String, Value>, variables: &Map<String, Val
         .and_then(Value::as_object)
         .and_then(parse_repository);
 
+    let normalized = normalize(&raw_obj, prompt.as_deref());
     Envelope {
         prompt,
         repository,
-        raw,
+        normalized,
     }
+}
+
+/// Node's `coerceInt`: a number, or a string with a leading integer.
+fn coerce_int(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            let end = t
+                .char_indices()
+                .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+                .map(|(i, _)| i)
+                .unwrap_or(t.len());
+            t[..end].parse().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Insert `key` only when the value is present — mirrors `JSON.stringify`
+/// dropping `undefined` fields in the Node plugin.
+fn put(m: &mut Map<String, Value>, key: &str, v: Option<Value>) {
+    if let Some(v) = v {
+        m.insert(key.to_string(), v);
+    }
+}
+
+/// Normalize the merged envelope to schema v1, field for field as the Node
+/// plugin's `normalizeTaskEnvelope` (so the agent sees an identical `task`).
+fn normalize(raw: &Map<String, Value>, prompt: Option<&str>) -> Value {
+    let s = |v: Option<&Value>| v.and_then(as_str).map(Value::String);
+    let int = |v: Option<&Value>| coerce_int(v).map(Value::from);
+    let mut env = Map::new();
+    env.insert("schemaVersion".into(), Value::from(1));
+
+    if let Some(repo) = raw.get("repository").and_then(Value::as_object) {
+        if repo
+            .get("url")
+            .and_then(as_str)
+            .is_some_and(|u| !u.is_empty())
+        {
+            let mut r = Map::new();
+            let provider = repo
+                .get("provider")
+                .and_then(as_str)
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "github".into())
+                .to_lowercase();
+            r.insert("provider".into(), Value::String(provider));
+            put(&mut r, "url", s(repo.get("url")));
+            put(&mut r, "ref", s(repo.get("ref")));
+            put(&mut r, "sha", s(repo.get("sha")));
+            put(&mut r, "depth", int(repo.get("depth")));
+            r.insert(
+                "singleBranch".into(),
+                Value::Bool(coerce_bool(repo.get("singleBranch"), false)),
+            );
+            put(&mut r, "filter", s(repo.get("filter")));
+            put(&mut r, "baseRef", s(repo.get("baseRef")));
+            put(&mut r, "baseSha", s(repo.get("baseSha")));
+            put(&mut r, "cloneTimeoutMs", int(repo.get("cloneTimeoutMs")));
+            r.insert(
+                "submodules".into(),
+                Value::Bool(coerce_bool(repo.get("submodules"), false)),
+            );
+            put(&mut r, "authRef", s(repo.get("authRef")));
+            env.insert("repository".into(), Value::Object(r));
+        }
+    }
+
+    let empty = Map::new();
+    let branch = raw
+        .get("branch")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let mut b = Map::new();
+    put(&mut b, "base", s(branch.get("base")));
+    put(&mut b, "create", s(branch.get("create")));
+    b.insert(
+        "push".into(),
+        Value::Bool(coerce_bool(branch.get("push"), true)),
+    );
+    env.insert("branch".into(), Value::Object(b));
+
+    let setup = raw
+        .get("setup")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let strings = |v: Option<&Value>| -> Value {
+        Value::Array(
+            v.and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|x| Value::String(as_str(x).unwrap_or_else(|| "null".into())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    };
+    let mut st = Map::new();
+    st.insert("commands".into(), strings(setup.get("commands")));
+    st.insert(
+        "env".into(),
+        setup
+            .get("env")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
+    st.insert("secretRefs".into(), strings(setup.get("secretRefs")));
+    env.insert("setup".into(), Value::Object(st));
+
+    let task = raw.get("task").and_then(Value::as_object).unwrap_or(&empty);
+    let mut t = Map::new();
+    put(
+        &mut t,
+        "prompt",
+        prompt.map(|p| Value::String(p.to_string())),
+    );
+    put(&mut t, "promptFile", s(task.get("promptFile")));
+    put(&mut t, "maxIterations", int(task.get("maxIterations")));
+    put(&mut t, "timeoutMs", int(task.get("timeoutMs")));
+    put(&mut t, "idleTimeoutMs", int(task.get("idleTimeoutMs")));
+    put(
+        &mut t,
+        "recoveryWindowMs",
+        int(task.get("recoveryWindowMs")),
+    );
+    t.insert(
+        "allowPr".into(),
+        Value::Bool(coerce_bool(task.get("allowPr"), false)),
+    );
+    put(&mut t, "prBase", s(task.get("prBase")));
+    env.insert("task".into(), Value::Object(t));
+    Value::Object(env)
 }
 
 fn parse_repository(repo: &Map<String, Value>) -> Option<Repository> {
@@ -198,6 +335,42 @@ fn parse_repository(repo: &Map<String, Value>) -> Option<Repository> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalized_matches_node_normalize_task_envelope() {
+        // The shape the Node plugin forwards as the payload's `task` for a job
+        // carrying only a `prompt` variable (captured from plugin 1.69.x).
+        let vars = json!({ "prompt": "do it" });
+        let env = assemble(&Map::new(), vars.as_object().unwrap());
+        assert_eq!(
+            env.normalized,
+            json!({
+                "schemaVersion": 1,
+                "branch": { "push": true },
+                "setup": { "commands": [], "env": {}, "secretRefs": [] },
+                "task": { "prompt": "do it", "allowPr": false },
+            })
+        );
+    }
+
+    #[test]
+    fn normalized_coerces_header_strings() {
+        let headers = json!({
+            "io.nanobpm.agentTask.repository.url": "https://h/o/r.git",
+            "io.nanobpm.agentTask.repository.depth": "5",
+            "io.nanobpm.agentTask.branch.push": "false",
+            "io.nanobpm.agentTask.task.allowPr": "true",
+            "io.nanobpm.agentTask.task.prompt": "p",
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let n = &env.normalized;
+        assert_eq!(n["repository"]["provider"], "github");
+        assert_eq!(n["repository"]["depth"], 5);
+        assert_eq!(n["repository"]["singleBranch"], false);
+        assert_eq!(n["branch"]["push"], false);
+        assert_eq!(n["task"]["allowPr"], true);
+        assert_eq!(n["task"]["prompt"], "p");
+    }
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()

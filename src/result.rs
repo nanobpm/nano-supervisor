@@ -15,7 +15,8 @@ pub const RESULT_SENTINEL: &str = "::nano:result::";
 const MAX_RESULT_FILE_BYTES: u64 = 1_048_576; // 1 MiB
 
 /// Keys the harness owns — an agent's returned result can never overwrite these
-/// (nor anything in the reserved `io.nanobpm.*` namespace).
+/// (nor anything in the reserved `io.nanobpm.*` namespace). Exactly the Node
+/// plugin's `RESERVED_RESULT_KEYS`.
 const RESERVED_RESULT_KEYS: &[&str] = &[
     "output",
     "exitCode",
@@ -32,14 +33,6 @@ const RESERVED_RESULT_KEYS: &[&str] = &[
     "branchMismatch",
     "scanError",
     "worldMarker",
-    // Host-stamped completion vars (set by the harness in `slot::execute` /
-    // `worker::run` AFTER the effectiveness check). They must be reserved so an
-    // agent cannot return e.g. `{"agentWorker":"x"}` — a value the host would
-    // overwrite anyway — to make `has_effective_result_vars` return true and slip
-    // an otherwise-empty result past the empty-result guard.
-    "agentResult",
-    "agentWorker",
-    "agentStopReason",
 ];
 
 const PROTO_POLLUTION_KEYS: &[&str] = &["__proto__", "constructor", "prototype"];
@@ -278,26 +271,31 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
     result
 }
 
-/// The empty-job detector. A run that produced NOTHING — no effective result
-/// vars and no substantive stdout (after value-less result markers/fences are
-/// stripped) — did no work: completing it would silently drop whatever the job
-/// carried, so the caller FAILS the job (preserving retries) instead. Note that
-/// neither raw ACP `session/update` activity (tool-call/status notifications
-/// without any assistant text) nor a lone value-less `::nano:result::` marker
-/// counts as work — both leave nothing substantive behind and so are failed
-/// rather than settled empty. Returns a reason when the run is empty.
-pub fn detect_empty(result_vars: Option<&Map<String, Value>>, stdout: &str) -> Option<String> {
+/// The empty-job detector — the Node plugin's `detectEmptyAgentJob`. A run that
+/// produced NOTHING — no effective result vars, no substantive stdout (after
+/// value-less result markers/fences are stripped) and no transcript turns (ACP
+/// `session/update` activity) — did no work: completing it would silently drop
+/// whatever the job carried, so the caller FAILS the job instead. Returns the
+/// Node plugin's reason text when the run is empty.
+pub fn detect_empty(
+    result_vars: Option<&Map<String, Value>>,
+    stdout: &str,
+    has_turns: bool,
+) -> Option<String> {
     if result_vars.is_some_and(has_effective_result_vars) {
         return None;
     }
     if !stdout_stripped_of_empty_result(stdout).trim().is_empty() {
         return None;
     }
+    if has_turns {
+        return None;
+    }
     Some(
-        "agent produced nothing — no result vars and no substantive output (only tool/status \
-         activity or a value-less result marker). This is the signature of a protocol-mismatched \
-         or no-op harness; completing the job would silently drop what it carried, so it is failed \
-         (retries preserved) instead of completed."
+        "agent exited 0 but produced nothing — no result vars, no output, no transcript turns, \
+         no commits and no push. This is the signature of a protocol-mismatched or no-op harness \
+         (e.g. an ACP-mode binary driven over protocol \"pipe\"): completing the job would silently \
+         drop what it carried, so it is failed (retries preserved) instead of completed."
             .to_string(),
     )
 }
@@ -344,7 +342,7 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_sentinel() {
         let out = "::nano:result:: {}\n";
-        assert!(detect_empty(None, out).is_some());
+        assert!(detect_empty(None, out, false).is_some());
     }
 
     #[test]
@@ -355,7 +353,7 @@ mod tests {
         // at offset 0 and leave the fence residue behind.
         let out = "```json\n```\n";
         assert!(
-            detect_empty(None, out).is_some(),
+            detect_empty(None, out, false).is_some(),
             "empty fence should not count as work"
         );
     }
@@ -363,19 +361,19 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_fence() {
         let out = "```json\n{}\n```\n";
-        assert!(detect_empty(None, out).is_some());
+        assert!(detect_empty(None, out, false).is_some());
     }
 
     #[test]
     fn not_empty_with_prose_fence() {
         // A non-empty, non-result fenced block is genuine output and is kept.
         let out = "```\nsome code the agent wrote\n```\n";
-        assert!(detect_empty(None, out).is_none());
+        assert!(detect_empty(None, out, false).is_none());
     }
 
     #[test]
     fn not_empty_with_substantive_stdout() {
-        assert!(detect_empty(None, "did real work\n").is_none());
+        assert!(detect_empty(None, "did real work\n", false).is_none());
     }
 
     #[test]
@@ -384,13 +382,15 @@ mod tests {
         // assistant text) and no structured result produced nothing to settle;
         // with no substantive stdout it must be failed, not silently completed.
         // (Finding: tool-only ACP updates must not bypass empty-run detection.)
-        assert!(detect_empty(None, "").is_some());
+        assert!(detect_empty(None, "", false).is_some());
+        // Transcript turns (ACP session/update activity) count as work, as in Node.
+        assert!(detect_empty(None, "", true).is_none());
     }
 
     #[test]
     fn not_empty_with_effective_vars() {
         let o = obj(json!({"status":"done"}));
-        assert!(detect_empty(Some(&o), "").is_none());
+        assert!(detect_empty(Some(&o), "", false).is_none());
     }
 
     #[test]

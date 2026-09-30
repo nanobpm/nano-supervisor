@@ -35,9 +35,13 @@ struct Record {
     /// Every `AGENT_*` and `NANO_*` variable (sorted), the observable environment
     /// the worker hands the agent.
     env: BTreeMap<String, String>,
-    /// The `session/prompt` texts in order: index 0 is the initial prompt, the
-    /// rest are steers.
+    /// The `session/prompt` texts (pipe: the stdin payload) in order, across
+    /// every agent process that shared this record: a worker that re-invokes
+    /// the agent for the same job (the result nudge) appends its prompts after
+    /// the first run's, so index 0 is always the initial prompt.
     prompts: Vec<String>,
+    /// How many agent processes have written this record (1 = a single run).
+    runs: usize,
     /// The client params from `initialize` (ACP only).
     initialize: Option<Value>,
     /// The params from `session/new` (ACP only).
@@ -136,6 +140,22 @@ fn main() {
         env: Record::capture_env(),
         ..Default::default()
     };
+    // A previous run for the same job (e.g. before a re-emit nudge) left its
+    // record: carry its prompts forward so the first prompt is never lost.
+    record.runs = 1;
+    if let Some(prev) = std::env::var("NS_FAKE_RECORD")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    {
+        if let Some(ps) = prev["prompts"].as_array() {
+            record.prompts = ps
+                .iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect();
+        }
+        record.runs = prev["runs"].as_u64().unwrap_or(1) as usize + 1;
+    }
     let script = load_script();
 
     let code = if acp {
