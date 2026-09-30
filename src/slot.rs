@@ -1025,7 +1025,11 @@ fn redact_credential_urls(value: &mut Value) {
 /// from the inherited environment at every agent launch (`acp` and `pipe`) —
 /// otherwise a daemon configured via ambient `CAMUNDA_*`/`ZEEBE_*` OAuth or
 /// basic-auth secrets would expose those secrets to the agent, which could read
-/// and exfiltrate them even with `NANO_AGENTIC=off`. The `NANO_AGENTIC_*`
+/// and exfiltrate them even with `NANO_AGENTIC=off`. The `*_REST_ADDRESS`
+/// connection URLs are stripped for the same reason: an operator may embed
+/// HTTP(S) userinfo (`https://user:secret@host`) directly in the address, so the
+/// URL itself carries an engine credential that must not be inherited by an
+/// agent. The `NANO_AGENTIC_*`
 /// credentials are stripped for the same reason: `NANO_AGENTIC=off` disables the
 /// visibility channel but does not stop a host agent from reading an inherited
 /// agentic token/secret out of its environment. Deployment secrets the agent
@@ -1041,6 +1045,8 @@ pub(crate) const SENSITIVE_DAEMON_ENV: &[&str] = &[
     "ZEEBE_CLIENT_SECRET",
     "ZEEBE_BASIC_AUTH_USERNAME",
     "ZEEBE_BASIC_AUTH_PASSWORD",
+    "CAMUNDA_REST_ADDRESS",
+    "ZEEBE_REST_ADDRESS",
     "NANO_AGENTIC_TOKEN",
     "NANO_AGENTIC_SECRET",
     "NANO_AGENTIC_CREDENTIAL",
@@ -1149,6 +1155,11 @@ mod tests {
             // credentials supplied that way must be stripped too.
             "ZEEBE_BASIC_AUTH_USERNAME",
             "ZEEBE_BASIC_AUTH_PASSWORD",
+            // A `*_REST_ADDRESS` connection URL can embed HTTP(S) userinfo
+            // (`https://user:secret@host`), so the address itself carries an
+            // engine credential and must be stripped from the agent env too.
+            "CAMUNDA_REST_ADDRESS",
+            "ZEEBE_REST_ADDRESS",
             // `NANO_AGENTIC=off` disables the channel but does not stop a host
             // agent reading an inherited agentic credential, so these must be
             // stripped too.
