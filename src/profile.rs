@@ -235,13 +235,21 @@ pub fn rest_address_and_basic(profile: Option<&Profile>) -> (String, Option<(Str
             std::env::var(k).ok().filter(|v| !v.is_empty())
         }
     };
-    let basic = match (
-        basic_get("CAMUNDA_BASIC_AUTH_USERNAME").or_else(|| basic_get("ZEEBE_BASIC_AUTH_USERNAME")),
-        basic_get("CAMUNDA_BASIC_AUTH_PASSWORD").or_else(|| basic_get("ZEEBE_BASIC_AUTH_PASSWORD")),
-    ) {
-        (Some(u), Some(p)) => Some((u, p)),
-        _ => None,
+    // Resolve each namespace as a COMPLETE username/password pair before
+    // falling back to the other one. Chaining `or_else` per-field would let a
+    // half-set `CAMUNDA_*` (username only) borrow the `ZEEBE_*` password,
+    // sending a mismatched cross-namespace credential; requiring a whole pair
+    // per namespace keeps the two credential sources from being spliced.
+    let namespace_basic = |prefix: &str| -> Option<(String, String)> {
+        match (
+            basic_get(&format!("{prefix}_BASIC_AUTH_USERNAME")),
+            basic_get(&format!("{prefix}_BASIC_AUTH_PASSWORD")),
+        ) {
+            (Some(u), Some(p)) => Some((u, p)),
+            _ => None,
+        }
     };
+    let basic = namespace_basic("CAMUNDA").or_else(|| namespace_basic("ZEEBE"));
     (address, basic)
 }
 
@@ -394,6 +402,38 @@ mod tests {
         std::env::set_var("ZEEBE_BASIC_AUTH_USERNAME", "zuser");
         std::env::set_var("ZEEBE_BASIC_AUTH_PASSWORD", "zpass");
         let (_addr, basic) = rest_address_and_basic(None);
+        assert_eq!(basic, Some(("zuser".to_string(), "zpass".to_string())));
+        // Restore prior environment so parallel tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn basic_auth_never_mixes_namespaces() {
+        // A half-set CAMUNDA namespace (username only) must NOT borrow the
+        // ZEEBE password: each namespace is resolved as a complete pair, so an
+        // incomplete CAMUNDA falls through to the whole ZEEBE pair rather than
+        // splicing a CAMUNDA username onto a ZEEBE password.
+        let _env = env_guard();
+        let keys = [
+            "CAMUNDA_BASIC_AUTH_USERNAME",
+            "CAMUNDA_BASIC_AUTH_PASSWORD",
+            "ZEEBE_BASIC_AUTH_USERNAME",
+            "ZEEBE_BASIC_AUTH_PASSWORD",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("CAMUNDA_BASIC_AUTH_USERNAME", "cuser");
+        std::env::set_var("ZEEBE_BASIC_AUTH_USERNAME", "zuser");
+        std::env::set_var("ZEEBE_BASIC_AUTH_PASSWORD", "zpass");
+        let (_addr, basic) = rest_address_and_basic(None);
+        // The complete ZEEBE pair wins; the lone CAMUNDA username is not spliced in.
         assert_eq!(basic, Some(("zuser".to_string(), "zpass".to_string())));
         // Restore prior environment so parallel tests are unaffected.
         for (k, v) in saved {
