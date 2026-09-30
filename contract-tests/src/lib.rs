@@ -549,7 +549,7 @@ impl Engine {
             // activatable again — the probe must observe engine state without
             // mutating it.
             if let Some(key) = job["jobKey"].as_str().or_else(|| job["key"].as_str()) {
-                let retries = job["retries"].as_i64().unwrap_or(1).max(1);
+                let retries = job["retries"].as_i64().unwrap_or(1);
                 let _ = self
                     .http
                     .post(format!("{}/v2/jobs/{key}/failure", self.url))

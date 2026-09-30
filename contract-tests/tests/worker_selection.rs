@@ -1,12 +1,10 @@
-//! **Job selection**: the rank × capability matrix, repeated `--job-type`,
-//! `--auto` / `--auto-scope`, and worker names. The worker only takes jobs it is
-//! configured for, and stamps its worker name on what it settles.
+//! **Job selection**: a worker only activates the job type it is configured
+//! for, and ignores unrelated types deployed alongside it.
 
 use contract_tests::{require_engine_and_target, run_worker_job, skip, Skip};
 use serde_json::json;
 
-/// A worker configured for a job type takes exactly that job type, and its
-/// worker name appears in the run.
+/// A worker configured for a job type takes exactly that job type.
 #[test]
 fn worker_takes_its_configured_job_type() {
     let (engine, target) = match require_engine_and_target() {
