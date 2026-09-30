@@ -156,7 +156,10 @@ impl Agent {
             }
             Err(_) => {
                 self.shared.lock().unwrap().pending.remove(&id);
-                bail!("agent stdin blocked for {}s during {method} (idle timeout)", idle.as_secs());
+                bail!(
+                    "agent stdin blocked for {}s during {method} (idle timeout)",
+                    idle.as_secs()
+                );
             }
         }
         let mut rx = rx;

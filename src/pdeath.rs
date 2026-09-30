@@ -312,8 +312,7 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32, _parent_start: Option<u64>) {
         change.flags = libc::EV_ADD | libc::EV_CLEAR;
         change.fflags = libc::NOTE_EXIT;
         // Register the parent-exit filter without blocking (nevents = 0).
-        let registered =
-            libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        let registered = libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
         let parent_died = if registered != 0 {
             // Could not watch the parent (e.g. it already exited): reap the group.
             true
@@ -419,7 +418,11 @@ fn parent_is_dead_or_zombie(pid: u32) -> bool {
 /// already gone away. Returns `true` when the parent died (the caller should
 /// reap the group), `false` when the group vanished on its own (nothing to do).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-unsafe fn wait_parent_or_group_gone(parent_pid: u32, pgid: u32, expected_start: Option<u64>) -> bool {
+unsafe fn wait_parent_or_group_gone(
+    parent_pid: u32,
+    pgid: u32,
+    expected_start: Option<u64>,
+) -> bool {
     #[cfg(not(target_os = "linux"))]
     let _ = expected_start;
     loop {

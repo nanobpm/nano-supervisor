@@ -374,8 +374,7 @@ fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
             MAX_SCRUB_BYTES
         );
     }
-    let contents =
-        String::from_utf8(raw).with_context(|| format!("reading {}", path.display()))?;
+    let contents = String::from_utf8(raw).with_context(|| format!("reading {}", path.display()))?;
     let scrubbed = scrub_url_credentials(&contents);
     if scrubbed != contents {
         file.seek(SeekFrom::Start(0))
@@ -498,8 +497,10 @@ fn scrub_url_credentials(text: &str) -> String {
         // URL inside surrounding prose).
         let auth_end = tail
             .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '|' | '\\' | '`')
-                    || c.is_whitespace()
+                matches!(
+                    c,
+                    '/' | '?' | '#' | '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '|' | '\\' | '`'
+                ) || c.is_whitespace()
             })
             .unwrap_or(tail.len());
         let authority = &tail[..auth_end];
@@ -864,14 +865,18 @@ mod tests {
         // `.git/modules/**/config`; the scrub must strip credentials from those
         // nested configs (recursively), leaving credential-free URLs behind.
         let tmp = std::env::temp_dir().join(format!("nano-sub-scrub-{}", std::process::id()));
-        let nested = tmp.join(".git").join("modules").join("sub").join("modules").join("inner");
+        let nested = tmp
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("modules")
+            .join("inner");
         std::fs::create_dir_all(&nested).unwrap();
         let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
         let outer_cfg = tmp.join(".git").join("modules").join("sub").join("config");
         let inner_cfg = nested.join("config");
-        let body = |host: &str| {
-            format!("[remote \"origin\"]\n\turl = https://{token}@{host}/o/r.git\n")
-        };
+        let body =
+            |host: &str| format!("[remote \"origin\"]\n\turl = https://{token}@{host}/o/r.git\n");
         std::fs::write(&outer_cfg, body("h1")).unwrap();
         std::fs::write(&inner_cfg, body("h2")).unwrap();
 
@@ -889,7 +894,11 @@ mod tests {
 
         for (cfg, host) in [(&outer_cfg, "h1"), (&inner_cfg, "h2"), (&top_cfg, "h3")] {
             let got = std::fs::read_to_string(cfg).unwrap();
-            assert!(!got.contains("s3cr3tPAT"), "credential left in {}: {got}", cfg.display());
+            assert!(
+                !got.contains("s3cr3tPAT"),
+                "credential left in {}: {got}",
+                cfg.display()
+            );
             assert!(got.contains(&format!("https://{host}/o/r.git")));
         }
         let _ = std::fs::remove_dir_all(&tmp);
@@ -928,7 +937,10 @@ mod tests {
 
         // The out-of-checkout config was left byte-for-byte untouched.
         let got = std::fs::read_to_string(&outside_cfg).unwrap();
-        assert!(got.contains("s3cr3tPAT"), "scrub must not follow the symlinked root");
+        assert!(
+            got.contains("s3cr3tPAT"),
+            "scrub must not follow the symlinked root"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -954,7 +966,10 @@ mod tests {
         scrub_fetch_head(&tmp).expect("scrub FETCH_HEAD");
 
         let got = std::fs::read_to_string(&fetch_head).unwrap();
-        assert!(!got.contains("s3cr3tPAT"), "credential left in FETCH_HEAD: {got}");
+        assert!(
+            !got.contains("s3cr3tPAT"),
+            "credential left in FETCH_HEAD: {got}"
+        );
         assert!(got.contains("https://github.com/o/r.git"));
         assert!(got.contains("branch 'main' of"));
         let _ = std::fs::remove_dir_all(&tmp);

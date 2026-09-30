@@ -367,9 +367,15 @@ mod tests {
         std::env::set_var("CAMUNDA_CLIENT_SECRET", "secret");
         assert!(env_has_oauth(), "credentials with no strategy infer OAuth");
         std::env::set_var("CAMUNDA_AUTH_STRATEGY", "NONE");
-        assert!(!env_has_oauth(), "explicit NONE overrides stale OAuth creds");
+        assert!(
+            !env_has_oauth(),
+            "explicit NONE overrides stale OAuth creds"
+        );
         std::env::set_var("CAMUNDA_AUTH_STRATEGY", "BASIC");
-        assert!(!env_has_oauth(), "explicit BASIC overrides stale OAuth creds");
+        assert!(
+            !env_has_oauth(),
+            "explicit BASIC overrides stale OAuth creds"
+        );
         // CAMUNDA_* precedence: CAMUNDA=NONE wins over ZEEBE=OAUTH.
         std::env::set_var("CAMUNDA_AUTH_STRATEGY", "NONE");
         std::env::set_var("ZEEBE_AUTH_STRATEGY", "OAUTH");
@@ -463,10 +469,14 @@ mod tests {
         std::env::set_var("CAMUNDA_BASIC_AUTH_PASSWORD", "secret");
         let none_profile = profile(r#"{"name":"prod","baseUrl":"http://engine:8080"}"#);
         let (_addr, basic) = rest_address_and_basic(Some(&none_profile));
-        assert_eq!(basic, None, "NONE-mode profile must not use ambient basic-auth");
+        assert_eq!(
+            basic, None,
+            "NONE-mode profile must not use ambient basic-auth"
+        );
         // A profile that *does* carry basic credentials still authenticates.
-        let basic_profile =
-            profile(r#"{"name":"prod","baseUrl":"http://engine:8080","username":"pu","password":"pp"}"#);
+        let basic_profile = profile(
+            r#"{"name":"prod","baseUrl":"http://engine:8080","username":"pu","password":"pp"}"#,
+        );
         let (_addr, basic) = rest_address_and_basic(Some(&basic_profile));
         assert_eq!(basic, Some(("pu".to_string(), "pp".to_string())));
         // Restore prior environment so parallel tests are unaffected.
@@ -505,7 +515,10 @@ mod tests {
         // An explicit NONE disables it (case-insensitive), even on the ZEEBE alias.
         std::env::set_var("ZEEBE_AUTH_STRATEGY", "none");
         let (_addr, basic) = rest_address_and_basic(None);
-        assert_eq!(basic, None, "explicit ambient NONE must suppress basic-auth");
+        assert_eq!(
+            basic, None,
+            "explicit ambient NONE must suppress basic-auth"
+        );
         // A non-NONE strategy still authenticates.
         std::env::remove_var("ZEEBE_AUTH_STRATEGY");
         std::env::set_var("CAMUNDA_AUTH_STRATEGY", "BASIC");

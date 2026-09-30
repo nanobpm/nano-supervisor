@@ -183,7 +183,11 @@ fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
         // following token) rather than only matching bare `acp` tokens.
         if opt == "--protocol" {
             let value = inline_val
-                .or_else(|| tokens.get(i + 1).map(|t| t.trim_matches(|c| c == '"' || c == '\'')))
+                .or_else(|| {
+                    tokens
+                        .get(i + 1)
+                        .map(|t| t.trim_matches(|c| c == '"' || c == '\''))
+                })
                 .unwrap_or("");
             if value.eq_ignore_ascii_case("acp") {
                 return true;
@@ -296,7 +300,10 @@ mod tests {
         assert!(command_has_acp_selector("nano-coder --acp", &[]));
         assert!(command_has_acp_selector("nano-coder", &["acp".into()]));
         assert!(command_has_acp_selector("claude-code-acp", &[]));
-        assert!(command_has_acp_selector("nano-coder", &["--protocol=acp".into()]));
+        assert!(command_has_acp_selector(
+            "nano-coder",
+            &["--protocol=acp".into()]
+        ));
         assert!(command_has_acp_selector(
             "nano-coder",
             &["--protocol".into(), "acp".into()]

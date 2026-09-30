@@ -369,10 +369,7 @@ fn prepare_run_dir_pinned(
     // open ever runs. Reject a symlinked existing ancestor first so the create
     // cannot be redirected out of the workspace.
     if let Err(e) = reject_symlinked_ancestors(runs_dir) {
-        return Err(PinError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        )));
+        return Err(PinError::Io(std::io::Error::other(e.to_string())));
     }
     std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
     let root = DirHandle::open_root_nofollow(runs_dir)?;
@@ -1324,6 +1321,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        // Resolve any symlinked ancestor of the system temp dir (e.g. macOS's
+        // /var -> /private/var) up front: the sweep legitimately refuses a
+        // symlinked root/ancestor, so exercise it against the canonical path.
+        let root = std::fs::canonicalize(&root).unwrap();
 
         let aged = root.join("failed-run");
         std::fs::create_dir_all(&aged).unwrap();
@@ -1363,6 +1364,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        // Resolve any symlinked ancestor of the system temp dir (e.g. macOS's
+        // /var -> /private/var) so the sweep's symlinked-ancestor guard does not
+        // skip this exercise against an otherwise-honest root.
+        let root = std::fs::canonicalize(&root).unwrap();
 
         let live = root.join("live-run");
         std::fs::create_dir_all(&live).unwrap();
