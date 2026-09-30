@@ -805,6 +805,11 @@ pub fn run_worker_job(
     let mut cmd = match target {
         Target::Rust => {
             let mut c = target.worker(&job_type, &agent, 1);
+            // Keep per-job run dirs inside this test's temp dir rather than the
+            // developer's real state dir, unless the test chose its own.
+            if !worker_flags.contains(&"--runs-dir") {
+                c.arg("--runs-dir").arg(work.path().join("runs"));
+            }
             c.args(worker_flags);
             c
         }
@@ -889,7 +894,12 @@ fn node_hire(target: Target, home: &TempHome, profile: &str) {
 /// matrix so the worker activates the deployed job. The remaining flags are the
 /// per-test knobs, translated from the Rust CLI's shapes by
 /// [`translate_node_flags`]. The caller applies the per-test home and env.
-fn node_work_command(target: Target, profile: &str, job_type: &str, worker_flags: &[&str]) -> Command {
+fn node_work_command(
+    target: Target,
+    profile: &str,
+    job_type: &str,
+    worker_flags: &[&str],
+) -> Command {
     let mut c = target.cmd(&["work", profile, "--job-type", job_type]);
     for arg in translate_node_flags(worker_flags) {
         c.arg(arg);
@@ -1433,12 +1443,7 @@ mod unit {
     #[test]
     fn translate_node_flags_passes_shared_knobs_through() {
         assert_eq!(
-            translate_node_flags(&[
-                "--recovery-window",
-                "9000",
-                "--min-free-mb",
-                "999999999",
-            ]),
+            translate_node_flags(&["--recovery-window", "9000", "--min-free-mb", "999999999",]),
             vec![
                 "--recovery-window".to_string(),
                 "9000".to_string(),

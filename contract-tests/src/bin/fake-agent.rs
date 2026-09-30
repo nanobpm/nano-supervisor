@@ -62,7 +62,10 @@ impl Record {
         if let Ok(path) = std::env::var("NS_FAKE_RECORD") {
             let json = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into());
             // Best effort: a failed write must not change the agent's exit code.
-            let _ = std::fs::write(path, json);
+            let tmp = format!("{path}.tmp{}", std::process::id());
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
     }
 }
@@ -158,6 +161,7 @@ fn run_steps(
     mut on_permission: impl FnMut(&Value) -> Value,
 ) -> StepEnd {
     for step in script {
+        record.flush();
         let obj = match step.as_object() {
             Some(o) => o,
             None => continue,
@@ -205,6 +209,7 @@ fn run_steps(
             std::process::abort();
         }
     }
+    record.flush();
     StepEnd::Done
 }
 

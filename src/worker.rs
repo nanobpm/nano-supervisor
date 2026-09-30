@@ -72,6 +72,11 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
         // so the agent (whose cwd is already the per-job dir) would resolve its
         // result file under a duplicated `cwd/cwd/...` path that `finalize`
         // cannot read. Anchor the fallback to an absolute path instead.
+        // Create the root first so it canonicalizes: otherwise a not-yet-existing
+        // root under a system symlink (macOS `/var` -> `/private/var`, e.g. a
+        // `$TMPDIR` runs dir) stays unresolved and the per-job symlink-ancestor
+        // guard rejects every job. A create failure is reported just below.
+        let _ = std::fs::create_dir_all(&opts.runs_dir);
         let canonical = std::fs::canonicalize(&opts.runs_dir).unwrap_or_else(|_| {
             if opts.runs_dir.is_absolute() {
                 opts.runs_dir.clone()
@@ -556,7 +561,10 @@ fn stable_namespace(worker_name: &str, job_type: &str, name_generated: bool) -> 
     // readable, restart-stable prefix but append a short deterministic digest
     // of the *raw* (base, job_type) identity so distinct roles never collide.
     let readable = sanitize_component(&format!("{base}-{job_type}"));
-    format!("{readable}-{}", identity_digest(base, job_type, name_generated))
+    format!(
+        "{readable}-{}",
+        identity_digest(base, job_type, name_generated)
+    )
 }
 
 /// A short, deterministic hex digest of a worker's raw `(base, job_type,
@@ -1604,11 +1612,7 @@ mod tests {
         // as live.
         let dir = std::env::temp_dir().join(format!("ns-blank-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(ACTIVE_MARKER),
-            format!("{}:", std::process::id()),
-        )
-        .unwrap();
+        std::fs::write(dir.join(ACTIVE_MARKER), format!("{}:", std::process::id())).unwrap();
         assert!(
             marker_owner_alive(&dir),
             "a live PID with a blank start token must read as live (fail-safe)"
