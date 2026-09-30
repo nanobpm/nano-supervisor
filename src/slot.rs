@@ -11,7 +11,7 @@
 //! fails only that job — the slot loop catches the join error, fails the job
 //! (preserving retries), and carries on.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -363,7 +363,17 @@ fn prepare_run_dir_pinned(
     // symlinked component is still caught the instant we open it (openat2
     // refuses it), so this only ever materialises real directories under an
     // honest root; a planted symlink ancestor fails the open rather than being
-    // silently followed.
+    // silently followed. But `create_dir_all` itself *follows* symlinks, so an
+    // attacker-planted symlinked ancestor could make the bootstrap materialise
+    // the root through it (in an attacker-chosen target) *before* the no-follow
+    // open ever runs. Reject a symlinked existing ancestor first so the create
+    // cannot be redirected out of the workspace.
+    if let Err(e) = reject_symlinked_ancestors(runs_dir) {
+        return Err(PinError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        )));
+    }
     std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
     let root = DirHandle::open_root_nofollow(runs_dir)?;
     root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
@@ -391,6 +401,42 @@ fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reap a completed run directory under `runs_dir` with the same pinned
+/// no-follow guarantee as [`prepare_run_dir`]: the removal happens *relative to*
+/// an `openat2(RESOLVE_NO_SYMLINKS)` handle on the runs root, so a same-UID
+/// actor cannot swap `run_dir` (or an ancestor) for a symlink between the
+/// job's completion and this cleanup and redirect a path-based
+/// `remove_dir_all` into deleting an unrelated tree outside the workspace.
+/// Falls back to a plain `remove_dir_all` only where the pinned path is
+/// unavailable (non-Linux, or a pre-5.6 kernel without `openat2`). `run_dir` is
+/// always `<runs_dir>/<key>` (a single engine-validated component), so its
+/// `file_name()` is the child to remove. A missing dir is treated as success.
+pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::saferoot::{DirHandle, PinError};
+        if let Some(name) = run_dir.file_name() {
+            match DirHandle::open_root_nofollow(runs_dir) {
+                Ok(root) => return root.remove_tree(name),
+                // Kernel too old for `openat2` (pre-5.6): fall through to the
+                // best-effort path-based remove below.
+                Err(PinError::Unsupported) => {}
+                // A refused symlinked root (ELOOP) or any other error is a real,
+                // security-relevant outcome — surface it, never retry the weaker
+                // path-based remove that would follow the very link we refused.
+                Err(PinError::Io(e)) => return Err(e),
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = runs_dir;
+    match std::fs::remove_dir_all(run_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// How long a *failed* run directory is retained under `runs_dir` for
 /// post-mortem inspection before it is swept. Successful runs are reaped
 /// immediately on completion (see [`execute`]); only failed runs — which bail
@@ -410,9 +456,16 @@ pub(crate) const FAILED_RUN_RETENTION: Duration = Duration::from_secs(3 * 24 * 6
 /// registers its run dir here for the duration of the job (see
 /// [`ActiveRunGuard`]) and the sweep skips any registered path, so only genuinely
 /// abandoned (failed, post-mortem) directories are ever removed.
-fn active_runs() -> &'static Mutex<HashSet<PathBuf>> {
-    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+///
+/// Registrations are **reference-counted**: a job dir is keyed by job key and so
+/// is reused across retries, and an old attempt's [`ActiveRunGuard`] can still be
+/// dropping (its `execute` future unwinding) while the retry has already
+/// registered the same path. A plain set would let that late drop unregister the
+/// path out from under the live retry, re-exposing its checkout to the sweep. The
+/// count keeps the path registered until the *last* overlapping guard drops.
+fn active_runs() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// RAII registration of an in-flight run directory in [`active_runs`]. The dir
@@ -423,8 +476,8 @@ struct ActiveRunGuard(PathBuf);
 
 impl ActiveRunGuard {
     fn new(run_dir: &Path) -> Self {
-        if let Ok(mut set) = active_runs().lock() {
-            set.insert(run_dir.to_path_buf());
+        if let Ok(mut map) = active_runs().lock() {
+            *map.entry(run_dir.to_path_buf()).or_insert(0) += 1;
         }
         ActiveRunGuard(run_dir.to_path_buf())
     }
@@ -432,8 +485,13 @@ impl ActiveRunGuard {
 
 impl Drop for ActiveRunGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = active_runs().lock() {
-            set.remove(&self.0);
+        if let Ok(mut map) = active_runs().lock() {
+            if let Some(count) = map.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(&self.0);
+                }
+            }
         }
     }
 }
@@ -442,7 +500,7 @@ impl Drop for ActiveRunGuard {
 fn is_active_run(path: &Path) -> bool {
     active_runs()
         .lock()
-        .map(|set| set.contains(path))
+        .map(|map| map.contains_key(path))
         .unwrap_or(false)
 }
 
@@ -625,13 +683,24 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
 /// would leak the secret into the daemon's stdout/journal. Every `scheme://…`
 /// occurrence in the string is stripped — not just the first — so a value
 /// carrying two credential-bearing URLs (e.g. a prompt or task field) never
-/// forwards the second token. Non-URL or credential-free inputs are returned
+/// forwards the second token. Only `http`/`https` authorities are redacted:
+/// other schemes carry a *login*, not a secret — `ssh://git@host` uses `git`
+/// as the required SSH username — so stripping their userinfo would corrupt an
+/// otherwise-valid remote handed to the agent via the ACP prompt / pipe
+/// payload. This mirrors `provision::scrub_url_credentials`, which likewise
+/// scopes its scrub to HTTP(S). Non-URL or credential-free inputs are returned
 /// unchanged.
 pub(crate) fn redact_url(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(pos) = rest.find("://") {
         let after = pos + 3;
+        // Only an HTTP(S) authority's userinfo is a credential to redact; for any
+        // other scheme the userinfo is a login we must preserve verbatim.
+        let redact = {
+            let scheme = url_scheme_before(&rest[..pos]);
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        };
         out.push_str(&rest[..after]);
         let tail = &rest[after..];
         // The authority runs until the first character that cannot be part of it
@@ -647,13 +716,25 @@ pub(crate) fn redact_url(raw: &str) -> String {
             .unwrap_or(tail.len());
         let authority = &tail[..auth_end];
         match authority.rfind('@') {
-            Some(at) => out.push_str(&authority[at + 1..]),
-            None => out.push_str(authority),
+            Some(at) if redact => out.push_str(&authority[at + 1..]),
+            _ => out.push_str(authority),
         }
         rest = &tail[auth_end..];
     }
     out.push_str(rest);
     out
+}
+
+/// Extract the URL scheme immediately preceding a `://` separator: the trailing
+/// run of scheme-valid characters (`[A-Za-z0-9+.-]`) in `prefix` (the substring
+/// before the `://`). Mirrors `provision::scheme_of` — `slot` cannot see that
+/// private helper — so `redact_url`'s scheme scoping matches the scrub's.
+fn url_scheme_before(prefix: &str) -> &str {
+    let start = prefix
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &prefix[start..]
 }
 
 async fn execute(
@@ -782,8 +863,10 @@ async fn execute(
     // bails earlier via `?`, leaving its directory in place for post-mortem
     // inspection (bounded: aged-out failed runs are swept by `sweep_stale_runs`
     // on a later job, see `FAILED_RUN_RETENTION`). Best-effort: a reap failure
-    // must not fail an otherwise-good job.
-    if let Err(e) = std::fs::remove_dir_all(&run_dir) {
+    // must not fail an otherwise-good job. The removal is pinned no-follow (see
+    // `reap_run_dir`) so it cannot be redirected outside the workspace by a
+    // symlink swapped in between the job finishing and this cleanup.
+    if let Err(e) = reap_run_dir(&cfg.runs_dir, &run_dir) {
         log(&format!(
             "job {key}: failed to reap run dir {}: {e:#}",
             run_dir.display()
@@ -1122,6 +1205,17 @@ mod tests {
             redact_url("git@github.com:o/r.git"),
             "git@github.com:o/r.git"
         );
+        // Non-HTTP(S) schemes carry a *login*, not a secret: `ssh://git@host`
+        // uses `git` as the required SSH username, so it must be preserved
+        // verbatim — stripping it would corrupt an otherwise-valid remote.
+        assert_eq!(
+            redact_url("ssh://git@github.com/o/r.git"),
+            "ssh://git@github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_url("ssh://user@git.example.com:22/o/r.git"),
+            "ssh://user@git.example.com:22/o/r.git"
+        );
     }
 
     #[test]
@@ -1279,6 +1373,69 @@ mod tests {
         assert!(!live.exists(), "a deregistered aged dir is swept normally");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn active_run_guard_is_refcounted_across_overlapping_retries() {
+        // A job dir is keyed by job key and reused across retries, so an old
+        // attempt's guard can still be dropping while the retry has already
+        // re-registered the same path. A plain set would let that late drop
+        // deregister the live retry; the refcount keeps the path registered
+        // until the *last* overlapping guard drops.
+        let root = std::env::temp_dir().join(format!(
+            "nano-refcount-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run = std::path::absolute(root.join("shared-run")).unwrap();
+
+        let first = ActiveRunGuard::new(&run);
+        let second = ActiveRunGuard::new(&run);
+        assert!(is_active_run(&run));
+
+        // The old attempt finishes and drops its guard; the live retry's
+        // registration must survive.
+        drop(first);
+        assert!(
+            is_active_run(&run),
+            "overlapping registration must keep the path active"
+        );
+
+        // Only when the last guard drops is the path deregistered.
+        drop(second);
+        assert!(
+            !is_active_run(&run),
+            "path deregistered once the last guard drops"
+        );
+    }
+
+    #[test]
+    fn reap_run_dir_removes_tree_and_tolerates_missing() {
+        // The pinned reap (Linux) and the path-based fallback must both remove a
+        // populated run dir and treat an already-absent dir as success.
+        let runs = std::env::temp_dir().join(format!(
+            "nano-reap-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&runs).unwrap();
+        let run = runs.join("42");
+        std::fs::create_dir_all(run.join("nested")).unwrap();
+        std::fs::write(run.join("nested").join("result.json"), b"{}").unwrap();
+
+        reap_run_dir(&runs, &run).expect("reap must remove a populated run dir");
+        assert!(!run.exists(), "run dir must be gone after reap");
+
+        // A second reap of the now-missing dir is a no-op success.
+        reap_run_dir(&runs, &run).expect("reaping a missing dir must succeed");
+
+        std::fs::remove_dir_all(&runs).ok();
     }
 
     #[cfg(unix)]

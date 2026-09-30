@@ -427,6 +427,18 @@ fn split_url_credential(url: &str) -> (String, Option<GitCredential>) {
     let Some(pos) = url.find("://") else {
         return (sanitized, None);
     };
+    // Only lift a credential for the schemes whose userinfo `scrub_url_credentials`
+    // actually strips — `http`/`https`. For other schemes (notably `ssh://git@host`,
+    // where the userinfo is a *login*, not a secret) the sanitized URL still carries
+    // the original userinfo verbatim, so extracting a credential here would both
+    // leave that userinfo in the argv `fetch_url` AND additionally hand git a helper
+    // credential — double-delivering a password-bearing non-HTTP URL into git's
+    // argv/config. Leave such URLs untouched (no lifted credential), mirroring the
+    // scrub's scheme scoping.
+    let scheme = scheme_of(&url[..pos]);
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return (sanitized, None);
+    }
     let after = pos + 3;
     let tail = &url[after..];
     let auth_end = tail
@@ -648,6 +660,14 @@ async fn git(
             }
             #[cfg(unix)]
             group_guard.disarm();
+            // Reap the just-killed leader (bounded) before returning. The `wait`
+            // future — which owns `child` — was dropped when the timeout fired,
+            // and `kill_on_drop` signals a dropped child but does *not* guarantee
+            // it is reaped; without an explicit wait, repeated clone/fetch
+            // timeouts would accumulate zombie git leaders in the long-lived
+            // daemon. The timeout bounds the wait so a wedged (uninterruptible)
+            // child cannot hang the slot.
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             bail!(
                 "git {} timed out after {}s",
                 args.first().map(String::as_str).unwrap_or(""),
@@ -818,6 +838,23 @@ mod tests {
         // A non-URL (e.g. a local path) is passed through with no credential.
         let (argv_url, cred) = split_url_credential("/tmp/local/repo");
         assert_eq!(argv_url, "/tmp/local/repo");
+        assert!(cred.is_none());
+
+        // A non-HTTP(S) scheme carries a *login*, not a secret: `scrub_url_credentials`
+        // deliberately leaves its userinfo intact, so lifting a credential here would
+        // double-deliver it (userinfo stays in the argv URL *and* a helper credential
+        // is emitted). No credential is lifted and the URL is returned unchanged.
+        let url = format!("ssh://{user}:{pass}@git.example.com/o/r.git");
+        let (argv_url, cred) = split_url_credential(&url);
+        assert_eq!(argv_url, url);
+        assert!(
+            cred.is_none(),
+            "no credential must be lifted from a non-HTTP scheme"
+        );
+        // The canonical `ssh://git@host` login form is likewise preserved verbatim.
+        let ssh = "ssh://git@git.example.com/o/r.git";
+        let (argv_url, cred) = split_url_credential(ssh);
+        assert_eq!(argv_url, ssh);
         assert!(cred.is_none());
     }
 
