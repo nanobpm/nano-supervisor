@@ -103,7 +103,7 @@ jobs:
       - name: start local nano engine
         run: .github/scripts/start-nano-engine.sh 1.69.2 8080
       - name: contract tests (Node target)
-        run: cargo test -p contract-tests --locked
+        run: cargo test -p contract-tests --locked --no-fail-fast
         env:
           NS_ENGINE_URL: http://localhost:8080
 

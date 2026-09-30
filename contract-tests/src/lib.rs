@@ -730,7 +730,20 @@ pub struct JobOutcome {
 
 impl JobOutcome {
     /// What the fake agent recorded (prompt, env, cwd, permissions, …).
+    ///
+    /// Panics with the worker's exit status and output when there is no record,
+    /// since "the agent never ran" is only diagnosable from the worker's logs.
     pub fn record(&self) -> fake::FakeRecord {
+        if !self.record_path.exists() {
+            panic!(
+                "the fake agent left no record at {} — the worker never ran it \
+                 (or it died first).\nworker status: {:?}\nworker stdout:\n{}\nworker stderr:\n{}",
+                self.record_path.display(),
+                self.output.status,
+                String::from_utf8_lossy(&self.output.stdout),
+                String::from_utf8_lossy(&self.output.stderr),
+            );
+        }
         fake::FakeRecord::read(&self.record_path)
     }
 
