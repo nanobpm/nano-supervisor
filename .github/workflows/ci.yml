@@ -64,9 +64,13 @@ jobs:
 
   # Contract tests against the Node plugin (issue #3). This is the target the
   # suite is written against, so it runs for real here (installs the pinned
-  # `c8ctl-plugin-nano` 1.69.2). No engine is available on CI, so engine-backed
-  # and live-supervisor cases skip cleanly; the CLI, state-file and socket-schema
-  # cases run in full. The plain `test` job above also compiles this crate, but
+  # `c8ctl-plugin-nano` 1.69.2). No engine runs here, so engine-backed and
+  # live-supervisor cases skip cleanly; the CLI, state-file and socket-schema
+  # cases run in full. Engine-backed Node worker cases stay off until the plugin
+  # can run a job end to end on a local engine: 1.69.2 activates the job but never
+  # dispatches it to the agent, and 1.69.4 dispatches but fails with
+  # `preGuardDrainTimedOut is not defined`. The Rust job below runs those worker
+  # contracts against a real engine. The plain `test` job above also compiles this crate, but
   # skips its target cases there (the Node plugin is not installed on that runner).
   contract-tests-node:
     name: contract tests (Node target, ${{ matrix.os }})
@@ -101,13 +105,42 @@ jobs:
           c8 nano --help | head -1
           c8 nano --help | grep -q 'c8ctl-plugin-nano 1.69.2'
       - name: contract tests (Node target)
-        run: cargo test -p contract-tests --locked
+        run: cargo test -p contract-tests --locked --no-fail-fast
+
+  # Worker contract tests against the Rust `nano-supervisor work` (issue #4),
+  # end to end on a real local engine. Only the worker_* files: the CLI surface
+  # (`hire`, `workforce`, …) is Node-only until #3 lands for Rust.
+  contract-tests-rust:
+    name: contract tests (Rust target, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      NS_TARGET: rust
+      NS_ENGINE_URL: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace --all-targets --locked
+      - name: start local nano engine
+        run: .github/scripts/start-nano-engine.sh 1.69.2 8080
+      - name: worker contract tests (Rust target)
+        run: |
+          export NS_BIN="$PWD/target/debug/nano-supervisor"
+          cargo test -p contract-tests --locked \
+            --test worker_prompt --test worker_env --test worker_result \
+            --test worker_lease --test worker_finalize --test worker_selection \
+            --test worker_resume --test worker_sweeps -- --nocapture
 
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [lint, test, contract-tests-node]
+    needs: [lint, test, contract-tests-node, contract-tests-rust]
     runs-on: ubuntu-latest
     steps:
       - name: all jobs passed
@@ -116,3 +149,4 @@ jobs:
           test "${{ needs.lint.result }}" = success
           test "${{ needs.test.result }}" = success
           test "${{ needs.contract-tests-node.result }}" = success
+          test "${{ needs.contract-tests-rust.result }}" = success

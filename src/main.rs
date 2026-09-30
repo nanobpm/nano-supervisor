@@ -1,9 +1,11 @@
-//! nano-supervisor — spike.
+//! nano-supervisor — job worker.
 //!
-//! `nano-supervisor spike` runs ONE worker slot: poll a job type through
-//! `camunda-orchestration-sdk`, keep each activation alive, drive an agent over
-//! ACP, and complete/fail the job. It exists to measure memory and to decide
-//! between the SDK's `JobWorker` and our own slot loop (see issue #1).
+//! `nano-supervisor work` (alias `spike`) runs ONE worker slot: poll a job type
+//! through `camunda-orchestration-sdk`, keep each activation alive, drive an
+//! agent over ACP, and complete/fail the job. It exists to measure memory and to
+//! decide between the SDK's `JobWorker` and our own slot loop (see issue #1), and
+//! is the Rust target the black-box contract-test suite drives (`NS_TARGET=rust`,
+//! issues #3/#4) alongside `c8 nano work` (Node).
 
 mod acp;
 mod daemon;
@@ -42,15 +44,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run one worker slot for a job type (spike).
-    Spike {
+    /// Run one worker slot for a job type.
+    #[command(visible_alias = "spike")]
+    Work {
         /// Job type to service.
         #[arg(long)]
         job_type: String,
         /// c8ctl connection profile (default: c8ctl's active profile, else CAMUNDA_* env).
         #[arg(long)]
         profile: Option<String>,
-        /// Agent command, split on whitespace, e.g. "nano-coder --acp".
+        /// Agent command, parsed with shell-style quoting, e.g. "nano-coder
+        /// --acp" or "'/path with spaces/agent' --acp".
         #[arg(long, default_value = "nano-coder --acp")]
         agent: String,
         /// Worker name reported to the engine (default ‹host›-spike-‹pid›).
@@ -75,6 +79,18 @@ enum Cmd {
         /// Exit after this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
+        /// Keep the N most recent per-job run directories; older ones are reaped.
+        #[arg(long)]
+        keep_runs: Option<usize>,
+        /// Refuse to take work when free disk under the run directory is below this (MiB).
+        #[arg(long)]
+        min_free_mb: Option<u64>,
+        /// Reap run directories older than this, on startup and each sweep (e.g. `30s`, `500ms`).
+        #[arg(long, value_parser = parse_duration)]
+        reap_age: Option<Duration>,
+        /// Sweep the run directory for stale directories on this cadence (e.g. `60s`).
+        #[arg(long, value_parser = parse_duration)]
+        reap_interval: Option<Duration>,
         /// Job command transport: `sdk`, `nano` (raw HTTP, Nano's `leaseToken`
         /// field), or `auto` (= `nano` with --with-lease, else `sdk`).
         #[arg(long, default_value = "auto")]
@@ -151,7 +167,7 @@ fn clamp_recovery_window(ms: u64) -> Duration {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Spike {
+        Cmd::Work {
             job_type,
             profile,
             agent,
@@ -162,9 +178,18 @@ async fn main() -> Result<()> {
             runs_dir,
             with_lease,
             max_jobs,
+            keep_runs,
+            min_free_mb,
+            reap_age,
+            reap_interval,
             job_api,
         } => {
-            let mut parts = agent.split_whitespace().map(String::from);
+            // Shell-style split so an executable path or argument containing
+            // spaces can be preserved by quoting it (plain unquoted commands
+            // behave exactly like whitespace splitting).
+            let Some(mut parts) = shlex::split(&agent).map(Vec::into_iter) else {
+                bail!("--agent has unbalanced quotes: {agent:?}")
+            };
             let Some(program) = parts.next() else {
                 bail!("--agent is empty")
             };
@@ -175,6 +200,7 @@ async fn main() -> Result<()> {
             )?;
             let opts = worker::WorkerOptions {
                 job_type,
+                name_generated: name.is_none(),
                 worker_name: name.unwrap_or_else(default_name),
                 agent_program: program,
                 agent_args: parts.collect(),
@@ -184,6 +210,10 @@ async fn main() -> Result<()> {
                 runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
                 with_lease,
                 max_jobs,
+                keep_runs,
+                min_free_mb,
+                reap_age,
+                reap_interval,
             };
             tokio::select! {
                 r = worker::run(jobs, opts) => r,
@@ -278,6 +308,31 @@ fn default_name() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "host".into());
     format!("{host}-spike-{}", std::process::id())
+}
+
+/// Parse a duration flag: a bare number is milliseconds, or a `ms`/`s`/`m`/`h`
+/// suffix (e.g. `500ms`, `30s`, `5m`). Used for `--reap-age`/`--reap-interval`.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1_000)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?} (use e.g. `30s`, `500ms`, or a ms count)"))?;
+    let ms = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("duration {s:?} is too large (overflows milliseconds)"))?;
+    Ok(Duration::from_millis(ms))
 }
 
 #[cfg(test)]

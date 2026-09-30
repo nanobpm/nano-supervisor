@@ -3,7 +3,7 @@
 # Keeping them in one workspace means `cargo test --workspace` and the pinned
 # toolchain / `Cargo.lock` cover both, and the Rust target of the suite resolves
 # `target/debug/nano-supervisor` from the same build.
-members = ["contract-tests"]
+members = [".", "contract-tests"]
 
 [package]
 name = "nano-supervisor"
@@ -21,10 +21,14 @@ anyhow = "1"
 # Raw job commands in the Nano engine's dialect (src/jobs.rs); same reqwest as the SDK.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 clap = { version = "4", features = ["derive"] }
+# Shell-style splitting for the `--agent` command string so an executable path
+# or argument containing spaces can be preserved by quoting (src/main.rs).
+shlex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
+# Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

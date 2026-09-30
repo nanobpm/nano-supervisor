@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 const PROTOCOL_VERSION: u64 = 1;
 
 /// What one prompt turn produced.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Outcome {
     pub stop_reason: String,
     /// Concatenated `agent_message_chunk` text.
