@@ -257,6 +257,17 @@ async fn handle(
         }
     }
     let started = Instant::now();
+    // Validate the engine-supplied key BEFORE it is used to build any request
+    // path. The refresher below (`extend`) and the `complete`/`fail` settle all
+    // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
+    // must be rejected up front — and an activation we cannot even address must
+    // not be settled. Drop it and let the engine redeliver.
+    if let Err(e) = crate::jobs::validate_job_key(&key) {
+        log(&format!(
+            "job {key}: refusing malformed engine key ({e:#}); not spawning refresher and not settling"
+        ));
+        return;
+    }
     log(&format!(
         "job {key} activated (type {}, retries {}, lease {})",
         job.r#type,
@@ -266,6 +277,7 @@ async fn handle(
 
     let refreshes = Arc::new(AtomicUsize::new(0));
     let (lost_tx, mut lost_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let refresher = tokio::spawn(refresh_loop(
         jobs.clone(),
         key.clone(),
@@ -273,18 +285,29 @@ async fn handle(
         opts.recovery_window,
         refreshes.clone(),
         lost_tx,
+        stop_rx,
     ));
 
     let result = tokio::select! {
         r = run_agent(opts, &key, &job) => Some(r),
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
+    // Reconcile the raced outcome with the current activation-loss watch value:
+    // `select!` can pick the `run_agent` branch even when the refresher published
+    // a 404/409 loss in the same tick (both futures ready), which would otherwise
+    // `complete`/`fail` the job with a stale lease after the activation was fenced.
+    // Downgrade any such outcome to "lost" (`None`) so we never settle a job we no
+    // longer own. The refresher is deliberately left running here so it keeps the
+    // lease alive across the (potentially slow) finalize/settle below; each match
+    // arm stops it gracefully via `stop_tx` once its work has returned.
+    let result = if *lost_rx.borrow() { None } else { result };
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
 
     match result {
         None => {
-            refresher.abort();
+            let _ = stop_tx.send(true);
+            let _ = refresher.await;
             log(&format!(
                 "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will hand it out again)"
             ));
@@ -294,9 +317,9 @@ async fn handle(
             // a fallback push may block for up to FALLBACK_PUSH_TIMEOUT, and the
             // completion HTTP call has its own timeout and can outlive the
             // remaining activation window (especially with a small
-            // `--recovery-window`). If the refresh task were aborted before
+            // `--recovery-window`). If the refresh task were stopped before
             // `jobs.complete` returns, the activation could expire mid-complete,
-            // fencing a successful run. Abort it only once the settle command
+            // fencing a successful run. Stop it only once the settle command
             // has returned.
             // `finalize` runs blocking git subprocesses and a `sleep`-based
             // timeout loop (a fallback push may take up to
@@ -338,12 +361,13 @@ async fn handle(
                 )),
                 Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
             }
-            refresher.abort();
+            let _ = stop_tx.send(true);
+            let _ = refresher.await;
         }
         Some(Err(e)) => {
             let msg = format!("{e:#}");
             // Keep the lease refresher alive until `jobs.fail` returns, exactly
-            // as the completion path above does. Aborting it first can let the
+            // as the completion path above does. Stopping it first can let the
             // lease expire before the failure is submitted, so a `fail` issued
             // near the end of the activation window gets fenced — leaving the
             // job active until it times out instead of retrying it promptly.
@@ -355,7 +379,8 @@ async fn handle(
                     &lease,
                 )
                 .await;
-            refresher.abort();
+            let _ = stop_tx.send(true);
+            let _ = refresher.await;
             match fail_result {
                 Ok(()) => log(&format!(
                     "job {key} failed after {elapsed:.1}s (refreshes={n}): {msg}"
@@ -375,8 +400,16 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
         .and_then(Value::as_str)
         .context("job has no string variable `prompt`")?
         .to_string();
+    // Validate the engine-supplied key against the numeric key format before
+    // joining it to a path: a malformed `../`/absolute key must not let
+    // `create_dir_all` (and the agent's cwd) escape `runs_dir`.
+    crate::jobs::validate_job_key(key)?;
     let cwd = opts.runs_dir.join(key);
-    std::fs::create_dir_all(&cwd).with_context(|| format!("creating {}", cwd.display()))?;
+    // Harden the run directory the same way the daemon slot path does — reject
+    // symlinked root/ancestors and enforce owner-only 0700 — via the shared
+    // helper, so `spike --runs-dir` cannot be redirected to an attacker-chosen
+    // location and the default root's mode does not depend on umask.
+    crate::slot::prepare_run_dir(&opts.runs_dir, &cwd)?;
     let env = vec![
         ("NANO_JOB_KEY".to_string(), key.to_string()),
         ("NANO_AGENT_NAME".to_string(), opts.worker_name.clone()),
@@ -428,18 +461,40 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     Ok(out)
 }
 
-async fn refresh_loop(
+pub(crate) async fn refresh_loop(
     jobs: Jobs,
     key: String,
     lease: Option<String>,
     window: Duration,
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,
+    mut stop: watch::Receiver<bool>,
 ) {
-    let every = window / 3;
+    // Refresh at a third of the window, but never a zero-length interval: a
+    // sub-3ms window divides to `Duration::ZERO`, which would spin this loop and
+    // hammer the engine (saturating a Tokio worker). Floor it at a positive
+    // minimum so the loop always yields between extends.
+    let every = (window / 3).max(Duration::from_millis(1));
     let mut failures = 0;
     loop {
-        tokio::time::sleep(every).await;
+        tokio::select! {
+            // A stop request during the idle interval ends the loop at once:
+            // there is no in-flight extend to lose, so the loss watch already
+            // holds its final value.
+            _ = stop.changed() => return,
+            _ = tokio::time::sleep(every) => {}
+        }
+        // Honour a stop that landed exactly as the interval elapsed before
+        // issuing another extend.
+        if *stop.borrow() {
+            return;
+        }
+        // Deliberately NOT wrapped in a cancellable select against `stop`: the
+        // caller stops us by signalling `stop` and awaiting our JoinHandle (never
+        // `abort()`), so an in-flight extend always runs to completion and
+        // publishes a 404/409 fence on `lost` before we return. Cancelling
+        // mid-extend would drop the very request that detects the fence, letting
+        // the caller settle a job whose activation was already revoked.
         match jobs.extend(&key, window, &lease).await {
             Ok(()) => {
                 failures = 0;
@@ -456,6 +511,12 @@ async fn refresh_loop(
                     return;
                 }
             }
+        }
+        // A stop that arrived while this extend was in flight: we have now
+        // published its result (success or fence) on the watch, so it is safe to
+        // exit.
+        if *stop.borrow() {
+            return;
         }
     }
 }

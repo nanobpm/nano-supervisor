@@ -1,0 +1,1592 @@
+//! A daemon slot: one capacity-1 worker that services a hire's whole
+//! rank×capability job-type matrix, one job at a time.
+//!
+//! A slot is a single tokio task that round-robins its job types (so capacity is
+//! naturally one — while it runs an agent it polls nothing). It reuses the
+//! spike's leased activation + lease-refresh fencing ([`crate::jobs`],
+//! [`crate::worker::refresh_loop`]) and adds the MVP job handling the daemon
+//! needs: prompt assembly, repo clone, ACP/pipe execution, and result parsing.
+//!
+//! The per-job execution runs on its own spawned task so a panic in one slot
+//! fails only that job — the slot loop catches the join error, fails the job
+//! (preserving retries), and carries on.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{bail, Context, Result};
+use camunda_orchestration_sdk::models::ActivatedJobResult;
+use serde_json::{json, Map, Value};
+use tokio::sync::watch;
+
+use crate::acp::Agent;
+use crate::envelope::{self, Envelope};
+use crate::jobs::{Job, Jobs};
+use crate::result;
+use crate::state::{Hire, Protocol};
+use crate::worker::{log, refresh_loop};
+
+/// Everything a slot needs, shared (via `Arc`) across its per-job tasks.
+#[derive(Debug, Clone)]
+pub struct SlotConfig {
+    pub hire: Hire,
+    /// The worker name reported to the engine — distinct from the Node
+    /// supervisor's so the daemon's jobs can be told apart.
+    pub worker_name: String,
+    /// The hire's job-type matrix, polled round-robin.
+    pub job_types: Vec<String>,
+    pub recovery_window: Duration,
+    pub idle_timeout: Duration,
+    pub poll_timeout: Duration,
+    pub clone_timeout: Duration,
+    pub runs_dir: PathBuf,
+    pub with_lease: bool,
+}
+
+/// Run the slot until `shutdown` is set. Never returns an error — a slot is
+/// resilient, logging and retrying transient failures — so one wedged engine
+/// can't take the daemon down.
+pub async fn run(
+    jobs: Jobs,
+    cfg: Arc<SlotConfig>,
+    mut shutdown: watch::Receiver<bool>,
+    fatal: watch::Sender<bool>,
+) {
+    log(&format!(
+        "slot {} up: types {:?} (recovery {}s, poll {}s, idle {}s, lease {}, protocol {:?})",
+        cfg.worker_name,
+        cfg.job_types,
+        cfg.recovery_window.as_secs(),
+        cfg.poll_timeout.as_secs(),
+        cfg.idle_timeout.as_secs(),
+        if cfg.with_lease { "on" } else { "off" },
+        cfg.hire.protocol,
+    ));
+    let mut next = 0usize;
+    loop {
+        if *shutdown.borrow() {
+            log(&format!("slot {} draining", cfg.worker_name));
+            return;
+        }
+        let job_type = &cfg.job_types[next % cfg.job_types.len()];
+        next = next.wrapping_add(1);
+
+        let batch = tokio::select! {
+            // Bias the drain watch ahead of activation: if SIGTERM makes
+            // `shutdown` ready in the same tick an activation response arrives,
+            // the shutdown arm must win so the slot does not lease/start newly
+            // returned work while draining was requested.
+            biased;
+            _ = shutdown.changed() => continue,
+            b = jobs.activate(job_type, &cfg.worker_name, cfg.recovery_window, cfg.poll_timeout, cfg.with_lease) => b,
+        };
+        let batch = match batch {
+            Ok(b) => b,
+            Err(e) => {
+                log(&format!(
+                    "slot {} activation of {job_type:?} failed: {e:#}; retrying in 5s",
+                    cfg.worker_name
+                ));
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        // Re-check the drain watch before touching the returned batch: `select!`
+        // resolves the activation the instant it is ready, but a SIGTERM may have
+        // set `shutdown` while `activate` was in flight. Starting these jobs now
+        // would lease/run work after draining was requested, so drop the batch
+        // (the activations simply expire and are redelivered) and stop the slot.
+        if *shutdown.borrow() {
+            log(&format!("slot {} draining", cfg.worker_name));
+            return;
+        }
+        for job in batch {
+            if cfg.with_lease && job.lease.is_none() {
+                // The CLI's `--with-lease` contract is to fail LOUDLY when the
+                // engine does not issue leases (see the flag's help). Merely
+                // skipping would leave the activation to expire and be
+                // re-delivered forever — a silent spin that never fences. If the
+                // engine returns an unleased activation here it will do so for
+                // every job, so the requested fencing is impossible: shut the
+                // whole daemon down loudly instead of running on unfenced.
+                log(&format!(
+                    "slot {}: job {} activated without a lease token under --with-lease; the engine \
+                     is not issuing leases, so the requested fencing is impossible — shutting the \
+                     daemon down instead of running unfenced",
+                    cfg.worker_name,
+                    job.job.job_key.value()
+                ));
+                let _ = fatal.send(true);
+                return;
+            }
+            handle(&jobs, &cfg, job).await;
+        }
+    }
+}
+
+/// Decide whether a raced job outcome is still ours to settle.
+///
+/// [`handle`] races job execution against activation loss with `select!`. That
+/// macro can pick the completed-`exec` branch (`Some(..)`) even when the
+/// refresher set the loss watch to `true` in the same tick, so the raw outcome
+/// must be downgraded to "lost" (`None`) whenever the activation was fenced —
+/// otherwise a job would be `complete`/`fail`ed with a stale lease after a
+/// 404/409. Keyed only on the post-select watch value, so it is pure/testable.
+fn reconcile_lost<T>(outcome: Option<T>, lost: bool) -> Option<T> {
+    if lost {
+        None
+    } else {
+        outcome
+    }
+}
+
+async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
+    let key = job.job_key.value().to_string();
+    let started = Instant::now();
+    // Validate the engine-supplied key BEFORE it is used to build any request
+    // path. The refresher below (`extend`) and the `complete`/`fail` settle all
+    // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
+    // must be rejected up front — and an activation we cannot even address must
+    // not be settled. Drop it and let the engine redeliver.
+    if let Err(e) = crate::jobs::validate_job_key(&key) {
+        log(&format!(
+            "job {key}: refusing malformed engine key ({e:#}); not spawning refresher and not settling"
+        ));
+        return;
+    }
+    log(&format!(
+        "job {key} activated on {} (type {}, retries {}, lease {})",
+        cfg.worker_name,
+        job.r#type,
+        job.retries,
+        lease.as_deref().unwrap_or("none")
+    ));
+
+    // Keep the activation alive while the agent works; a 404/409 fences us out.
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (lost_tx, mut lost_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let refresher = tokio::spawn(refresh_loop(
+        jobs.clone(),
+        key.clone(),
+        lease.clone(),
+        cfg.recovery_window,
+        refreshes.clone(),
+        lost_tx,
+        stop_rx,
+    ));
+
+    // Run the job on its own task so a panic fails only THIS job (the slot loop
+    // survives). Race it against activation loss so a superseded worker stops.
+    let mut exec = tokio::spawn(execute(cfg.clone(), key.clone(), job.clone()));
+    let raced = tokio::select! {
+        r = &mut exec => Some(match r {
+            Ok(inner) => inner,
+            Err(join) => Err(anyhow::anyhow!(
+                "slot task for job {key} panicked: {join}"
+            )),
+        }),
+        // Drop the watch guard immediately; the abort/await happens below.
+        _ = lost_rx.wait_for(|lost| *lost) => None,
+    };
+    // Stop the refresher and wait for it to fully exit BEFORE sampling the
+    // activation-loss watch, so the watch value cannot change under us. Signal a
+    // graceful stop and AWAIT the task — never `abort()`: aborting could cancel
+    // an in-flight `extend` in the window between our exec completing and the
+    // stop, dropping the very request that would report a 404/409 fence. The
+    // refresher would then never publish the loss, and we would settle the job
+    // with a stale lease — violating the no-settle-after-fencing guarantee. A
+    // graceful stop lets any in-flight extend run to completion and publish its
+    // result first; once the task is joined no further writes to the watch can
+    // happen, so the value we read below is final.
+    let _ = stop_tx.send(true);
+    let _ = refresher.await;
+    // Re-check the activation-loss watch after the select. `select!` can pick the
+    // `exec` branch even when the refresher set `lost` to true in the same tick
+    // (both futures are ready), which would otherwise settle the job with a stale
+    // lease after a 404/409 fence. Downgrade an outcome to "lost" whenever the
+    // activation was fenced, so we never `complete`/`fail` a job we no longer own.
+    let outcome = reconcile_lost(raced, *lost_rx.borrow());
+    if outcome.is_none() {
+        // We lost the activation: actually stop the agent instead of detaching
+        // the task. Aborting drops the execute future, whose child processes are
+        // spawned `kill_on_drop`, so the clone/agent tree is torn down before we
+        // return.
+        exec.abort();
+        let _ = exec.await;
+    }
+    let elapsed = started.elapsed().as_secs_f32();
+    let n = refreshes.load(Ordering::Relaxed);
+
+    match outcome {
+        None => log(&format!(
+            "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will redeliver it)"
+        )),
+        Some(Ok(vars)) => match jobs.complete(&key, vars, &lease).await {
+            Ok(()) => log(&format!(
+                "job {key} completed in {elapsed:.1}s (refreshes={n})"
+            )),
+            Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
+        },
+        Some(Err(e)) => {
+            let msg = format!("{e:#}");
+            let retries = (job.retries - 1).max(0);
+            match jobs.fail(&key, retries, &truncate(&msg, 2000), &lease).await {
+                Ok(()) => log(&format!(
+                    "job {key} failed after {elapsed:.1}s (refreshes={n}, retries left {retries}): {msg}"
+                )),
+                Err(e2) => log(&format!(
+                    "job {key}: fail failed: {e2:#} (original error: {msg})"
+                )),
+            }
+        }
+    }
+}
+
+/// Restrict a directory to owner-only access (mode 0700) on Unix, so job data
+/// placed under the shared temp directory is not readable/traversable by other
+/// local users. A no-op on non-Unix platforms and when the path is absent.
+fn restrict_dir_mode(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if dir.exists() {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting permissions on {}", dir.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Bail when `dir` (or the runs root above it) is a symlink. The check/remove/
+/// create sequence in [`execute`] is not atomic: another local process can swap
+/// a numeric job dir — or the runs root — for a symlink between operations, so
+/// the agent cwd and `restrict_dir_mode` would otherwise target a path outside
+/// `runs_dir`. `symlink_metadata` inspects the link itself rather than
+/// following it, so a dangling or replaced link is still caught.
+fn reject_symlink(dir: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "refusing to use symlinked path {} (possible local symlink attack)",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Bail when any *existing ancestor* of `dir` is a symlink. [`reject_symlink`]
+/// only inspects the leaf `runs_dir` / `run_dir`, but `create_dir_all` follows a
+/// symlinked ancestor: if a configurable `--runs-dir` (or an `$XDG_STATE_HOME`
+/// state root) is missing under a world-writable parent, another local user can
+/// pre-create a symlinked ancestor so the job directory is materialised outside
+/// the intended root — and the leaf check cannot see it, because the final path
+/// is then a real directory at the redirected location. Walking every existing
+/// ancestor and rejecting the first symlink refuses that redirection before we
+/// create or touch job data. A non-existent ancestor (`symlink_metadata` errors)
+/// is skipped: `create_dir_all` will materialise it as a fresh real directory,
+/// not follow a link. Paired with the leaf [`reject_symlink`] and re-run after
+/// the non-atomic create, this closes the whole chain to symlink redirection.
+fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
+    for ancestor in dir.ancestors() {
+        if std::fs::symlink_metadata(ancestor)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            bail!(
+                "refusing to use {}: ancestor {} is a symlink (possible local symlink attack)",
+                dir.display(),
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Prepare a per-job run directory under `runs_dir` with the full symlink and
+/// permission hardening, wiping any stale prior-attempt contents. Shared by the
+/// daemon slot path ([`execute`]) and the `spike` worker path so both get
+/// identical protection: reject a symlinked leaf / ancestor before *and* after
+/// the non-atomic remove+create (a local process can swap the fresh dir for a
+/// link in between), then restrict both the runs root and the job dir to 0700 so
+/// the clone, prompt-derived files, and `result.json` are not readable by other
+/// local users regardless of umask — this still matters when `runs_dir` falls
+/// back to a shared system temp location.
+pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match prepare_run_dir_pinned(runs_dir, run_dir) {
+            Ok(()) => return Ok(()),
+            // Kernel too old for `openat2` (pre-5.6): fall through to the
+            // best-effort path-based checks below.
+            Err(crate::saferoot::PinError::Unsupported) => {}
+            // A refused symlinked component (ELOOP) or any other error is a
+            // real, security-relevant outcome — surface it, never retry the
+            // weaker path-based version.
+            Err(crate::saferoot::PinError::Io(e)) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("preparing run dir {}", run_dir.display())));
+            }
+        }
+    }
+    prepare_run_dir_path_based(runs_dir, run_dir)
+}
+
+/// `prepare_run_dir` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
+/// runs root: the stale-wipe, create, and 0700 chmod of both the root and the
+/// job dir all happen *relative to that pinned handle*, so a same-UID actor
+/// cannot swap `runs_dir` (or an ancestor) for a symlink between a check and the
+/// operation and redirect the remove/create outside the workspace. This is the
+/// atomic fix the path-based `reject_symlink` re-checks can only approximate.
+/// `run_dir` is always `<runs_dir>/<key>` (a single, engine-validated numeric
+/// component), so its `file_name()` is the child directory to prepare.
+#[cfg(target_os = "linux")]
+fn prepare_run_dir_pinned(
+    runs_dir: &Path,
+    run_dir: &Path,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::{DirHandle, PinError};
+    let name = run_dir.file_name().ok_or_else(|| {
+        PinError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("run dir {} has no final component", run_dir.display()),
+        ))
+    })?;
+    // Bootstrap: the runs root must exist before it can be opened no-follow. A
+    // symlinked component is still caught the instant we open it (openat2
+    // refuses it), so this only ever materialises real directories under an
+    // honest root; a planted symlink ancestor fails the open rather than being
+    // silently followed. But `create_dir_all` itself *follows* symlinks, so an
+    // attacker-planted symlinked ancestor could make the bootstrap materialise
+    // the root through it (in an attacker-chosen target) *before* the no-follow
+    // open ever runs. Reject a symlinked existing ancestor first so the create
+    // cannot be redirected out of the workspace.
+    if let Err(e) = reject_symlinked_ancestors(runs_dir) {
+        return Err(PinError::Io(std::io::Error::other(e.to_string())));
+    }
+    std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
+    let root = DirHandle::open_root_nofollow(runs_dir)?;
+    root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
+    Ok(())
+}
+
+/// Path-based `prepare_run_dir`: the pre-`openat2` fallback (non-Linux, or a
+/// Linux kernel older than 5.6). Rejects a symlinked leaf / ancestor before
+/// *and* after the non-atomic remove+create — a best-effort approximation of
+/// the pinned-handle guarantee that cannot fully close the TOCTOU window.
+fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+    reject_symlink(runs_dir)?;
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors(run_dir)?;
+    if run_dir.exists() {
+        std::fs::remove_dir_all(run_dir)
+            .with_context(|| format!("clearing stale {}", run_dir.display()))?;
+    }
+    std::fs::create_dir_all(run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    reject_symlink(runs_dir)?;
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors(run_dir)?;
+    restrict_dir_mode(runs_dir)?;
+    restrict_dir_mode(run_dir)?;
+    Ok(())
+}
+
+/// Reap a completed run directory under `runs_dir` with the same pinned
+/// no-follow guarantee as [`prepare_run_dir`]: the removal happens *relative to*
+/// an `openat2(RESOLVE_NO_SYMLINKS)` handle on the runs root, so a same-UID
+/// actor cannot swap `run_dir` (or an ancestor) for a symlink between the
+/// job's completion and this cleanup and redirect a path-based
+/// `remove_dir_all` into deleting an unrelated tree outside the workspace.
+/// Falls back to a plain `remove_dir_all` only where the pinned path is
+/// unavailable (non-Linux, or a pre-5.6 kernel without `openat2`). `run_dir` is
+/// always `<runs_dir>/<key>` (a single engine-validated component), so its
+/// `file_name()` is the child to remove. A missing dir is treated as success.
+pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::saferoot::{DirHandle, PinError};
+        if let Some(name) = run_dir.file_name() {
+            match DirHandle::open_root_nofollow(runs_dir) {
+                Ok(root) => return root.remove_tree(name),
+                // Kernel too old for `openat2` (pre-5.6): fall through to the
+                // best-effort path-based remove below.
+                Err(PinError::Unsupported) => {}
+                // A refused symlinked root (ELOOP) or any other error is a real,
+                // security-relevant outcome — surface it, never retry the weaker
+                // path-based remove that would follow the very link we refused.
+                Err(PinError::Io(e)) => return Err(e),
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = runs_dir;
+    match std::fs::remove_dir_all(run_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// How long a *failed* run directory is retained under `runs_dir` for
+/// post-mortem inspection before it is swept. Successful runs are reaped
+/// immediately on completion (see [`execute`]); only failed runs — which bail
+/// via `?` and are deliberately left in place — accumulate. On a long-lived
+/// daemon that retention is otherwise unbounded, so leftover failed runs are
+/// deleted once they age past this window (3 days).
+pub(crate) const FAILED_RUN_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Process-global set of run directories currently being serviced by a slot.
+///
+/// [`sweep_stale_runs`] reaps aged directories purely from their mtime, but an
+/// in-flight agent can legitimately run *longer* than [`FAILED_RUN_RETENTION`]
+/// without ever writing to its run dir (so its mtime ages out) — and a
+/// *different* slot runs the sweep at the start of every job. Without this
+/// guard, that concurrent sweep could delete a live checkout out from under a
+/// still-running agent, corrupting its work or losing its result. Every slot
+/// registers its run dir here for the duration of the job (see
+/// [`ActiveRunGuard`]) and the sweep skips any registered path, so only genuinely
+/// abandoned (failed, post-mortem) directories are ever removed.
+///
+/// Registrations are **reference-counted**: a job dir is keyed by job key and so
+/// is reused across retries, and an old attempt's [`ActiveRunGuard`] can still be
+/// dropping (its `execute` future unwinding) while the retry has already
+/// registered the same path. A plain set would let that late drop unregister the
+/// path out from under the live retry, re-exposing its checkout to the sweep. The
+/// count keeps the path registered until the *last* overlapping guard drops.
+fn active_runs() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII registration of an in-flight run directory in [`active_runs`]. The dir
+/// is protected from the sweep from construction until this guard drops, which
+/// covers every exit path of [`execute`] — normal return, an early `?` bail, or
+/// a panic — so a registration can never leak and permanently pin a dir.
+struct ActiveRunGuard(PathBuf);
+
+impl ActiveRunGuard {
+    fn new(run_dir: &Path) -> Self {
+        if let Ok(mut map) = active_runs().lock() {
+            *map.entry(run_dir.to_path_buf()).or_insert(0) += 1;
+        }
+        ActiveRunGuard(run_dir.to_path_buf())
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = active_runs().lock() {
+            if let Some(count) = map.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `path` is a currently in-flight run dir that must not be swept.
+fn is_active_run(path: &Path) -> bool {
+    active_runs()
+        .lock()
+        .map(|map| map.contains_key(path))
+        .unwrap_or(false)
+}
+
+/// Best-effort sweep of stale retained run directories under `runs_dir`.
+///
+/// Successful runs are reaped the instant their result is captured, so the only
+/// directories that linger here are *failed* runs kept for post-mortem. This
+/// bounds that retention: any entry whose last modification is older than
+/// [`FAILED_RUN_RETENTION`] is removed — **unless** it is a currently in-flight
+/// run (registered in [`active_runs`]), which is skipped no matter how stale its
+/// mtime looks, so a long-running agent's live checkout is never reaped by a
+/// concurrent slot's sweep. A symlinked root (or one reached through a symlinked
+/// ancestor) is refused up front — `read_dir`/`remove_dir_all` follow such a
+/// link, so a symlinked `runs_dir` could otherwise redirect the sweep to delete
+/// aged directories outside the configured workspace. Entirely best-effort: a
+/// `read_dir`/`metadata`/`remove` failure is logged and skipped, never fatal,
+/// because reaping old debris must not block servicing a new job.
+pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
+    #[cfg(target_os = "linux")]
+    {
+        match sweep_stale_runs_pinned(runs_dir, max_age) {
+            Ok(()) => return,
+            // Kernel too old for `openat2` (pre-5.6): fall through to the
+            // best-effort path-based sweep below.
+            Err(crate::saferoot::PinError::Unsupported) => {}
+            // A refused symlinked root (ELOOP) or any other error: skip the
+            // sweep entirely rather than risk traversing a redirected root —
+            // exactly the behaviour the path-based version's up-front reject
+            // provided, now enforced atomically at open time.
+            Err(crate::saferoot::PinError::Io(e)) => {
+                log(&format!(
+                    "skipping stale-run sweep of {}: {e} (possible local symlink attack)",
+                    runs_dir.display()
+                ));
+                return;
+            }
+        }
+    }
+    sweep_stale_runs_path_based(runs_dir, max_age);
+}
+
+/// `sweep_stale_runs` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
+/// runs root: `read_dir`, the per-entry `lstat`, and every `remove` run
+/// *relative to that pinned handle* with the `*at` syscalls, never re-resolving
+/// the path. A same-UID actor can therefore not swap `runs_dir` (or an
+/// ancestor) for a symlink between the check and the traversal to redirect the
+/// sweep's deletions outside the workspace — the race path-based re-checks
+/// cannot atomically close. Descent into an aged run dir is likewise no-follow,
+/// so a symlink *inside* a swept dir deletes the link, never its target.
+#[cfg(target_os = "linux")]
+fn sweep_stale_runs_pinned(
+    runs_dir: &Path,
+    max_age: Duration,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::{DirHandle, PinError};
+    let root = match DirHandle::open_root_nofollow(runs_dir) {
+        Ok(h) => h,
+        // A missing runs_dir (first job) is nothing to sweep — not an error;
+        // the prepare path will (re)create and validate it.
+        Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // `execute` registers each in-flight run by its ABSOLUTE path, so resolve
+    // the root once to compare entries against the active set correctly even
+    // when `runs_dir` is relative.
+    let runs_abs = std::path::absolute(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
+    let now = SystemTime::now();
+    for name in root.entry_names().map_err(PinError::Io)? {
+        let meta = match root.symlink_metadata(&name) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Only sweep real directories — never follow a symlink (which could
+        // point outside runs_dir), and leave stray files be.
+        if !meta.is_dir || meta.is_symlink {
+            continue;
+        }
+        // Never reap a live run, however old its mtime.
+        if is_active_run(&runs_abs.join(&name)) {
+            continue;
+        }
+        // Age from the directory's own mtime; keep it when the platform
+        // withholds a modified time rather than risk deleting a fresh run.
+        let aged_out = meta
+            .modified
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if !aged_out {
+            continue;
+        }
+        let path = runs_dir.join(&name);
+        match root.remove_tree(&name) {
+            Ok(()) => log(&format!(
+                "swept stale run dir {} (older than {}d)",
+                path.display(),
+                max_age.as_secs() / 86_400
+            )),
+            Err(e) => log(&format!(
+                "failed to sweep stale run dir {}: {e:#}",
+                path.display()
+            )),
+        }
+    }
+    Ok(())
+}
+
+/// Path-based `sweep_stale_runs`: the pre-`openat2` fallback (non-Linux, or a
+/// Linux kernel older than 5.6). Rejects a symlinked root/ancestor up front,
+/// then reads and removes by path — a best-effort approximation that cannot
+/// fully close the check/traverse TOCTOU the pinned version does.
+fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
+    // Refuse to traverse a symlinked root, or one reached through a symlinked
+    // ancestor, before touching it: `read_dir` (and the `remove_dir_all` below)
+    // follow such a link, so a symlinked `--runs-dir` — or an attacker-planted
+    // symlinked ancestor under a world-writable parent — could redirect the
+    // sweep to delete aged directories *outside* the configured workspace.
+    // `prepare_run_dir` validates the same root, but only when a job is later
+    // provisioned — after this sweep has already read and deleted — so the
+    // check has to be repeated here, before the very first `read_dir`.
+    if reject_symlink(runs_dir).is_err() || reject_symlinked_ancestors(runs_dir).is_err() {
+        log(&format!(
+            "skipping stale-run sweep of {}: symlinked root or ancestor (possible local symlink attack)",
+            runs_dir.display()
+        ));
+        return;
+    }
+    let entries = match std::fs::read_dir(runs_dir) {
+        Ok(e) => e,
+        // A missing runs_dir (first job) or an unreadable one is nothing to
+        // sweep — the normal prepare path will (re)create/validate it.
+        Err(_) => return,
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only sweep directories (real ones — never follow a symlink, which
+        // could point outside runs_dir); leave any stray files be.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        // Never reap a live run, however old its mtime. `execute` registers the
+        // run dir as its absolute path, so match against that (a relative
+        // `runs_dir` would otherwise yield a relative entry path that never
+        // compares equal to the stored absolute one).
+        let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        if is_active_run(&abs) {
+            continue;
+        }
+        // Age from the directory's own mtime. If the platform withholds a
+        // modified time, keep the dir rather than risk deleting a fresh run.
+        let aged_out = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if !aged_out {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => log(&format!(
+                "swept stale run dir {} (older than {}d)",
+                path.display(),
+                max_age.as_secs() / 86_400
+            )),
+            Err(e) => log(&format!(
+                "failed to sweep stale run dir {}: {e:#}",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// Redact any embedded userinfo (`user:token@`) from a URL's authority before
+/// logging it. A repository URL from the task envelope may carry an HTTPS
+/// credential (`https://x-access-token:<pat>@host/...`); logging it verbatim
+/// would leak the secret into the daemon's stdout/journal. Every `scheme://…`
+/// occurrence in the string is stripped — not just the first — so a value
+/// carrying two credential-bearing URLs (e.g. a prompt or task field) never
+/// forwards the second token. Only `http`/`https` authorities are redacted:
+/// other schemes carry a *login*, not a secret — `ssh://git@host` uses `git`
+/// as the required SSH username — so stripping their userinfo would corrupt an
+/// otherwise-valid remote handed to the agent via the ACP prompt / pipe
+/// payload. This mirrors `provision::scrub_url_credentials`, which likewise
+/// scopes its scrub to HTTP(S). Non-URL or credential-free inputs are returned
+/// unchanged.
+pub(crate) fn redact_url(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("://") {
+        let after = pos + 3;
+        // Only an HTTP(S) authority's userinfo is a credential to redact; for any
+        // other scheme the userinfo is a login we must preserve verbatim.
+        let redact = {
+            let scheme = url_scheme_before(&rest[..pos]);
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        };
+        out.push_str(&rest[..after]);
+        let tail = &rest[after..];
+        // The authority runs until the first character that cannot be part of it
+        // (path/query/fragment separators, or any whitespace/quoting that ends
+        // the URL inside surrounding prose).
+        let auth_end = tail
+            .find(|c: char| {
+                matches!(
+                    c,
+                    '/' | '?' | '#' | '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '|' | '\\' | '`'
+                ) || c.is_whitespace()
+            })
+            .unwrap_or(tail.len());
+        let authority = &tail[..auth_end];
+        match authority.rfind('@') {
+            Some(at) if redact => out.push_str(&authority[at + 1..]),
+            _ => out.push_str(authority),
+        }
+        rest = &tail[auth_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract the URL scheme immediately preceding a `://` separator: the trailing
+/// run of scheme-valid characters (`[A-Za-z0-9+.-]`) in `prefix` (the substring
+/// before the `://`). Mirrors `provision::scheme_of` — `slot` cannot see that
+/// private helper — so `redact_url`'s scheme scoping matches the scrub's.
+fn url_scheme_before(prefix: &str) -> &str {
+    let start = prefix
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &prefix[start..]
+}
+
+async fn execute(
+    cfg: Arc<SlotConfig>,
+    key: String,
+    job: ActivatedJobResult,
+) -> Result<HashMap<String, Value>> {
+    let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
+    let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
+    let env = envelope::assemble(&custom_headers, &variables);
+    let prompt = env
+        .prompt
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .context("job carries no prompt (task.prompt / prompt / task)")?;
+
+    // Per-job working directory; the repo (when present) is cloned inside it.
+    // The dir is keyed by job key and so is reused across retries — wipe any
+    // prior attempt's checkout and stale `result.json` first, so a retry starts
+    // from a clean slate (a leftover clone would fail provisioning, and a stale
+    // result could be accepted as this attempt's result).
+    //
+    // Validate the key against the engine's numeric format *before* joining it to
+    // a path: `key` originates from the engine response, and a malformed `../` or
+    // absolute key would otherwise make `remove_dir_all` / `create_dir_all`
+    // operate outside `runs_dir`.
+    crate::jobs::validate_job_key(&key)?;
+    // Resolve to an absolute path so a relative `--runs-dir` cannot break the
+    // daemon↔agent result-file contract: the child runs with `cwd` set inside
+    // `run_dir`, so a relative `AGENT_RESULT_FILE` would resolve against the
+    // child's cwd while the daemon reads it against its own — the completion
+    // would be silently missed. `std::path::absolute` is purely lexical (it does
+    // not touch the filesystem or resolve symlinks), so the symlink-rejection
+    // hardening in `prepare_run_dir` still inspects the real on-disk structure.
+    let run_dir = std::path::absolute(cfg.runs_dir.join(&key)).with_context(|| {
+        format!(
+            "resolving absolute run dir under {}",
+            cfg.runs_dir.display()
+        )
+    })?;
+    // Register this run dir as in-flight for the whole job so a concurrent
+    // slot's retention sweep can never reap it, even if the agent runs longer
+    // than `FAILED_RUN_RETENTION` without touching the dir. The guard drops on
+    // every exit path (return, `?` bail, panic), after which a *failed* run is
+    // left to age out normally and a *successful* one is reaped just below.
+    let _active = ActiveRunGuard::new(&run_dir);
+    // Best-effort: reap any *failed* runs left for post-mortem that have now
+    // aged past the retention window, so a long-lived daemon's `runs_dir` stays
+    // bounded. Age-based, and it skips any in-flight run registered above, so it
+    // never touches this fresh run or a concurrent slot's live one.
+    sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION);
+    // Reject symlinked runs root / job dir / ancestors, wipe any stale prior
+    // attempt, (re-)create the dir, and lock it to owner-only 0700 — the full
+    // hardening lives in one shared helper (also used by the `spike` path).
+    prepare_run_dir(&cfg.runs_dir, &run_dir)?;
+    let agent_cwd = match &env.repository {
+        Some(repo) => {
+            log(&format!(
+                "job {key}: cloning {} ({})",
+                redact_url(&repo.url),
+                repo.provider
+            ));
+            crate::provision::provision(repo, &run_dir, cfg.clone_timeout)
+                .await
+                .context("provisioning repository")?
+        }
+        None => run_dir.clone(),
+    };
+
+    let result_file = run_dir.join("result.json");
+    let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
+
+    let (result_obj, detect_stdout) = match cfg.hire.protocol {
+        Protocol::Acp => {
+            // The pipe payload is recursively credential-scrubbed in
+            // `build_pipe_payload`, but the ACP branch forwards the prompt
+            // verbatim. A prompt carrying a `user:token@` clone URL would
+            // otherwise leak the PAT to the ACP agent (and its tools/results),
+            // so scrub the prompt with the same URL redactor before `run_acp`.
+            let safe_prompt = redact_url(&prompt);
+            run_acp(
+                &cfg,
+                &key,
+                &agent_cwd,
+                &safe_prompt,
+                &result_file,
+                &agent_env,
+            )
+            .await?
+        }
+        Protocol::Pipe => {
+            run_pipe(&cfg, &key, &agent_cwd, &env, &job, &result_file, &agent_env).await?
+        }
+    };
+
+    // A run that produced nothing did no work — fail it (retries preserved)
+    // rather than silently complete and drop what the job carried.
+    if let Some(reason) = result::detect_empty(result_obj.as_ref(), &detect_stdout) {
+        bail!(reason);
+    }
+
+    // Build the completion variables: the agent's sanitized result vars plus the
+    // host-owned bookkeeping the harness always stamps.
+    let mut vars: HashMap<String, Value> = result_obj
+        .as_ref()
+        .map(result::sanitize_result_vars)
+        .unwrap_or_default();
+    // If the agent returned no effective structured result but still produced
+    // substantive output, surface that output as `agentResult` (as the spike
+    // worker does) instead of silently completing with only bookkeeping and
+    // dropping the agent's response. This applies to BOTH protocols. The
+    // empty-result guard above already failed runs that did NOTHING, so
+    // reaching here with non-empty `detect_stdout` means real work to preserve.
+    let has_effective = result_obj
+        .as_ref()
+        .is_some_and(result::has_effective_result_vars);
+    if !has_effective && !detect_stdout.trim().is_empty() {
+        vars.insert("agentResult".into(), json!(detect_stdout));
+    }
+    vars.insert("agentWorker".into(), json!(cfg.worker_name));
+    // Reap this job's run directory now that its result has been fully captured
+    // (result vars are already parsed into memory above). Without this, a
+    // long-running daemon would accumulate one per-job clone per completed job —
+    // job keys are unique, so nothing else ever removes them — until the runs
+    // filesystem fills. Only *successful* runs are reaped here: a failing run
+    // bails earlier via `?`, leaving its directory in place for post-mortem
+    // inspection (bounded: aged-out failed runs are swept by `sweep_stale_runs`
+    // on a later job, see `FAILED_RUN_RETENTION`). Best-effort: a reap failure
+    // must not fail an otherwise-good job. The removal is pinned no-follow (see
+    // `reap_run_dir`) so it cannot be redirected outside the workspace by a
+    // symlink swapped in between the job finishing and this cleanup.
+    if let Err(e) = reap_run_dir(&cfg.runs_dir, &run_dir) {
+        log(&format!(
+            "job {key}: failed to reap run dir {}: {e:#}",
+            run_dir.display()
+        ));
+    }
+    Ok(vars)
+}
+
+/// Drive an ACP harness: send the prompt, collect the message text, and read any
+/// structured result the agent also wrote/printed.
+async fn run_acp(
+    cfg: &SlotConfig,
+    key: &str,
+    cwd: &std::path::Path,
+    prompt: &str,
+    result_file: &std::path::Path,
+    env: &[(String, String)],
+) -> Result<(Option<Map<String, Value>>, String)> {
+    let mut agent = Agent::spawn(&cfg.hire.command, &cfg.hire.args, cwd, env)?;
+    log(&format!(
+        "job {key}: acp agent pid {} in {}",
+        agent.pid().unwrap_or(0),
+        cwd.display()
+    ));
+    let out = agent.run(cwd, prompt, cfg.idle_timeout).await;
+    agent.shutdown().await;
+    let out = out?;
+    // Prefer the result file, then a `::nano:result::` sentinel in the message text.
+    let result_obj = result::read_result_file(result_file)
+        .or_else(|| result::parse_result_from_stdout(&out.text));
+    Ok((result_obj, out.text))
+}
+
+/// Drive a pipe harness: feed it the JSON job payload on stdin and scrape its
+/// stdout / result file for a structured result.
+async fn run_pipe(
+    cfg: &SlotConfig,
+    key: &str,
+    cwd: &std::path::Path,
+    env: &Envelope,
+    job: &ActivatedJobResult,
+    result_file: &std::path::Path,
+    agent_env: &[(String, String)],
+) -> Result<(Option<Map<String, Value>>, String)> {
+    let payload = build_pipe_payload(cfg, job, env);
+    log(&format!("job {key}: pipe agent in {}", cwd.display()));
+    let out = crate::pipe::run(
+        &cfg.hire.command,
+        &cfg.hire.args,
+        cwd,
+        agent_env,
+        &payload,
+        cfg.idle_timeout,
+    )
+    .await?;
+    if out.idle_timed_out {
+        bail!(
+            "agent produced no output for {}s (idle timeout)",
+            cfg.idle_timeout.as_secs()
+        );
+    }
+    let result_obj = result::read_result_file(result_file)
+        .or_else(|| result::parse_result_from_stdout(&out.stdout));
+    // The harness must have exited cleanly (code 0) for its output to be trusted.
+    match out.exit_code {
+        // Clean exit: nothing to gate on here (empty-result is handled below).
+        Some(0) => {}
+        // A non-zero exit means the run failed. Only tolerate it when the agent
+        // still emitted an *effective* structured result (a real result var in
+        // the result file or stdout sentinel) — a reserved-only/null object such
+        // as `::nano:result:: {}` carries no result, so honoring it would let
+        // `detect_empty` mistake diagnostic stdout for real work and silently
+        // settle a failed job. Require an effective result; otherwise fail so the
+        // job is retried instead.
+        Some(code) => {
+            if !result_obj
+                .as_ref()
+                .is_some_and(result::has_effective_result_vars)
+            {
+                bail!("pipe agent exited with code {code} without writing an effective result");
+            }
+            log(&format!(
+                "job {key}: pipe agent exited with code {code}; honoring the explicit result it wrote"
+            ));
+        }
+        // No exit code at all: the child was killed by a signal or the EOF wait
+        // timed out and we tore it down. The harness never exited successfully,
+        // so any result it wrote may be partial/untrustworthy — never honor it;
+        // fail the job so it is retried rather than settled on a broken run.
+        None => {
+            bail!(
+                "pipe agent did not exit cleanly (killed by a signal or the EOF wait timed out); \
+                 refusing to honor any result from a run that never terminated successfully"
+            );
+        }
+    }
+    // The pipe path has no "turns"; substantive stdout is the work signal.
+    Ok((result_obj, out.stdout))
+}
+
+/// The JSON payload a pipe harness reads on stdin (the Node plugin's
+/// `buildAgentPayload` shape).
+fn build_pipe_payload(cfg: &SlotConfig, job: &ActivatedJobResult, env: &Envelope) -> String {
+    let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
+    let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
+    let mut payload = json!({
+        "jobKey": job.job_key.value(),
+        "jobType": job.r#type,
+        "processInstanceKey": job.process_instance_key.value(),
+        "elementInstanceKey": job.element_instance_key.value(),
+        "elementId": job.element_id.value(),
+        "bpmnProcessId": job.process_definition_id.value(),
+        "prompt": env.prompt,
+        "task": if env.raw.is_null() { Value::Null } else { env.raw.clone() },
+        "variables": variables,
+        "customHeaders": custom_headers,
+        "profile": {
+            "name": cfg.hire.name,
+            "rank": cfg.hire.rank,
+            "model": cfg.hire.model,
+            "capabilities": cfg.hire.capabilities,
+        },
+    });
+    // Strip clone-credential userinfo from any URL anywhere in the payload before
+    // it reaches the agent's stdin. The task envelope (and the raw
+    // variables/customHeaders it is assembled from) can carry a credential-bearing
+    // repository URL (`https://x-access-token:<pat>@host/...`) that `provision`
+    // deliberately supports for the clone. The agent already receives a checkout
+    // and never needs that token, so forwarding it verbatim would only expose the
+    // secret to the agent (and thus its result/exfiltration path). `redact_url`
+    // is a no-op on any string without `scheme://user:secret@` userinfo, so
+    // ordinary URLs, prose, and non-URL values pass through unchanged.
+    redact_credential_urls(&mut payload);
+    payload.to_string()
+}
+
+/// Recursively rewrite every string in `value` through [`redact_url`], stripping
+/// embedded `user:secret@` userinfo from any credential-bearing URL while leaving
+/// all other strings untouched.
+fn redact_credential_urls(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            let redacted = redact_url(s);
+            if redacted != *s {
+                *s = redacted;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_credential_urls),
+        Value::Object(map) => map.values_mut().for_each(redact_credential_urls),
+        _ => {}
+    }
+}
+
+/// The daemon's own engine-connection credentials, read from its environment by
+/// [`crate::profile`]. A coding agent never needs them, so they are stripped
+/// from the inherited environment at every agent launch (`acp` and `pipe`) —
+/// otherwise a daemon configured via ambient `CAMUNDA_*`/`ZEEBE_*` OAuth or
+/// basic-auth secrets would expose those secrets to the agent, which could read
+/// and exfiltrate them even with `NANO_AGENTIC=off`. The `*_REST_ADDRESS`
+/// connection URLs are stripped for the same reason: an operator may embed
+/// HTTP(S) userinfo (`https://user:secret@host`) directly in the address, so the
+/// URL itself carries an engine credential that must not be inherited by an
+/// agent. The `NANO_AGENTIC_*`
+/// credentials are stripped for the same reason: `NANO_AGENTIC=off` disables the
+/// visibility channel but does not stop a host agent from reading an inherited
+/// agentic token/secret out of its environment. Deployment secrets the agent
+/// legitimately needs (e.g. its own GitHub credentials for push) are delivered
+/// through the deliberate `hire.env` channel and are re-applied after this strip,
+/// so an explicitly hired value is unaffected.
+pub(crate) const SENSITIVE_DAEMON_ENV: &[&str] = &[
+    "CAMUNDA_CLIENT_ID",
+    "CAMUNDA_CLIENT_SECRET",
+    "CAMUNDA_BASIC_AUTH_USERNAME",
+    "CAMUNDA_BASIC_AUTH_PASSWORD",
+    "ZEEBE_CLIENT_ID",
+    "ZEEBE_CLIENT_SECRET",
+    "ZEEBE_BASIC_AUTH_USERNAME",
+    "ZEEBE_BASIC_AUTH_PASSWORD",
+    "CAMUNDA_REST_ADDRESS",
+    "ZEEBE_REST_ADDRESS",
+    "NANO_AGENTIC_TOKEN",
+    "NANO_AGENTIC_SECRET",
+    "NANO_AGENTIC_CREDENTIAL",
+];
+
+/// The environment every harness gets: the reserved `AGENT_*`/`NANO_*` vars, the
+/// result-file path, the agentic off-switch, and the hire's own env last-but-one
+/// (reserved vars always win).
+fn build_agent_env(
+    cfg: &SlotConfig,
+    key: &str,
+    job: &ActivatedJobResult,
+    result_file: &std::path::Path,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    // Hire-configured env first, so reserved vars below can never be shadowed.
+    for (k, v) in &cfg.hire.env {
+        env.push((k.clone(), v.clone()));
+    }
+    env.push(("NANO_JOB_KEY".into(), key.to_string()));
+    env.push(("NANO_AGENT_NAME".into(), cfg.worker_name.clone()));
+    // MVP: the agentic visibility channel is off (host sandbox only).
+    env.push(("NANO_AGENTIC".into(), "off".into()));
+    env.push((
+        "AGENT_RESULT_FILE".into(),
+        result_file.to_string_lossy().into_owned(),
+    ));
+    env.push(("AGENT_PROFILE".into(), cfg.hire.name.clone()));
+    env.push(("AGENT_RANK".into(), cfg.hire.rank.clone()));
+    env.push(("AGENT_MODEL".into(), cfg.hire.model.clone()));
+    env.push(("AGENT_CAPABILITIES".into(), cfg.hire.capabilities.join(",")));
+    env.push(("AGENT_JOB_TYPE".into(), job.r#type.clone()));
+    env
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max).collect();
+    t.push('…');
+    t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hire() -> Hire {
+        Hire {
+            name: "coder".into(),
+            rank: "senior".into(),
+            command: "true".into(),
+            args: vec![],
+            model: "m".into(),
+            capabilities: vec!["pr-review".into()],
+            protocol: Protocol::Pipe,
+            sandbox: "none".into(),
+            env: Default::default(),
+        }
+    }
+
+    fn cfg() -> SlotConfig {
+        SlotConfig {
+            hire: hire(),
+            worker_name: "host-nanod-coder-0".into(),
+            job_types: vec!["senior".into(), "senior:pr-review".into()],
+            recovery_window: Duration::from_secs(300),
+            idle_timeout: Duration::from_secs(300),
+            poll_timeout: Duration::from_secs(30),
+            clone_timeout: Duration::from_secs(120),
+            runs_dir: std::env::temp_dir(),
+            with_lease: true,
+        }
+    }
+
+    #[test]
+    fn agent_env_has_reserved_and_off_switch() {
+        let job = ActivatedJobResult {
+            r#type: "senior:pr-review".into(),
+            ..Default::default()
+        };
+        let rf = std::path::Path::new("/tmp/r.json");
+        let env = build_agent_env(&cfg(), "42", &job, rf);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("NANO_AGENTIC"), Some("off"));
+        assert_eq!(get("NANO_JOB_KEY"), Some("42"));
+        assert_eq!(get("AGENT_RESULT_FILE"), Some("/tmp/r.json"));
+        assert_eq!(get("AGENT_JOB_TYPE"), Some("senior:pr-review"));
+        assert_eq!(get("AGENT_PROFILE"), Some("coder"));
+    }
+
+    #[test]
+    fn sensitive_daemon_env_covers_engine_secrets() {
+        // The daemon's engine-connection secrets must be in the strip list so a
+        // launched agent never inherits them. `build_agent_env` never emits them
+        // either (it only adds reserved + hire vars), so the leak can only come
+        // from the inherited environment — which the launch sites strip via this
+        // list.
+        for k in [
+            "CAMUNDA_CLIENT_SECRET",
+            "ZEEBE_CLIENT_SECRET",
+            "CAMUNDA_BASIC_AUTH_PASSWORD",
+            // The SDK also accepts the `ZEEBE_*` aliases as an ambient
+            // connection source (see `profile::env_has_oauth`), so basic-auth
+            // credentials supplied that way must be stripped too.
+            "ZEEBE_BASIC_AUTH_USERNAME",
+            "ZEEBE_BASIC_AUTH_PASSWORD",
+            // A `*_REST_ADDRESS` connection URL can embed HTTP(S) userinfo
+            // (`https://user:secret@host`), so the address itself carries an
+            // engine credential and must be stripped from the agent env too.
+            "CAMUNDA_REST_ADDRESS",
+            "ZEEBE_REST_ADDRESS",
+            // `NANO_AGENTIC=off` disables the channel but does not stop a host
+            // agent reading an inherited agentic credential, so these must be
+            // stripped too.
+            "NANO_AGENTIC_TOKEN",
+            "NANO_AGENTIC_SECRET",
+            "NANO_AGENTIC_CREDENTIAL",
+        ] {
+            assert!(
+                SENSITIVE_DAEMON_ENV.contains(&k),
+                "{k} missing from SENSITIVE_DAEMON_ENV"
+            );
+        }
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&cfg(), "1", &job, std::path::Path::new("/tmp/r.json"));
+        for (k, _) in &env {
+            assert!(
+                !SENSITIVE_DAEMON_ENV.contains(&k.as_str()),
+                "build_agent_env must never emit daemon secret {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn hire_env_cannot_shadow_reserved() {
+        let mut c = cfg();
+        c.hire.env.insert("NANO_AGENTIC".into(), "on".into());
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, std::path::Path::new("/tmp/r.json"));
+        // The reserved value is pushed AFTER the hire env, so it wins for any
+        // consumer that reads the last occurrence (as a child process does).
+        let last = env
+            .iter()
+            .rfind(|(k, _)| k == "NANO_AGENTIC")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(last, Some("off"));
+    }
+
+    #[test]
+    fn redact_url_strips_embedded_credentials() {
+        assert_eq!(
+            redact_url("https://x-access-token:ghp_secret@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_url("https://user:pw@host:8443/path?x=1"),
+            "https://host:8443/path?x=1"
+        );
+        // No credentials / non-URL inputs are returned unchanged.
+        assert_eq!(
+            redact_url("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_url("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+        // Non-HTTP(S) schemes carry a *login*, not a secret: `ssh://git@host`
+        // uses `git` as the required SSH username, so it must be preserved
+        // verbatim — stripping it would corrupt an otherwise-valid remote.
+        assert_eq!(
+            redact_url("ssh://git@github.com/o/r.git"),
+            "ssh://git@github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_url("ssh://user@git.example.com:22/o/r.git"),
+            "ssh://user@git.example.com:22/o/r.git"
+        );
+    }
+
+    #[test]
+    fn redact_url_strips_every_occurrence() {
+        // A single string carrying two credential-bearing URLs must have BOTH
+        // tokens stripped, not just the first (the field could be a prompt or a
+        // task value forwarded to a pipe agent). Build the userinfo at runtime so
+        // no credential-like literal is stored in source.
+        let a = format!("{}:{}", "x-access-token", "tokenA1");
+        let b = format!("{}:{}", "x-access-token", "tokenB2");
+        let s = format!("clone https://{a}@h1/x.git then https://{b}@h2/y.git done");
+        let out = redact_url(&s);
+        assert!(!out.contains("tokenA1"), "first credential leaked: {out}");
+        assert!(!out.contains("tokenB2"), "second credential leaked: {out}");
+        assert!(out.contains("https://h1/x.git"));
+        assert!(out.contains("https://h2/y.git"));
+    }
+
+    #[test]
+    fn pipe_payload_redacts_repository_clone_credentials() {
+        let cfg = cfg();
+        let job = ActivatedJobResult::default();
+        // Build the credential-bearing URL at runtime so no credential-like
+        // literal is stored in source (mirrors the provision.rs tests).
+        let token = format!("{}-{}", "x-access", "token");
+        let secret = format!("pat{}value", 1234);
+        let cred_url = format!("https://{token}:{secret}@github.com/o/r.git");
+        let env = Envelope {
+            prompt: Some("do it".into()),
+            repository: None,
+            raw: json!({ "repository": { "url": cred_url } }),
+        };
+        let payload = build_pipe_payload(&cfg, &job, &env);
+        assert!(
+            !payload.contains(&secret),
+            "clone credential must not reach the agent payload: {payload}"
+        );
+        assert!(payload.contains("https://github.com/o/r.git"));
+    }
+
+    #[test]
+    fn acp_prompt_is_redacted_of_clone_credentials() {
+        // The ACP branch forwards the prompt verbatim, so a credential URL
+        // embedded in a task prompt must be scrubbed by the same `redact_url`
+        // path the pipe payload uses before it reaches the ACP agent. Build the
+        // userinfo at runtime so no credential-like literal is stored in source.
+        let token = format!("{}-{}", "x-access", "token");
+        let secret = format!("pat{}value", 1234);
+        let prompt = format!("clone https://{token}:{secret}@github.com/o/r.git and build");
+        let safe_prompt = redact_url(&prompt);
+        assert!(
+            !safe_prompt.contains(&secret),
+            "clone credential must not reach the ACP agent prompt: {safe_prompt}"
+        );
+        assert!(safe_prompt.contains("https://github.com/o/r.git"));
+        assert!(safe_prompt.contains("and build"));
+    }
+
+    #[test]
+    fn reconcile_lost_downgrades_completed_outcome_when_activation_lost() {
+        // The core of the lease-loss/completion race fix: even a job whose
+        // `exec` future completed (an `Ok`/`Err` outcome) must NOT be settled
+        // once the activation-loss watch reads `true`, because `select!` can
+        // pick the completed branch in the same tick the refresher fences us out
+        // (404/409). Settling then would `complete`/`fail` with a stale lease.
+        let completed: Option<Result<()>> = Some(Ok(()));
+        assert!(
+            reconcile_lost(completed, true).is_none(),
+            "a completed outcome must be downgraded to lost when the activation was fenced"
+        );
+        let failed: Option<Result<()>> = Some(Err(anyhow::anyhow!("boom")));
+        assert!(
+            reconcile_lost(failed, true).is_none(),
+            "a failed outcome must also be downgraded to lost when the activation was fenced"
+        );
+        // Not lost: the outcome passes through unchanged so a genuine completion
+        // still settles.
+        assert!(matches!(
+            reconcile_lost(Some(Ok::<(), anyhow::Error>(())), false),
+            Some(Ok(()))
+        ));
+        // Already lost via the select's None branch stays lost.
+        assert!(reconcile_lost(None::<Result<()>>, false).is_none());
+    }
+
+    #[test]
+    fn sweep_stale_runs_removes_only_aged_dirs() {
+        // Unique per-test root under the system temp dir (no tempfile dep here).
+        let root = std::env::temp_dir().join(format!(
+            "nano-sweep-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // Resolve any symlinked ancestor of the system temp dir (e.g. macOS's
+        // /var -> /private/var) up front: the sweep legitimately refuses a
+        // symlinked root/ancestor, so exercise it against the canonical path.
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let aged = root.join("failed-run");
+        std::fs::create_dir_all(&aged).unwrap();
+        std::fs::write(aged.join("result.json"), b"{}").unwrap();
+        let stray = root.join("stray.txt");
+        std::fs::write(&stray, b"x").unwrap();
+
+        // max_age = 0 → every existing dir is at/over the threshold and swept,
+        // but stray files are left untouched.
+        sweep_stale_runs(&root, Duration::ZERO);
+        assert!(!aged.exists(), "aged-out run dir should be swept");
+        assert!(stray.exists(), "stray files must be left alone");
+
+        // A fresh dir with a long retention window is kept.
+        let fresh = root.join("in-flight-run");
+        std::fs::create_dir_all(&fresh).unwrap();
+        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60));
+        assert!(fresh.exists(), "a fresh run dir must not be swept");
+
+        // A missing runs_dir is a no-op (must not panic).
+        sweep_stale_runs(&root.join("does-not-exist"), Duration::ZERO);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_skips_active_run_however_aged() {
+        // A long-running agent's dir can age past the retention window without
+        // being touched; while it is registered as in-flight the sweep must
+        // never reap it, even with max_age = 0.
+        let root = std::env::temp_dir().join(format!(
+            "nano-active-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // Resolve any symlinked ancestor of the system temp dir (e.g. macOS's
+        // /var -> /private/var) so the sweep's symlinked-ancestor guard does not
+        // skip this exercise against an otherwise-honest root.
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let live = root.join("live-run");
+        std::fs::create_dir_all(&live).unwrap();
+        // Registered as absolute, exactly as `execute` does.
+        let live_abs = std::path::absolute(&live).unwrap();
+        let _guard = ActiveRunGuard::new(&live_abs);
+        assert!(is_active_run(&live_abs));
+
+        sweep_stale_runs(&root, Duration::ZERO);
+        assert!(
+            live.exists(),
+            "an in-flight run must not be swept, however aged"
+        );
+
+        // Once the guard drops, the same dir becomes eligible again.
+        drop(_guard);
+        assert!(!is_active_run(&live_abs));
+        sweep_stale_runs(&root, Duration::ZERO);
+        assert!(!live.exists(), "a deregistered aged dir is swept normally");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn active_run_guard_is_refcounted_across_overlapping_retries() {
+        // A job dir is keyed by job key and reused across retries, so an old
+        // attempt's guard can still be dropping while the retry has already
+        // re-registered the same path. A plain set would let that late drop
+        // deregister the live retry; the refcount keeps the path registered
+        // until the *last* overlapping guard drops.
+        let root = std::env::temp_dir().join(format!(
+            "nano-refcount-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run = std::path::absolute(root.join("shared-run")).unwrap();
+
+        let first = ActiveRunGuard::new(&run);
+        let second = ActiveRunGuard::new(&run);
+        assert!(is_active_run(&run));
+
+        // The old attempt finishes and drops its guard; the live retry's
+        // registration must survive.
+        drop(first);
+        assert!(
+            is_active_run(&run),
+            "overlapping registration must keep the path active"
+        );
+
+        // Only when the last guard drops is the path deregistered.
+        drop(second);
+        assert!(
+            !is_active_run(&run),
+            "path deregistered once the last guard drops"
+        );
+    }
+
+    #[test]
+    fn reap_run_dir_removes_tree_and_tolerates_missing() {
+        // The pinned reap (Linux) and the path-based fallback must both remove a
+        // populated run dir and treat an already-absent dir as success.
+        let runs = std::env::temp_dir().join(format!(
+            "nano-reap-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&runs).unwrap();
+        let run = runs.join("42");
+        std::fs::create_dir_all(run.join("nested")).unwrap();
+        std::fs::write(run.join("nested").join("result.json"), b"{}").unwrap();
+
+        reap_run_dir(&runs, &run).expect("reap must remove a populated run dir");
+        assert!(!run.exists(), "run dir must be gone after reap");
+
+        // A second reap of the now-missing dir is a no-op success.
+        reap_run_dir(&runs, &run).expect("reaping a missing dir must succeed");
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_refuses_symlinked_root() {
+        // A symlinked `runs_dir` must never be traversed: `read_dir`/
+        // `remove_dir_all` would follow the link and delete aged directories in
+        // the *real* target, outside the configured workspace. The sweep must
+        // refuse the symlinked root and leave the target untouched.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("nano-symlink-sweep-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The real target holds an aged dir that a followed sweep would delete.
+        let real_root = base.join("real-root");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let aged = real_root.join("aged-run");
+        std::fs::create_dir_all(&aged).unwrap();
+
+        // A symlink standing in for a malicious `--runs-dir`.
+        let link_root = base.join("link-root");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        sweep_stale_runs(&link_root, Duration::ZERO);
+        assert!(
+            aged.exists(),
+            "sweep of a symlinked root must not follow it and delete the target's contents"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A unique scratch dir under the system temp root (no tempfile dep here).
+    #[cfg(target_os = "linux")]
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nano-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_run_dir_pinned_creates_owner_only_and_wipes_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let runs = unique_tmp("prep-pinned");
+        let run = runs.join("42");
+
+        // A stale prior attempt with a leftover file must be wiped.
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("stale.json"), b"old").unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "run dir must exist after prepare");
+        assert!(
+            !run.join("stale.json").exists(),
+            "a stale prior attempt must be wiped"
+        );
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "job dir must be locked to owner-only 0700");
+        let root_mode = std::fs::metadata(&runs).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            root_mode, 0o700,
+            "runs root must be locked to owner-only 0700"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_run_dir_pinned_refuses_symlinked_root() {
+        // A symlinked runs root must be refused by the pinned open (ELOOP),
+        // surfaced as an error — never silently followed to prepare a job dir
+        // in the real target.
+        let base = unique_tmp("prep-symlink");
+        let real_root = base.join("real-runs");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let link_root = base.join("link-runs");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let run = link_root.join("7");
+        let err = prepare_run_dir(&link_root, &run).unwrap_err();
+        assert!(
+            !real_root.join("7").exists(),
+            "a symlinked root must not be followed to create the job dir in the target"
+        );
+        let _ = err;
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sweep_pinned_does_not_follow_symlinked_entry_inside_aged_dir() {
+        // An aged run dir containing a symlink to an outside directory must be
+        // removed WITHOUT following the link: the link is deleted, its target
+        // (and the target's contents) survive.
+        let base = unique_tmp("sweep-nofollow");
+        let runs = base.join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), b"keep me").unwrap();
+
+        let aged = runs.join("aged-run");
+        std::fs::create_dir_all(&aged).unwrap();
+        std::os::unix::fs::symlink(&outside, aged.join("evil-link")).unwrap();
+
+        sweep_stale_runs(&runs, Duration::ZERO);
+
+        assert!(
+            !aged.exists(),
+            "aged run dir (and its symlink child) must be swept"
+        );
+        assert!(
+            outside.join("precious.txt").exists(),
+            "sweep must not follow the inner symlink and delete its target's contents"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
