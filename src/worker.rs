@@ -81,6 +81,17 @@ pub async fn run(jobs: Jobs, opts: WorkerOptions) -> Result<()> {
 async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
     let started = Instant::now();
+    // Validate the engine-supplied key BEFORE it is used to build any request
+    // path. The refresher below (`extend`) and the `complete`/`fail` settle all
+    // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
+    // must be rejected up front — and an activation we cannot even address must
+    // not be settled. Drop it and let the engine redeliver.
+    if let Err(e) = crate::jobs::validate_job_key(&key) {
+        log(&format!(
+            "job {key}: refusing malformed engine key ({e:#}); not spawning refresher and not settling"
+        ));
+        return;
+    }
     log(&format!(
         "job {key} activated (type {}, retries {}, lease {})",
         job.r#type,
@@ -90,6 +101,7 @@ async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
 
     let refreshes = Arc::new(AtomicUsize::new(0));
     let (lost_tx, mut lost_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let refresher = tokio::spawn(refresh_loop(
         jobs.clone(),
         key.clone(),
@@ -97,13 +109,27 @@ async fn handle(jobs: &Jobs, opts: &WorkerOptions, Job { job, lease }: Job) {
         opts.recovery_window,
         refreshes.clone(),
         lost_tx,
+        stop_rx,
     ));
 
     let result = tokio::select! {
         r = run_agent(opts, &key, &job) => Some(r),
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
-    refresher.abort();
+    // Graceful stop + await (never `abort()`): let any in-flight `extend` run to
+    // completion and publish its 404/409 fence before the refresher exits,
+    // instead of cancelling the request that detects the fence.
+    let _ = stop_tx.send(true);
+    let _ = refresher.await;
+    // Reconcile the raced outcome with the FINAL activation-loss watch value,
+    // exactly as `slot::handle` does. `select!` can pick the `run_agent` branch
+    // even when the refresher published a 404/409 loss in the same tick (both
+    // futures ready), which would otherwise `complete`/`fail` the job with a
+    // stale lease after the activation was fenced. Once the refresher is joined
+    // no further writes to the watch can happen, so this value is final: downgrade
+    // any outcome to "lost" (`None`) whenever the activation was fenced, so we
+    // never settle a job we no longer own.
+    let result = if *lost_rx.borrow() { None } else { result };
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
 
@@ -148,8 +174,16 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
         .and_then(Value::as_str)
         .context("job has no string variable `prompt`")?
         .to_string();
+    // Validate the engine-supplied key against the numeric key format before
+    // joining it to a path: a malformed `../`/absolute key must not let
+    // `create_dir_all` (and the agent's cwd) escape `runs_dir`.
+    crate::jobs::validate_job_key(key)?;
     let cwd = opts.runs_dir.join(key);
-    std::fs::create_dir_all(&cwd).with_context(|| format!("creating {}", cwd.display()))?;
+    // Harden the run directory the same way the daemon slot path does — reject
+    // symlinked root/ancestors and enforce owner-only 0700 — via the shared
+    // helper, so `spike --runs-dir` cannot be redirected to an attacker-chosen
+    // location and the default root's mode does not depend on umask.
+    crate::slot::prepare_run_dir(&opts.runs_dir, &cwd)?;
     let env = vec![
         ("NANO_JOB_KEY".to_string(), key.to_string()),
         ("NANO_AGENT_NAME".to_string(), opts.worker_name.clone()),
@@ -170,18 +204,40 @@ async fn run_agent(opts: &WorkerOptions, key: &str, job: &ActivatedJobResult) ->
     Ok(out)
 }
 
-async fn refresh_loop(
+pub(crate) async fn refresh_loop(
     jobs: Jobs,
     key: String,
     lease: Option<String>,
     window: Duration,
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,
+    mut stop: watch::Receiver<bool>,
 ) {
-    let every = window / 3;
+    // Refresh at a third of the window, but never a zero-length interval: a
+    // sub-3ms window divides to `Duration::ZERO`, which would spin this loop and
+    // hammer the engine (saturating a Tokio worker). Floor it at a positive
+    // minimum so the loop always yields between extends.
+    let every = (window / 3).max(Duration::from_millis(1));
     let mut failures = 0;
     loop {
-        tokio::time::sleep(every).await;
+        tokio::select! {
+            // A stop request during the idle interval ends the loop at once:
+            // there is no in-flight extend to lose, so the loss watch already
+            // holds its final value.
+            _ = stop.changed() => return,
+            _ = tokio::time::sleep(every) => {}
+        }
+        // Honour a stop that landed exactly as the interval elapsed before
+        // issuing another extend.
+        if *stop.borrow() {
+            return;
+        }
+        // Deliberately NOT wrapped in a cancellable select against `stop`: the
+        // caller stops us by signalling `stop` and awaiting our JoinHandle (never
+        // `abort()`), so an in-flight extend always runs to completion and
+        // publishes a 404/409 fence on `lost` before we return. Cancelling
+        // mid-extend would drop the very request that detects the fence, letting
+        // the caller settle a job whose activation was already revoked.
         match jobs.extend(&key, window, &lease).await {
             Ok(()) => {
                 failures = 0;
@@ -198,6 +254,12 @@ async fn refresh_loop(
                     return;
                 }
             }
+        }
+        // A stop that arrived while this extend was in flight: we have now
+        // published its result (success or fence) on the watch, so it is safe to
+        // exit.
+        if *stop.borrow() {
+            return;
         }
     }
 }
