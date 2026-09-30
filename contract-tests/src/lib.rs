@@ -156,11 +156,28 @@ impl Target {
         }
     }
 
-    /// A worker command for one job type, running `agent` for at most `max_jobs`
-    /// jobs: `<cli> work --job-type <t> --agent <agent> --max-jobs <n>`. Tests add
-    /// the flags their area needs (`--with-lease`, `--recovery-window`, …). The
+    /// The **Rust**-target worker command for one job type, running `agent` for
+    /// at most `max_jobs` jobs:
+    /// `<bin> work --job-type <t> --agent <agent> --max-jobs <n>`. Tests add the
+    /// flags their area needs (`--with-lease`, `--recovery-window`, …). The
     /// caller applies the per-test home (see [`TempHome::apply`]).
+    ///
+    /// This standalone flag-driven form is Rust-only: the Node plugin's `work`
+    /// takes a positional *hired profile* (`work <profile>`) and has no
+    /// `--agent`/`--max-jobs`, so it cannot be driven this way. The Node target
+    /// instead `hire`s an isolated profile pointing at the same fake-agent binary
+    /// and runs `work <profile>` with the flag-driven config translated to the
+    /// Node CLI's shapes — see [`run_worker_job`] (`node_hire` /
+    /// `node_work_command` / `translate_node_flags`). Calling this for
+    /// [`Target::Node`] would emit a command the Node plugin rejects, so it is
+    /// gated to the Rust target.
     pub fn worker(self, job_type: &str, agent: &str, max_jobs: usize) -> Command {
+        debug_assert_eq!(
+            self,
+            Target::Rust,
+            "Target::worker builds the Rust standalone --job-type form; the Node \
+             target must go through the hired-profile path in run_worker_job"
+        );
         let mj = max_jobs.to_string();
         let mut c = self.cmd(&[
             "work",
@@ -778,9 +795,26 @@ pub fn run_worker_job(
     let script_json = serde_json::to_string(&serde_json::Value::Array(script.to_vec())).unwrap();
 
     let agent = fake_agent_acp_arg();
-    let mut cmd = target.worker(&job_type, &agent, 1);
+    // Build the worker command for the selected target. The Rust worker takes its
+    // whole configuration from flags (`--job-type`/`--agent`/`--max-jobs` …) in
+    // one standalone process. The Node plugin instead runs a *hired profile*
+    // (`work <profile>`) — it has no `--agent`/`--max-jobs` — so we first `hire`
+    // an isolated profile that points at the same fake-agent binary over ACP,
+    // then `work` it with the flag-driven config translated to the Node CLI's
+    // shapes (see `node_hire` / `node_work_command` / `translate_node_flags`).
+    let mut cmd = match target {
+        Target::Rust => {
+            let mut c = target.worker(&job_type, &agent, 1);
+            c.args(worker_flags);
+            c
+        }
+        Target::Node => {
+            let profile = format!("ctfake{}", rand_suffix());
+            node_hire(*target, &home, &profile);
+            node_work_command(*target, &profile, &job_type, worker_flags)
+        }
+    };
     home.apply(&mut cmd);
-    cmd.args(worker_flags);
     // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
     // allocates it inside the per-job run dir and hands it to the agent. The
     // harness must not provide the very behavior these tests verify; read the
@@ -794,13 +828,221 @@ pub fn run_worker_job(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = output_within(cmd, WORKER_TEST_TIMEOUT);
+    let output = match target {
+        // The Rust worker self-exits after `--max-jobs 1`, so wait for it (and
+        // fail fast if it wedges).
+        Target::Rust => output_within(cmd, WORKER_TEST_TIMEOUT),
+        // The Node worker never self-exits (it has no `--max-jobs`), so run it
+        // until the job has been handled, then reap the tree (see
+        // `run_node_worker`).
+        Target::Node => run_node_worker(cmd, &record_path),
+    };
     JobOutcome {
         job_type,
         record_path,
         output,
         _home: home,
         _work: work,
+    }
+}
+
+/// Hire an isolated Node worker profile that runs the bundled `fake-agent` over
+/// ACP. The profile is what `c8 nano work <profile>` drives — the Node plugin
+/// has no flag-driven `--agent`, so the agent binary is bound here at hire time.
+///
+/// Rank `junior` with no extra capabilities yields the minimal job-type matrix
+/// (`["junior"]`), so the profile never subscribes to unrelated job types on its
+/// own; the caller adds the one test job type explicitly via `--job-type`. The
+/// fake agent speaks ACP, so `--protocol acp` matches (a `pipe` protocol against
+/// an ACP binary is rejected by the plugin's guard).
+fn node_hire(target: Target, home: &TempHome, profile: &str) {
+    let agent = fake_agent_path();
+    let agent = agent.to_string_lossy();
+    let mut cmd = target.cmd(&[
+        "hire",
+        "--name",
+        profile,
+        "--rank",
+        "junior",
+        "--command",
+        &agent,
+        "--arg",
+        "--acp",
+        "--protocol",
+        "acp",
+    ]);
+    home.apply(&mut cmd);
+    let out = cmd.output().expect("spawn node hire");
+    assert!(
+        out.status.success(),
+        "node hire of profile {profile:?} failed: status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Build the Node `work <profile>` command that services one test job type.
+///
+/// The positional profile (hired by [`node_hire`]) supplies the agent binding;
+/// `--job-type <t>` adds the unique test job type on top of the profile's rank
+/// matrix so the worker activates the deployed job. The remaining flags are the
+/// per-test knobs, translated from the Rust CLI's shapes by
+/// [`translate_node_flags`]. The caller applies the per-test home and env.
+fn node_work_command(target: Target, profile: &str, job_type: &str, worker_flags: &[&str]) -> Command {
+    let mut c = target.cmd(&["work", profile, "--job-type", job_type]);
+    for arg in translate_node_flags(worker_flags) {
+        c.arg(arg);
+    }
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    c
+}
+
+/// Translate the flag-driven worker knobs the tests express in the Rust CLI's
+/// vocabulary into the Node plugin's `work` flags. Most flags share their name,
+/// units, and shape across both targets and pass straight through; the few that
+/// differ are adapted here:
+///
+/// - `--with-lease` — Rust-only boolean; the Node worker manages leasing itself,
+///   so it is dropped.
+/// - `--reap-age` / `--reap-interval` — Rust takes a duration string (`"1s"`),
+///   the Node CLI an integer millisecond count, so the value is converted via
+///   [`duration_to_ms_string`].
+/// - `--keep-runs` — Rust keeps the N most-recent runs (takes a count); the Node
+///   flag is a boolean switch, so the count is consumed and the bare switch
+///   emitted.
+fn translate_node_flags(flags: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let f = flags[i];
+        match f {
+            "--with-lease" => {
+                i += 1;
+            }
+            "--reap-age" | "--reap-interval" => {
+                let v = flags.get(i + 1).copied().unwrap_or("");
+                out.push(f.to_string());
+                out.push(duration_to_ms_string(v));
+                i += 2;
+            }
+            "--keep-runs" => {
+                out.push(f.to_string());
+                i += 2; // consume (and drop) the Rust count value
+            }
+            _ => {
+                out.push(f.to_string());
+                if let Some(v) = flags.get(i + 1) {
+                    out.push((*v).to_string());
+                }
+                i += 2;
+            }
+        }
+    }
+    out
+}
+
+/// Convert a Rust-CLI duration (`"500ms"`, `"30s"`, `"5m"`, `"2h"`, or a bare ms
+/// count) to the integer millisecond string the Node CLI expects. Mirrors the
+/// worker's own `parse_duration`. An unparseable value is passed through
+/// unchanged so the Node CLI surfaces its own error rather than this masking it.
+fn duration_to_ms_string(s: &str) -> String {
+    let s = s.trim();
+    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1u64)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1_000)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000)
+    } else {
+        (s, 1)
+    };
+    match num.trim().parse::<u64>() {
+        Ok(n) => match n.checked_mul(mult) {
+            Some(ms) => ms.to_string(),
+            None => s.to_string(),
+        },
+        Err(_) => s.to_string(),
+    }
+}
+
+/// Grace period after the fake agent records its run, giving the Node worker
+/// time to finish logging the job's completion/nudge before we reap it. The
+/// agent flushes `record.json` at exit, which happens once the worker closes the
+/// ACP session — i.e. after the worker has handled the job — so a short settle
+/// window captures the trailing "completed"/"nudge" log line.
+const NODE_SETTLE_GRACE: Duration = Duration::from_secs(4);
+
+/// How long to wait for the Node worker to handle the job before giving up.
+/// The Node worker polls forever (no `--max-jobs`), so unlike the Rust path this
+/// deadline is the *normal* exit for the one test where the agent never runs
+/// (`min_free_mb_gates_work`); reaching it is not a failure.
+const NODE_NO_WORK_DEADLINE: Duration = Duration::from_secs(45);
+
+/// Run a Node `work <profile>` worker until it has handled the single test job,
+/// then reap it and its agent subtree.
+///
+/// The Node worker never self-exits (it has no `--max-jobs`), so we cannot wait
+/// for it like the Rust path. Instead we watch for the fake agent's
+/// `record.json` — which it flushes at exit, after the worker has finished
+/// handling the job — as the "job done" signal, wait a short settle window for
+/// the worker to log the outcome, then kill the whole process tree. If the
+/// record never appears within [`NODE_NO_WORK_DEADLINE`] (e.g. the worker gated
+/// the job and never launched the agent, as in `min_free_mb_gates_work`) we reap
+/// anyway and return whatever was logged; unlike [`output_within`] this is an
+/// expected outcome, so it does NOT panic.
+fn run_node_worker(mut cmd: Command, record_path: &Path) -> Output {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().expect("spawn node worker");
+    let mut out = child.stdout.take().expect("node worker stdout");
+    let mut err = child.stderr.take().expect("node worker stderr");
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+
+    let start = Instant::now();
+    let mut settle_until: Option<Instant> = None;
+    let status = loop {
+        // The worker may still crash/exit on its own — take that immediately.
+        if let Some(status) = child.try_wait().expect("try_wait node worker") {
+            break status;
+        }
+        // Agent recorded its run => the worker has handled the job. Start a short
+        // settle window so the worker can log the outcome, then reap.
+        if settle_until.is_none() && record_path.exists() {
+            settle_until = Some(Instant::now() + NODE_SETTLE_GRACE);
+        }
+        let reap = match settle_until {
+            Some(until) => Instant::now() >= until,
+            None => start.elapsed() >= NODE_NO_WORK_DEADLINE,
+        };
+        if reap {
+            #[cfg(unix)]
+            kill_process_tree(child.id());
+            let _ = child.kill();
+            break child.wait().expect("wait killed node worker");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    Output {
+        status,
+        stdout,
+        stderr,
     }
 }
 
@@ -1133,6 +1375,76 @@ mod unit {
         assert_eq!(
             host_port("http://localhost"),
             Some(("localhost".to_string(), 80))
+        );
+    }
+
+    #[test]
+    fn duration_to_ms_translates_suffixes() {
+        assert_eq!(duration_to_ms_string("500ms"), "500");
+        assert_eq!(duration_to_ms_string("1s"), "1000");
+        assert_eq!(duration_to_ms_string("30s"), "30000");
+        assert_eq!(duration_to_ms_string("5m"), "300000");
+        assert_eq!(duration_to_ms_string("2h"), "7200000");
+        // A bare number is already milliseconds.
+        assert_eq!(duration_to_ms_string("250"), "250");
+        // Surrounding whitespace is tolerated.
+        assert_eq!(duration_to_ms_string(" 1s "), "1000");
+    }
+
+    #[test]
+    fn duration_to_ms_passes_unparseable_through() {
+        // Not a number: let the Node CLI report its own error rather than mask it.
+        assert_eq!(duration_to_ms_string("soon"), "soon");
+        assert_eq!(duration_to_ms_string("1x"), "1x");
+    }
+
+    #[test]
+    fn translate_node_flags_drops_with_lease() {
+        // Rust-only boolean; the Node worker manages leasing itself.
+        assert_eq!(
+            translate_node_flags(&["--with-lease", "--recovery-window", "3000"]),
+            vec!["--recovery-window".to_string(), "3000".to_string()]
+        );
+    }
+
+    #[test]
+    fn translate_node_flags_converts_reap_durations() {
+        assert_eq!(
+            translate_node_flags(&["--reap-age", "1s", "--reap-interval", "500ms"]),
+            vec![
+                "--reap-age".to_string(),
+                "1000".to_string(),
+                "--reap-interval".to_string(),
+                "500".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn translate_node_flags_keep_runs_becomes_boolean() {
+        // Rust `--keep-runs <n>` (a count) maps to the Node boolean switch: the
+        // count is consumed and the bare flag emitted.
+        assert_eq!(
+            translate_node_flags(&["--keep-runs", "1"]),
+            vec!["--keep-runs".to_string()]
+        );
+    }
+
+    #[test]
+    fn translate_node_flags_passes_shared_knobs_through() {
+        assert_eq!(
+            translate_node_flags(&[
+                "--recovery-window",
+                "9000",
+                "--min-free-mb",
+                "999999999",
+            ]),
+            vec![
+                "--recovery-window".to_string(),
+                "9000".to_string(),
+                "--min-free-mb".to_string(),
+                "999999999".to_string(),
+            ]
         );
     }
 }
