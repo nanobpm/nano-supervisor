@@ -81,13 +81,6 @@ fn empty_result_fails_never_completes() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    if target == contract_tests::Target::Node {
-        // c8ctl-plugin-nano ≤1.69.4 crashes settling an agent job with no
-        // transcript turns (`preGuardDrainTimedOut` is read outside the block
-        // that declares it → ReferenceError), so the job is never failed. The
-        // plugin's settle code fails it with retries-1, which Rust mirrors.
-        skip!("node plugin bug: empty-result settle throws ReferenceError (preGuardDrainTimedOut)");
-    }
     let outcome = run_worker_job(
         &engine,
         &target,
