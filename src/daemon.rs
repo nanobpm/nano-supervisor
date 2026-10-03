@@ -236,6 +236,119 @@ fn is_launch_prefix(t: &str) -> bool {
             }))
 }
 
+/// Is `t` the `env` launch wrapper (matched by basename, so an absolute path
+/// such as `/usr/bin/env` counts)? Only `env` carries its OWN option tokens
+/// between the wrapper and the real command, so it is the one prefix whose
+/// trailing options the effective-command scan must step over.
+fn is_env_wrapper(t: &str) -> bool {
+    let t = t.trim_matches(|c| c == '"' || c == '\'');
+    t.rsplit(['/', '\\']).next().unwrap_or(t) == "env"
+}
+
+/// How many tokens an `env` option consumes INCLUDING the option token itself:
+/// `0` for a nullary flag (`-i`), `1` when the value is glued on (`-uNAME`,
+/// `-C/dir`, `-Sstr`), `2` when the value is the NEXT token (`-u NAME`,
+/// `-C DIR`). Returns `None` when the token is not a recognised `env` option,
+/// so the caller stops skipping. Only the options that take a separate argument
+/// need a `2`; every other `env` flag is nullary or carries its value inline.
+///
+/// The point is not to parse `env` fully but to step over the options a valid
+/// hire can place between `env` and the real command (`env -i sh -c …`,
+/// `env -u FOO bash -lc …`, `env -- sh …`), so the effective-command scan is
+/// not fooled into naming `-i` the command. Stopping at `--` mirrors `env`
+/// itself, which treats `--` as the end of its own options.
+///
+/// KNOWN LIMIT: `-S`/`--split-string` makes `env` split its string argument
+/// into the command PLUS its own arguments (`env -S "sh -c nano-coder"` runs
+/// `sh` with `-c nano-coder`), so the effective command lives INSIDE the `-S`
+/// string token rather than at a top-level index. A positional scan cannot
+/// point into that sub-token, so a `-S`-wrapped shell resolves non-shell and
+/// the selector is appended to the outer argv (the safe failure — the agent
+/// still boots, just possibly without ACP) rather than mis-injected. That case
+/// is rare and shell-quoting-sensitive; the common wrapper options above are
+/// resolved exactly.
+fn env_option_arity(t: &str) -> Option<usize> {
+    let t = t.trim_matches(|c| c == '"' || c == '\'');
+    if t == "--" {
+        return Some(1);
+    }
+    if !t.starts_with('-') || t == "-" {
+        return None;
+    }
+    if let Some(long) = t.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        // Only the long options that take a value consume a second token when
+        // the value is not glued on with `=`; the rest (`--ignore-environment`,
+        // `--null`, …) are nullary.
+        return Some(match name {
+            "unset" | "chdir" | "split-string" | "argv0" | "default-signal" | "block-signal"
+            | "ignore-signal" | "list-signal-handling" => {
+                if long.contains('=') {
+                    1
+                } else {
+                    2
+                }
+            }
+            _ => 1,
+        });
+    }
+    // Short options. `-u`/`-C` take a separate-argument value; `-S` takes its
+    // (possibly quoted, multi-word) string as the next token. A glued-on value
+    // (`-uNAME`, `-C/dir`) or a bundled nullary flag (`-i`, `-iv`, `-0`) is one
+    // token. The first byte after the dash decides, because `env` bundles
+    // nullary short flags but never bundles a value-taking flag ahead of more
+    // letters (the rest of the token IS the value).
+    let rest = &t[1..];
+    let first = rest.chars().next()?;
+    Some(match first {
+        'u' | 'C' | 'S' | 'a' => {
+            if rest.len() > 1 {
+                1
+            } else {
+                2
+            }
+        }
+        _ => 1,
+    })
+}
+
+/// Index of the EFFECTIVE command token — the first token past every launch
+/// prefix AND past any options belonging to an `env` prefix. This is the single
+/// resolver every consumer (`scan_acp_tokens`, `effective_command_is_shell`,
+/// `inject_selector_into_script`) uses, so the whole class of wrapper
+/// (`exec`/`command`/`builtin`/`env`/`VAR=value`) plus wrapper-option
+/// (`env -i`/`env -u NAME`/`env --`) indirection is resolved the same way
+/// everywhere instead of each call site stopping at the first non-prefix —
+/// which, for `env -i sh -c …`, is the `-i` flag, not the shell.
+///
+/// `T` is the token type (`&str` for an argv slice, `ScriptToken` for a
+/// tokenized script); `as_text` extracts the comparable text so the same logic
+/// serves both without forcing an artificial lifetime on the returned borrow.
+fn effective_command_index<T>(tokens: &[T], as_text: impl Fn(&T) -> &str) -> Option<usize> {
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = as_text(&tokens[i]);
+        if !is_launch_prefix(tok) {
+            return Some(i);
+        }
+        if is_env_wrapper(tok) {
+            // Step over this `env` wrapper's own options before re-testing for
+            // the command: `env -i sh`, `env -u FOO sh`, `env -- sh` all run
+            // `sh`, so the option tokens must not be mistaken for it.
+            i += 1;
+            while i < tokens.len() {
+                match env_option_arity(as_text(&tokens[i])) {
+                    Some(arity) => i += arity,
+                    None => break,
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Scan an argv token list for an ACP selector, recursing into shell `-c`
 /// scripts.
 ///
@@ -248,12 +361,15 @@ fn is_launch_prefix(t: &str) -> bool {
 /// that script on whitespace and scan it too. Recursion depth is bounded by the
 /// finite nesting of quoted scripts.
 fn scan_acp_tokens(tokens: &[&str]) -> bool {
-    // The command token is the first token that is not a launch prefix: leading
-    // `exec`/`command`/`builtin`/`env` wrappers and `VAR=value` env assignments
-    // only re-exec or decorate the real command (`sh -c "exec claude-code-acp"`,
-    // `sh -c "env X=1 claude-code-acp"`), so the `*-acp` suffix check must look
-    // past them instead of gating on the literal first token.
-    let command_pos = tokens.iter().position(|t| !is_launch_prefix(t));
+    // The command token is the first token past every launch prefix AND past
+    // any `env`-wrapper options: leading `exec`/`command`/`builtin`/`env`
+    // wrappers, `VAR=value` env assignments, and an `env` wrapper's own options
+    // (`env -i`, `env -u NAME`, `env --`) only re-exec or decorate the real
+    // command (`sh -c "exec claude-code-acp"`, `env -i sh -c "nano-coder
+    // --acp"`), so the `*-acp` suffix check must look past them instead of
+    // gating on the literal first token — or on an `env` option it mistakes
+    // for the command.
+    let command_pos = effective_command_index(tokens, |t| t);
     // The `-…c` shell-wrapper recursion below must fire ONLY when this level's
     // command is an actual shell: a non-shell agent's own `-c` option (e.g.
     // `agent -c "config --acp"`) is config text, not a script, so recursing into
@@ -358,11 +474,12 @@ pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
 /// so the whole class — prefixed outer argv AND prefixed inner script — is
 /// handled, not just the inner one.
 fn effective_command_is_shell(command: &str, args: &[String]) -> bool {
-    command
+    let tokens: Vec<&str> = command
         .split_whitespace()
         .chain(args.iter().map(String::as_str))
-        .find(|t| !is_launch_prefix(t))
-        .map(is_shell_command)
+        .collect();
+    effective_command_index(&tokens, |t| t)
+        .map(|p| is_shell_command(tokens[p]))
         .unwrap_or(false)
 }
 
@@ -384,7 +501,7 @@ fn shell_script_arg_index(args: &[String]) -> Option<usize> {
 /// the inner shell would consume as `$0`, dropping the selector again).
 fn inject_selector_into_script(script: &str) -> String {
     let toks = tokenize_script(script);
-    let command_pos = toks.iter().position(|t| !is_launch_prefix(&t.text));
+    let command_pos = effective_command_index(&toks, |t| t.text.as_str());
     let command_is_shell = command_pos
         .map(|p| is_shell_command(&toks[p].text))
         .unwrap_or(false);
@@ -859,6 +976,130 @@ mod tests {
                 "config".to_string(),
                 "--acp".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_when_shell_is_behind_env_options() {
+        // `env` carries its OWN options between the wrapper and the real command
+        // (`env -i sh -c …`, `env -u FOO sh …`, `env -- sh …`). A scan that stops
+        // at the first non-prefix token names `-i` the effective command, gates
+        // the `-c` injection off, and appends `--acp` to the outer argv — where
+        // POSIX `sh` swallows it as `$0` and the inner agent never sees it. The
+        // effective command is the first token past the wrapper's options.
+        let mut env_i = hire(Protocol::Acp, "env", "none");
+        env_i.args = vec!["-i".into(), "sh".into(), "-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&env_i),
+            vec![
+                "-i".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // `-u` consumes its NAME argument as a separate token.
+        let mut env_u = hire(Protocol::Acp, "/usr/bin/env", "none");
+        env_u.args = vec![
+            "-u".into(),
+            "FOO".into(),
+            "bash".into(),
+            "-lc".into(),
+            "nano-coder".into(),
+        ];
+        assert_eq!(
+            acp_spawn_args(&env_u),
+            vec![
+                "-u".to_string(),
+                "FOO".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // `--` ends `env`'s own options; the next token is the command.
+        let mut env_ddash = hire(Protocol::Acp, "env", "none");
+        env_ddash.args = vec!["--".into(), "sh".into(), "-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&env_ddash),
+            vec![
+                "--".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // A glued-on value (`-uFOO`) and a nullary bundle (`-i0`) are one token.
+        let mut env_glued = hire(Protocol::Acp, "env", "none");
+        env_glued.args = vec!["-uFOO".into(), "sh".into(), "-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&env_glued),
+            vec![
+                "-uFOO".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // `env` options in front of a NON-shell program still just append — the
+        // option skip must not mistake a non-shell for a shell wrapper.
+        let mut env_agent = hire(Protocol::Acp, "env", "none");
+        env_agent.args = vec!["-i".into(), "nano-coder".into(), "-c".into(), "config".into()];
+        assert_eq!(
+            acp_spawn_args(&env_agent),
+            vec![
+                "-i".to_string(),
+                "nano-coder".to_string(),
+                "-c".to_string(),
+                "config".to_string(),
+                "--acp".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_selector_detection_sees_past_env_options() {
+        // The selector scan must look past an `env` wrapper's options too, or a
+        // pipe hire that hides an ACP selector behind `env -i …` fails open.
+        assert!(command_has_acp_selector(
+            "env",
+            &["-i".into(), "sh".into(), "-c".into(), "nano-coder --acp".into()]
+        ));
+        assert!(command_has_acp_selector(
+            "/usr/bin/env",
+            &["-u".into(), "FOO".into(), "sh".into(), "-c".into(), "nano-coder --acp".into()]
+        ));
+        assert!(command_has_acp_selector(
+            "env",
+            &["--".into(), "claude-code-acp".into()]
+        ));
+        // A wrapped NON-ACP script behind env options is still accepted.
+        assert!(!command_has_acp_selector(
+            "env",
+            &["-i".into(), "sh".into(), "-c".into(), "nano-coder --pipe".into()]
+        ));
+        // An `env` option's own value is not a command: `env -u sh copilot` runs
+        // `copilot` (the `-u` value `sh` is unset, not executed), so no `-acp`
+        // suffix on the real command and no shell `-c` recursion.
+        assert!(!command_has_acp_selector(
+            "env",
+            &["-u".into(), "sh".into(), "copilot".into()]
+        ));
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_into_innermost_script_behind_env_options() {
+        // The inner `-c` script can itself begin with an `env` wrapper carrying
+        // options; the injection must descend past them to the innermost command.
+        let mut h = hire(Protocol::Acp, "sh", "none");
+        h.args = vec!["-c".into(), "env -i bash -c 'nano-coder'".into()];
+        assert_eq!(
+            acp_spawn_args(&h),
+            vec!["-c".to_string(), "env -i bash -c 'nano-coder --acp'".to_string()]
         );
     }
 
