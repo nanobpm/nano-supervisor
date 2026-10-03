@@ -479,6 +479,41 @@ pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bail when any component of `dir` strictly *below* `anchor` is a symlink,
+/// leaving the anchor itself and its own ancestors unchecked (the anchor is
+/// trusted: on macOS the system temp base contains the platform symlink `/var` →
+/// `/private/var`). [`reject_symlinked_ancestors`] walks the whole chain to the
+/// filesystem root, which would reject that legitimate platform link. When the
+/// trusted base is known, the operator-controlled tail beneath it is the part a
+/// same-UID attacker can plant a link in — so validate exactly that tail
+/// no-follow, on the ORIGINAL (pre-canonicalization) path, before
+/// [`canonicalize_existing_base`] resolves the trusted anchor's platform links.
+/// `anchor` must be an ancestor of `dir` (or equal to it); components at or
+/// above `anchor` are trusted and skipped. A non-existent component is skipped:
+/// `create_dir_all` materialises it as a fresh real directory, not a link.
+pub(crate) fn reject_symlinked_ancestors_below(dir: &Path, anchor: &Path) -> Result<()> {
+    // Walk dir's ancestors from the leaf up to (but not past) `anchor`, stopping
+    // before the anchor's own (trusted) ancestors. The anchor itself is trusted:
+    // break at it WITHOUT inspecting its own type, so a platform symlink in the
+    // anchor (macOS `/var`) is not rejected.
+    for ancestor in dir.ancestors() {
+        if ancestor == anchor {
+            break;
+        }
+        if std::fs::symlink_metadata(ancestor)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            bail!(
+                "refusing to use {}: component {} is a symlink (possible local symlink attack)",
+                dir.display(),
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Canonicalize only the *existing* prefix of `dir`, leaving any not-yet-created
 /// trailing components unresolved. This resolves PLATFORM symlinks in a trusted
 /// base (macOS `/var` → `/private/var`, where the system temp dir lives) so the
@@ -3533,6 +3568,71 @@ mod tests {
         assert!(
             reject_symlink(&followed).is_ok(),
             "the followed target is a real dir, so the check would wrongly pass"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_symlinked_ancestors_below_rejects_user_tail_but_spares_anchor() {
+        // Regression for `work::run`: canonicalizing the configurable run-dir
+        // parent resolves EVERY existing symlink in it — including a planted
+        // ancestor (`--runs-dir /shared/link/runs` with `link` -> an attacker
+        // target) — so the no-follow checks then inspect only the canonical
+        // target and pass, redirecting the workspace and the stale-run sweep.
+        // The fix validates the ORIGINAL path no-follow at/below a trusted
+        // anchor BEFORE canonicalizing, so the planted link is rejected, while
+        // a PLATFORM symlink in the anchor itself (macOS `/var`) is spared.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("nano-below-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        // Trusted anchor (stands in for the state home / temp base).
+        let anchor = base.join("anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        // A planted symlink in the operator-controlled tail below the anchor.
+        let outside = base.join("attacker-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        let planted = anchor.join("link");
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+        let requested = planted.join("rust-worker-123");
+
+        // The planted ancestor below the anchor is rejected on the ORIGINAL path.
+        assert!(
+            reject_symlinked_ancestors_below(&requested, &anchor).is_err(),
+            "a planted symlink below the trusted anchor must be rejected no-follow"
+        );
+        // ...even though canonicalizing it would silently follow to the target.
+        assert_eq!(
+            std::fs::canonicalize(requested.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(&outside).unwrap(),
+            "canonicalize follows the planted ancestor (the bypass being prevented)"
+        );
+
+        // A clean tail below the anchor passes.
+        let clean = anchor.join("real").join("rust-worker-123");
+        std::fs::create_dir_all(clean.parent().unwrap()).unwrap();
+        assert!(reject_symlinked_ancestors_below(&clean, &anchor).is_ok());
+
+        // A symlink IN the anchor itself is spared (the platform-link case): the
+        // walk stops at the anchor and does not inspect the anchor's own type.
+        let real_anchor = base.join("real-anchor");
+        std::fs::create_dir_all(&real_anchor).unwrap();
+        let platform_anchor = base.join("platform-anchor");
+        std::os::unix::fs::symlink(&real_anchor, &platform_anchor).unwrap();
+        let under = platform_anchor.join("rust-worker-123");
+        assert!(
+            reject_symlinked_ancestors_below(&under, &platform_anchor).is_ok(),
+            "a platform symlink in the trusted anchor must not be rejected"
         );
 
         std::fs::remove_dir_all(&base).ok();

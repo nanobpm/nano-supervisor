@@ -151,3 +151,81 @@ fn min_free_mb_does_not_gate_host_runs() {
     );
     assert!(outcome.record_exists());
 }
+
+/// `--keep-runs` promises retained runs are KEPT: it gates the startup sweep,
+/// the cadence sweep, the per-job execute-start reap, and the per-completion
+/// cleanup. A regression that deletes a supposedly retained run would otherwise
+/// go undetected — every other sweep test runs WITHOUT the flag. Run one job
+/// with `--keep-runs` (and an aggressive `--reap-age 0` so any sweep that DID
+/// fire would delete it) and assert the completed run directory survives.
+#[test]
+fn keep_runs_preserves_completed_run() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    // Only the Rust worker owns `rust-worker-<pid>` namespaces; the Node plugin
+    // has no equivalent run-dir layout to assert against.
+    if target != Target::Rust {
+        skip!("rust-worker-<pid> run namespaces are a Rust-worker layout");
+    }
+    let home = TempHome::new();
+    let sweep_root = home.path().join("agent-runs");
+    let outcome = run_worker_job_in(
+        &engine,
+        &target,
+        &home,
+        "keep-runs",
+        &[
+            json!({ "emit": "ok" }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({ "prompt": "keep my run" }),
+        // `--reap-age 0` makes every run dir "stale", so if `--keep-runs` failed
+        // to gate ANY sweep (startup, cadence, execute-start, or completion) the
+        // run dir would be reaped and this test would catch it.
+        &["--keep-runs", "--reap-age", "0", "--reap-interval", "1000"],
+        &[],
+    );
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "stderr:\n{}",
+        outcome.stderr()
+    );
+    assert!(
+        outcome.record_exists(),
+        "the agent never ran.\nstderr:\n{}",
+        outcome.stderr()
+    );
+    // The completed run dir must survive under SOME `rust-worker-<pid>`
+    // namespace (the worker's pid is a child process we cannot predict, so scan
+    // the shared `agent-runs` root for any retained run dir).
+    let retained = std::fs::read_dir(&sweep_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("rust-worker-"))
+                .unwrap_or(false)
+        })
+        .flat_map(|ns| {
+            std::fs::read_dir(ns)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|p| p.is_dir())
+        .count();
+    assert!(
+        retained > 0,
+        "--keep-runs must preserve the completed run dir under {}.\nstderr:\n{}",
+        sweep_root.display(),
+        outcome.stderr()
+    );
+}

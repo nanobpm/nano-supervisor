@@ -102,30 +102,55 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // root: liveness is tracked only in-process (`slot::active_runs`), so a
     // shared root would let either worker's sweep treat the other's long-running
     // run dir as inactive and delete it once it ages past `--reap-age`.
-    let runs_dir = match opts.runs_dir.clone() {
-        Some(d) => d.join(format!("rust-worker-{}", std::process::id())),
-        None => state::state_home()
-            .map(|h| {
-                h.join("agent-runs")
-                    .join(format!("rust-worker-{}", std::process::id()))
-            })
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("nano-runs-{}", std::process::id()))
-            }),
+    //
+    // `anchor` is the TRUSTED base that may legitimately contain a PLATFORM
+    // symlink (on macOS the system temp dir is `/var/folders/...` and `/var` is a
+    // symlink to `/private/var`); everything at or below `anchor` is the
+    // OPERATOR-CONTROLLED tail a same-UID attacker can plant a link in. For the
+    // default path the anchor is the state home (or the temp-dir fallback); for
+    // an explicit `--runs-dir` the whole path is operator-controlled, so the
+    // anchor is the filesystem root and the entire path is validated no-follow.
+    let (runs_dir, anchor) = match opts.runs_dir.clone() {
+        Some(d) => (
+            d.join(format!("rust-worker-{}", std::process::id())),
+            PathBuf::from(std::path::Component::RootDir.as_os_str()),
+        ),
+        None => {
+            let ns = format!("rust-worker-{}", std::process::id());
+            match state::state_home() {
+                Some(h) => (h.join("agent-runs").join(&ns), h),
+                None => {
+                    let t = std::env::temp_dir();
+                    // Use the SAME `rust-worker-<pid>` namespace prefix as the
+                    // normal paths: the shared-parent sweeper recognises only
+                    // that prefix (`slot::namespace_owner_liveness`), so a
+                    // distinctly named fallback would be skipped by every later
+                    // sweep and a crashed worker's run tree would leak forever.
+                    (t.join(format!("rust-worker-{}", std::process::id())), t)
+                }
+            }
+        }
     };
     // Validate the configured path, but resolve PLATFORM symlinks in the trusted
-    // existing base FIRST: on macOS the system temp dir is `/var/folders/...` and
-    // `/var` is itself a symlink to `/private/var`, so a pre-canonicalization
-    // ancestor walk would reject the legitimate `tempfile::tempdir()` root the
+    // anchor FIRST (see above): a pre-canonicalization ancestor walk over the
+    // whole path would reject the legitimate `tempfile::tempdir()` root the
     // contract harness hands us via `C8CTL_NANO_HOME` (the Rust worker matrix
-    // includes `macos-latest`). Canonicalize ONLY THE PARENT of the worker
-    // namespace, then re-append the `rust-worker-<pid>` leaf unresolved: the
-    // parent holds the platform links, while the leaf is predictable, so a
-    // same-UID attacker can pre-create it as a symlink — and
-    // `canonicalize_existing_base` on the *whole* path would follow that planted
-    // leaf to its target, making the no-follow checks inspect the target rather
-    // than reject the link. Splitting the leaf off keeps it literal so the
-    // no-follow checks below reject a planted (or swapped-in) link.
+    // includes `macos-latest`). So:
+    //   1. Reject any symlink in the OPERATOR-CONTROLLED tail on the ORIGINAL
+    //      path (below `anchor`) BEFORE canonicalizing — canonicalization
+    //      would otherwise FOLLOW a planted ancestor (e.g. `--runs-dir
+    //      /shared/link/runs` with `link` -> an attacker target) to its target,
+    //      and the no-follow checks below would then inspect only that canonical
+    //      target and pass, redirecting both the workspace and the stale-run
+    //      sweep despite the hardening.
+    //   2. Canonicalize ONLY THE PARENT of the worker namespace (resolving the
+    //      trusted anchor's platform links), then re-append the
+    //      `rust-worker-<pid>` leaf unresolved: the leaf is predictable, so a
+    //      same-UID attacker can pre-create it as a symlink — and
+    //      `canonicalize_existing_base` on the *whole* path would follow that
+    //      planted leaf to its target. Splitting the leaf off keeps it literal
+    //      so the no-follow checks below reject a planted (or swapped-in) link.
+    slot::reject_symlinked_ancestors_below(&runs_dir, &anchor)?;
     let leaf = runs_dir
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
