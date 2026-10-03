@@ -1014,12 +1014,16 @@ const NODE_NO_WORK_DEADLINE: Duration = Duration::from_secs(45);
 /// anyway and return whatever was logged; unlike [`output_within`] this is an
 /// expected outcome, so it does NOT panic.
 /// Whether the engine reports `job` as settled by a worker: it left `CREATED`
-/// (completed / failed out / error thrown), or it was failed with retries left
-/// (still `CREATED`, but below the BPMN default of 3 retries).
+/// for a TERMINAL state (completed / failed out / error thrown), or it was
+/// failed with retries left (still `CREATED`, but below the BPMN default of 3
+/// retries). `ACTIVATED` is explicitly NOT settled — it is the live, in-flight
+/// state between activation and completion/failure, so treating it as settled
+/// would let the harness start its reap/kill timer before the worker's
+/// completion or failure variables land, racing the engine-observable assertions.
 pub fn job_is_settled(job: &serde_json::Value) -> bool {
     let state = job["state"].as_str().unwrap_or("");
     let retries = job["retries"].as_i64().unwrap_or(3);
-    (state != "CREATED" && !state.is_empty()) || retries < 3
+    (state != "CREATED" && state != "ACTIVATED" && !state.is_empty()) || retries < 3
 }
 
 fn run_node_worker(mut cmd: Command, record_path: &Path, settled: impl Fn() -> bool) -> Output {

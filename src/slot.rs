@@ -565,10 +565,25 @@ fn is_active_run(path: &Path) -> bool {
 /// aged directories outside the configured workspace. Entirely best-effort: a
 /// `read_dir`/`metadata`/`remove` failure is logged and skipped, never fatal,
 /// because reaping old debris must not block servicing a new job.
-pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
+///
+/// `recurse_namespaces` selects WHAT the top-level entries are:
+///   - `false` — each top-level entry IS a job run (an explicit `--runs-dir`, or
+///     a worker's own `cfg.runs_dir` namespace). Sweep those entries by mtime and
+///     **never descend** into them: a retained failed run holds its own repo
+///     checkout and scratch dirs, which are not independent runs and must not be
+///     aged out individually (that would corrupt post-mortem data).
+///   - `true` — `runs_dir` is the SHARED `agent-runs` parent, so each top-level
+///     entry is a *worker namespace* (`rust-worker-<pid>`), not a run. A namespace
+///     is NEVER removed wholesale by its own mtime (a live worker's namespace can
+///     age out immediately under `--reap-age 0`); instead the sweep refuses to
+///     touch a namespace whose owning process is still alive (cross-process
+///     liveness), and only descends into our own or a dead worker's namespace to
+///     reap its aged, inactive child runs — then removes that namespace only if
+///     it is left empty.
+pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration, recurse_namespaces: bool) {
     #[cfg(target_os = "linux")]
     {
-        match sweep_stale_runs_pinned(runs_dir, max_age) {
+        match sweep_stale_runs_pinned(runs_dir, max_age, recurse_namespaces) {
             Ok(()) => return,
             // Kernel too old for `openat2` (pre-5.6): fall through to the
             // best-effort path-based sweep below.
@@ -586,7 +601,41 @@ pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
             }
         }
     }
-    sweep_stale_runs_path_based(runs_dir, max_age);
+    sweep_stale_runs_path_based(runs_dir, max_age, recurse_namespaces);
+}
+
+/// Parse a worker-namespace dir name (`rust-worker-<pid>`) and report its owner
+/// PID together with whether that process is still alive:
+///   - `Some((pid, true))`  — a parseable owner PID whose process is still live
+///   - `Some((pid, false))` — a parseable owner PID whose process is gone
+///   - `None`               — not a `rust-worker-<pid>` namespace this binary owns
+///     (e.g. a Node worker's `worker-<incarnation>`, or any other sibling); the
+///     caller must leave it untouched, since it may be another live owner's tree.
+fn namespace_owner_liveness(name: &std::ffi::OsStr) -> Option<(i32, bool)> {
+    let pid: i32 = name.to_str()?.strip_prefix("rust-worker-")?.parse().ok()?;
+    Some((pid, process_is_alive(pid)))
+}
+
+/// Whether `pid` names a live process. Best-effort; a reused PID can read as
+/// alive, which only *defers* reaping — never a wrongful delete.
+#[cfg(unix)]
+fn process_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // `kill(pid, 0)` sends no signal: 0 => alive; EPERM => alive but not ours;
+    // ESRCH => no such process.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Non-Unix fallback: assume alive so we never delete a namespace that might
+/// still be owned by a live process we cannot probe.
+#[cfg(not(unix))]
+fn process_is_alive(_pid: i32) -> bool {
+    true
 }
 
 /// `sweep_stale_runs` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
@@ -601,6 +650,7 @@ pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration) {
 fn sweep_stale_runs_pinned(
     runs_dir: &Path,
     max_age: Duration,
+    recurse_namespaces: bool,
 ) -> std::result::Result<(), crate::saferoot::PinError> {
     use crate::saferoot::{DirHandle, PinError};
     let root = match DirHandle::open_root_nofollow(runs_dir) {
@@ -615,6 +665,7 @@ fn sweep_stale_runs_pinned(
     // when `runs_dir` is relative.
     let runs_abs = std::path::absolute(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
     let now = SystemTime::now();
+    let self_pid = std::process::id() as i32;
     for name in root.entry_names().map_err(PinError::Io)? {
         let meta = match root.symlink_metadata(&name) {
             Ok(m) => m,
@@ -625,64 +676,92 @@ fn sweep_stale_runs_pinned(
         if !meta.is_dir || meta.is_symlink {
             continue;
         }
-        // Never reap a live run, however old its mtime.
-        if is_active_run(&runs_abs.join(&name)) {
-            continue;
-        }
-        // Age from the directory's own mtime; keep it when the platform
-        // withholds a modified time rather than risk deleting a fresh run.
-        if is_aged_out(meta.modified, now, max_age) {
-            let path = runs_dir.join(&name);
-            match root.remove_tree(&name) {
-                Ok(()) => log(&format!(
-                    "swept stale run dir {} (older than {}d)",
-                    path.display(),
-                    max_age.as_secs() / 86_400
-                )),
-                Err(e) => log(&format!(
-                    "failed to sweep stale run dir {}: {e:#}",
-                    path.display()
-                )),
+
+        if !recurse_namespaces {
+            // Top-level entry IS a job run: age it by its own mtime, never
+            // descend into it (its repo checkout / scratch dirs are not runs).
+            if is_active_run(&runs_abs.join(&name)) {
+                continue;
+            }
+            if is_aged_out(meta.modified, now, max_age) {
+                reap_pinned(&root, &name, &runs_dir.join(&name), max_age);
             }
             continue;
         }
-        // A fresh top-level dir may be a worker NAMESPACE (`agent-runs/
-        // rust-worker-<pid>`) whose own mtime is recent but which holds stale
-        // run dirs — notably the `rust-worker-<old-pid>` of a crashed worker,
-        // which a per-worker sweep rooted at its own namespace could never
-        // reach. Descend one level (pinned, no-follow) and sweep its children.
-        if let Ok(child) = root.open_child_dir(&name) {
-            let child_abs = runs_abs.join(&name);
-            for sub in child.entry_names().map_err(PinError::Io)? {
-                let smeta = match child.symlink_metadata(&sub) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if !smeta.is_dir || smeta.is_symlink {
-                    continue;
-                }
-                if is_active_run(&child_abs.join(&sub)) {
-                    continue;
-                }
-                if !is_aged_out(smeta.modified, now, max_age) {
-                    continue;
-                }
-                let path = child_abs.join(&sub);
-                match child.remove_tree(&sub) {
-                    Ok(()) => log(&format!(
-                        "swept stale run dir {} (older than {}d)",
-                        path.display(),
-                        max_age.as_secs() / 86_400
-                    )),
-                    Err(e) => log(&format!(
-                        "failed to sweep stale run dir {}: {e:#}",
-                        path.display()
-                    )),
-                }
+
+        // Shared-parent mode: this entry is a worker NAMESPACE, not a run, and
+        // is NEVER removed wholesale by its own mtime. Honour cross-process
+        // liveness — a live owner's namespace (even aged under `--reap-age 0`)
+        // is left entirely untouched, as its child runs may be in-flight in that
+        // other process and are not in *our* `active_runs`.
+        let owner_dead = match namespace_owner_liveness(&name) {
+            // Another live owner (or a different-target namespace we don't own):
+            // do not touch it or any of its descendants.
+            None => continue,
+            Some((pid, true)) if pid != self_pid => continue,
+            Some((_, alive)) => !alive,
+        };
+        // Our own namespace, or a dead worker's: descend one level (pinned,
+        // no-follow) and reap aged, inactive child runs.
+        let child = match root.open_child_dir(&name) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let child_abs = runs_abs.join(&name);
+        for sub in child.entry_names().map_err(PinError::Io)? {
+            let smeta = match child.symlink_metadata(&sub) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !smeta.is_dir || smeta.is_symlink {
+                continue;
+            }
+            if is_active_run(&child_abs.join(&sub)) {
+                continue;
+            }
+            if !is_aged_out(smeta.modified, now, max_age) {
+                continue;
+            }
+            reap_pinned(&child, &sub, &child_abs.join(&sub), max_age);
+        }
+        // A dead worker's namespace that is now empty (every child reaped, none
+        // retained) is itself removed, so repeated crashes don't leak empty
+        // namespaces. Only when empty: a non-aged retained failed run must
+        // survive for post-mortem, and `remove_tree` on a non-empty dir would
+        // erase it. Never remove our OWN namespace here — `work` does that on
+        // its clean exit, also only when empty.
+        if owner_dead && child.entry_names().map(|e| e.is_empty()).unwrap_or(false) {
+            if let Err(e) = root.remove_tree(&name) {
+                log(&format!(
+                    "failed to remove empty stale namespace {}: {e:#}",
+                    child_abs.display()
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// Reap a single aged run dir `name` (relative to pinned `dir`), logging the
+/// outcome. Shared by the top-level and one-level-descent sweep paths.
+#[cfg(target_os = "linux")]
+fn reap_pinned(
+    dir: &crate::saferoot::DirHandle,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    max_age: Duration,
+) {
+    match dir.remove_tree(name) {
+        Ok(()) => log(&format!(
+            "swept stale run dir {} (older than {}d)",
+            path.display(),
+            max_age.as_secs() / 86_400
+        )),
+        Err(e) => log(&format!(
+            "failed to sweep stale run dir {}: {e:#}",
+            path.display()
+        )),
+    }
 }
 
 /// Whether a directory's `modified` time is older than `max_age`. Keep the dir
@@ -698,7 +777,7 @@ fn is_aged_out(modified: Option<SystemTime>, now: SystemTime, max_age: Duration)
 /// Linux kernel older than 5.6). Rejects a symlinked root/ancestor up front,
 /// then reads and removes by path — a best-effort approximation that cannot
 /// fully close the check/traverse TOCTOU the pinned version does.
-fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
+fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_namespaces: bool) {
     // Refuse to traverse a symlinked root, or one reached through a symlinked
     // ancestor, before touching it: `read_dir` (and the `remove_dir_all` below)
     // follow such a link, so a symlinked `--runs-dir` — or an attacker-planted
@@ -721,6 +800,7 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
         Err(_) => return,
     };
     let now = SystemTime::now();
+    let self_pid = std::process::id() as i32;
     for entry in entries.flatten() {
         let path = entry.path();
         // Only sweep directories (real ones — never follow a symlink, which
@@ -732,63 +812,87 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
         if !meta.is_dir() {
             continue;
         }
-        // Never reap a live run, however old its mtime. `execute` registers the
-        // run dir as its absolute path, so match against that (a relative
-        // `runs_dir` would otherwise yield a relative entry path that never
-        // compares equal to the stored absolute one).
-        let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-        if is_active_run(&abs) {
+
+        if !recurse_namespaces {
+            // Top-level entry IS a job run: age it by its own mtime, never
+            // descend into it (its repo checkout / scratch dirs are not runs).
+            let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+            if is_active_run(&abs) {
+                continue;
+            }
+            if is_aged_out(meta.modified().ok(), now, max_age) {
+                reap_path(&path, max_age);
+            }
             continue;
         }
-        // Age from the directory's own mtime. If the platform withholds a
-        // modified time, keep the dir rather than risk deleting a fresh run.
-        if is_aged_out(meta.modified().ok(), now, max_age) {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => log(&format!(
-                    "swept stale run dir {} (older than {}d)",
-                    path.display(),
-                    max_age.as_secs() / 86_400
-                )),
-                Err(e) => log(&format!(
-                    "failed to sweep stale run dir {}: {e:#}",
+
+        // Shared-parent mode: this entry is a worker NAMESPACE, not a run, and
+        // is NEVER removed wholesale by its own mtime. Honour cross-process
+        // liveness — a live owner's namespace is left entirely untouched, as its
+        // children may be in-flight in that other process.
+        let name = match path.file_name() {
+            Some(n) => n,
+            None => continue,
+        };
+        let owner_dead = match namespace_owner_liveness(name) {
+            None => continue,
+            Some((pid, true)) if pid != self_pid => continue,
+            Some((_, alive)) => !alive,
+        };
+        // Our own namespace, or a dead worker's: descend one level and reap
+        // aged, inactive child runs, still never following symlinks.
+        let children = match std::fs::read_dir(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for child in children.flatten() {
+            let cpath = child.path();
+            let cmeta = match std::fs::symlink_metadata(&cpath) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !cmeta.is_dir() {
+                continue;
+            }
+            let cabs = std::path::absolute(&cpath).unwrap_or_else(|_| cpath.clone());
+            if is_active_run(&cabs) {
+                continue;
+            }
+            if !is_aged_out(cmeta.modified().ok(), now, max_age) {
+                continue;
+            }
+            reap_path(&cpath, max_age);
+        }
+        // Remove a dead worker's now-empty namespace (see the pinned version);
+        // only when empty, so a retained failed run survives. Never our own.
+        if owner_dead
+            && std::fs::read_dir(&path)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false)
+        {
+            if let Err(e) = std::fs::remove_dir(&path) {
+                log(&format!(
+                    "failed to remove empty stale namespace {}: {e:#}",
                     path.display()
-                )),
-            }
-            continue;
-        }
-        // A fresh top-level dir may be a worker NAMESPACE holding stale run
-        // dirs (e.g. a crashed worker's `rust-worker-<old-pid>`); descend one
-        // level and sweep its children, still never following symlinks.
-        if let Ok(children) = std::fs::read_dir(&path) {
-            for child in children.flatten() {
-                let cpath = child.path();
-                let cmeta = match std::fs::symlink_metadata(&cpath) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if !cmeta.is_dir() {
-                    continue;
-                }
-                let cabs = std::path::absolute(&cpath).unwrap_or_else(|_| cpath.clone());
-                if is_active_run(&cabs) {
-                    continue;
-                }
-                if !is_aged_out(cmeta.modified().ok(), now, max_age) {
-                    continue;
-                }
-                match std::fs::remove_dir_all(&cpath) {
-                    Ok(()) => log(&format!(
-                        "swept stale run dir {} (older than {}d)",
-                        cpath.display(),
-                        max_age.as_secs() / 86_400
-                    )),
-                    Err(e) => log(&format!(
-                        "failed to sweep stale run dir {}: {e:#}",
-                        cpath.display()
-                    )),
-                }
+                ));
             }
         }
+    }
+}
+
+/// Reap a single aged run dir at `path` by path (fallback sweep), logging the
+/// outcome.
+fn reap_path(path: &Path, max_age: Duration) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => log(&format!(
+            "swept stale run dir {} (older than {}d)",
+            path.display(),
+            max_age.as_secs() / 86_400
+        )),
+        Err(e) => log(&format!(
+            "failed to sweep stale run dir {}: {e:#}",
+            path.display()
+        )),
     }
 }
 
@@ -913,7 +1017,10 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // Register this run dir as in-flight for the whole job so a concurrent
     // slot's retention sweep can never reap it.
     let _active = ActiveRunGuard::new(&run_dir);
-    sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION);
+    // `cfg.runs_dir` is this worker's own namespace, so its top-level entries
+    // are job runs, not namespaces: sweep them directly, never descending into a
+    // retained failed run's own checkout/scratch dirs.
+    sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION, false);
     prepare_run_dir(&cfg.runs_dir, &run_dir)?;
     let agent_cwd = match &env.repository {
         Some(repo) => {
@@ -967,7 +1074,13 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         };
         let (text, capped) = cap_stdout_tail(joined);
         run.stdout = text;
-        run.truncated = run.truncated || capped;
+        // Merge the nudge run's OWN collector-level truncation too: if the ACP
+        // transcript / pipe capture dropped bytes while reading the second
+        // invocation, that output is incomplete even when the joined tail still
+        // fits this second cap (so `capped` is false), e.g. because UTF-8
+        // boundary trimming left it just under the limit. Dropping `nudge.truncated`
+        // would mislabel such a run `truncated: false`.
+        run.truncated = run.truncated || nudge.truncated || capped;
         run.has_turns = run.has_turns || nudge.has_turns;
         let recovered = result::read_result_file(&result_file)
             .or_else(|| result::parse_result_from_stdout(&run.stdout))
@@ -1672,18 +1785,18 @@ mod tests {
 
         // max_age = 0 → every existing dir is at/over the threshold and swept,
         // but stray files are left untouched.
-        sweep_stale_runs(&root, Duration::ZERO);
+        sweep_stale_runs(&root, Duration::ZERO, false);
         assert!(!aged.exists(), "aged-out run dir should be swept");
         assert!(stray.exists(), "stray files must be left alone");
 
         // A fresh dir with a long retention window is kept.
         let fresh = root.join("in-flight-run");
         std::fs::create_dir_all(&fresh).unwrap();
-        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60));
+        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60), false);
         assert!(fresh.exists(), "a fresh run dir must not be swept");
 
         // A missing runs_dir is a no-op (must not panic).
-        sweep_stale_runs(&root.join("does-not-exist"), Duration::ZERO);
+        sweep_stale_runs(&root.join("does-not-exist"), Duration::ZERO, false);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1719,7 +1832,7 @@ mod tests {
             // Cannot backdate a dir mtime on this platform: the selective case
             // is untestable here, so just verify the recursion reaches a child
             // at all (a zero window sweeps every aged child of a fresh ns).
-            sweep_stale_runs(&root, Duration::ZERO);
+            sweep_stale_runs(&root, Duration::ZERO, true);
             assert!(
                 !stale_child.exists(),
                 "a stale run dir inside a fresh namespace must be swept"
@@ -1729,7 +1842,7 @@ mod tests {
         }
         // The namespace itself stays fresh (just created), so a positive window
         // must NOT reap it wholesale, but MUST still reach the stale child.
-        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60));
+        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60), true);
         assert!(
             !stale_child.exists(),
             "a stale run dir inside a fresh namespace must be swept"
@@ -1768,6 +1881,113 @@ mod tests {
         false
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sweep_leaves_a_live_owners_namespace_untouched() {
+        // Cross-process liveness: the shared-parent sweep must NOT delete (or
+        // descend into) a worker namespace whose owning process is still alive,
+        // even under `--reap-age 0`. That namespace's child runs may be in-flight
+        // in the other process and are NOT in this process's `active_runs`, so
+        // reaping them would destroy a live sibling's workspace.
+        let root = std::env::temp_dir().join(format!(
+            "nano-sweep-live-ns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        // PID 1 (init/launchd) is always alive and never us: a perfect stand-in
+        // for a live sibling worker's namespace.
+        let live_ns = root.join("rust-worker-1");
+        let child = live_ns.join("some-job");
+        std::fs::create_dir_all(&child).unwrap();
+
+        sweep_stale_runs(&root, Duration::ZERO, true);
+        assert!(
+            child.exists(),
+            "a live owner's in-flight run must never be reaped cross-process"
+        );
+        assert!(
+            live_ns.exists(),
+            "a live owner's namespace must never be removed"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_run_mode_never_descends_into_a_run_dir() {
+        // Non-recurse mode: top-level entries ARE runs, so the sweep must never
+        // descend into a retained failed run's own subdirs (its repo checkout /
+        // scratch), which are not independent runs. A fresh run holding an aged
+        // inner dir must keep that inner dir intact.
+        let root = std::env::temp_dir().join(format!(
+            "nano-sweep-nodescend-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let run = root.join("failed-run");
+        let checkout = run.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("src.rs"), b"keep").unwrap();
+        // Age the inner checkout well past the window; the run itself stays fresh.
+        backdate_mtime(&checkout, Duration::from_secs(10 * 24 * 60 * 60));
+
+        // A positive window: the fresh run is kept and — crucially — the aged
+        // inner dir is NOT reaped, because run mode never descends.
+        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60), false);
+        assert!(run.exists(), "a fresh run dir must be kept");
+        assert!(
+            checkout.join("src.rs").exists(),
+            "run mode must not descend into a run dir and reap its inner checkout"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_a_dead_workers_empty_namespace() {
+        // A crashed worker's namespace whose runs have all been reaped is left
+        // empty; the shared-parent sweep removes it so repeated crashes don't
+        // leak empty namespaces. (PID 99999 exceeds every platform's pid_max, so
+        // it is deterministically dead.)
+        let root = std::env::temp_dir().join(format!(
+            "nano-sweep-deadns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let dead_ns = root.join("rust-worker-99999");
+        let only_child = dead_ns.join("111");
+        std::fs::create_dir_all(&only_child).unwrap();
+
+        // max_age 0 reaps the (inactive) child, leaving the namespace empty, which
+        // the sweep then removes.
+        sweep_stale_runs(&root, Duration::ZERO, true);
+        assert!(
+            !dead_ns.exists(),
+            "a dead worker's emptied namespace must be removed"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn sweep_skips_active_run_however_aged() {
         // A long-running agent's dir can age past the retention window without
@@ -1794,7 +2014,7 @@ mod tests {
         let _guard = ActiveRunGuard::new(&live_abs);
         assert!(is_active_run(&live_abs));
 
-        sweep_stale_runs(&root, Duration::ZERO);
+        sweep_stale_runs(&root, Duration::ZERO, false);
         assert!(
             live.exists(),
             "an in-flight run must not be swept, however aged"
@@ -1803,7 +2023,7 @@ mod tests {
         // Once the guard drops, the same dir becomes eligible again.
         drop(_guard);
         assert!(!is_active_run(&live_abs));
-        sweep_stale_runs(&root, Duration::ZERO);
+        sweep_stale_runs(&root, Duration::ZERO, false);
         assert!(!live.exists(), "a deregistered aged dir is swept normally");
 
         std::fs::remove_dir_all(&root).ok();
@@ -1900,7 +2120,7 @@ mod tests {
         let link_root = base.join("link-root");
         std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
 
-        sweep_stale_runs(&link_root, Duration::ZERO);
+        sweep_stale_runs(&link_root, Duration::ZERO, false);
         assert!(
             aged.exists(),
             "sweep of a symlinked root must not follow it and delete the target's contents"
@@ -1994,7 +2214,7 @@ mod tests {
         std::fs::create_dir_all(&aged).unwrap();
         std::os::unix::fs::symlink(&outside, aged.join("evil-link")).unwrap();
 
-        sweep_stale_runs(&runs, Duration::ZERO);
+        sweep_stale_runs(&runs, Duration::ZERO, false);
 
         assert!(
             !aged.exists(),

@@ -108,14 +108,18 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // discover it and repeated crashes would leak run trees despite `--reap-age`.
     // The sweep recurses one level (worker namespaces, then their run dirs) and
     // skips any in-flight run registered in `active_runs`. For an explicit
-    // `--runs-dir` the worker namespace is the dir itself, so sweep it directly.
-    let sweep_root = if opts.runs_dir.is_some() {
-        runs_dir.clone()
+    // `--runs-dir` the worker namespace is the dir itself and its top-level
+    // entries are runs, so sweep it directly without namespace recursion.
+    let (sweep_root, recurse_ns) = if opts.runs_dir.is_some() {
+        (runs_dir.clone(), false)
     } else {
-        runs_dir.parent().map(PathBuf::from).unwrap_or_else(|| runs_dir.clone())
+        (
+            runs_dir.parent().map(PathBuf::from).unwrap_or_else(|| runs_dir.clone()),
+            true,
+        )
     };
     // Startup reap, then on a cadence: run dirs older than `--reap-age`.
-    slot::sweep_stale_runs(&sweep_root, opts.reap_age);
+    slot::sweep_stale_runs(&sweep_root, opts.reap_age, recurse_ns);
     let reaper = {
         let dir = sweep_root.clone();
         let (age, every) = (
@@ -125,7 +129,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                slot::sweep_stale_runs(&dir, age);
+                slot::sweep_stale_runs(&dir, age, recurse_ns);
             }
         })
     };
