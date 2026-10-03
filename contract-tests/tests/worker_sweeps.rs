@@ -42,16 +42,17 @@ fn startup_sweep_reaps_stale_runs() {
         "the agent never ran — the sweep must not remove a live run dir.\nstderr:\n{}",
         outcome.stderr()
     );
-    let result = outcome.result_file().unwrap_or_else(|| {
-        panic!(
-            "the agent's result file is gone — the worker reaped the run dir before reading the result.\nstderr:\n{}",
-            outcome.stderr()
-        )
-    });
+    // The worker consumed the agent's result and completed the job with it. The
+    // per-job `result.json` is deliberately unlinked and the run dir reaped on a
+    // successful settle, so the durable proof the result was parsed is the
+    // completion variable the worker wrote back to the engine — not the file,
+    // which is gone by the time the worker exits.
+    let vars = outcome.variables();
     assert_eq!(
-        result["ok"],
-        json!(true),
-        "the worker must read the agent's result before any reap: {result}"
+        vars.get("ok"),
+        Some(&json!(true)),
+        "the worker must read the agent's result and complete the job with it before any reap.\nstderr:\n{}",
+        outcome.stderr()
     );
 }
 

@@ -85,10 +85,14 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         }
     }
 
-    // Per-worker run namespace under the state home (the Node plugin's
-    // `agent-runs/worker-<incarnation>`), unless `--runs-dir` overrides it.
+    // Per-worker run namespace, unless `--runs-dir` overrides it. Both the
+    // default (state home) and an explicit `--runs-dir` get a per-process
+    // `rust-worker-<pid>` namespace so two worker processes never share one run
+    // root: liveness is tracked only in-process (`slot::active_runs`), so a
+    // shared root would let either worker's sweep treat the other's long-running
+    // run dir as inactive and delete it once it ages past `--reap-age`.
     let runs_dir = match opts.runs_dir.clone() {
-        Some(d) => d,
+        Some(d) => d.join(format!("rust-worker-{}", std::process::id())),
         None => state::state_home()
             .map(|h| {
                 h.join("agent-runs")
@@ -102,27 +106,23 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // Resolve platform symlinks in the path (macOS `/var` → `/private/var`):
     // the run-dir sweep refuses any root with a symlinked ancestor.
     let runs_dir = std::fs::canonicalize(&runs_dir)?;
-    // Sweep at the SHARED `agent-runs` parent, not this worker's own
-    // PID-namespaced dir: a crashed worker leaves `rust-worker-<old-pid>` as a
-    // sibling of the next launch's root, so sweeping only `runs_dir` could never
-    // discover it and repeated crashes would leak run trees despite `--reap-age`.
-    // The sweep recurses one level (worker namespaces, then their run dirs) and
-    // skips any in-flight run registered in `active_runs`. For an explicit
-    // `--runs-dir` the worker namespace is the dir itself and its top-level
-    // entries are runs, so sweep it directly without namespace recursion.
-    let (sweep_root, recurse_ns) = if opts.runs_dir.is_some() {
-        (runs_dir.clone(), false)
-    } else {
-        (
-            runs_dir
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| runs_dir.clone()),
-            true,
-        )
-    };
+    // Sweep at the SHARED parent of this worker's namespace, not the namespace
+    // itself: a crashed worker leaves `rust-worker-<old-pid>` as a sibling of
+    // the next launch's root, so sweeping only `runs_dir` could never discover
+    // it and repeated crashes would leak run trees despite `--reap-age`. The
+    // sweep recurses one level (worker namespaces, then their run dirs),
+    // honours cross-process namespace liveness, and skips any in-flight run
+    // registered in `active_runs`. For BOTH the default and an explicit
+    // `--runs-dir` the shared parent holds per-process namespaces, so sweep it
+    // with namespace recursion — an explicit dir is now namespaced exactly like
+    // the default, so two workers pointed at the same `--runs-dir` sweep the
+    // shared parent but never touch each other's live namespace.
+    let sweep_root = runs_dir
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runs_dir.clone());
     // Startup reap, then on a cadence: run dirs older than `--reap-age`.
-    slot::sweep_stale_runs(&sweep_root, opts.reap_age, recurse_ns);
+    slot::sweep_stale_runs(&sweep_root, opts.reap_age, true);
     let reaper = {
         let dir = sweep_root.clone();
         let (age, every) = (
@@ -132,7 +132,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                slot::sweep_stale_runs(&dir, age, recurse_ns);
+                slot::sweep_stale_runs(&dir, age, true);
             }
         })
     };
@@ -175,8 +175,10 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // remove it when EMPTY: `execute` intentionally retains failed run dirs for
     // post-mortem and age-based reaping, so a recursive delete here would erase
     // those diagnostics. An empty namespace means every run was reaped on
-    // completion, so removing it just cleans up the per-worker dir.
-    if opts.runs_dir.is_none() && !opts.keep_runs {
+    // completion, so removing it just cleans up the per-worker dir. This applies
+    // to an explicit `--runs-dir` too: it is now a per-process namespace, so the
+    // empty dir removed here is this worker's own, never the shared parent.
+    if !opts.keep_runs {
         match std::fs::remove_dir(&runs_dir) {
             Ok(()) => {}
             // NotEmpty: retained failed runs survive for post-mortem/reaping.

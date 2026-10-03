@@ -541,11 +541,43 @@ impl Drop for ActiveRunGuard {
 }
 
 /// Whether `path` is a currently in-flight run dir that must not be swept.
+/// Only the tests probe this directly; the sweep itself uses the atomic
+/// [`remove_if_inactive`] so the check and the removal stay one locked step.
+#[cfg(test)]
 fn is_active_run(path: &Path) -> bool {
     active_runs()
         .lock()
         .map(|map| map.contains_key(path))
         .unwrap_or(false)
+}
+
+/// Atomically check `path` against [`active_runs`] and, when it is not
+/// registered, remove it — all while holding the active-runs mutex. This closes
+/// the check/remove TOCTOU that a bare `is_active_run` + `remove_*` pair leaves
+/// open: a retry's [`ActiveRunGuard::new`] registers the run dir under the same
+/// mutex, so holding the lock across the check and the removal guarantees no
+/// registration can slip in between and have its live workspace deleted out from
+/// under it. `remove` performs the actual deletion (pinned `remove_tree` or the
+/// path-based fallback); it runs with the lock held, so it must stay quick and
+/// must not itself try to acquire [`active_runs`]. Returns `true` when the path
+/// was inactive and the removal was attempted.
+fn remove_if_inactive(path: &Path, remove: impl FnOnce()) -> bool {
+    let map = match active_runs().lock() {
+        Ok(m) => m,
+        // A poisoned mutex means a panicking slot may still hold a registration;
+        // fail closed (treat as active) rather than risk deleting a live run.
+        Err(_) => return false,
+    };
+    if map.contains_key(path) {
+        return false;
+    }
+    // The lock is held continuously from the check through the removal, so no
+    // `ActiveRunGuard::new` can register `path` in between — the retry blocks on
+    // the mutex until the delete finishes, then registers a path that no longer
+    // exists (its own `prepare_run_dir` recreates it). The removal is therefore
+    // never of a live run.
+    remove();
+    true
 }
 
 /// Best-effort sweep of stale retained run directories under `runs_dir`.
@@ -677,11 +709,12 @@ fn sweep_stale_runs_pinned(
         if !recurse_namespaces {
             // Top-level entry IS a job run: age it by its own mtime, never
             // descend into it (its repo checkout / scratch dirs are not runs).
-            if is_active_run(&runs_abs.join(&name)) {
-                continue;
-            }
+            // The active check and the removal are one atomic step (under the
+            // active-runs mutex) so a retry registering this same path cannot
+            // slip in between and have its live workspace deleted.
             if is_aged_out(meta.modified, now, max_age) {
-                reap_pinned(&root, &name, &runs_dir.join(&name), max_age);
+                let path = runs_abs.join(&name);
+                remove_if_inactive(&path, || reap_pinned(&root, &name, &path, max_age));
             }
             continue;
         }
@@ -713,13 +746,13 @@ fn sweep_stale_runs_pinned(
             if !smeta.is_dir || smeta.is_symlink {
                 continue;
             }
-            if is_active_run(&child_abs.join(&sub)) {
-                continue;
-            }
             if !is_aged_out(smeta.modified, now, max_age) {
                 continue;
             }
-            reap_pinned(&child, &sub, &child_abs.join(&sub), max_age);
+            // Atomic check-and-remove (see the top-level branch): a retry can
+            // register this same child path between a bare check and the delete.
+            let cpath = child_abs.join(&sub);
+            remove_if_inactive(&cpath, || reap_pinned(&child, &sub, &cpath, max_age));
         }
         // A dead worker's namespace that is now empty (every child reaped, none
         // retained) is itself removed, so repeated crashes don't leak empty
@@ -813,12 +846,10 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
         if !recurse_namespaces {
             // Top-level entry IS a job run: age it by its own mtime, never
             // descend into it (its repo checkout / scratch dirs are not runs).
+            // Atomic check-and-remove (see the pinned branch).
             let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-            if is_active_run(&abs) {
-                continue;
-            }
             if is_aged_out(meta.modified().ok(), now, max_age) {
-                reap_path(&path, max_age);
+                remove_if_inactive(&abs, || reap_path(&path, max_age));
             }
             continue;
         }
@@ -852,13 +883,11 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
                 continue;
             }
             let cabs = std::path::absolute(&cpath).unwrap_or_else(|_| cpath.clone());
-            if is_active_run(&cabs) {
-                continue;
-            }
             if !is_aged_out(cmeta.modified().ok(), now, max_age) {
                 continue;
             }
-            reap_path(&cpath, max_age);
+            // Atomic check-and-remove (see the pinned branch).
+            remove_if_inactive(&cabs, || reap_path(&cpath, max_age));
         }
         // Remove a dead worker's now-empty namespace (see the pinned version);
         // only when empty, so a retained failed run survives. Never our own.
@@ -2029,6 +2058,65 @@ mod tests {
         assert!(!is_active_run(&live_abs));
         sweep_stale_runs(&root, Duration::ZERO, false);
         assert!(!live.exists(), "a deregistered aged dir is swept normally");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_remove_is_atomic_against_concurrent_registration() {
+        // Regression for the check/remove TOCTOU: a retry registering the same
+        // run path must not be able to slip in between the sweep's liveness
+        // check and its `remove_tree`. `remove_if_inactive` holds the
+        // active-runs mutex across both, so a concurrent `ActiveRunGuard::new`
+        // blocks until the delete is decided — the live run is never reaped.
+        let root = std::env::temp_dir().join(format!(
+            "nano-atomic-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let run = root.join("retry-run");
+        std::fs::create_dir_all(&run).unwrap();
+        let run_abs = std::path::absolute(&run).unwrap();
+
+        // Deterministic core: a run dir kept continuously registered across a
+        // sweep must survive, however aged. This is the invariant the atomic
+        // check-and-remove protects.
+        let guard = ActiveRunGuard::new(&run_abs);
+        sweep_stale_runs(&root, Duration::ZERO, false);
+        assert!(
+            run.exists(),
+            "a run registered as active must never be swept"
+        );
+        drop(guard);
+
+        // Concurrency smoke check: hammer the sweep while a register/deregister
+        // cycle runs on another thread. With the atomic check-and-remove, no
+        // interleaving panics, deadlocks, or tears — the sweep and the churn
+        // just serialise on the mutex. (No assertion on the dir's existence
+        // here: whether it survives a given pass depends on whether a guard
+        // happened to be live, which is intentionally nondeterministic.)
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let run2 = run_abs.clone();
+        let churn = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let g = ActiveRunGuard::new(&run2);
+                std::thread::sleep(Duration::from_millis(1));
+                drop(g);
+            }
+        });
+        for _ in 0..50 {
+            std::fs::create_dir_all(&run).unwrap();
+            sweep_stale_runs(&root, Duration::ZERO, false);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
 
         std::fs::remove_dir_all(&root).ok();
     }
