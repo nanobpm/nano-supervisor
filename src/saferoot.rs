@@ -49,6 +49,7 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 /// The reason a pinned-handle operation could not be performed.
+#[derive(Debug)]
 pub(crate) enum PinError {
     /// The running kernel lacks `openat2` (pre-5.6). The caller should fall
     /// back to the path-based implementation rather than treat this as a
@@ -207,6 +208,15 @@ impl DirHandle {
             unsafe { libc::close(dupfd) };
             return Err(e);
         }
+        // `dup` shares the underlying open file description — and thus the
+        // directory read offset — with `self.fd`. A prior enumeration (or one
+        // on another dup of the same handle) can have advanced that shared
+        // offset to EOF, so a fresh `fdopendir` would resume past the end and
+        // report the directory empty. Rewind to the start so every call
+        // enumerates the full, current contents; this also makes `entry_names`
+        // safe to call again after the directory has been mutated (e.g. the
+        // sweep's post-reap emptiness check).
+        unsafe { libc::rewinddir(dirp) };
         let mut names = Vec::new();
         loop {
             // The classic `while ((e = readdir(d)))` idiom: a NULL return is
@@ -293,5 +303,77 @@ impl DirHandle {
         child.restrict_mode(mode)?;
         self.restrict_mode(mode)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "nano-saferoot-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::canonicalize(&root).unwrap()
+    }
+
+    // `entry_names` must enumerate the full, current contents on EVERY call —
+    // including a second call on the same handle and a call made after the
+    // directory has been mutated. `dup` shares the open file description's read
+    // offset, so without a rewind the second call would resume at EOF and
+    // wrongly report the directory empty (which made the sweep delete a live
+    // sibling run dir).
+    #[test]
+    fn entry_names_is_idempotent_and_survives_mutation() {
+        let root = scratch_root("entrynames");
+        for name in ["aaa", "bbb", "ccc"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let handle = DirHandle::open_root_nofollow(&root).expect("pin root");
+
+        let mut first = handle.entry_names().expect("first list");
+        first.sort();
+        assert_eq!(
+            first,
+            vec![
+                OsString::from("aaa"),
+                OsString::from("bbb"),
+                OsString::from("ccc")
+            ]
+        );
+
+        // Second call on the SAME handle must see everything again, not resume
+        // from the prior call's EOF offset.
+        let mut second = handle.entry_names().expect("second list");
+        second.sort();
+        assert_eq!(
+            first, second,
+            "entry_names must be idempotent on a reused handle"
+        );
+
+        // After removing one child, a fresh call must report exactly the
+        // survivors (and crucially NOT empty).
+        handle.remove_tree(OsStr::new("aaa")).expect("remove aaa");
+        let mut after = handle.entry_names().expect("post-mutation list");
+        after.sort();
+        assert_eq!(after, vec![OsString::from("bbb"), OsString::from("ccc")]);
+        assert!(
+            !after.is_empty(),
+            "a non-empty dir must never list as empty"
+        );
+
+        // Remove the rest; only a genuinely empty dir lists empty.
+        handle.remove_tree(OsStr::new("bbb")).unwrap();
+        handle.remove_tree(OsStr::new("ccc")).unwrap();
+        assert!(handle.entry_names().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

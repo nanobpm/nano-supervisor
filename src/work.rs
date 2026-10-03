@@ -114,7 +114,10 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         (runs_dir.clone(), false)
     } else {
         (
-            runs_dir.parent().map(PathBuf::from).unwrap_or_else(|| runs_dir.clone()),
+            runs_dir
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| runs_dir.clone()),
             true,
         )
     };

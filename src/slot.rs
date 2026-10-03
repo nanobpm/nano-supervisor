@@ -288,10 +288,7 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
 /// `extend`, dropping the very request that would report a 404/409 fence. A
 /// graceful stop lets any in-flight extend run to completion first; once the
 /// task is joined no further writes to the loss watch can happen.
-async fn stop_refresher(
-    stop_tx: watch::Sender<bool>,
-    refresher: tokio::task::JoinHandle<()>,
-) {
+async fn stop_refresher(stop_tx: watch::Sender<bool>, refresher: tokio::task::JoinHandle<()>) {
     let _ = stop_tx.send(true);
     let _ = refresher.await;
 }
@@ -1873,7 +1870,14 @@ mod tests {
         };
         // Set both atime and mtime; do not follow symlinks.
         let times = [ts, ts];
-        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) == 0 }
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+        }
     }
 
     #[cfg(not(unix))]
