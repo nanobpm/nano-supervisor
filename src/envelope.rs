@@ -62,8 +62,18 @@ fn js_stringify(v: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => s.clone(),
         // `Array.prototype.toString` is `join(",")`: empty → `""`, nested
-        // arrays/objects recurse through the same `String()` conversion.
-        Value::Array(items) => items.iter().map(js_stringify).collect::<Vec<_>>().join(","),
+        // arrays/objects recurse through the same `String()` conversion —
+        // except null/undefined ELEMENTS, which join renders as the empty
+        // string (String([null]) is `""`, String([1,null,2]) is `"1,,2"`),
+        // unlike a top-level String(null) → `"null"`.
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_stringify(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
         // A plain object has no custom `toString`, so it stringifies to the
         // invariant `"[object Object]"` regardless of its contents.
         Value::Object(_) => "[object Object]".to_string(),
@@ -439,6 +449,22 @@ mod tests {
         assert!(!coerce_bool(Some(&json!({})), false));
         // Nested values recurse through String(): [["on"]] → "on" → true.
         assert!(coerce_bool(Some(&json!([["on"]])), false));
+        // Array.prototype.join renders null/undefined ELEMENTS as the empty
+        // string (unlike a top-level String(null) → "null", which coerce_bool
+        // pre-filters to the default anyway): String([null]) is "" (false),
+        // String([1,null,2]) is "1,,2" (unrecognised → default), and
+        // String([null,"on"]) is ",on" (unrecognised → default). A prior
+        // version joined null as the literal "null", so `push: [null]`
+        // normalised to `true` (the default) where Node yields `false`.
+        assert!(!coerce_bool(Some(&json!([null])), true));
+        assert!(!coerce_bool(Some(&json!([null])), false));
+        assert!(coerce_bool(Some(&json!([1, null, 2])), true));
+        assert!(!coerce_bool(Some(&json!([1, null, 2])), false));
+        assert!(coerce_bool(Some(&json!([null, "on"])), true));
+        assert!(!coerce_bool(Some(&json!([null, "on"])), false));
+        // Nested arrays recurse through join: [[null,"on"]] → ",on" → default.
+        assert!(coerce_bool(Some(&json!([[null, "on"]])), true));
+        assert!(!coerce_bool(Some(&json!([[null, "on"]])), false));
     }
 
     #[test]
