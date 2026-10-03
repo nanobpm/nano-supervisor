@@ -1729,7 +1729,7 @@ async fn run_agent(
                         stdout,
                         truncated: capped || o.truncated,
                         exit_code: Some(0),
-                        has_turns: o.updates > 0,
+                        has_turns: o.effective_turns > 0,
                         acp_outcome: o.outcome,
                         ..RunResult::default()
                     }

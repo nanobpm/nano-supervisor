@@ -31,6 +31,14 @@ pub struct Outcome {
     pub truncated: bool,
     pub updates: usize,
     pub tool_calls: usize,
+    /// Count of `session/update` notifications that persist a transcript turn (a
+    /// message, a tool call, or a TERMINAL tool result) or carry a valid plan —
+    /// the ONLY updates Node 1.70.1 treats as evidence the agent did work.
+    /// Unlike `updates`, this excludes ignored/intermediate notifications (an
+    /// `in_progress` `tool_call_update`, an empty chunk, a bare status) so an
+    /// otherwise-empty agent that emits one such update is not mistaken for a
+    /// run that produced turns. See [`update_is_effective_turn`].
+    pub effective_turns: usize,
     pub permissions_granted: usize,
     /// The prompt response's `_meta.outcome` object, if the agent emitted one.
     /// Node parity (plugin 1.70.1): an explicit ACP outcome is an effective
@@ -49,6 +57,7 @@ struct Shared {
     truncated: bool,
     updates: usize,
     tool_calls: usize,
+    effective_turns: usize,
     permissions_granted: usize,
     last_activity: Option<Instant>,
 }
@@ -235,6 +244,7 @@ impl Agent {
             truncated: s.truncated,
             updates: s.updates,
             tool_calls: s.tool_calls,
+            effective_turns: s.effective_turns,
             permissions_granted: s.permissions_granted,
             // Preserve the prompt response's `_meta.outcome` (plugin 1.70.1): a
             // `blocked`/explicit outcome is a usable fallback result and proof
@@ -385,6 +395,48 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// Does this `session/update` persist a transcript turn or carry a valid plan —
+/// the signals Node 1.70.1 counts as "the agent did work"? This mirrors the
+/// canonical transcript bridge's non-`Ignored` classification (a message chunk
+/// with text, a `tool_call` with an id, a TERMINAL `tool_call_update` with an
+/// id) plus a `plan` update that carries at least one entry.
+///
+/// Everything else — an `in_progress`/unknown `tool_call_update`, an empty or
+/// text-less chunk, an empty plan, a bare status, any unrecognised update — is
+/// NOT a turn. Counting every `session/update` (as a raw `updates` tally does)
+/// would let an otherwise-empty agent that emits a single status notification
+/// masquerade as having produced work, so empty-run detection must key off this
+/// instead.
+fn update_is_effective_turn(update: &Value) -> bool {
+    let Some(kind) = update["sessionUpdate"].as_str() else {
+        return false;
+    };
+    match kind {
+        // Reasoning (`agent_thought_chunk`) folds to an assistant turn; a chunk
+        // with no text content persists nothing, so it does not count.
+        "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" => {
+            update["content"]["text"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        }
+        "tool_call" => update["toolCallId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        // Only a TERMINAL tool result is a transcript turn; an intermediate
+        // `in_progress`/`pending` update (or one without an id) is ignored.
+        "tool_call_update" => {
+            matches!(update["status"].as_str(), Some("completed" | "failed"))
+                && update["toolCallId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+        }
+        "plan" => update["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        _ => false,
+    }
+}
+
 /// Process one JSON-RPC line: a response to one of our requests, a notification,
 /// or a request from the agent (permission prompts are auto-answered).
 fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Value>) -> bool {
@@ -410,6 +462,12 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
         (Some("session/update"), None) => {
             s.updates += 1;
             let update = &msg["params"]["update"];
+            // Count effective transcript turns / valid plans the Node way, BEFORE
+            // the narrower match below (which only tracks message text and tool
+            // calls): `updates` alone overcounts ignored/intermediate updates.
+            if update_is_effective_turn(update) {
+                s.effective_turns += 1;
+            }
             match update["sessionUpdate"].as_str() {
                 Some("agent_message_chunk") => {
                     if let Some(t) = update["content"]["text"].as_str() {
@@ -809,6 +867,45 @@ mod tests {
                 prompt_outcome(&done).is_none(),
                 "non-object outcome must extract to None: {done}"
             );
+        }
+    }
+
+    #[test]
+    fn update_is_effective_turn_counts_only_persisted_turns_or_valid_plans() {
+        // Persisted transcript turns: a message/thought/user chunk WITH text, a
+        // tool_call with an id, and a TERMINAL tool_call_update with an id. A
+        // plan counts only when it carries at least one entry.
+        let effective = [
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hmm" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "go" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read" }),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed", "rawOutput": {} }),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed" }),
+            json!({ "sessionUpdate": "plan", "entries": [ { "content": "step", "status": "pending" } ] }),
+        ];
+        for u in &effective {
+            assert!(update_is_effective_turn(u), "should count as a turn: {u}");
+        }
+
+        // Ignored/intermediate updates: an empty or text-less chunk, a tool_call
+        // without an id, an in_progress/unknown tool_call_update, an id-less
+        // terminal update, an empty plan, a bare status, and any unknown update.
+        let ignored = [
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "" } }),
+            json!({ "sessionUpdate": "agent_message_chunk" }),
+            json!({ "sessionUpdate": "tool_call", "title": "read" }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "" }),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "in_progress" }),
+            json!({ "sessionUpdate": "tool_call_update", "status": "completed" }),
+            json!({ "sessionUpdate": "plan", "entries": [] }),
+            json!({ "sessionUpdate": "plan" }),
+            json!({ "sessionUpdate": "current_mode_update", "modeId": "x" }),
+            json!({ "sessionUpdate": "available_commands_update" }),
+            json!({ "foo": "bar" }),
+        ];
+        for u in &ignored {
+            assert!(!update_is_effective_turn(u), "should NOT count as a turn: {u}");
         }
     }
 }

@@ -99,23 +99,40 @@ fn js_stringify(v: &Value) -> String {
 /// derives (`String(0.000001)` parses to `0` in Node but `1` from serde's
 /// `"1e-6"`) and the text a string field receives.
 ///
-/// Integers (`i64`/`u64`) already render as plain digits under both serde_json
-/// and JS, so they pass through unchanged. Only a float needs reformatting:
-/// ryu yields the same shortest round-trip digits serde_json used, and the
-/// ECMAScript `Number::toString` rules below place the decimal point / choose
-/// exponential notation the way V8 does. Let the shortest digits be `d[0..k]`
-/// and the decimal exponent `e` (value = `0.d[0..k] × 10^e`, equivalently
+/// An integer is a plain-digit fast path ONLY while it is an exact IEEE-754
+/// double — i.e. its magnitude is `<= 2^53` (`Number.MAX_SAFE_INTEGER` rounded
+/// up to the first unsafe power of two). Within that range serde_json's digits
+/// and `String(Number)` agree, so it passes through unchanged. A larger integer
+/// is NOT exactly representable as the double JS parses it to, and ECMAScript
+/// renders the SHORTEST decimal that round-trips to that rounded double — e.g.
+/// the JSON integer `9007199254740993` becomes the Number `9007199254740992`
+/// (`"9007199254740992"`), and `9223372036854775808` prints as
+/// `"9223372036854776000"`, not its exact digits. So an unsafe-magnitude
+/// integer must fall through to the `f64` path below; the plain-digit fast path
+/// would otherwise emit the exact (and therefore wrong) digits.
+///
+/// Only a float (or an unsafe-magnitude integer) needs reformatting: ryu yields
+/// the same shortest round-trip digits serde_json used, and the ECMAScript
+/// `Number::toString` rules below place the decimal point / choose exponential
+/// notation the way V8 does. Let the shortest digits be `d[0..k]` and the
+/// decimal exponent `e` (value = `0.d[0..k] × 10^e`, equivalently
 /// `d[0].d[1..k] × 10^(e-1)`):
 ///   * `k <= e <= 21`   → the digits followed by `e - k` zeros (plain integer);
 ///   * `0 < e < k` (and `e <= 21`) → `d[0..e].d[e..k]` (point inside the digits);
 ///   * `-6 < e <= 0`    → `0.` then `-e` zeros then the digits (small decimal);
 ///   * otherwise        → `d[0][.d[1..k]]e±(e-1)` (exponential).
 fn js_number_string(n: &serde_json::Number) -> String {
+    // 2^53: the largest magnitude at which every integer is still an exact
+    // double, so serde_json's plain digits equal `String(Number)`.
+    const MAX_EXACT_INT: u64 = 1 << 53;
     if let Some(i) = n.as_i64() {
-        return i.to_string();
-    }
-    if let Some(u) = n.as_u64() {
-        return u.to_string();
+        if i.unsigned_abs() <= MAX_EXACT_INT {
+            return i.to_string();
+        }
+    } else if let Some(u) = n.as_u64() {
+        if u <= MAX_EXACT_INT {
+            return u.to_string();
+        }
     }
     let x = match n.as_f64() {
         Some(x) if x.is_finite() => x,
@@ -388,16 +405,38 @@ pub fn assemble(custom_headers: &Map<String, Value>, variables: &Map<String, Val
 /// large number such as `1e21` → `"1e+21"` → `1` (Node yields `1`; a numeric
 /// fast path that instead casts the `f64` saturates to `i64::MAX`). A leading
 /// `+`/`-` with no digit, or no leading digit at all, is `NaN` → absent.
-fn coerce_int(v: Option<&Value>) -> Option<i64> {
-    match v {
-        None => None,
-        // parseInt yields a double; truncate toward zero and clamp to the `i64`
-        // range. `f64 -> i64` saturates, so a finite-but-huge magnitude clamps
-        // to `i64::MIN`/`MAX` instead of overflowing to absent — the value stays
-        // present (the parity fix), matching Node keeping a finite Number.
-        Some(value) => parse_int_str(&js_stringify(value))
-            .filter(|f| f.is_finite())
-            .map(|f| f.trunc() as i64),
+///
+/// The result is returned as a JSON numeric [`Value`], NOT an `i64`: `parseInt`
+/// yields a JavaScript Number (a double), and Node places that Number verbatim
+/// in the normalized envelope. Narrowing it to `i64` would clamp a finite-but-
+/// huge magnitude — `coerceInt("100000000000000000000")` is `1e20` in Node, not
+/// `i64::MAX` — silently changing a normalized field. [`finite_int_double_to_json`]
+/// preserves the finite Number instead of saturating.
+fn coerce_int(v: Option<&Value>) -> Option<Value> {
+    let f = parse_int_str(&js_stringify(v?)).filter(|f| f.is_finite())?;
+    Some(finite_int_double_to_json(f))
+}
+
+/// Represent `parseInt`'s finite, integer-valued double as a JSON number WITHOUT
+/// narrowing, mirroring Node placing `coerceInt`'s Number verbatim in the
+/// normalized envelope. A magnitude within `i64` range is emitted as that exact
+/// integer (covering every realistic timeout/depth value, and matching Node's
+/// `String(Number)` byte-for-byte up to `2^53`); a larger magnitude is kept as
+/// the finite IEEE-754 double itself — the very Number Node holds — rather than
+/// being clamped to `i64::MIN`/`MAX`, which would silently corrupt the value.
+fn finite_int_double_to_json(f: f64) -> Value {
+    let t = f.trunc();
+    // `i64::MAX as f64` rounds UP to 2^63, so compare against that power of two
+    // with a strict `<`: 2^63 itself is out of `i64` range and would saturate.
+    const I64_SUP: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    if t >= i64::MIN as f64 && t < I64_SUP {
+        Value::from(t as i64)
+    } else {
+        // Beyond `i64` range: preserve the finite Number (`from_f64` only
+        // rejects NaN/±Inf, already filtered out) instead of a saturating clamp.
+        serde_json::Number::from_f64(t)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -413,7 +452,7 @@ fn put(m: &mut Map<String, Value>, key: &str, v: Option<Value>) {
 /// plugin's `normalizeTaskEnvelope` (so the agent sees an identical `task`).
 fn normalize(raw: &Map<String, Value>, prompt: Option<&str>) -> Value {
     let s = |v: Option<&Value>| v.and_then(as_str).map(Value::String);
-    let int = |v: Option<&Value>| coerce_int(v).map(Value::from);
+    let int = coerce_int;
     let mut env = Map::new();
     env.insert("schemaVersion".into(), Value::from(1));
 
@@ -659,12 +698,12 @@ mod tests {
         // Int fields: parseInt(String(["1000"])) → 1000 (was dropped); a
         // multi-element array parses only its leading integer ("1,2" → 1); a
         // non-numeric-leading value is NaN → absent.
-        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(1000));
-        assert_eq!(coerce_int(Some(&json!(["1", "2"]))), Some(1));
-        assert_eq!(coerce_int(Some(&json!(" 42abc"))), Some(42));
+        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(json!(1000)));
+        assert_eq!(coerce_int(Some(&json!(["1", "2"]))), Some(json!(1)));
+        assert_eq!(coerce_int(Some(&json!(" 42abc"))), Some(json!(42)));
         assert_eq!(coerce_int(Some(&json!("abc"))), None);
         assert_eq!(coerce_int(Some(&json!([]))), None); // String([]) is "" → NaN
-        assert_eq!(coerce_int(Some(&json!(7))), Some(7));
+        assert_eq!(coerce_int(Some(&json!(7))), Some(json!(7)));
         assert_eq!(coerce_int(None), None);
     }
 
@@ -744,6 +783,17 @@ mod tests {
             ("-3", "-3"),
             ("0", "0"),
             ("-0.0", "0"),
+            // Integer-typed JSON numbers (i64/u64, no `.0`) beyond the safe
+            // range (|v| > 2^53) are NOT exactly representable as the double JS
+            // parses them to, so `String(Number)` renders the shortest decimal
+            // that round-trips to that rounded double — NOT the exact digits
+            // serde_json's integer fast path would emit. These must match V8.
+            ("9007199254740992", "9007199254740992"), // 2^53: still exact
+            ("9007199254740993", "9007199254740992"), // 2^53+1 rounds down
+            ("9223372036854775807", "9223372036854776000"), // i64::MAX
+            ("9223372036854775808", "9223372036854776000"), // 2^63 (u64, > i64::MAX)
+            ("18446744073709551615", "18446744073709552000"), // u64::MAX
+            ("-9007199254740993", "-9007199254740992"), // negative, unsafe
         ];
         for (input, want) in cases {
             let v: Value = serde_json::from_str(input).unwrap();
@@ -774,32 +824,42 @@ mod tests {
     }
 
     #[test]
-    fn coerce_int_keeps_finite_numbers_beyond_i64_range() {
-        // Same parity for the signed fields: a finite-but-huge magnitude clamps
-        // to the `i64` range instead of overflowing to absent.
+    fn coerce_int_preserves_the_finite_number_without_i64_clamping() {
+        // parseInt keeps a finite JavaScript Number of ANY magnitude; the
+        // normalized field must preserve that Number, NOT clamp it to
+        // i64::MIN/MAX (which would silently change the value). Within i64 range
+        // the exact integer is kept — rounding above 2^53 the double way, like
+        // Node's parseInt("9007199254740993") → 9007199254740992.
         assert_eq!(
             coerce_int(Some(&json!("9007199254740993"))),
-            Some(9007199254740992)
+            Some(json!(9007199254740992_i64)),
         );
-        assert_eq!(
-            coerce_int(Some(&json!("9223372036854775808"))),
-            Some(i64::MAX)
-        );
-        assert_eq!(
-            coerce_int(Some(&json!("-9223372036854775809"))),
-            Some(i64::MIN)
-        );
+        // Beyond i64 range the finite IEEE-754 double is kept, NOT clamped to
+        // i64::MIN/MAX. (The exact low digits of such a huge magnitude follow
+        // `parse_int_str`'s double accumulation; what matters here is that the
+        // value is preserved rather than saturated.)
+        let e20 = coerce_int(Some(&json!("100000000000000000000"))).unwrap();
+        assert_eq!(e20.as_f64(), Some(1e20));
+        assert_ne!(e20, json!(i64::MAX));
+        let neg_e20 = coerce_int(Some(&json!("-100000000000000000000"))).unwrap();
+        assert_eq!(neg_e20.as_f64(), Some(-1e20));
+        assert_ne!(neg_e20, json!(i64::MIN));
+        // A magnitude just past i64::MAX (2^63) is preserved as a double rather
+        // than saturated to i64::MAX (2^63 - 1).
+        let past = coerce_int(Some(&json!("9223372036854775808"))).unwrap();
+        assert!(past.as_f64().unwrap() >= 9223372036854775808.0);
+        assert_ne!(past, json!(i64::MAX));
     }
 
     #[test]
     fn coerce_int_parses_large_numbers_the_js_way() {
         // Same `parseInt(String(v), 10)` for the signed fields: the number is
         // JS-stringified first, never cast, so a huge magnitude is not saturated.
-        assert_eq!(coerce_int(Some(&json!(1e21))), Some(1)); // "1e+21" → 1
-        assert_eq!(coerce_int(Some(&json!(-1e21))), Some(-1)); // "-1e+21" → -1
-        assert_eq!(coerce_int(Some(&json!(7.9))), Some(7));
-        assert_eq!(coerce_int(Some(&json!(-3))), Some(-3));
-        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(1000));
+        assert_eq!(coerce_int(Some(&json!(1e21))), Some(json!(1))); // "1e+21" → 1
+        assert_eq!(coerce_int(Some(&json!(-1e21))), Some(json!(-1))); // "-1e+21" → -1
+        assert_eq!(coerce_int(Some(&json!(7.9))), Some(json!(7)));
+        assert_eq!(coerce_int(Some(&json!(-3))), Some(json!(-3)));
+        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(json!(1000)));
         assert_eq!(coerce_int(Some(&json!(null))), None); // "null" → NaN
     }
 
