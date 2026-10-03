@@ -248,9 +248,10 @@ fn is_env_wrapper(t: &str) -> bool {
 /// How many tokens an `env` option consumes INCLUDING the option token itself:
 /// `0` for a nullary flag (`-i`), `1` when the value is glued on (`-uNAME`,
 /// `-C/dir`, `-Sstr`), `2` when the value is the NEXT token (`-u NAME`,
-/// `-C DIR`). Returns `None` when the token is not a recognised `env` option,
-/// so the caller stops skipping. Only the options that take a separate argument
-/// need a `2`; every other `env` flag is nullary or carries its value inline.
+/// `-C DIR`, BSD/macOS `-P ALTPATH`). Returns `None` when the token is not a
+/// recognised `env` option, so the caller stops skipping. Only the options
+/// that take a separate argument need a `2`; every other `env` flag is nullary
+/// or carries its value inline.
 ///
 /// The point is not to parse `env` fully but to step over the options a valid
 /// hire can place between `env` and the real command (`env -i sh -c …`,
@@ -293,15 +294,20 @@ fn env_option_arity(t: &str) -> Option<usize> {
         });
     }
     // Short options. `-u`/`-C` take a separate-argument value; `-S` takes its
-    // (possibly quoted, multi-word) string as the next token. A glued-on value
-    // (`-uNAME`, `-C/dir`) or a bundled nullary flag (`-i`, `-iv`, `-0`) is one
-    // token. The first byte after the dash decides, because `env` bundles
-    // nullary short flags but never bundles a value-taking flag ahead of more
-    // letters (the rest of the token IS the value).
+    // (possibly quoted, multi-word) string as the next token. BSD/macOS `env`
+    // (the deployment OS) adds `-P altpath`, which also takes its value as the
+    // NEXT token — treating it as nullary lands the scan on the altpath as the
+    // effective command, so a `-P`-wrapped `*-acp` adapter fails the selector
+    // scan OPEN and a `-P`-wrapped shell gets `--acp` appended to the outer
+    // argv (swallowed as `$0`) instead of injected. A glued-on value (`-uNAME`,
+    // `-C/dir`) or a bundled nullary flag (`-i`, `-iv`, `-0`) is one token. The
+    // first byte after the dash decides, because `env` bundles nullary short
+    // flags but never bundles a value-taking flag ahead of more letters (the
+    // rest of the token IS the value).
     let rest = &t[1..];
     let first = rest.chars().next()?;
     Some(match first {
-        'u' | 'C' | 'S' | 'a' => {
+        'u' | 'C' | 'S' | 'P' | 'a' => {
             if rest.len() > 1 {
                 1
             } else {
@@ -1019,6 +1025,29 @@ mod tests {
             ]
         );
 
+        // BSD/macOS `env -P ALTPATH` (the deployment OS) consumes its altpath
+        // as a separate token too: treating `-P` as nullary lands the scan on
+        // the altpath as the effective command, so the shell is missed and
+        // `--acp` is appended to the outer argv where `sh` swallows it as `$0`.
+        let mut env_p = hire(Protocol::Acp, "env", "none");
+        env_p.args = vec![
+            "-P".into(),
+            "/alt/bin".into(),
+            "sh".into(),
+            "-c".into(),
+            "nano-coder".into(),
+        ];
+        assert_eq!(
+            acp_spawn_args(&env_p),
+            vec![
+                "-P".to_string(),
+                "/alt/bin".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
         // `--` ends `env`'s own options; the next token is the command.
         let mut env_ddash = hire(Protocol::Acp, "env", "none");
         env_ddash.args = vec!["--".into(), "sh".into(), "-c".into(), "nano-coder".into()];
@@ -1088,6 +1117,35 @@ mod tests {
         assert!(!command_has_acp_selector(
             "env",
             &["-u".into(), "sh".into(), "copilot".into()]
+        ));
+        // BSD/macOS `env -P ALTPATH` takes its value as a separate token, so a
+        // `-P`-wrapped `*-acp` adapter must still be caught: treating `-P` as
+        // nullary names the altpath the effective command and fails the
+        // validator OPEN on the deployment OS (issue #275's class).
+        assert!(command_has_acp_selector(
+            "env",
+            &["-P".into(), "/alt/bin".into(), "claude-code-acp".into()]
+        ));
+        assert!(command_has_acp_selector(
+            "env",
+            &[
+                "-P".into(),
+                "/alt/bin".into(),
+                "sh".into(),
+                "-c".into(),
+                "nano-coder --acp".into()
+            ]
+        ));
+        // The `-P` VALUE is not a command either: `env -P /alt/bin copilot`
+        // runs `copilot`, so no `-acp` suffix and no shell `-c` recursion.
+        assert!(!command_has_acp_selector(
+            "env",
+            &["-P".into(), "/alt/bin".into(), "copilot".into()]
+        ));
+        // A glued-on `-P` value (`-P/alt/bin`) is one token.
+        assert!(command_has_acp_selector(
+            "env",
+            &["-P/alt/bin".into(), "claude-code-acp".into()]
         ));
     }
 
