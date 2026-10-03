@@ -46,21 +46,43 @@ fn as_str(v: &Value) -> Option<String> {
     }
 }
 
+/// JavaScript's `String(v)` for the value shapes `coerceBool` can meet. Node's
+/// `coerceBool` stringifies ANY non-boolean/non-null value before matching, so
+/// arrays and objects coerce by their JS stringification — not by a hard
+/// default: `String([])` is `""` (false), `String(["on"])` is `"on"` (true),
+/// `String(["a","b"])` is `"a,b"`, and `String({})` is `"[object Object]"`.
+/// Matching that exactly is load-bearing: a prior version returned the field
+/// default for every array/object, so `branch.push: []` normalised to `true`
+/// (the default) where Node yields `false`, and `allowPr: ["on"]` normalised to
+/// `false` where Node yields `true`.
+fn js_stringify(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        // `Array.prototype.toString` is `join(",")`: empty → `""`, nested
+        // arrays/objects recurse through the same `String()` conversion.
+        Value::Array(items) => items.iter().map(js_stringify).collect::<Vec<_>>().join(","),
+        // A plain object has no custom `toString`, so it stringifies to the
+        // invariant `"[object Object]"` regardless of its contents.
+        Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
 /// Node's `coerceBool`: booleans pass through; `null`/absent yields the default;
-/// any other value is stringified and matched against the true-set
-/// (`true`/`1`/`yes`/`on`) and the false-set (`false`/`0`/`no`/`off`/empty),
-/// with anything unrecognised falling back to the default. Matching Node here is
-/// load-bearing: a prior version only recognised `true`/`1`/`yes` and returned
-/// `false` (not the default) for every other string, so `"on"` normalised to
-/// false and an unrecognised string on a default-`true` field (e.g. `push`)
-/// flipped to false.
+/// any other value is stringified (JavaScript `String(v)`, see [`js_stringify`])
+/// and matched against the true-set (`true`/`1`/`yes`/`on`) and the false-set
+/// (`false`/`0`/`no`/`off`/empty), with anything unrecognised falling back to
+/// the default. Matching Node here is load-bearing: a prior version only
+/// recognised `true`/`1`/`yes` and returned `false` (not the default) for every
+/// other string, so `"on"` normalised to false and an unrecognised string on a
+/// default-`true` field (e.g. `push`) flipped to false.
 fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
     let s = match v {
         None | Some(Value::Null) => return default,
         Some(Value::Bool(b)) => return *b,
-        Some(Value::String(s)) => s.trim().to_ascii_lowercase(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(_) => return default,
+        Some(other) => js_stringify(other).trim().to_ascii_lowercase(),
     };
     match s.as_str() {
         "true" | "1" | "yes" | "on" => true,
@@ -390,6 +412,33 @@ mod tests {
         // Absent / null yields the default.
         assert!(coerce_bool(None, true));
         assert!(!coerce_bool(Some(&Value::Null), false));
+    }
+
+    #[test]
+    fn coerce_bool_matches_node_js_stringification_for_arrays_and_objects() {
+        // Node stringifies ANY non-boolean value with `String(v)` before
+        // matching, so arrays/objects coerce by their JS stringification rather
+        // than a hard default. `String([])` is `""` (false), `String(["on"])`
+        // is `"on"` (true), `String({})` is `"[object Object]"` (unrecognised →
+        // default). A prior version returned the field default for every
+        // array/object, so `push: []` normalised to `true` and `allowPr:
+        // ["on"]` to `false` — both wrong.
+        // Empty array → "" → false regardless of the default.
+        assert!(!coerce_bool(Some(&json!([])), true));
+        assert!(!coerce_bool(Some(&json!([])), false));
+        // Single-element arrays stringify to the element: "on"/"true" → true,
+        // "off" → false (the false-set wins over a `true` default).
+        assert!(coerce_bool(Some(&json!(["on"])), false));
+        assert!(coerce_bool(Some(&json!(["true"])), false));
+        assert!(!coerce_bool(Some(&json!(["off"])), true));
+        // Multi-element arrays join with "," — "a,b" is unrecognised → default.
+        assert!(coerce_bool(Some(&json!(["a", "b"])), true));
+        assert!(!coerce_bool(Some(&json!(["a", "b"])), false));
+        // A plain object stringifies to "[object Object]" → unrecognised → default.
+        assert!(coerce_bool(Some(&json!({})), true));
+        assert!(!coerce_bool(Some(&json!({})), false));
+        // Nested values recurse through String(): [["on"]] → "on" → true.
+        assert!(coerce_bool(Some(&json!([["on"]])), false));
     }
 
     #[test]

@@ -162,12 +162,29 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));
+    // The slot's `JoinHandle` resolves to `Result<(), JoinError>`: `Ok(())` on a
+    // clean return, `Err` on a PANIC/abort. That error must NOT be discarded —
+    // a panicked worker loop that `work` then reports as exit 0 tells the
+    // supervisor the worker stopped cleanly when it actually crashed, so the
+    // daemon never restarts it and the failure is invisible. Capture the join
+    // outcome and propagate any error as a non-zero exit (below).
+    let slot_result: std::result::Result<(), tokio::task::JoinError>;
     tokio::select! {
-        _ = &mut slot_task => {}
+        r = &mut slot_task => {
+            slot_result = r;
+        }
         _ = wait_for_signal(&shutdown_tx) => {
             log("shutdown signal received; draining…");
             let _ = shutdown_tx.send(true);
-            let _ = tokio::time::timeout(Duration::from_secs(20), slot_task).await;
+            // A graceful drain that ends in a slot panic is still a crash —
+            // surface it rather than reporting a clean shutdown.
+            slot_result = match tokio::time::timeout(Duration::from_secs(20), slot_task).await {
+                Ok(r) => r,
+                Err(_) => {
+                    log("slot did not drain within 20s of shutdown; aborting it");
+                    Ok(())
+                }
+            };
         }
     }
     reaper.abort();
@@ -191,6 +208,12 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
                 runs_dir.display()
             )),
         }
+    }
+    // Propagate a slot crash AFTER cleanup so the run-dir teardown above still
+    // runs, but the process exits non-zero: a panicked worker loop must surface
+    // as a failure, not a clean exit 0 that a supervisor reads as intentional.
+    if let Err(e) = slot_result {
+        return Err(anyhow::anyhow!("worker slot task failed: {e}"));
     }
     Ok(())
 }
