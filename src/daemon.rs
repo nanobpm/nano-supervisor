@@ -203,6 +203,21 @@ pub(crate) fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
 /// that script on whitespace and scan it too. Recursion depth is bounded by the
 /// finite nesting of quoted scripts.
 fn scan_acp_tokens(tokens: &[&str]) -> bool {
+    // The command token is the first token that is not a launch prefix: leading
+    // `exec`/`command`/`builtin`/`env` wrappers and `VAR=value` env assignments
+    // only re-exec or decorate the real command (`sh -c "exec claude-code-acp"`,
+    // `sh -c "env X=1 claude-code-acp"`), so the `*-acp` suffix check must look
+    // past them instead of gating on the literal first token.
+    let is_env_assignment = |t: &str| {
+        !t.starts_with('-')
+            && t.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+    };
+    let command_pos = tokens.iter().position(|t| {
+        let t = t.trim_matches(|c| c == '"' || c == '\'');
+        !matches!(t, "exec" | "command" | "builtin" | "env") && !is_env_assignment(t)
+    });
     for (i, tok) in tokens.iter().enumerate() {
         let name = tok.trim_matches(|c| c == '"' || c == '\'');
         let (opt, inline_val) = match name.split_once('=') {
@@ -228,9 +243,10 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
             }
         }
         // The `*-acp` adapter suffix identifies the command token only — the
-        // first token of this (sub)command, so it also catches a wrapped inner
-        // command like `sh -c "claude-code-acp"` when recursing.
-        if i == 0 {
+        // first non-prefix token of this (sub)command, so it also catches a
+        // wrapped inner command like `sh -c "exec claude-code-acp"` when
+        // recursing.
+        if Some(i) == command_pos {
             let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
             if base.ends_with("-acp") {
                 return true;
@@ -239,7 +255,10 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
         // Shell wrapper: a short `-…c` flag (e.g. `-c`, `-ec`) hides the real
         // agent invocation inside the following script token. Scan that script's
         // own tokens so a shell-wrapped ACP selector is not missed.
-        if name.starts_with('-') && !name.starts_with("--") && name.len() >= 2 && name.ends_with('c')
+        if name.starts_with('-')
+            && !name.starts_with("--")
+            && name.len() >= 2
+            && name.ends_with('c')
         {
             if let Some(script) = tokens.get(i + 1).copied() {
                 let sub: Vec<&str> = script
@@ -427,6 +446,37 @@ mod tests {
         assert!(!command_has_acp_selector(
             "sh",
             &["-c".into(), "nano-coder --pipe".into()]
+        ));
+        // A launch prefix (`exec`, `env`, `VAR=value` assignments) shifts the
+        // adapter off the literal first token; the suffix check must look past
+        // it or a pipe hire like `sh -c "exec claude-code-acp"` fails open.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "exec claude-code-acp".into()]
+        ));
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "env X=1 claude-code-acp".into()]
+        ));
+        assert!(command_has_acp_selector(
+            "sh",
+            &[
+                "-c".into(),
+                "exec env FOO=bar /opt/bin/claude-code-acp".into()
+            ]
+        ));
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "exec nano-coder --acp".into()]
+        ));
+        // …while a prefixed NON-ACP command is still accepted.
+        assert!(!command_has_acp_selector(
+            "sh",
+            &["-c".into(), "exec nano-coder --pipe".into()]
+        ));
+        assert!(!command_has_acp_selector(
+            "sh",
+            &["-c".into(), "env X=1 copilot".into()]
         ));
     }
 
