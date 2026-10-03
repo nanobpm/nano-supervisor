@@ -1342,6 +1342,16 @@ fn detect_commits(before: Option<&str>, after: Option<&str>, provisioned: bool) 
     }
 }
 
+/// Whether a successfully-completed run's directory may be reaped. A provisioned
+/// checkout that advanced HEAD (`has_commits`) holds commits that — absent a
+/// finalize/push stage — live ONLY in the run dir, so reaping would destroy the
+/// single copy of work the job just reported successful. Retain those (they are
+/// aged out later by `sweep_stale_runs`); reap everything else (non-repository
+/// runs and provisioned runs that made no commit).
+fn may_reap_completed_run(provisioned: bool, has_commits: bool) -> bool {
+    !(provisioned && has_commits)
+}
+
 async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
@@ -1494,6 +1504,26 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let name = &cfg.hire.name;
     let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
 
+    // Node's `gitResult.commits.length > 0` / `pushed === true` empty-detection
+    // signals. A repository agent that advanced the checkout HEAD committed
+    // real work, so it is NOT empty even with no stdout/result; failing it
+    // would burn a retry. No `finalizeGit` push stage exists yet, so
+    // `pushed` is always false here. A newly PROVISIONED repository starts
+    // with no baseline HEAD (`start_head` is `None`), so the agent's FIRST
+    // commit yields `(None, Some(after))` — treat that appearance of HEAD as
+    // a commit too (Node's non-empty `gitResult.commits`), or a quiet pipe
+    // agent that made its first commit would be misread as empty and
+    // retried. A NON-repository run dir (no checkout) reads `None`/`None`
+    // and stays "no commits". Computed once here: it both drives empty-detection
+    // AND gates reaping (a provisioned checkout that advanced HEAD holds commits
+    // that, absent a push stage, exist ONLY in the run dir).
+    let provisioned = env.repository.is_some();
+    let has_commits = detect_commits(
+        start_head.as_deref(),
+        git_head(&agent_cwd).as_deref(),
+        provisioned,
+    );
+
     let settle = if !run.ok {
         let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {
             Some(c) => format!("exit code {c}"),
@@ -1503,33 +1533,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             message: format!("agent \"{name}\" failed: {detail}"),
             vars: Some(envelope_vars()),
         }
-    } else if let Some(reason) = {
-        // Node's `gitResult.commits.length > 0` / `pushed === true` empty-detection
-        // signals. A repository agent that advanced the checkout HEAD committed
-        // real work, so it is NOT empty even with no stdout/result; failing it
-        // would burn a retry. No `finalizeGit` push stage exists yet, so
-        // `pushed` is always false here. A newly PROVISIONED repository starts
-        // with no baseline HEAD (`start_head` is `None`), so the agent's FIRST
-        // commit yields `(None, Some(after))` — treat that appearance of HEAD as
-        // a commit too (Node's non-empty `gitResult.commits`), or a quiet pipe
-        // agent that made its first commit would be misread as empty and
-        // retried. A NON-repository run dir (no checkout) reads `None`/`None`
-        // and stays "no commits".
-        let provisioned = env.repository.is_some();
-        let has_commits = detect_commits(
-            start_head.as_deref(),
-            git_head(&agent_cwd).as_deref(),
-            provisioned,
-        );
-        result::detect_empty(
-            raw_result.as_ref(),
-            &run.stdout,
-            run.has_turns,
-            has_commits,
-            false,
-            run.acp_outcome.is_some(),
-        )
-    } {
+    } else if let Some(reason) = result::detect_empty(
+        raw_result.as_ref(),
+        &run.stdout,
+        run.has_turns,
+        has_commits,
+        false,
+        run.acp_outcome.is_some(),
+    ) {
         Settle::Fail {
             message: format!("agent \"{name}\" produced an empty result: {reason}"),
             vars: Some(envelope_vars()),
@@ -1558,8 +1569,23 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // `sweep_stale_runs`. Best-effort, pinned no-follow (see `reap_run_dir`), and
     // dispatched to the blocking pool so a large checkout removal cannot stall
     // the executor and starve the lease refresher before `complete_job` lands.
+    //
+    // DO NOT reap a provisioned checkout that advanced HEAD: with no
+    // finalize/push stage those commits are not durable — they live ONLY in this
+    // run dir, so deleting it would destroy the single copy of work the job just
+    // reported successful. Retain such a run (like a failed one) for recovery;
+    // `sweep_stale_runs` ages it out later on the normal cadence.
     if matches!(settle, Settle::Complete(_)) && !cfg.keep_runs {
-        reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
+        if may_reap_completed_run(provisioned, has_commits) {
+            reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
+        } else {
+            log(&format!(
+                "job {key}: retaining run dir {} — provisioned checkout advanced HEAD but the \
+                 worker has no finalize/push stage, so its commits are not durable; reaping would \
+                 delete their only copy (aged out later by sweep_stale_runs)",
+                run_dir.display()
+            ));
+        }
     }
     Ok(settle)
 }
@@ -2913,6 +2939,19 @@ mod tests {
         assert!(!detect_commits(None, None, false));
         // HEAD disappeared (agent force-reset to nothing): not a new commit.
         assert!(!detect_commits(Some("aaa"), None, true));
+    }
+
+    #[test]
+    fn provisioned_commits_are_retained_not_reaped() {
+        // A provisioned checkout that advanced HEAD holds commits that — with no
+        // finalize/push stage — live ONLY in the run dir, so a successful run
+        // must NOT reap it (that would destroy the sole copy).
+        assert!(!may_reap_completed_run(true, true));
+        // A provisioned run that made no commit has nothing durable to lose.
+        assert!(may_reap_completed_run(true, false));
+        // A non-repository run never holds commits, so it is always reapable.
+        assert!(may_reap_completed_run(false, false));
+        assert!(may_reap_completed_run(false, true));
     }
 
     #[cfg(unix)]

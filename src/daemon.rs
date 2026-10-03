@@ -120,8 +120,17 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         handles.len()
     ));
 
-    wait_for_signal(&shutdown_tx).await;
-    log("shutdown signal received; draining slots…");
+    // `wait_for_signal` reports whether a slot flipped the watch for a FATAL
+    // misconfiguration (an unleased activation under `--with-lease`) versus an
+    // operator Ctrl-C/SIGTERM. We still drain either way, but a fatal shutdown
+    // must surface as a non-zero exit (issue: `--with-lease` is documented to
+    // fail LOUDLY — returning `Ok(())` made the daemon look like a clean drain).
+    let fatal = wait_for_signal(&shutdown_tx).await;
+    if fatal {
+        log("fatal: a slot could not fence its work under --with-lease (engine not issuing leases); draining and exiting non-zero");
+    } else {
+        log("shutdown signal received; draining slots…");
+    }
     let _ = shutdown_tx.send(true);
 
     // Give slots a bounded window to finish in-flight work; then exit (dropping
@@ -138,6 +147,12 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         ));
     } else {
         log("all slots drained; exiting");
+    }
+    if fatal {
+        bail!(
+            "daemon shut down because a slot received an unleased activation under --with-lease — \
+             the engine is not issuing leases, so the requested fencing is impossible"
+        );
     }
     Ok(())
 }
@@ -222,8 +237,12 @@ pub(crate) fn short_hostname() -> String {
         .to_ascii_lowercase()
 }
 
-/// Resolve when the daemon should shut down: Ctrl-C or (on Unix) SIGTERM.
-pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) {
+/// Block until a shutdown trigger fires. Returns `true` when a slot flipped the
+/// `fatal` watch — an unrecoverable misconfiguration (e.g. an unleased activation
+/// under `--with-lease`) that must exit loudly — and `false` for an operator
+/// Ctrl-C/SIGTERM drain. The caller distinguishes the two so a fatal shutdown
+/// surfaces as a non-zero exit rather than a clean `Ok(())`.
+pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) -> bool {
     // Also wake if a slot flips the shutdown watch (a fatal misconfiguration,
     // e.g. an unleased activation under --with-lease), so the daemon exits loudly
     // rather than lingering with the offending slot stopped.
@@ -237,24 +256,23 @@ pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(_) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = slot_requested => {}
-                }
-                return;
+                return tokio::select! {
+                    _ = tokio::signal::ctrl_c() => false,
+                    _ = slot_requested => true,
+                };
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-            _ = slot_requested => {}
+            _ = tokio::signal::ctrl_c() => false,
+            _ = term.recv() => false,
+            _ = slot_requested => true,
         }
     }
     #[cfg(not(unix))]
     {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = slot_requested => {}
+            _ = tokio::signal::ctrl_c() => false,
+            _ = slot_requested => true,
         }
     }
 }
@@ -324,5 +342,18 @@ mod tests {
             "copilot",
             &["--allow-all".into()]
         ));
+    }
+
+    // A slot that flips the fatal watch (an unleased activation under
+    // `--with-lease`) must be reported as fatal so `run` exits non-zero rather
+    // than returning a clean drain `Ok(())`.
+    #[tokio::test]
+    async fn wait_for_signal_reports_slot_requested_fatal() {
+        let (tx, _rx) = watch::channel(false);
+        tx.send(true).expect("flip fatal watch");
+        assert!(
+            wait_for_signal(&tx).await,
+            "a slot-flipped watch must be reported as a fatal shutdown"
+        );
     }
 }
