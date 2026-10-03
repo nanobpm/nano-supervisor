@@ -1318,6 +1318,22 @@ fn git_head(dir: &Path) -> Option<String> {
     git_head_timeout(dir, GIT_HEAD_TIMEOUT)
 }
 
+/// `git_head` dispatched to the blocking pool. The probe polls a spawned
+/// `Command` with `thread::sleep` (see `git_head_timeout`); run inline on a
+/// Tokio worker thread that occupies the worker for the whole probe, and a
+/// wedged agent-controlled checkout (e.g. `.git/HEAD` a FIFO) then holds it for
+/// the full [`GIT_HEAD_TIMEOUT`] — long enough to starve the lease refresher
+/// (especially on a single-core host) and lose the very lease this job runs
+/// under. Use this from async contexts; `git_head` remains for synchronous
+/// callers and tests. Best-effort like the probe itself: a panicked or
+/// cancelled blocking task reads as `None` ("no commits"), the safe default.
+pub(crate) async fn git_head_blocking(dir: PathBuf) -> Option<String> {
+    tokio::task::spawn_blocking(move || git_head(&dir))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
 /// checkout. A healthy read is milliseconds; 5s is generous headroom for a
 /// loaded host while still bounding a blocked one well under any activation
@@ -1469,7 +1485,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // "commits" signal from a pre/post `rev-parse` of this HEAD (any advance =
     // a commit) and reports no push. `None` for a non-git run dir (no
     // repository) or when HEAD can't be read — treated as "no commits".
-    let start_head = git_head(&agent_cwd);
+    let start_head = git_head_blocking(agent_cwd.clone()).await;
 
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
@@ -1574,7 +1590,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let provisioned = env.repository.is_some();
     let has_commits = detect_commits(
         start_head.as_deref(),
-        git_head(&agent_cwd).as_deref(),
+        git_head_blocking(agent_cwd.clone()).await.as_deref(),
         provisioned,
     );
 
@@ -3037,6 +3053,48 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "probe must be bounded, took {elapsed:?}"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn git_head_blocking_does_not_starve_the_runtime() {
+        // The class Copilot flagged in review 5400515287: run inline, the
+        // probe's `try_wait` + `thread::sleep` poll would occupy the single
+        // Tokio worker for the whole wedged-probe timeout, starving a
+        // concurrent task (the lease refresher's analogue). On the blocking
+        // pool the worker stays free, so the concurrent task completes while
+        // the probe is still waiting out its (wedged) deadline.
+        let base =
+            std::env::temp_dir().join(format!("nano-git-head-starve-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let git_dir = base.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        // A FIFO never yields data, so git blocks reading HEAD until the
+        // probe's deadline kills it — the probe takes the full timeout.
+        let mk = std::process::Command::new("mkfifo")
+            .arg(git_dir.join("HEAD"))
+            .output()
+            .unwrap();
+        assert!(mk.status.success(), "mkfifo failed");
+
+        let started = Instant::now();
+        let probe = tokio::spawn(git_head_blocking(base.clone()));
+        // Yield so the probe is dispatched to the blocking pool before the
+        // concurrent task starts.
+        tokio::task::yield_now().await;
+        // The lease-refresher analogue: a task that must keep running while the
+        // probe waits. On a single worker it can only complete if the probe is
+        // NOT holding that worker.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < GIT_HEAD_TIMEOUT,
+            "the runtime worker was starved for the whole probe ({waited:?}); the probe must run on the blocking pool"
+        );
+        // The wedged probe still resolves to "no commits" once its deadline
+        // kills the blocked git.
+        assert_eq!(probe.await.unwrap(), None);
         std::fs::remove_dir_all(&base).ok();
     }
 
