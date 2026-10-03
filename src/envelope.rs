@@ -38,11 +38,18 @@ pub struct Envelope {
     pub normalized: Value,
 }
 
+/// Node's `str(v) = (v == null ? undefined : String(v))`: `null`/absent drops
+/// the field, every other value is its JavaScript `String(v)`. Arrays join with
+/// "," (`String(["x"])` is `"x"`) and a plain object is `"[object Object]"` —
+/// NOT JSON — so `promptFile: ["x"]` normalizes to `"x"` and `ref: ["a","b"]`
+/// to `"a,b"`, exactly as the plugin delivers them. A prior version used
+/// `Value::to_string()` (JSON), so `promptFile: ["x"]` became the literal
+/// `["x"]` — a divergence from the field-for-field Node parity this normalize
+/// claims.
 fn as_str(v: &Value) -> Option<String> {
     match v {
-        Value::String(s) => Some(s.clone()),
         Value::Null => None,
-        other => Some(other.to_string()),
+        other => Some(js_stringify(other)),
     }
 }
 
@@ -208,12 +215,21 @@ pub fn assemble(custom_headers: &Map<String, Value>, variables: &Map<String, Val
     }
 }
 
-/// Node's `coerceInt`: a number, or a string with a leading integer.
+/// Node's `coerceInt`: `null`/`""` → absent; otherwise
+/// `Number.parseInt(String(v), 10)` kept only when finite. `String(v)` runs
+/// FIRST, so a non-string is stringified the JavaScript way before the leading
+/// integer is parsed: `timeoutMs: ["1000"]` → `String(["1000"])` is `"1000"` →
+/// `1000`, and `["1","2"]` → `"1,2"` → `1`. A prior version parsed only a JSON
+/// string and dropped arrays/objects entirely, so `timeoutMs: ["1000"]` was
+/// lost where Node yields `1000`. `parseInt` trims leading whitespace and reads
+/// the longest `[+-]?digit*` prefix; a leading `+`/`-` with no digit, or no
+/// leading digit at all, is `NaN` → absent.
 fn coerce_int(v: Option<&Value>) -> Option<i64> {
     match v {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-        Some(Value::String(s)) => {
-            let t = s.trim();
+        Some(other) => {
+            let t = js_stringify(other);
+            let t = t.trim_start();
             let end = t
                 .char_indices()
                 .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
@@ -221,7 +237,7 @@ fn coerce_int(v: Option<&Value>) -> Option<i64> {
                 .unwrap_or(t.len());
             t[..end].parse().ok()
         }
-        _ => None,
+        None => None,
     }
 }
 
@@ -294,12 +310,15 @@ fn normalize(raw: &Map<String, Value>, prompt: Option<&str>) -> Value {
         .get("setup")
         .and_then(Value::as_object)
         .unwrap_or(&empty);
+    // Node: `Array.isArray(setup.commands) ? setup.commands.map(String) : []`.
+    // Every element is `String(x)`, so a nested array joins with "," and an
+    // object is `"[object Object]"` — via the shared `js_stringify`, never JSON.
     let strings = |v: Option<&Value>| -> Value {
         Value::Array(
             v.and_then(Value::as_array)
                 .map(|a| {
                     a.iter()
-                        .map(|x| Value::String(as_str(x).unwrap_or_else(|| "null".into())))
+                        .map(|x| Value::String(js_stringify(x)))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -465,6 +484,47 @@ mod tests {
         // Nested arrays recurse through join: [[null,"on"]] → ",on" → default.
         assert!(coerce_bool(Some(&json!([[null, "on"]])), true));
         assert!(!coerce_bool(Some(&json!([[null, "on"]])), false));
+    }
+
+    #[test]
+    fn string_and_int_fields_apply_node_string_v() {
+        // Node's `str(v) = String(v)` and `coerceInt(v) = parseInt(String(v),10)`
+        // run on EVERY value shape, not just strings — a "previously missed"
+        // parity gap where arrays were JSON-serialised or dropped instead of
+        // JS-stringified.
+        // String fields: String(["x"]) is "x"; String(["a","b"]) is "a,b";
+        // String({}) is "[object Object]" (NOT JSON); String(null) drops the field.
+        assert_eq!(as_str(&json!(["x"])).as_deref(), Some("x"));
+        assert_eq!(as_str(&json!(["a", "b"])).as_deref(), Some("a,b"));
+        assert_eq!(as_str(&json!({"k": 1})).as_deref(), Some("[object Object]"));
+        assert_eq!(as_str(&json!("s")).as_deref(), Some("s"));
+        assert_eq!(as_str(&json!(42)).as_deref(), Some("42"));
+        assert!(as_str(&json!(null)).is_none());
+        // Int fields: parseInt(String(["1000"])) → 1000 (was dropped); a
+        // multi-element array parses only its leading integer ("1,2" → 1); a
+        // non-numeric-leading value is NaN → absent.
+        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(1000));
+        assert_eq!(coerce_int(Some(&json!(["1", "2"]))), Some(1));
+        assert_eq!(coerce_int(Some(&json!(" 42abc"))), Some(42));
+        assert_eq!(coerce_int(Some(&json!("abc"))), None);
+        assert_eq!(coerce_int(Some(&json!([]))), None); // String([]) is "" → NaN
+        assert_eq!(coerce_int(Some(&json!(7))), Some(7));
+        assert_eq!(coerce_int(None), None);
+    }
+
+    #[test]
+    fn normalize_applies_string_v_to_promptfile_timeout_and_commands() {
+        // End-to-end through `normalize`: `promptFile: ["x"]` → "x",
+        // `timeoutMs: ["1000"]` → 1000, and a non-string setup command is
+        // String()-mapped (a nested array joins with ",").
+        let raw = json!({
+            "task": { "prompt": "p", "promptFile": ["x"], "timeoutMs": ["1000"] },
+            "setup": { "commands": ["echo hi", ["a", "b"], 7] },
+        });
+        let n = normalize(raw.as_object().unwrap(), None);
+        assert_eq!(n["task"]["promptFile"], json!("x"));
+        assert_eq!(n["task"]["timeoutMs"], json!(1000));
+        assert_eq!(n["setup"]["commands"], json!(["echo hi", "a,b", "7"]));
     }
 
     #[test]

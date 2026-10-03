@@ -102,10 +102,25 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
                 std::env::temp_dir().join(format!("nano-runs-{}", std::process::id()))
             }),
     };
+    // Validate the configured path WITHOUT following symlinks BEFORE creating or
+    // canonicalizing it: `create_dir_all` follows a pre-existing
+    // `rust-worker-<pid>` symlink (or a symlinked ancestor of `--runs-dir`), and
+    // canonicalizing right after would erase the evidence that the requested
+    // root was reached through one — letting a planted link redirect
+    // `sweep_root` so the startup reaper deletes matching worker trees outside
+    // the requested root. Reject a symlinked leaf / ancestor first (the same
+    // hardening `prepare_run_dir` applies to each job's run dir), then create
+    // and canonicalize. The canonical path is re-validated below so a platform
+    // symlink (macOS `/var` → `/private/var`) is only ever resolved, never
+    // followed into a redirected sweep root.
+    slot::reject_symlink(&runs_dir)?;
+    slot::reject_symlinked_ancestors(&runs_dir)?;
     std::fs::create_dir_all(&runs_dir)?;
     // Resolve platform symlinks in the path (macOS `/var` → `/private/var`):
     // the run-dir sweep refuses any root with a symlinked ancestor.
     let runs_dir = std::fs::canonicalize(&runs_dir)?;
+    slot::reject_symlink(&runs_dir)?;
+    slot::reject_symlinked_ancestors(&runs_dir)?;
     // Sweep at the SHARED parent of this worker's namespace, not the namespace
     // itself: a crashed worker leaves `rust-worker-<old-pid>` as a sibling of
     // the next launch's root, so sweeping only `runs_dir` could never discover
@@ -177,12 +192,28 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
             log("shutdown signal received; draining…");
             let _ = shutdown_tx.send(true);
             // A graceful drain that ends in a slot panic is still a crash —
-            // surface it rather than reporting a clean shutdown.
-            slot_result = match tokio::time::timeout(Duration::from_secs(20), slot_task).await {
+            // surface it rather than reporting a clean shutdown. On timeout the
+            // slot is STILL RUNNING: `timeout` only cancels the join *wait*, and
+            // dropping the `JoinHandle` would detach the live task, so cleanup
+            // (the namespace teardown below) could race a worker that is still
+            // writing run dirs, and `work::run` would return while its worker
+            // runs on. Abort the task and then JOIN it, so the handle is awaited
+            // to completion and no slot outlives this function. The abort join
+            // error is expected (we cancelled it), not a crash, so map it to
+            // `Ok(())` rather than propagating it as a worker failure.
+            slot_result = match tokio::time::timeout(Duration::from_secs(20), &mut slot_task).await
+            {
                 Ok(r) => r,
                 Err(_) => {
                     log("slot did not drain within 20s of shutdown; aborting it");
-                    Ok(())
+                    slot_task.abort();
+                    match slot_task.await {
+                        // Aborted as requested: the task is finished, not running.
+                        Err(e) if e.is_cancelled() => Ok(()),
+                        // It completed (or panicked) just as we aborted: keep the
+                        // real outcome so a panic still surfaces as a crash.
+                        other => other,
+                    }
                 }
             };
         }

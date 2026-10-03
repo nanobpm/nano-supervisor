@@ -316,7 +316,7 @@ fn restrict_dir_mode(dir: &Path) -> Result<()> {
 /// the agent cwd and `restrict_dir_mode` would otherwise target a path outside
 /// `runs_dir`. `symlink_metadata` inspects the link itself rather than
 /// following it, so a dangling or replaced link is still caught.
-fn reject_symlink(dir: &Path) -> Result<()> {
+pub(crate) fn reject_symlink(dir: &Path) -> Result<()> {
     if std::fs::symlink_metadata(dir)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -341,7 +341,7 @@ fn reject_symlink(dir: &Path) -> Result<()> {
 /// is skipped: `create_dir_all` will materialise it as a fresh real directory,
 /// not follow a link. Paired with the leaf [`reject_symlink`] and re-run after
 /// the non-atomic create, this closes the whole chain to symlink redirection.
-fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
+pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
     for ancestor in dir.ancestors() {
         if std::fs::symlink_metadata(ancestor)
             .map(|m| m.file_type().is_symlink())
@@ -1052,6 +1052,28 @@ struct RunResult {
     has_turns: bool,
 }
 
+/// Best-effort `git rev-parse HEAD` of a checkout, for the empty-job detector's
+/// "did the agent commit anything" signal. Returns `None` when `dir` is not a
+/// git work tree (a no-repository run dir) or git fails — both read as "no
+/// commits", which is the safe default (a genuinely empty no-git run is still
+/// failed; only a *repository* run gets the commit signal). Never fails the job.
+fn git_head(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(dir)
+        // An agent-controlled checkout could carry a prompt/sidebar config; keep
+        // the invocation minimal and non-interactive.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
 async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
@@ -1097,6 +1119,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         }
         None => run_dir.clone(),
     };
+    // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
+    // the empty-job detector can tell whether the agent committed anything.
+    // Node feeds `gitResult.commits`/`pushed` into `detectEmptyAgentJob`; the
+    // Rust worker has no `finalizeGit` push stage yet, so it derives the
+    // "commits" signal from a pre/post `rev-parse` of this HEAD (any advance =
+    // a commit) and reports no push. `None` for a non-git run dir (no
+    // repository) or when HEAD can't be read — treated as "no commits".
+    let start_head = git_head(&agent_cwd);
 
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
@@ -1175,9 +1205,24 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             message: format!("agent \"{name}\" failed: {detail}"),
             vars: Some(envelope_vars()),
         }
-    } else if let Some(reason) =
-        result::detect_empty(raw_result.as_ref(), &run.stdout, run.has_turns)
-    {
+    } else if let Some(reason) = {
+        // Node's `gitResult.commits.length > 0` / `pushed === true` empty-detection
+        // signals. A repository agent that advanced the checkout HEAD committed
+        // real work, so it is NOT empty even with no stdout/result; failing it
+        // would burn a retry. No `finalizeGit` push stage exists yet, so
+        // `pushed` is always false here.
+        let has_commits = match (start_head.as_deref(), git_head(&agent_cwd)) {
+            (Some(before), Some(after)) => before != after,
+            _ => false,
+        };
+        result::detect_empty(
+            raw_result.as_ref(),
+            &run.stdout,
+            run.has_turns,
+            has_commits,
+            false,
+        )
+    } {
         Settle::Fail {
             message: format!("agent \"{name}\" produced an empty result: {reason}"),
             vars: Some(envelope_vars()),

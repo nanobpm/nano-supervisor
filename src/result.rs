@@ -273,14 +273,23 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
 
 /// The empty-job detector — the Node plugin's `detectEmptyAgentJob`. A run that
 /// produced NOTHING — no effective result vars, no substantive stdout (after
-/// value-less result markers/fences are stripped) and no transcript turns (ACP
-/// `session/update` activity) — did no work: completing it would silently drop
-/// whatever the job carried, so the caller FAILS the job instead. Returns the
-/// Node plugin's reason text when the run is empty.
+/// value-less result markers/fences are stripped), no transcript turns (ACP
+/// `session/update` activity) and no repository work — did no work: completing
+/// it would silently drop whatever the job carried, so the caller FAILS the job
+/// instead. Returns the Node plugin's reason text when the run is empty.
+///
+/// `has_commits` / `has_pushed` are the plugin's `gitResult.commits.length > 0`
+/// and `gitResult.pushed === true` signals: a repository agent that commits or
+/// pushes real work but emits no stdout/result is NOT empty and must complete,
+/// not be failed into a retry. The Rust worker has no `finalizeGit` push stage
+/// yet, so the caller derives `has_commits` from a pre/post `rev-parse` of the
+/// checkout HEAD (any advance = a commit) and passes `has_pushed: false`.
 pub fn detect_empty(
     result_vars: Option<&Map<String, Value>>,
     stdout: &str,
     has_turns: bool,
+    has_commits: bool,
+    has_pushed: bool,
 ) -> Option<String> {
     if result_vars.is_some_and(has_effective_result_vars) {
         return None;
@@ -289,6 +298,12 @@ pub fn detect_empty(
         return None;
     }
     if has_turns {
+        return None;
+    }
+    // Node: `if ((gitResult?.commits?.length ?? 0) > 0) return null;` then
+    // `if (gitResult?.pushed === true) return null;` — repository work alone
+    // (commits or a push) is evidence the run was not a no-op husk.
+    if has_commits || has_pushed {
         return None;
     }
     Some(
@@ -342,7 +357,7 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_sentinel() {
         let out = "::nano:result:: {}\n";
-        assert!(detect_empty(None, out, false).is_some());
+        assert!(detect_empty(None, out, false, false, false).is_some());
     }
 
     #[test]
@@ -353,7 +368,7 @@ mod tests {
         // at offset 0 and leave the fence residue behind.
         let out = "```json\n```\n";
         assert!(
-            detect_empty(None, out, false).is_some(),
+            detect_empty(None, out, false, false, false).is_some(),
             "empty fence should not count as work"
         );
     }
@@ -361,19 +376,19 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_fence() {
         let out = "```json\n{}\n```\n";
-        assert!(detect_empty(None, out, false).is_some());
+        assert!(detect_empty(None, out, false, false, false).is_some());
     }
 
     #[test]
     fn not_empty_with_prose_fence() {
         // A non-empty, non-result fenced block is genuine output and is kept.
         let out = "```\nsome code the agent wrote\n```\n";
-        assert!(detect_empty(None, out, false).is_none());
+        assert!(detect_empty(None, out, false, false, false).is_none());
     }
 
     #[test]
     fn not_empty_with_substantive_stdout() {
-        assert!(detect_empty(None, "did real work\n", false).is_none());
+        assert!(detect_empty(None, "did real work\n", false, false, false).is_none());
     }
 
     #[test]
@@ -382,15 +397,33 @@ mod tests {
         // assistant text) and no structured result produced nothing to settle;
         // with no substantive stdout it must be failed, not silently completed.
         // (Finding: tool-only ACP updates must not bypass empty-run detection.)
-        assert!(detect_empty(None, "", false).is_some());
+        assert!(detect_empty(None, "", false, false, false).is_some());
         // Transcript turns (ACP session/update activity) count as work, as in Node.
-        assert!(detect_empty(None, "", true).is_none());
+        assert!(detect_empty(None, "", true, false, false).is_none());
     }
 
     #[test]
     fn not_empty_with_effective_vars() {
         let o = obj(json!({"status":"done"}));
-        assert!(detect_empty(Some(&o), "", false).is_none());
+        assert!(detect_empty(Some(&o), "", false, false, false).is_none());
+    }
+
+    #[test]
+    fn not_empty_with_commits_or_push() {
+        // Node's `gitResult.commits.length > 0` / `gitResult.pushed === true`:
+        // a repository agent that committed or pushed real work is NOT empty
+        // even with no result vars, no stdout and no transcript turns — failing
+        // it would burn a retry (the advisory this regression pins).
+        assert!(
+            detect_empty(None, "", false, true, false).is_none(),
+            "a commit alone must mark the run non-empty"
+        );
+        assert!(
+            detect_empty(None, "", false, false, true).is_none(),
+            "a push alone must mark the run non-empty"
+        );
+        // …but with neither, the otherwise-empty run is still failed.
+        assert!(detect_empty(None, "", false, false, false).is_some());
     }
 
     #[test]
