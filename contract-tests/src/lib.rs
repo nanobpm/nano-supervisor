@@ -727,6 +727,11 @@ pub struct JobOutcome {
     record_path: PathBuf,
     pub output: std::process::Output,
     home_path: PathBuf,
+    /// Owns the worker's `C8CTL_NANO_HOME` when [`run_worker_job`] created a
+    /// fresh one, so the temp dir outlives the outcome and [`JobOutcome::home`]
+    /// never dangles. `None` when the caller supplied the home
+    /// ([`run_worker_job_in`]) — there the caller's `TempHome` keeps it alive.
+    _home: Option<TempHome>,
     _work: tempfile::TempDir,
 }
 
@@ -734,6 +739,10 @@ impl JobOutcome {
     /// The isolated `C8CTL_NANO_HOME` the worker ran under — the root of its
     /// `agent-runs/rust-worker-<pid>` run namespaces. Tests that seed or inspect
     /// run dirs (e.g. the stale-run sweep) use this to find the sweep root.
+    ///
+    /// The home directory is alive for as long as this outcome: [`run_worker_job`]
+    /// outcomes own their fresh `TempHome`, and [`run_worker_job_in`] outcomes
+    /// borrow the caller's (which the caller must keep alive).
     pub fn home(&self) -> &Path {
         &self.home_path
     }
@@ -844,10 +853,53 @@ pub fn run_worker_job(
     worker_flags: &[&str],
     extra_env: &[(&str, &str)],
 ) -> JobOutcome {
-    run_worker_job_in(
+    // Own the fresh home so it outlives the returned outcome: passing a
+    // temporary `&TempHome::new()` would drop it (deleting the temp dir and
+    // stopping any daemon) when this function returns, leaving
+    // `JobOutcome::home()` pointing at a removed directory.
+    let home = TempHome::new();
+    let mut outcome = run_worker_job_with_home(
         engine,
         target,
-        &TempHome::new(),
+        &home,
+        None,
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+    );
+    // The outcome cloned the home's path (it borrows nothing from `home`), so
+    // now that the `&home` borrow has ended, move the home into the outcome to
+    // keep the temp dir alive for the outcome's lifetime.
+    outcome._home = Some(home);
+    outcome
+}
+
+/// [`run_worker_job`] against a caller-supplied [`TempHome`] instead of a fresh
+/// one, so a test can run the worker twice (or seed/inspect run dirs) under ONE
+/// shared home — e.g. the stale-run sweep, which must plant a dead-worker's run
+/// tree in the same `agent-runs` root the next worker's startup sweep walks.
+///
+/// The caller keeps `home` alive; the returned [`JobOutcome`] borrows its path
+/// but does not own it, so the caller must keep the `TempHome` alive for as
+/// long as it uses the outcome's [`JobOutcome::home`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_in(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> JobOutcome {
+    run_worker_job_with_home(
+        engine,
+        target,
+        home,
+        None,
         test,
         script,
         vars,
@@ -856,15 +908,16 @@ pub fn run_worker_job(
     )
 }
 
-/// [`run_worker_job`] against a caller-supplied [`TempHome`] instead of a fresh
-/// one, so a test can run the worker twice (or seed/inspect run dirs) under ONE
-/// shared home — e.g. the stale-run sweep, which must plant a dead-worker's run
-/// tree in the same `agent-runs` root the next worker's startup sweep walks.
+/// Shared body of [`run_worker_job`] / [`run_worker_job_in`]. `owned_home` is
+/// `Some` when the worker ran under a home this harness created (so the outcome
+/// must own it to keep the temp dir alive) and `None` when the caller supplied
+/// `home` (and so keeps it alive).
 #[allow(clippy::too_many_arguments)]
-pub fn run_worker_job_in(
+fn run_worker_job_with_home(
     engine: &Engine,
     target: &Target,
     home: &TempHome,
+    owned_home: Option<TempHome>,
     test: &str,
     script: &[serde_json::Value],
     vars: serde_json::Value,
@@ -936,6 +989,7 @@ pub fn run_worker_job_in(
         record_path,
         output,
         home_path: home.path().to_path_buf(),
+        _home: owned_home,
         _work: work,
     }
 }
