@@ -220,10 +220,16 @@ fn is_short_c_flag(name: &str) -> bool {
 
 /// `true` when a token only re-execs or decorates the real command (`exec`,
 /// `command`, `builtin`, `env`, or a `VAR=value` assignment), so the command
-/// name is the first token PAST any such prefix.
+/// name is the first token PAST any such prefix. The wrapper name is matched by
+/// BASENAME, as [`is_shell_command`] already does for absolute shell paths: a
+/// hire such as `command = "/usr/bin/env"`, `args = ["sh", "-c", "nano-coder"]`
+/// runs `sh` as the real program, and matching only the bare `env` would stop at
+/// the `/usr/bin/env` wrapper, gate the `-c` injection off, and append `--acp`
+/// to the outer argv where POSIX `sh` swallows it as `$0`.
 fn is_launch_prefix(t: &str) -> bool {
     let t = t.trim_matches(|c| c == '"' || c == '\'');
-    matches!(t, "exec" | "command" | "builtin" | "env")
+    let base = t.rsplit(['/', '\\']).next().unwrap_or(t);
+    matches!(base, "exec" | "command" | "builtin" | "env")
         || (!t.starts_with('-')
             && t.split_once('=').is_some_and(|(k, _)| {
                 !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -801,6 +807,52 @@ mod tests {
         env_agent.args = vec!["nano-coder".into(), "-c".into(), "config".into()];
         assert_eq!(
             acp_spawn_args(&env_agent),
+            vec![
+                "nano-coder".to_string(),
+                "-c".to_string(),
+                "config".to_string(),
+                "--acp".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_when_shell_is_behind_an_absolute_launch_prefix() {
+        // The launch wrapper may be invoked by ABSOLUTE path (`command =
+        // "/usr/bin/env"`). Matching only the bare `env` stops at the wrapper, so
+        // the `-c` injection is gated off and `--acp` is appended to the outer
+        // argv, where POSIX `sh` swallows it as `$0` and the inner agent never
+        // sees it. Match the wrapper by basename, as `is_shell_command` already
+        // does for absolute shell paths.
+        let mut abs_env = hire(Protocol::Acp, "/usr/bin/env", "none");
+        abs_env.args = vec!["sh".into(), "-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&abs_env),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // Same for the other wrappers behind an absolute path.
+        let mut abs_exec = hire(Protocol::Acp, "/usr/bin/exec", "none");
+        abs_exec.args = vec!["bash".into(), "-lc".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&abs_exec),
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // An absolute-path wrapper in front of a NON-shell program is still just
+        // appended to — basename matching must not mistake it for a shell.
+        let mut abs_env_agent = hire(Protocol::Acp, "/usr/bin/env", "none");
+        abs_env_agent.args = vec!["nano-coder".into(), "-c".into(), "config".into()];
+        assert_eq!(
+            acp_spawn_args(&abs_env_agent),
             vec![
                 "nano-coder".to_string(),
                 "-c".to_string(),
