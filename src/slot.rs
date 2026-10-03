@@ -551,6 +551,18 @@ fn is_active_run(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Test-only seam for the check/remove TOCTOU regression test: when set,
+/// [`remove_if_inactive`] invokes this closure with the path after the active
+/// check has found it inactive but BEFORE the removal runs, letting a test land
+/// a registration exactly in that window. `None` in every non-test build and
+/// whenever no test has armed it, so production behaviour is unchanged. The
+/// slot is cleared BEFORE the closure fires, so a panicking test cannot leave
+/// the hook armed for its neighbours.
+#[cfg(test)]
+type RemovePauseHook = Box<dyn FnOnce(&Path) + Send>;
+#[cfg(test)]
+static REMOVE_IF_INACTIVE_PAUSE: Mutex<Option<RemovePauseHook>> = Mutex::new(None);
+
 /// Atomically check `path` against [`active_runs`] and, when it is not
 /// registered, remove it — all while holding the active-runs mutex. This closes
 /// the check/remove TOCTOU that a bare `is_active_run` + `remove_*` pair leaves
@@ -570,6 +582,19 @@ fn remove_if_inactive(path: &Path, remove: impl FnOnce()) -> bool {
     };
     if map.contains_key(path) {
         return false;
+    }
+    // Test-only: let the regression test park the sweep exactly here — after
+    // the check, before the removal — so it can attempt a registration in the
+    // window the atomic fix closes. A correct (locked) implementation blocks
+    // that registration until the delete is decided; the pre-fix pair held no
+    // lock here, so the registration landed and the live run was deleted.
+    #[cfg(test)]
+    if let Some(pause) = REMOVE_IF_INACTIVE_PAUSE
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    {
+        pause(path);
     }
     // The lock is held continuously from the check through the removal, so no
     // `ActiveRunGuard::new` can register `path` in between — the retry blocks on
@@ -2064,11 +2089,29 @@ mod tests {
 
     #[test]
     fn sweep_remove_is_atomic_against_concurrent_registration() {
-        // Regression for the check/remove TOCTOU: a retry registering the same
-        // run path must not be able to slip in between the sweep's liveness
-        // check and its `remove_tree`. `remove_if_inactive` holds the
-        // active-runs mutex across both, so a concurrent `ActiveRunGuard::new`
-        // blocks until the delete is decided — the live run is never reaped.
+        // Regression for the check/remove TOCTOU, driven deterministically
+        // through the test-only pause hook in `remove_if_inactive`: the sweep
+        // is parked AFTER its liveness check has found the run inactive but
+        // BEFORE the removal runs, and a retry's `ActiveRunGuard::new` for the
+        // same path is attempted exactly in that window.
+        //
+        // What each implementation does with a registration in that window:
+        //   - pre-fix (bare `is_active_run` + unlocked remove): no lock is
+        //     held across the window, so the registration lands IMMEDIATELY
+        //     and the removal then deletes the newly-registered live run out
+        //     from under the retry.
+        //   - fixed (mutex held across check+remove): the registration BLOCKS
+        //     until the removal finishes, then registers — the delete never
+        //     observes a live registration, and the retry's `prepare_run_dir`
+        //     recreates the dir.
+        //
+        // The test asserts the observable split between the two:
+        //   1. whether the registration completed while the sweep was parked
+        //      (pre-fix: yes; fixed: no, it is blocked on the mutex), and
+        //   2. that the live registration is never silently lost: after the
+        //     sweep, `active_runs` holds the path and a subsequent sweep skips
+        //     it (pre-fix: the guard registered fine but its dir was deleted —
+        //     the invariant "registered ⇒ on disk" is violated).
         let root = std::env::temp_dir().join(format!(
             "nano-atomic-test-{}-{}",
             std::process::id(),
@@ -2084,39 +2127,71 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let run_abs = std::path::absolute(&run).unwrap();
 
-        // Deterministic core: a run dir kept continuously registered across a
-        // sweep must survive, however aged. This is the invariant the atomic
-        // check-and-remove protects.
-        let guard = ActiveRunGuard::new(&run_abs);
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let hook_path = run_abs.clone();
+        *REMOVE_IF_INACTIVE_PAUSE.lock().unwrap() = Some(Box::new(move |p| {
+            assert_eq!(p, hook_path.as_path(), "hook fired for an unexpected path");
+            // Parked in the check/remove window: tell the main thread, then
+            // wait until it has attempted the racing registration.
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+
+        let sweep_path = run_abs.clone();
+        let sweep = std::thread::spawn(move || {
+            remove_if_inactive(&sweep_path, || {
+                std::fs::remove_dir_all(&sweep_path).ok();
+            })
+        });
+
+        // Wait until the sweep is provably parked between check and remove,
+        // then attempt the registration a racing retry would make.
+        entered_rx.recv().unwrap();
+        let reg_path = run_abs.clone();
+        let registration = std::thread::spawn(move || ActiveRunGuard::new(&reg_path));
+
+        // Assertion 1: with the mutex held across the window, the registration
+        // CANNOT complete while the sweep is parked. Give it a generous beat;
+        // a completed registration here means no lock was held (the pre-fix
+        // behaviour) — and the parked removal is about to delete a live run.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !registration.is_finished(),
+            "registration completed inside the sweep's check/remove window: \
+             the active-runs mutex is not held across it (pre-fix TOCTOU)"
+        );
+
+        // Release the sweep. The registration then unblocks and registers.
+        // (No assertion on the sweep's own outcome here: what a hypothetical
+        // re-checking implementation returns is not the invariant under test,
+        // and joining the registration first keeps every failure a bounded
+        // panic rather than a hang.)
+        release_tx.send(()).unwrap();
+        let guard = registration.join().unwrap();
+        sweep.join().unwrap();
+
+        // Assertion 2: the registration survived the sweep — the path is
+        // active now, exactly as the retry expects after `ActiveRunGuard::new`
+        // returns. The retry's own `prepare_run_dir` recreates the dir; the
+        // sweep must then skip it no matter how aged it looks.
+        assert!(
+            is_active_run(&run_abs),
+            "the registration that raced the sweep must not be lost"
+        );
+        std::fs::create_dir_all(&run).unwrap();
         sweep_stale_runs(&root, Duration::ZERO, false);
         assert!(
             run.exists(),
-            "a run registered as active must never be swept"
+            "a run registered as active must never be swept, however aged"
         );
         drop(guard);
 
-        // Concurrency smoke check: hammer the sweep while a register/deregister
-        // cycle runs on another thread. With the atomic check-and-remove, no
-        // interleaving panics, deadlocks, or tears — the sweep and the churn
-        // just serialise on the mutex. (No assertion on the dir's existence
-        // here: whether it survives a given pass depends on whether a guard
-        // happened to be live, which is intentionally nondeterministic.)
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let run2 = run_abs.clone();
-        let churn = std::thread::spawn(move || {
-            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-                let g = ActiveRunGuard::new(&run2);
-                std::thread::sleep(Duration::from_millis(1));
-                drop(g);
-            }
-        });
-        for _ in 0..50 {
-            std::fs::create_dir_all(&run).unwrap();
-            sweep_stale_runs(&root, Duration::ZERO, false);
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        churn.join().unwrap();
+        // Once the guard drops, the same dir is eligible again.
+        assert!(!is_active_run(&run_abs));
+        sweep_stale_runs(&root, Duration::ZERO, false);
+        assert!(!run.exists(), "a deregistered aged dir is swept normally");
 
         std::fs::remove_dir_all(&root).ok();
     }
