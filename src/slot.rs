@@ -1293,10 +1293,13 @@ struct RunResult {
     timed_out: bool,
     /// ACP `session/update` activity (the transcript turns Node counts).
     has_turns: bool,
-    /// The ACP prompt response's `_meta.outcome` (plugin 1.70.1). An explicit
-    /// outcome is an effective fallback result AND non-empty evidence, so it is
-    /// threaded through result selection and empty detection alongside the file
-    /// and stdout sources. `None` for the pipe protocol (no ACP outcome channel).
+    /// The ACP prompt response's canonical `_meta.outcome` (plugin 1.70.1):
+    /// `{status, summary}` only. It is non-empty evidence (threaded through
+    /// empty detection) and is recorded separately as
+    /// `io.nanobpm.agentResult.outcome`, but it contributes fallback RESULT
+    /// variables only via the blocked-only mapping (`acp::outcome_result_vars`)
+    /// at candidate selection. `None` for the pipe protocol (no ACP outcome
+    /// channel).
     acp_outcome: Option<Map<String, Value>>,
 }
 
@@ -1501,11 +1504,17 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // agent process in the same workspace, writing to the same result file.
     // Select the first EFFECTIVE result across file → stdout → ACP-outcome
     // sources (plugin 1.70.1), not merely the first that parses, so a `{}`
-    // result file does not shadow a usable stdout sentinel or ACP outcome.
+    // result file does not shadow a usable stdout sentinel or ACP outcome. The
+    // ACP outcome contributes only its BLOCKED-only result mapping
+    // (`outcome_result_vars`): a `completed` outcome derives no result vars, so
+    // it must not suppress this nudge.
     let already = result::select_effective_result([
         result::read_result_file(&result_file),
         result::parse_result_from_stdout(&first.stdout),
-        first.acp_outcome.clone(),
+        first
+            .acp_outcome
+            .as_ref()
+            .and_then(crate::acp::outcome_result_vars),
     ]);
     let mut run = first;
     if run.ok
@@ -1548,7 +1557,9 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         let recovered = result::select_effective_result([
             result::read_result_file(&result_file),
             result::parse_result_from_stdout(&run.stdout),
-            run.acp_outcome.clone(),
+            run.acp_outcome
+                .as_ref()
+                .and_then(crate::acp::outcome_result_vars),
         ])
         .is_some_and(|r| result::has_effective_result_vars(&r));
         log(&format!(
@@ -1563,11 +1574,17 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
 
     // Read the agent's structured result, selecting the first EFFECTIVE source
     // across file → stdout → ACP-outcome (plugin 1.70.1), and remove the result
-    // channel, as the Node plugin does.
+    // channel, as the Node plugin does. The ACP outcome contributes only its
+    // BLOCKED-only result mapping (`outcome_result_vars`): a `completed`
+    // outcome derives no result vars, so it injects no guessed top-level
+    // `status`. The canonical outcome is recorded SEPARATELY in the envelope as
+    // `io.nanobpm.agentResult.outcome` (see `build_result_envelope`).
     let raw_result = result::select_effective_result([
         result::read_result_file(&result_file),
         result::parse_result_from_stdout(&run.stdout),
-        run.acp_outcome.clone(),
+        run.acp_outcome
+            .as_ref()
+            .and_then(crate::acp::outcome_result_vars),
     ]);
     let _ = std::fs::remove_file(&result_file);
     let envelope = build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref());
@@ -1851,6 +1868,14 @@ fn build_result_envelope(
     });
     if let Some(r) = agent_result {
         env["result"] = Value::Object(r.clone());
+    }
+    // Plugin 1.70.1: record the canonical ACP outcome SEPARATELY from the
+    // selected `result`. The `result` field is the blocked-only result mapping
+    // (or a file/stdout result); the canonical `{status, summary}` outcome is a
+    // distinct audit record, preserved even when a file/stdout result shadows
+    // it in `result`, and never carrying the synthesized `question`.
+    if let Some(outcome) = &run.acp_outcome {
+        env["outcome"] = Value::Object(outcome.clone());
     }
     env
 }
@@ -2277,6 +2302,45 @@ mod tests {
             build_result_envelope(&failed, "none", None)["status"],
             "timedOut"
         );
+    }
+
+    #[test]
+    fn result_envelope_records_the_canonical_outcome_separately() {
+        // Plugin 1.70.1: the canonical ACP outcome is recorded as a DISTINCT
+        // `outcome` field, separate from the selected `result` — and preserved
+        // even when a file/stdout result shadows it in `result`.
+        let mut outcome = Map::new();
+        outcome.insert("status".into(), json!("blocked"));
+        outcome.insert("summary".into(), json!("need creds"));
+        let mut file_result = Map::new();
+        file_result.insert("status".into(), json!("done"));
+        let run = RunResult {
+            ok: true,
+            stdout: "out".into(),
+            exit_code: Some(0),
+            acp_outcome: Some(outcome.clone()),
+            ..RunResult::default()
+        };
+        let env = build_result_envelope(&run, "none", Some(&file_result));
+        // The selected result is the file result…
+        assert_eq!(env["result"], json!({ "status": "done" }));
+        // …while the canonical outcome is recorded separately, without the
+        // synthesized `question` (that mapping lives only in result vars).
+        assert_eq!(
+            env["outcome"],
+            json!({ "status": "blocked", "summary": "need creds" })
+        );
+        assert!(env["outcome"].get("question").is_none());
+
+        // No outcome → no `outcome` key at all.
+        let plain = RunResult {
+            ok: true,
+            stdout: "out".into(),
+            exit_code: Some(0),
+            ..RunResult::default()
+        };
+        let env = build_result_envelope(&plain, "none", Some(&file_result));
+        assert!(env.get("outcome").is_none());
     }
 
     #[test]
@@ -3014,10 +3078,21 @@ mod tests {
             assert!(out.status.success(), "git {args:?} failed");
         };
         git(&["init", "-q"]);
-        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
         let head = git_head(&base);
         assert!(
-            head.as_deref().is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+            head.as_deref()
+                .is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
             "expected a 40-char hex HEAD, got {head:?}"
         );
         std::fs::remove_dir_all(&base).ok();

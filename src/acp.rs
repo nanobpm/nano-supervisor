@@ -461,39 +461,67 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
 }
 
 /// The Node plugin's cap on an ACP outcome's `summary` (plugin 1.70.1): a
-/// longer summary is not a valid outcome.
+/// longer summary is TRUNCATED to this many characters, not discarded.
 const OUTCOME_SUMMARY_MAX: usize = 8_000;
 
 /// Extract the prompt response's `_meta.outcome` object (plugin 1.70.1),
 /// validated and canonicalized the way the Node plugin does before it uses one.
 ///
-/// The plugin accepts an outcome only when its `status` is `completed` or
-/// `blocked` and its `summary` is a non-blank string of at most 8,000
-/// characters; any other shape is discarded (`None`) rather than forwarded, so
-/// an arbitrary `_meta.outcome` object can neither suppress the nudge/empty
-/// guard nor be promoted into process variables. A `blocked` outcome is then
-/// mapped to the result vars the plugin synthesizes — `status: "blocked"`,
-/// `summary`, and `question: summary` (the question a blocked run must carry) —
-/// while a `completed` outcome keeps its own `status`/`summary`. Anything else
-/// the agent put on the object is dropped: the canonical outcome is what the
-/// audit envelope records separately.
+/// The plugin accepts an outcome only when its `status` is EXACTLY `completed`
+/// or `blocked` (lowercase, no surrounding whitespace) and its `summary` is a
+/// non-blank string; any other shape is discarded (`None`) rather than
+/// forwarded, so an arbitrary `_meta.outcome` object can neither suppress the
+/// nudge/empty guard nor be promoted into process variables. A summary longer
+/// than 8,000 characters is TRUNCATED to the cap (the plugin slices it), not
+/// dropped, so a valid long `blocked` outcome still escalates instead of being
+/// lost. The canonical outcome keeps ONLY `status` and `summary` here — the
+/// blocked-only result mapping (`question: summary`) is applied later, at the
+/// slot's candidate-selection step, so this canonical form stays the pure
+/// `io.nanobpm.agentResult.outcome` audit record.
 fn prompt_outcome(done: &Value) -> Option<Map<String, Value>> {
     let outcome = done.get("_meta")?.get("outcome")?.as_object()?;
-    let status = outcome.get("status")?.as_str()?.trim();
-    if !status.eq_ignore_ascii_case("completed") && !status.eq_ignore_ascii_case("blocked") {
+    // Plugin 1.70.1: an EXACT lowercase status match — no case folding, no
+    // trim. An uppercase/whitespace variant is not a valid outcome and must not
+    // suppress empty-result handling.
+    let status = outcome.get("status")?.as_str()?;
+    if status != "completed" && status != "blocked" {
         return None;
     }
     let summary = outcome.get("summary")?.as_str()?.trim();
-    if summary.is_empty() || summary.chars().count() > OUTCOME_SUMMARY_MAX {
+    if summary.is_empty() {
         return None;
     }
+    // Plugin 1.70.1 truncates an overlong summary to the cap rather than
+    // discarding the outcome. `floor_char_boundary` keeps the cut on a UTF-8
+    // boundary so a multibyte character is never split.
+    let summary = if summary.chars().count() > OUTCOME_SUMMARY_MAX {
+        let byte_cap = summary.floor_char_boundary(OUTCOME_SUMMARY_MAX);
+        &summary[..byte_cap]
+    } else {
+        summary
+    };
     let mut canonical = Map::new();
     canonical.insert("status".to_string(), Value::String(status.to_string()));
     canonical.insert("summary".to_string(), Value::String(summary.to_string()));
-    if status.eq_ignore_ascii_case("blocked") {
-        canonical.insert("question".to_string(), Value::String(summary.to_string()));
-    }
     Some(canonical)
+}
+
+/// The blocked-only result mapping (plugin 1.70.1): only a `blocked` ACP
+/// outcome derives fallback result variables — `{status, summary, question}`
+/// with `question` synthesized from the summary (the escalation a blocked run
+/// must surface to a human). A `completed` outcome derives NO result vars, so
+/// it must not suppress the re-emit nudge or inject a guessed top-level
+/// `status`; the canonical outcome is still recorded separately as
+/// `io.nanobpm.agentResult.outcome`.
+pub fn outcome_result_vars(outcome: &Map<String, Value>) -> Option<Map<String, Value>> {
+    if outcome.get("status")?.as_str()? != "blocked" {
+        return None;
+    }
+    let mut vars = outcome.clone();
+    if let Some(summary) = outcome.get("summary").cloned() {
+        vars.insert("question".to_string(), summary);
+    }
+    Some(vars)
 }
 
 /// `yolo`: pick an allow option, preferring allow_always, else the first option.
@@ -571,10 +599,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_outcome_blocked_maps_question_from_summary() {
-        // Plugin 1.70.1 maps a `blocked` outcome to result vars and synthesizes
-        // `question: summary`: the canonical outcome carries the summary as the
-        // question a blocked run must surface to a human.
+    fn prompt_outcome_keeps_canonical_status_and_summary_only() {
+        // The canonical outcome is the pure audit record: status + summary only.
+        // The blocked-only `question` mapping is applied later, at the slot's
+        // candidate-selection step — NOT here.
         let done = json!({
             "stopReason": "end_turn",
             "_meta": { "outcome": { "status": "blocked", "summary": "need creds" } }
@@ -582,20 +610,71 @@ mod tests {
         let out = prompt_outcome(&done).expect("blocked outcome must be extracted");
         assert_eq!(out["status"], "blocked");
         assert_eq!(out["summary"], "need creds");
-        assert_eq!(out["question"], "need creds");
+        assert!(
+            out.get("question").is_none(),
+            "the canonical outcome must not carry the synthesized question"
+        );
     }
 
     #[test]
-    fn prompt_outcome_completed_keeps_status_and_summary() {
-        let done = json!({
-            "stopReason": "end_turn",
-            "_meta": { "outcome": { "status": "completed", "summary": "shipped" } }
-        });
-        let out = prompt_outcome(&done).expect("completed outcome must be extracted");
-        assert_eq!(out["status"], "completed");
-        assert_eq!(out["summary"], "shipped");
-        // A completed outcome does not synthesize a question.
-        assert!(out.get("question").is_none());
+    fn outcome_result_vars_maps_only_blocked() {
+        // Plugin 1.70.1: only a `blocked` outcome derives fallback result vars,
+        // synthesizing `question: summary`. A `completed` outcome derives NONE.
+        let blocked = json!({ "status": "blocked", "summary": "need creds" });
+        let vars = outcome_result_vars(blocked.as_object().unwrap())
+            .expect("a blocked outcome must derive result vars");
+        assert_eq!(vars["status"], "blocked");
+        assert_eq!(vars["summary"], "need creds");
+        assert_eq!(vars["question"], "need creds");
+
+        let completed = json!({ "status": "completed", "summary": "shipped" });
+        assert!(
+            outcome_result_vars(completed.as_object().unwrap()).is_none(),
+            "a completed outcome must derive no result vars"
+        );
+    }
+
+    #[test]
+    fn prompt_outcome_requires_exact_lowercase_status() {
+        // Plugin 1.70.1 accepts ONLY the exact lowercase statuses. A case
+        // variant or surrounding whitespace is NOT a valid outcome and must not
+        // suppress empty-result handling.
+        for status in ["Blocked", "BLOCKED", " blocked", "blocked ", "Completed"] {
+            let done = json!({ "_meta": { "outcome": { "status": status, "summary": "s" } } });
+            assert!(
+                prompt_outcome(&done).is_none(),
+                "a non-exact status must be discarded: {status:?}"
+            );
+        }
+        for status in ["completed", "blocked"] {
+            let done = json!({ "_meta": { "outcome": { "status": status, "summary": "s" } } });
+            assert!(prompt_outcome(&done).is_some());
+        }
+    }
+
+    #[test]
+    fn prompt_outcome_truncates_an_overlong_summary() {
+        // Plugin 1.70.1 TRUNCATES a nonblank overlong summary to 8,000 chars
+        // rather than discarding the outcome, so a valid long `blocked` outcome
+        // still escalates instead of being lost.
+        let over_limit = "x".repeat(OUTCOME_SUMMARY_MAX + 50);
+        let done =
+            json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } });
+        let out =
+            prompt_outcome(&done).expect("an overlong summary must be truncated, not dropped");
+        assert_eq!(
+            out["summary"].as_str().unwrap().chars().count(),
+            OUTCOME_SUMMARY_MAX
+        );
+        // Exactly at the limit is kept whole.
+        let at_limit = "y".repeat(OUTCOME_SUMMARY_MAX);
+        let done =
+            json!({ "_meta": { "outcome": { "status": "completed", "summary": at_limit } } });
+        let out = prompt_outcome(&done).expect("an at-limit summary must be accepted");
+        assert_eq!(
+            out["summary"].as_str().unwrap().chars().count(),
+            OUTCOME_SUMMARY_MAX
+        );
     }
 
     #[test]
@@ -613,15 +692,15 @@ mod tests {
 
     #[test]
     fn prompt_outcome_rejects_invalid_status_and_summary() {
-        // Only completed|blocked with a non-blank, ≤8000-char summary is a valid
-        // outcome; every other shape is discarded (None), so it can neither
-        // suppress the nudge/empty guard nor become process variables.
-        let over_limit = "x".repeat(OUTCOME_SUMMARY_MAX + 1);
+        // Only an exact completed|blocked status with a non-blank summary is a
+        // valid outcome; every other shape is discarded (None), so it can
+        // neither suppress the nudge/empty guard nor become process variables.
+        // (An overlong summary is TRUNCATED, not rejected — see
+        // `prompt_outcome_truncates_an_overlong_summary`.)
         for done in [
             json!({ "_meta": { "outcome": { "status": "failed", "summary": "s" } } }),
             json!({ "_meta": { "outcome": { "status": "blocked" } } }),
             json!({ "_meta": { "outcome": { "status": "blocked", "summary": "   " } } }),
-            json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } }),
             json!({ "_meta": { "outcome": { "summary": "s" } } }),
         ] {
             assert!(
@@ -629,11 +708,6 @@ mod tests {
                 "invalid outcome must be discarded: {done}"
             );
         }
-        // Exactly at the limit is accepted.
-        let at_limit = "x".repeat(OUTCOME_SUMMARY_MAX);
-        let done =
-            json!({ "_meta": { "outcome": { "status": "completed", "summary": at_limit } } });
-        assert!(prompt_outcome(&done).is_some());
     }
 
     #[test]
