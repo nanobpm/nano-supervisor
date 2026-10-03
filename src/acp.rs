@@ -239,11 +239,7 @@ impl Agent {
             // Preserve the prompt response's `_meta.outcome` (plugin 1.70.1): a
             // `blocked`/explicit outcome is a usable fallback result and proof
             // the run did work, so it must not be dropped here.
-            outcome: done
-                .get("_meta")
-                .and_then(|m| m.get("outcome"))
-                .and_then(Value::as_object)
-                .cloned(),
+            outcome: prompt_outcome(&done),
         })
     }
 
@@ -464,6 +460,18 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
     }
 }
 
+/// Extract the prompt response's `_meta.outcome` object (plugin 1.70.1). An
+/// explicit ACP outcome is a usable fallback result and proof the run did work,
+/// so it must survive settlement; a schema/path drift here silently drops it and
+/// restores the empty-result failure this path exists to prevent, hence the
+/// dedicated regression coverage below.
+fn prompt_outcome(done: &Value) -> Option<Map<String, Value>> {
+    done.get("_meta")
+        .and_then(|m| m.get("outcome"))
+        .and_then(Value::as_object)
+        .cloned()
+}
+
 /// `yolo`: pick an allow option, preferring allow_always, else the first option.
 fn permission_choice(params: &Value) -> Value {
     let options = params["options"].as_array().cloned().unwrap_or_default();
@@ -536,5 +544,39 @@ mod tests {
         assert!(handle_message(&line, &shared, &out));
         let reply = rx.try_recv().expect("a normal reply must be enqueued");
         assert_eq!(reply["id"], 7);
+    }
+
+    #[test]
+    fn prompt_outcome_extracted_from_meta() {
+        // The exact shape plugin 1.70.1 emits on `session/prompt`: the outcome
+        // map under `_meta.outcome` must be carried through verbatim so worker
+        // settlement can use it as the effective result.
+        let done = json!({
+            "stopReason": "end_turn",
+            "_meta": { "outcome": { "status": "blocked", "question": "why?" } }
+        });
+        let out = prompt_outcome(&done).expect("outcome must be extracted");
+        assert_eq!(out["status"], "blocked");
+        assert_eq!(out["question"], "why?");
+    }
+
+    #[test]
+    fn prompt_outcome_absent_shapes_yield_none() {
+        // Every non-outcome shape must yield `None` (not a panic, not an empty
+        // map): a bare response, missing `_meta`, `_meta` without `outcome`, and
+        // an `outcome` that is not an object. Guards the schema/path drift class
+        // that would otherwise silently drop a real outcome.
+        for done in [
+            json!({ "stopReason": "end_turn" }),
+            json!({ "stopReason": "end_turn", "_meta": {} }),
+            json!({ "stopReason": "end_turn", "_meta": { "outcome": "blocked" } }),
+            json!({ "stopReason": "end_turn", "_meta": { "outcome": ["x"] } }),
+            json!({ "stopReason": "end_turn", "_meta": { "outcome": null } }),
+        ] {
+            assert!(
+                prompt_outcome(&done).is_none(),
+                "non-object outcome must extract to None: {done}"
+            );
+        }
     }
 }
