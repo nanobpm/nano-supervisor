@@ -1204,8 +1204,13 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let _active = ActiveRunGuard::new(&run_dir);
     // `cfg.runs_dir` is this worker's own namespace, so its top-level entries
     // are job runs, not namespaces: sweep them directly, never descending into a
-    // retained failed run's own checkout/scratch dirs.
-    sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION, false);
+    // retained failed run's own checkout/scratch dirs. Gated on `--keep-runs`
+    // like every other age-based reaper (startup/cadence in `work.rs`, the
+    // per-completion cleanup below): that flag promises retained failed runs are
+    // kept for post-mortem, so this per-job reap must not delete them either.
+    if !cfg.keep_runs {
+        sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION, false);
+    }
     prepare_run_dir(&cfg.runs_dir, &run_dir)?;
     let agent_cwd = match &env.repository {
         Some(repo) => {

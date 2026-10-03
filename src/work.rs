@@ -141,7 +141,8 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // Startup reap, then on a cadence: run dirs older than `--reap-age`. Both
     // sweeps are skipped under `--keep-runs`: that flag promises retained runs
     // are kept, so the age-based reaper must not delete them at startup or on
-    // the cadence (only the immediate per-completion cleanup is already gated).
+    // the cadence (the per-completion cleanup and the per-job execute-start
+    // reap in `slot.rs` are gated on the same flag).
     if !opts.keep_runs {
         slot::sweep_stale_runs(&sweep_root, opts.reap_age, true);
     }
