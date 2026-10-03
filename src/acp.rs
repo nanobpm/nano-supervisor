@@ -492,17 +492,17 @@ fn prompt_outcome(done: &Value) -> Option<Map<String, Value>> {
         return None;
     }
     // Plugin 1.70.1 truncates an overlong summary to the cap rather than
-    // discarding the outcome. `floor_char_boundary` keeps the cut on a UTF-8
-    // boundary so a multibyte character is never split.
-    let summary = if summary.chars().count() > OUTCOME_SUMMARY_MAX {
-        let byte_cap = summary.floor_char_boundary(OUTCOME_SUMMARY_MAX);
-        &summary[..byte_cap]
+    // discarding the outcome. The cap counts CHARACTERS, so take the first
+    // `OUTCOME_SUMMARY_MAX` chars — this never splits a multibyte character and,
+    // unlike a byte index, keeps the cut faithful for multibyte summaries.
+    let summary: String = if summary.chars().count() > OUTCOME_SUMMARY_MAX {
+        summary.chars().take(OUTCOME_SUMMARY_MAX).collect()
     } else {
-        summary
+        summary.to_string()
     };
     let mut canonical = Map::new();
     canonical.insert("status".to_string(), Value::String(status.to_string()));
-    canonical.insert("summary".to_string(), Value::String(summary.to_string()));
+    canonical.insert("summary".to_string(), Value::String(summary));
     Some(canonical)
 }
 
@@ -671,6 +671,22 @@ mod tests {
         let done =
             json!({ "_meta": { "outcome": { "status": "completed", "summary": at_limit } } });
         let out = prompt_outcome(&done).expect("an at-limit summary must be accepted");
+        assert_eq!(
+            out["summary"].as_str().unwrap().chars().count(),
+            OUTCOME_SUMMARY_MAX
+        );
+    }
+
+    #[test]
+    fn prompt_outcome_truncates_an_overlong_multibyte_summary_by_chars() {
+        // Regression: the cap counts CHARACTERS, not bytes. A summary of
+        // multibyte characters (`€` is 3 bytes) must truncate to exactly
+        // OUTCOME_SUMMARY_MAX chars — a byte-indexed cut would keep only ~1/3.
+        let over_limit = "\u{20ac}".repeat(OUTCOME_SUMMARY_MAX + 1);
+        let done =
+            json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } });
+        let out =
+            prompt_outcome(&done).expect("an overlong multibyte summary must be truncated");
         assert_eq!(
             out["summary"].as_str().unwrap().chars().count(),
             OUTCOME_SUMMARY_MAX
