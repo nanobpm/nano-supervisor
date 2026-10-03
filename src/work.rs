@@ -118,13 +118,23 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // `/var` is itself a symlink to `/private/var`, so a pre-canonicalization
     // ancestor walk would reject the legitimate `tempfile::tempdir()` root the
     // contract harness hands us via `C8CTL_NANO_HOME` (the Rust worker matrix
-    // includes `macos-latest`). Canonicalizing the existing base resolves only
-    // those platform links — it cannot follow a USER-planted descendant, because
-    // the worker-owned `rust-worker-<pid>` leaf does not exist yet and so is left
-    // unresolved. Then run the no-follow leaf/ancestor checks on the canonical
-    // path (a planted symlink at the not-yet-created leaf, or a symlinked
-    // ancestor of the real base, is still rejected) before creating it.
-    let runs_dir = slot::canonicalize_existing_base(&runs_dir)?;
+    // includes `macos-latest`). Canonicalize ONLY THE PARENT of the worker
+    // namespace, then re-append the `rust-worker-<pid>` leaf unresolved: the
+    // parent holds the platform links, while the leaf is predictable, so a
+    // same-UID attacker can pre-create it as a symlink — and
+    // `canonicalize_existing_base` on the *whole* path would follow that planted
+    // leaf to its target, making the no-follow checks inspect the target rather
+    // than reject the link. Splitting the leaf off keeps it literal so the
+    // no-follow checks below reject a planted (or swapped-in) link.
+    let leaf = runs_dir
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| format!("rust-worker-{}", std::process::id()).into());
+    let parent = runs_dir.parent().map(PathBuf::from).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("nano-runs-{}", std::process::id()))
+    });
+    let parent = slot::canonicalize_existing_base(&parent)?;
+    let runs_dir = parent.join(&leaf);
     slot::reject_symlink(&runs_dir)?;
     slot::reject_symlinked_ancestors(&runs_dir)?;
     std::fs::create_dir_all(&runs_dir)?;
@@ -159,9 +169,14 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // sweeps are skipped under `--keep-runs`: that flag promises retained runs
     // are kept, so the age-based reaper must not delete them at startup or on
     // the cadence (the per-completion cleanup and the per-job execute-start
-    // reap in `slot.rs` are gated on the same flag).
+    // reap in `slot.rs` are gated on the same flag). Each sweep is a recursive
+    // filesystem removal, so it is dispatched to the blocking pool rather than
+    // run inline on a Tokio worker thread: a large stale checkout removed on a
+    // worker thread can block the executor long enough to starve the lease
+    // refresher (especially on a single-core host) and lose an active job's
+    // lease.
     if !opts.keep_runs {
-        slot::sweep_stale_runs(&sweep_root, opts.reap_age, true);
+        slot::sweep_stale_runs_blocking(sweep_root.clone(), opts.reap_age, true).await;
     }
     let reaper = {
         let dir = sweep_root.clone();
@@ -174,7 +189,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
             loop {
                 tokio::time::sleep(every).await;
                 if !keep {
-                    slot::sweep_stale_runs(&dir, age, true);
+                    slot::sweep_stale_runs_blocking(dir.clone(), age, true).await;
                 }
             }
         })

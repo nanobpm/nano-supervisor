@@ -856,6 +856,24 @@ pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration, recurse_names
     sweep_stale_runs_path_based(runs_dir, max_age, recurse_namespaces);
 }
 
+/// `sweep_stale_runs` dispatched to the blocking pool. The sweep is a recursive
+/// filesystem removal; run inline on a Tokio worker thread it can block the
+/// executor long enough to starve the lease refresher (especially on a
+/// single-core host) and lose an active job's lease. Use this from async
+/// contexts; `sweep_stale_runs` remains for synchronous callers and tests.
+pub(crate) async fn sweep_stale_runs_blocking(
+    runs_dir: PathBuf,
+    max_age: Duration,
+    recurse_namespaces: bool,
+) {
+    // The sweep is best-effort and self-logging; a panic or a cancelled spawn
+    // must not propagate, so discard the join outcome.
+    let _ = tokio::task::spawn_blocking(move || {
+        sweep_stale_runs(&runs_dir, max_age, recurse_namespaces);
+    })
+    .await;
+}
+
 /// Parse a worker-namespace dir name (`rust-worker-<pid>`) and report its owner
 /// PID together with whether that process is still alive:
 ///   - `Some((pid, true))`  — a parseable owner PID whose process is still live
@@ -1326,7 +1344,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // per-completion cleanup below): that flag promises retained failed runs are
     // kept for post-mortem, so this per-job reap must not delete them either.
     if !cfg.keep_runs {
-        sweep_stale_runs(&cfg.runs_dir, FAILED_RUN_RETENTION, false);
+        sweep_stale_runs_blocking(cfg.runs_dir.clone(), FAILED_RUN_RETENTION, false).await;
     }
     prepare_run_dir(&cfg.runs_dir, &run_dir)?;
     let agent_cwd = match &env.repository {
@@ -2949,6 +2967,66 @@ mod tests {
         assert!(
             reject_symlink(&followed).is_ok(),
             "the followed target is a real dir, so a post-canonicalize check would wrongly pass"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_existing_base_rejects_precreated_symlink_leaf() {
+        // Regression for the run-dir setup in `work::run`: an attacker who
+        // predicts the worker PID can pre-create the `rust-worker-<pid>` leaf as
+        // a symlink before the worker starts. Canonicalizing the *whole* path
+        // would follow that planted leaf to its target, so the no-follow checks
+        // inspect the (real) target and pass — redirecting provisioning/sweeping
+        // outside the configured root. `work::run` now canonicalizes only the
+        // PARENT and re-appends the leaf unresolved, so the leaf stays literal
+        // and `reject_symlink` rejects the planted link.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("nano-leafpre-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        // The attacker-chosen target (outside the leaf) the planted link points at.
+        let outside = base.join("attacker-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        // Pre-create the worker leaf as a symlink to that target.
+        let requested = base.join("rust-worker-123");
+        std::os::unix::fs::symlink(&outside, &requested).unwrap();
+
+        // The fix (as `work::run` applies it): canonicalize only the parent, then
+        // re-append the leaf. The leaf is left unresolved (still the planted
+        // link), so the no-follow check rejects it.
+        let parent = canonicalize_existing_base(requested.parent().unwrap()).unwrap();
+        let resolved = parent.join(requested.file_name().unwrap());
+        assert_eq!(
+            resolved, requested,
+            "re-appending the leaf to the canonical parent keeps the planted link literal"
+        );
+        assert!(
+            reject_symlink(&resolved).is_err(),
+            "the pre-created symlink leaf must be rejected no-follow"
+        );
+
+        // The bug it replaced: canonicalizing the whole path follows the planted
+        // leaf to the attacker target, which a no-follow check would then accept.
+        let followed = canonicalize_existing_base(&requested).unwrap();
+        assert_eq!(
+            followed,
+            std::fs::canonicalize(&outside).unwrap(),
+            "whole-path canonicalize follows the planted leaf to the attacker target (the bug)"
+        );
+        assert!(
+            reject_symlink(&followed).is_ok(),
+            "the followed target is a real dir, so the check would wrongly pass"
         );
 
         std::fs::remove_dir_all(&base).ok();
