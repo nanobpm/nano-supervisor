@@ -551,17 +551,20 @@ fn is_active_run(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Test-only seam for the check/remove TOCTOU regression test: when set,
-/// [`remove_if_inactive`] invokes this closure with the path after the active
-/// check has found it inactive but BEFORE the removal runs, letting a test land
-/// a registration exactly in that window. `None` in every non-test build and
-/// whenever no test has armed it, so production behaviour is unchanged. The
-/// slot is cleared BEFORE the closure fires, so a panicking test cannot leave
-/// the hook armed for its neighbours.
+/// Test-only seam for the check/remove TOCTOU regression test: when armed with a
+/// `(path, closure)`, [`remove_if_inactive`] invokes the closure after the active
+/// check has found that exact path inactive but BEFORE the removal runs, letting a
+/// test land a registration in that window. `None` in every non-test build and
+/// whenever no test has armed it, so production behaviour is unchanged. The hook
+/// is PATH-SCOPED — it fires (and clears) only for the path it was armed with — so
+/// unrelated sweeps running concurrently in other tests never trip it, and because
+/// it is taken out of the slot BEFORE firing, a panicking test cannot leave the
+/// hook armed for its neighbours.
 #[cfg(test)]
-type RemovePauseHook = Box<dyn FnOnce(&Path) + Send>;
+type RemovePauseHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
-static REMOVE_IF_INACTIVE_PAUSE: Mutex<Option<RemovePauseHook>> = Mutex::new(None);
+static REMOVE_IF_INACTIVE_PAUSE: Mutex<Option<(std::path::PathBuf, RemovePauseHook)>> =
+    Mutex::new(None);
 
 /// Atomically check `path` against [`active_runs`] and, when it is not
 /// registered, remove it — all while holding the active-runs mutex. This closes
@@ -587,14 +590,22 @@ fn remove_if_inactive(path: &Path, remove: impl FnOnce()) -> bool {
     // the check, before the removal — so it can attempt a registration in the
     // window the atomic fix closes. A correct (locked) implementation blocks
     // that registration until the delete is decided; the pre-fix pair held no
-    // lock here, so the registration landed and the live run was deleted.
+    // lock here, so the registration landed and the live run was deleted. The
+    // hook is PATH-SCOPED: it fires (and clears) only for the exact path the
+    // test armed it with, so unrelated sweeps running concurrently in other
+    // tests never trip it (test isolation).
     #[cfg(test)]
-    if let Some(pause) = REMOVE_IF_INACTIVE_PAUSE
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take())
     {
-        pause(path);
+        let armed = REMOVE_IF_INACTIVE_PAUSE
+            .lock()
+            .ok()
+            .and_then(|mut slot| match slot.as_ref() {
+                Some((p, _)) if p == path => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            });
+        if let Some(pause) = armed {
+            pause();
+        }
     }
     // The lock is held continuously from the check through the removal, so no
     // `ActiveRunGuard::new` can register `path` in between — the retry blocks on
@@ -1482,7 +1493,22 @@ fn build_agent_env(
     result_file: &std::path::Path,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
-    // Hire-configured env first, so reserved vars below can never be shadowed.
+    // #283: a headless agent has no interactive terminal, so any git command that
+    // launches an editor (a `commit` without `-m`, a `rebase -i`/`merge` without a
+    // message) blocks until the idle timeout. Point every editor git might spawn at
+    // its built-in `:` no-op for BOTH launch protocols. Pushed FIRST — beneath the
+    // hire env and the reserved vars below — so an explicit `hire.env` override
+    // still wins, while these defaults override any ambient `EDITOR`/`VISUAL`
+    // inherited from the daemon's environment.
+    for (k, v) in [
+        ("GIT_EDITOR", ":"),
+        ("GIT_SEQUENCE_EDITOR", ":"),
+        ("EDITOR", ":"),
+        ("VISUAL", ":"),
+    ] {
+        env.push((k.to_string(), v.to_string()));
+    }
+    // Hire-configured env next, so reserved vars below can never be shadowed.
     for (k, v) in &cfg.hire.env {
         env.push((k.clone(), v.clone()));
     }
@@ -1559,6 +1585,50 @@ mod tests {
         assert_eq!(get("AGENT_RESULT_FILE"), Some("/tmp/r.json"));
         assert_eq!(get("AGENT_JOB_TYPE"), Some("senior:pr-review"));
         assert_eq!(get("AGENT_PROFILE"), Some("coder"));
+    }
+
+    #[test]
+    fn agent_env_sets_headless_editor_noops() {
+        let job = ActivatedJobResult {
+            r#type: "senior:pr-review".into(),
+            ..Default::default()
+        };
+        let rf = std::path::Path::new("/tmp/r.json");
+        let env = build_agent_env(&cfg(), "42", &job, rf);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        // #283: every editor git might spawn points at the `:` no-op so a headless
+        // agent's `git commit`/`rebase -i` can never block on an interactive editor.
+        for k in ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL"] {
+            assert_eq!(get(k), Some(":"), "{k} must default to the git no-op");
+        }
+    }
+
+    #[test]
+    fn hire_env_overrides_editor_noops_but_not_reserved() {
+        let mut h = hire();
+        h.env.insert("EDITOR".into(), "vim".into());
+        h.env.insert("NANO_AGENTIC".into(), "on".into());
+        let mut c = cfg();
+        c.hire = h;
+        let job = ActivatedJobResult {
+            r#type: "t".into(),
+            ..Default::default()
+        };
+        let rf = std::path::Path::new("/tmp/r.json");
+        let env = build_agent_env(&c, "1", &job, rf);
+        // `.envs()` is last-wins, so the LAST entry for a key is the effective value.
+        let last = |k: &str| {
+            env.iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+        };
+        // An explicit hire override of an editor var wins over the no-op default…
+        assert_eq!(last("EDITOR"), Some("vim"));
+        // …but the editor vars the hire did NOT set keep their no-op default…
+        assert_eq!(last("GIT_EDITOR"), Some(":"));
+        // …and a reserved var the hire tried to shadow is still forced off.
+        assert_eq!(last("NANO_AGENTIC"), Some("off"));
     }
 
     #[test]
@@ -2131,13 +2201,15 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let hook_path = run_abs.clone();
-        *REMOVE_IF_INACTIVE_PAUSE.lock().unwrap() = Some(Box::new(move |p| {
-            assert_eq!(p, hook_path.as_path(), "hook fired for an unexpected path");
-            // Parked in the check/remove window: tell the main thread, then
-            // wait until it has attempted the racing registration.
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        }));
+        *REMOVE_IF_INACTIVE_PAUSE.lock().unwrap() = Some((
+            hook_path,
+            Box::new(move || {
+                // Parked in the check/remove window: tell the main thread, then
+                // wait until it has attempted the racing registration.
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+        ));
 
         let sweep_path = run_abs.clone();
         let sweep = std::thread::spawn(move || {

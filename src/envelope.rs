@@ -46,12 +46,25 @@ fn as_str(v: &Value) -> Option<String> {
     }
 }
 
+/// Node's `coerceBool`: booleans pass through; `null`/absent yields the default;
+/// any other value is stringified and matched against the true-set
+/// (`true`/`1`/`yes`/`on`) and the false-set (`false`/`0`/`no`/`off`/empty),
+/// with anything unrecognised falling back to the default. Matching Node here is
+/// load-bearing: a prior version only recognised `true`/`1`/`yes` and returned
+/// `false` (not the default) for every other string, so `"on"` normalised to
+/// false and an unrecognised string on a default-`true` field (e.g. `push`)
+/// flipped to false.
 fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => {
-            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
-        }
+    let s = match v {
+        None | Some(Value::Null) => return default,
+        Some(Value::Bool(b)) => return *b,
+        Some(Value::String(s)) => s.trim().to_ascii_lowercase(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(_) => return default,
+    };
+    match s.as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" | "" => false,
         _ => default,
     }
 }
@@ -351,6 +364,53 @@ mod tests {
                 "task": { "prompt": "do it", "allowPr": false },
             })
         );
+    }
+
+    #[test]
+    fn coerce_bool_matches_node_true_false_sets() {
+        let v = |x: Value| coerce_bool(Some(&x), false);
+        // Whole true-set, case/whitespace-insensitive (incl. the formerly-missing "on").
+        for t in ["true", "1", "yes", "on", "ON", " On ", "YES"] {
+            assert!(v(json!(t)), "{t:?} should coerce true");
+        }
+        // Whole false-set, including empty string.
+        for f in ["false", "0", "no", "off", "", "OFF", " No "] {
+            assert!(!v(json!(f)), "{f:?} should coerce false");
+        }
+        // Booleans pass through; numbers stringify (1/0 recognised).
+        assert!(coerce_bool(Some(&json!(true)), false));
+        assert!(!coerce_bool(Some(&json!(false)), true));
+        assert!(coerce_bool(Some(&json!(1)), false));
+        assert!(!coerce_bool(Some(&json!(0)), true));
+        // Unrecognised value falls back to the DEFAULT (not hard-false) — the
+        // divergence that previously flipped a default-`true` field to false.
+        assert!(coerce_bool(Some(&json!("maybe")), true));
+        assert!(!coerce_bool(Some(&json!("maybe")), false));
+        assert!(coerce_bool(Some(&json!(2)), true));
+        // Absent / null yields the default.
+        assert!(coerce_bool(None, true));
+        assert!(!coerce_bool(Some(&Value::Null), false));
+    }
+
+    #[test]
+    fn on_normalizes_true_across_bool_fields() {
+        // "on" must normalize to true for every coerced boolean field (Node parity).
+        let headers = json!({
+            "io.nanobpm.agentTask.repository.url": "https://h/o/r.git",
+            "io.nanobpm.agentTask.repository.singleBranch": "on",
+            "io.nanobpm.agentTask.repository.submodules": "on",
+            "io.nanobpm.agentTask.task.allowPr": "on",
+            "io.nanobpm.agentTask.task.prompt": "p",
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let n = &env.normalized;
+        assert_eq!(n["repository"]["singleBranch"], true);
+        assert_eq!(n["repository"]["submodules"], true);
+        assert_eq!(n["task"]["allowPr"], true);
+        // And the typed envelope agrees.
+        let repo = env.repository.unwrap();
+        assert!(repo.single_branch);
+        assert!(repo.submodules);
     }
 
     #[test]
