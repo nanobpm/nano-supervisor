@@ -114,14 +114,42 @@ fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
 /// digit at all, is `NaN` → `None`. This is the shared core of [`coerce_int`]
 /// and [`coerce_u`]; both stringify first (see [`js_stringify`]) so a non-string
 /// is converted the JavaScript way before the leading integer is parsed.
-fn parse_int_str(s: &str) -> Option<i64> {
+///
+/// The digit run is accumulated into an `f64`, not a fixed-width integer.
+/// `parseInt` yields a JavaScript Number (an IEEE-754 double), so a digit run of
+/// ANY magnitude stays a finite number in Node — `parseInt("9223372036854775808")`
+/// is `9223372036854776000`, not an error. Parsing into `i64` instead overflows
+/// to `None` past `i64::MAX`, silently DROPPING a field such as `cloneTimeoutMs`
+/// (the clone then runs on the default timeout) and rounding values above 2^53
+/// differently (`"9007199254740993"`). Accumulating into `f64` matches Node's
+/// double exactly: the result is finite for any digit run, and the f64's own
+/// rounding IS the JavaScript Number's rounding.
+fn parse_int_str(s: &str) -> Option<f64> {
     let t = s.trim_start();
     let end = t
         .char_indices()
         .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
         .map(|(i, _)| i)
         .unwrap_or(t.len());
-    t[..end].parse().ok()
+    let tok = &t[..end];
+    let (neg, digits) = match tok.as_bytes().first() {
+        Some(b'-') => (true, &tok[1..]),
+        Some(b'+') => (false, &tok[1..]),
+        _ => (false, tok),
+    };
+    if digits.is_empty() {
+        return None; // a bare sign, or no leading digit at all → NaN
+    }
+    // Accumulate the leading integer as a double. Beyond ~17 significant digits
+    // the added digits no longer change the f64 (it is already at the limit of
+    // double precision), which is exactly how far JavaScript's Number can
+    // represent the value too — so this stays finite and identically-rounded
+    // where an integer accumulator would overflow.
+    let mut acc: f64 = 0.0;
+    for &d in digits.as_bytes() {
+        acc = acc * 10.0 + f64::from(d - b'0');
+    }
+    Some(if neg { -acc } else { acc })
 }
 
 /// Node's `coerceInt` for the unsigned fields (`depth`, `cloneTimeoutMs`):
@@ -137,7 +165,14 @@ fn parse_int_str(s: &str) -> Option<i64> {
 fn coerce_u(v: Option<&Value>) -> Option<u64> {
     match v {
         None => None,
-        Some(value) => parse_int_str(&js_stringify(value)).and_then(|i| u64::try_from(i).ok()),
+        // parseInt yields a double; truncate toward zero (parseInt drops any
+        // fraction) and keep only a finite, non-negative result in `u64` range.
+        // `f64 -> u64` is a saturating cast, so a finite-but-huge value clamps
+        // to `u64::MAX` rather than wrapping — and it is still PRESENT (not
+        // dropped), which is the parity fix.
+        Some(value) => parse_int_str(&js_stringify(value))
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f.trunc() as u64),
     }
 }
 
@@ -251,7 +286,13 @@ pub fn assemble(custom_headers: &Map<String, Value>, variables: &Map<String, Val
 fn coerce_int(v: Option<&Value>) -> Option<i64> {
     match v {
         None => None,
-        Some(value) => parse_int_str(&js_stringify(value)),
+        // parseInt yields a double; truncate toward zero and clamp to the `i64`
+        // range. `f64 -> i64` saturates, so a finite-but-huge magnitude clamps
+        // to `i64::MIN`/`MAX` instead of overflowing to absent — the value stays
+        // present (the parity fix), matching Node keeping a finite Number.
+        Some(value) => parse_int_str(&js_stringify(value))
+            .filter(|f| f.is_finite())
+            .map(|f| f.trunc() as i64),
     }
 }
 
@@ -558,6 +599,42 @@ mod tests {
         assert_eq!(coerce_u(Some(&json!(0.000001))), Some(1)); // serde "1e-6" → 1
                                                                // A float within range still truncates like parseInt.
         assert_eq!(coerce_u(Some(&json!(7.9))), Some(7));
+    }
+
+    #[test]
+    fn coerce_u_keeps_finite_numbers_beyond_i64_range() {
+        // parseInt yields a finite JavaScript Number for a digit run of ANY
+        // magnitude, so a decimal outside `i64` range must stay PRESENT — not
+        // overflow to `None` and silently drop the field (a dropped
+        // `cloneTimeoutMs` makes the clone run on the default timeout).
+        // `"9223372036854775808"` is past `i64::MAX`; Node parseInt yields the
+        // finite `9223372036854776000`, so the field survives (saturating to
+        // `u64` on the typed path) instead of being dropped.
+        assert!(coerce_u(Some(&json!("9223372036854775808"))).is_some());
+        // Above 2^53 the value rounds the JavaScript-double way, exactly as
+        // Node's `parseInt("9007199254740993")` → `9007199254740992`.
+        assert_eq!(
+            coerce_u(Some(&json!("9007199254740993"))),
+            Some(9007199254740992)
+        );
+    }
+
+    #[test]
+    fn coerce_int_keeps_finite_numbers_beyond_i64_range() {
+        // Same parity for the signed fields: a finite-but-huge magnitude clamps
+        // to the `i64` range instead of overflowing to absent.
+        assert_eq!(
+            coerce_int(Some(&json!("9007199254740993"))),
+            Some(9007199254740992)
+        );
+        assert_eq!(
+            coerce_int(Some(&json!("9223372036854775808"))),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            coerce_int(Some(&json!("-9223372036854775809"))),
+            Some(i64::MIN)
+        );
     }
 
     #[test]

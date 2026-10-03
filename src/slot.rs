@@ -1305,20 +1305,74 @@ struct RunResult {
 /// git work tree (a no-repository run dir) or git fails — both read as "no
 /// commits", which is the safe default (a genuinely empty no-git run is still
 /// failed; only a *repository* run gets the commit signal). Never fails the job.
+///
+/// The checkout is AGENT-CONTROLLED by the time of the post-run probe, so the
+/// probe must be bounded: a run can leave blocking Git metadata behind (for
+/// example `.git/HEAD` replaced by a FIFO), and an unbounded synchronous
+/// `Command::output()` on a Tokio worker thread would then hang forever — the
+/// job would never settle and a small runtime would be starved. The probe
+/// therefore runs under [`GIT_HEAD_TIMEOUT`]: a git that has not exited by then
+/// is killed and reaped, and the read reports `None` ("no commits" — the safe
+/// default above) instead of hanging settlement.
 fn git_head(dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    git_head_timeout(dir, GIT_HEAD_TIMEOUT)
+}
+
+/// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
+/// checkout. A healthy read is milliseconds; 5s is generous headroom for a
+/// loaded host while still bounding a blocked one well under any activation
+/// recovery window, so a wedged probe can never stall settlement (or starve a
+/// small runtime's Tokio worker threads) indefinitely.
+const GIT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for the bounded `git rev-parse` probe to exit.
+const GIT_HEAD_POLL: Duration = Duration::from_millis(10);
+
+fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(dir)
         // An agent-controlled checkout could carry a prompt/sidebar config; keep
         // the invocation minimal and non-interactive.
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        // stdin must not be inherited: a git that blocks reading it (a hostile
+        // checkout's config can arrange that) would otherwise never finish.
+        // stdout is piped (not `output()`) so the deadline below owns the wait
+        // instead of blocking unboundedly inside `Child::wait_with_output`.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    // Bounded wait: poll `try_wait` so a git wedged on agent-planted blocking
+    // metadata (e.g. `.git/HEAD` a FIFO) is killed and reaped at the deadline
+    // rather than waited on forever. Killing also guarantees no git child is
+    // left running once this thread moves on.
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_HEAD_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+    // Reap the child (a no-op once `try_wait` observed the exit; collects the
+    // zombie after a kill) so a timed-out probe never leaks one.
+    let _ = child.wait();
+    if !status.is_some_and(|s| s.success()) {
         return None;
     }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // The child has exited, so this read returns at EOF without blocking.
+    let mut buf = Vec::new();
+    child.stdout.take()?.read_to_end(&mut buf).ok()?;
+    let sha = String::from_utf8_lossy(&buf).trim().to_string();
     if sha.is_empty() {
         None
     } else {
@@ -2918,6 +2972,71 @@ mod tests {
             "sweep must not follow the inner symlink and delete its target's contents"
         );
 
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn git_head_reads_a_real_checkout_head() {
+        // The happy path: a real git work tree yields its HEAD sha, so the
+        // bounded probe preserves the pre/post "did the agent commit" signal.
+        let base = std::env::temp_dir().join(format!("nano-git-head-ok-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let head = git_head(&base);
+        assert!(
+            head.as_deref().is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+            "expected a 40-char hex HEAD, got {head:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn git_head_returns_none_for_a_non_git_dir() {
+        // A no-repository run dir is "no commits", never an error.
+        let base = std::env::temp_dir().join(format!("nano-git-head-nogit-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(git_head(&base), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_head_is_bounded_when_git_hangs() {
+        // The class Copilot flagged: an agent-controlled checkout can make
+        // `git rev-parse` block indefinitely (here `.git/HEAD` is a FIFO, so
+        // git blocks opening it). The probe must return "no commits" within the
+        // deadline instead of hanging settlement — and must not leak a child.
+        let base = std::env::temp_dir().join(format!("nano-git-head-fifo-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let git_dir = base.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        // A FIFO never yields data, so git blocks reading HEAD.
+        let mk = std::process::Command::new("mkfifo")
+            .arg(git_dir.join("HEAD"))
+            .output()
+            .unwrap();
+        assert!(mk.status.success(), "mkfifo failed");
+
+        let started = Instant::now();
+        let head = git_head_timeout(&base, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        assert_eq!(head, None, "a wedged probe must read as no commits");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "probe must be bounded, took {elapsed:?}"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
