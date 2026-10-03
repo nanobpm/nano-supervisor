@@ -1672,7 +1672,13 @@ async fn run_agent(
 ) -> RunResult {
     match cfg.hire.protocol {
         Protocol::Acp => {
-            let mut agent = match Agent::spawn(&cfg.hire.command, &cfg.hire.args, cwd, env) {
+            // Plugin 1.70.1 parity: a plain ACP hire whose command carries no
+            // ACP selector is launched with `--acp` appended, so the agent starts
+            // in ACP mode and the JSON-RPC handshake succeeds (otherwise it boots
+            // in its default/non-ACP mode and the handshake fails). A hire that
+            // already selects ACP is spawned unchanged (never doubled).
+            let args = crate::daemon::acp_spawn_args(&cfg.hire);
+            let mut agent = match Agent::spawn(&cfg.hire.command, &args, cwd, env) {
                 Ok(a) => a,
                 Err(e) => {
                     return RunResult {

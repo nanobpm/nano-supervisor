@@ -184,7 +184,7 @@ pub(crate) fn validate(hire: &Hire) -> Result<()> {
 
 /// Does the command line select ACP mode (an `acp`/`--acp` token or a `*-acp`
 /// adapter command)? A conservative port of the Node plugin's selector scan.
-fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
+pub(crate) fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
     let mut tokens: Vec<&str> = command.split_whitespace().collect();
     tokens.extend(args.iter().map(String::as_str));
     for (i, tok) in tokens.iter().enumerate() {
@@ -220,6 +220,20 @@ fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
         }
     }
     false
+}
+
+/// The argv an ACP hire is launched with (plugin 1.70.1 parity). The Node worker
+/// accepts an ACP hire whose command carries no ACP selector and appends `--acp`
+/// at spawn time, so a plain agent binary is started in ACP mode rather than its
+/// default (non-ACP) mode — where the JSON-RPC handshake would fail. A hire that
+/// already selects ACP (an `acp`/`--acp` token, `--protocol acp`, or a `*-acp`
+/// adapter command) is returned unchanged, so the selector is never doubled.
+pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
+    let mut args = hire.args.clone();
+    if !command_has_acp_selector(&hire.command, &args) {
+        args.push("--acp".to_string());
+    }
+    args
 }
 
 /// This machine's short hostname (first dot-label, lowercased), for worker names.
@@ -342,6 +356,35 @@ mod tests {
             "copilot",
             &["--allow-all".into()]
         ));
+    }
+
+    #[test]
+    fn acp_spawn_args_appends_selector_for_plain_acp_hire() {
+        // Plugin 1.70.1 parity: an ACP hire whose command has no ACP selector is
+        // launched with `--acp` appended, so the agent boots in ACP mode and the
+        // JSON-RPC handshake succeeds.
+        let h = hire(Protocol::Acp, "nano-coder", "none");
+        assert_eq!(acp_spawn_args(&h), vec!["--acp".to_string()]);
+    }
+
+    #[test]
+    fn acp_spawn_args_never_doubles_an_existing_selector() {
+        // A hire that already selects ACP (a `--acp` token, `--protocol acp`, or
+        // a `*-acp` adapter command) is spawned unchanged — the selector is not
+        // appended again.
+        let mut with_flag = hire(Protocol::Acp, "nano-coder", "none");
+        with_flag.args = vec!["--acp".into()];
+        assert_eq!(acp_spawn_args(&with_flag), vec!["--acp".to_string()]);
+
+        let adapter = hire(Protocol::Acp, "claude-code-acp", "none");
+        assert!(acp_spawn_args(&adapter).is_empty());
+
+        let mut with_protocol = hire(Protocol::Acp, "nano-coder", "none");
+        with_protocol.args = vec!["--protocol=acp".into()];
+        assert_eq!(
+            acp_spawn_args(&with_protocol),
+            vec!["--protocol=acp".to_string()]
+        );
     }
 
     // A slot that flips the fatal watch (an unleased activation under

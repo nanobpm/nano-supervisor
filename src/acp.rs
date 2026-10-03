@@ -460,16 +460,40 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
     }
 }
 
-/// Extract the prompt response's `_meta.outcome` object (plugin 1.70.1). An
-/// explicit ACP outcome is a usable fallback result and proof the run did work,
-/// so it must survive settlement; a schema/path drift here silently drops it and
-/// restores the empty-result failure this path exists to prevent, hence the
-/// dedicated regression coverage below.
+/// The Node plugin's cap on an ACP outcome's `summary` (plugin 1.70.1): a
+/// longer summary is not a valid outcome.
+const OUTCOME_SUMMARY_MAX: usize = 8_000;
+
+/// Extract the prompt response's `_meta.outcome` object (plugin 1.70.1),
+/// validated and canonicalized the way the Node plugin does before it uses one.
+///
+/// The plugin accepts an outcome only when its `status` is `completed` or
+/// `blocked` and its `summary` is a non-blank string of at most 8,000
+/// characters; any other shape is discarded (`None`) rather than forwarded, so
+/// an arbitrary `_meta.outcome` object can neither suppress the nudge/empty
+/// guard nor be promoted into process variables. A `blocked` outcome is then
+/// mapped to the result vars the plugin synthesizes — `status: "blocked"`,
+/// `summary`, and `question: summary` (the question a blocked run must carry) —
+/// while a `completed` outcome keeps its own `status`/`summary`. Anything else
+/// the agent put on the object is dropped: the canonical outcome is what the
+/// audit envelope records separately.
 fn prompt_outcome(done: &Value) -> Option<Map<String, Value>> {
-    done.get("_meta")
-        .and_then(|m| m.get("outcome"))
-        .and_then(Value::as_object)
-        .cloned()
+    let outcome = done.get("_meta")?.get("outcome")?.as_object()?;
+    let status = outcome.get("status")?.as_str()?.trim();
+    if !status.eq_ignore_ascii_case("completed") && !status.eq_ignore_ascii_case("blocked") {
+        return None;
+    }
+    let summary = outcome.get("summary")?.as_str()?.trim();
+    if summary.is_empty() || summary.chars().count() > OUTCOME_SUMMARY_MAX {
+        return None;
+    }
+    let mut canonical = Map::new();
+    canonical.insert("status".to_string(), Value::String(status.to_string()));
+    canonical.insert("summary".to_string(), Value::String(summary.to_string()));
+    if status.eq_ignore_ascii_case("blocked") {
+        canonical.insert("question".to_string(), Value::String(summary.to_string()));
+    }
+    Some(canonical)
 }
 
 /// `yolo`: pick an allow option, preferring allow_always, else the first option.
@@ -547,17 +571,69 @@ mod tests {
     }
 
     #[test]
-    fn prompt_outcome_extracted_from_meta() {
-        // The exact shape plugin 1.70.1 emits on `session/prompt`: the outcome
-        // map under `_meta.outcome` must be carried through verbatim so worker
-        // settlement can use it as the effective result.
+    fn prompt_outcome_blocked_maps_question_from_summary() {
+        // Plugin 1.70.1 maps a `blocked` outcome to result vars and synthesizes
+        // `question: summary`: the canonical outcome carries the summary as the
+        // question a blocked run must surface to a human.
         let done = json!({
             "stopReason": "end_turn",
-            "_meta": { "outcome": { "status": "blocked", "question": "why?" } }
+            "_meta": { "outcome": { "status": "blocked", "summary": "need creds" } }
         });
-        let out = prompt_outcome(&done).expect("outcome must be extracted");
+        let out = prompt_outcome(&done).expect("blocked outcome must be extracted");
         assert_eq!(out["status"], "blocked");
-        assert_eq!(out["question"], "why?");
+        assert_eq!(out["summary"], "need creds");
+        assert_eq!(out["question"], "need creds");
+    }
+
+    #[test]
+    fn prompt_outcome_completed_keeps_status_and_summary() {
+        let done = json!({
+            "stopReason": "end_turn",
+            "_meta": { "outcome": { "status": "completed", "summary": "shipped" } }
+        });
+        let out = prompt_outcome(&done).expect("completed outcome must be extracted");
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["summary"], "shipped");
+        // A completed outcome does not synthesize a question.
+        assert!(out.get("question").is_none());
+    }
+
+    #[test]
+    fn prompt_outcome_drops_arbitrary_extra_fields() {
+        // An arbitrary object must not be promoted into process variables: only
+        // the canonical status/summary(/question) survive.
+        let done = json!({
+            "stopReason": "end_turn",
+            "_meta": { "outcome": { "status": "blocked", "summary": "s", "evil": "x", "pushed": true } }
+        });
+        let out = prompt_outcome(&done).expect("valid outcome must be extracted");
+        assert!(out.get("evil").is_none());
+        assert!(out.get("pushed").is_none());
+    }
+
+    #[test]
+    fn prompt_outcome_rejects_invalid_status_and_summary() {
+        // Only completed|blocked with a non-blank, ≤8000-char summary is a valid
+        // outcome; every other shape is discarded (None), so it can neither
+        // suppress the nudge/empty guard nor become process variables.
+        let over_limit = "x".repeat(OUTCOME_SUMMARY_MAX + 1);
+        for done in [
+            json!({ "_meta": { "outcome": { "status": "failed", "summary": "s" } } }),
+            json!({ "_meta": { "outcome": { "status": "blocked" } } }),
+            json!({ "_meta": { "outcome": { "status": "blocked", "summary": "   " } } }),
+            json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } }),
+            json!({ "_meta": { "outcome": { "summary": "s" } } }),
+        ] {
+            assert!(
+                prompt_outcome(&done).is_none(),
+                "invalid outcome must be discarded: {done}"
+            );
+        }
+        // Exactly at the limit is accepted.
+        let at_limit = "x".repeat(OUTCOME_SUMMARY_MAX);
+        let done =
+            json!({ "_meta": { "outcome": { "status": "completed", "summary": at_limit } } });
+        assert!(prompt_outcome(&done).is_some());
     }
 
     #[test]
