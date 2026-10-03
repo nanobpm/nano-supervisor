@@ -61,7 +61,18 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
             config_exit("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
         }),
     };
-    let hires = state::read_hires_from(&config_path)?;
+    // A malformed or unreadable config.json is a non-restartable configuration
+    // failure, exactly like an unknown hire or failed validation below, so it
+    // must exit EX_CONFIG (78) via `config_exit` rather than bubbling `?` out
+    // through `main` as a generic status-1 error — otherwise a supervisor would
+    // restart-loop a permanently invalid hire configuration.
+    let hires = match state::read_hires_from(&config_path) {
+        Ok(hires) => hires,
+        Err(e) => config_exit(&format!(
+            "cannot read hire config {}: {e:#}",
+            config_path.display()
+        )),
+    };
     let Some(hire) = hires.into_iter().find(|h| h.name == opts.hire) else {
         config_exit(&format!(
             "No hire named \"{}\". List profiles with: c8ctl nano hire --list",
