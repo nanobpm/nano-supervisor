@@ -2007,11 +2007,11 @@ fn build_agent_env(
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    // Hard cut, no ellipsis — the Node plugin's `.slice(0, 2000)`.
-    s.chars().take(max).collect()
+    // Hard cut, no ellipsis — the Node plugin's `.slice(0, 2000)`. JavaScript
+    // strings are UTF-16, so the cap counts code units, not scalar values; an
+    // astral character (an emoji) is a surrogate pair and costs two. Delegate
+    // to the shared UTF-16 cut so this mirrors Node exactly.
+    crate::acp::truncate_utf16(s, max)
 }
 
 #[cfg(test)]

@@ -464,6 +464,30 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
 /// longer summary is TRUNCATED to this many characters, not discarded.
 const OUTCOME_SUMMARY_MAX: usize = 8_000;
 
+/// Truncate `s` to at most `max` UTF-16 code units, the way the Node plugin's
+/// `s.slice(0, max)` does. JavaScript strings are UTF-16, so `slice` counts
+/// code UNITS, not Unicode scalar values: an astral character (an emoji, a
+/// supplementary-plane ideograph) is a surrogate PAIR — two code units — and
+/// `char::len_utf16()` reports its width. A `chars().take(max)` cut instead
+/// counts scalar values, so `8001` emoji survive where Node keeps only `4000`,
+/// letting roughly twice the intended UTF-16 length into a result variable.
+/// The cut never splits a surrogate pair: a character is included only when it
+/// fits whole within the remaining budget, matching how `slice` rounds a
+/// boundary that lands mid-pair down to the last complete character.
+pub(crate) fn truncate_utf16(s: &str, max: usize) -> String {
+    let mut units = 0usize;
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        let w = c.len_utf16();
+        if units + w > max {
+            end = i;
+            break;
+        }
+        units += w;
+    }
+    s[..end].to_string()
+}
+
 /// Extract the prompt response's `_meta.outcome` object (plugin 1.70.1),
 /// validated and canonicalized the way the Node plugin does before it uses one.
 ///
@@ -492,14 +516,11 @@ fn prompt_outcome(done: &Value) -> Option<Map<String, Value>> {
         return None;
     }
     // Plugin 1.70.1 truncates an overlong summary to the cap rather than
-    // discarding the outcome. The cap counts CHARACTERS, so take the first
-    // `OUTCOME_SUMMARY_MAX` chars — this never splits a multibyte character and,
-    // unlike a byte index, keeps the cut faithful for multibyte summaries.
-    let summary: String = if summary.chars().count() > OUTCOME_SUMMARY_MAX {
-        summary.chars().take(OUTCOME_SUMMARY_MAX).collect()
-    } else {
-        summary.to_string()
-    };
+    // discarding the outcome. The cap counts UTF-16 code units (the plugin's
+    // `summary.slice(0, 8000)`), so cut by code units — this never splits a
+    // surrogate pair and, unlike a char count, keeps the cut faithful for
+    // astral (emoji) summaries, which Node measures as two units each.
+    let summary: String = truncate_utf16(summary, OUTCOME_SUMMARY_MAX);
     let mut canonical = Map::new();
     canonical.insert("status".to_string(), Value::String(status.to_string()));
     canonical.insert("summary".to_string(), Value::String(summary));
@@ -679,9 +700,10 @@ mod tests {
 
     #[test]
     fn prompt_outcome_truncates_an_overlong_multibyte_summary_by_chars() {
-        // Regression: the cap counts CHARACTERS, not bytes. A summary of
-        // multibyte characters (`€` is 3 bytes) must truncate to exactly
-        // OUTCOME_SUMMARY_MAX chars — a byte-indexed cut would keep only ~1/3.
+        // Regression: the cap counts UTF-16 code units, not bytes. A summary of
+        // BMP multibyte characters (`€` is 3 bytes but ONE UTF-16 code unit)
+        // must truncate to exactly OUTCOME_SUMMARY_MAX — a byte-indexed cut
+        // would keep only ~1/3.
         let over_limit = "\u{20ac}".repeat(OUTCOME_SUMMARY_MAX + 1);
         let done =
             json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } });
@@ -689,6 +711,27 @@ mod tests {
             prompt_outcome(&done).expect("an overlong multibyte summary must be truncated");
         assert_eq!(
             out["summary"].as_str().unwrap().chars().count(),
+            OUTCOME_SUMMARY_MAX
+        );
+    }
+
+    #[test]
+    fn prompt_outcome_truncates_an_overlong_astral_summary_by_utf16_units() {
+        // Regression: the cap counts UTF-16 code units (the plugin's
+        // `summary.slice(0, 8000)`), not Unicode scalar values. An astral
+        // character (an emoji) is a surrogate PAIR — two code units — so 8,001
+        // emoji are truncated by Node to 4,000 emoji (8,000 units), NOT the
+        // 8,000 a `chars().take(8000)` cut would keep.
+        let over_limit = "\u{1F600}".repeat(OUTCOME_SUMMARY_MAX + 1); // 😀
+        let done =
+            json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } });
+        let out =
+            prompt_outcome(&done).expect("an overlong astral summary must be truncated");
+        let summary = out["summary"].as_str().unwrap();
+        // 4,000 emoji = 8,000 UTF-16 code units = 4,000 scalar values.
+        assert_eq!(summary.chars().count(), OUTCOME_SUMMARY_MAX / 2);
+        assert_eq!(
+            summary.chars().map(char::len_utf16).sum::<usize>(),
             OUTCOME_SUMMARY_MAX
         );
     }

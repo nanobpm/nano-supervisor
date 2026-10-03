@@ -66,7 +66,7 @@ fn js_stringify(v: &Value) -> String {
     match v {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
+        Value::Number(n) => js_number_string(n),
         Value::String(s) => s.clone(),
         // `Array.prototype.toString` is `join(",")`: empty → `""`, nested
         // arrays/objects recurse through the same `String()` conversion —
@@ -84,6 +84,111 @@ fn js_stringify(v: &Value) -> String {
         // A plain object has no custom `toString`, so it stringifies to the
         // invariant `"[object Object]"` regardless of its contents.
         Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// ECMAScript's `Number::toString` (what Node's `String(number)` and
+/// `Number.prototype.toString()` produce) for a JSON number. This is the
+/// string `parseInt`/`String(v)` actually consume in the plugin, so the
+/// normalizer must reproduce it exactly — serde_json's own `Number::to_string`
+/// is NOT it: it renders an integral float with a trailing `.0` (`100.0`,
+/// `9007199254740992.0`) where JS drops it (`"100"`, `"9007199254740992"`), and
+/// it switches to exponential notation at different thresholds (`1e-6` → serde
+/// `"1e-6"` vs JS `"0.000001"`; `1e20` → serde `"1e+20"` vs JS
+/// `"100000000000000000000"`). Those divergences change the value `coerceInt`
+/// derives (`String(0.000001)` parses to `0` in Node but `1` from serde's
+/// `"1e-6"`) and the text a string field receives.
+///
+/// Integers (`i64`/`u64`) already render as plain digits under both serde_json
+/// and JS, so they pass through unchanged. Only a float needs reformatting:
+/// ryu yields the same shortest round-trip digits serde_json used, and the
+/// ECMAScript `Number::toString` rules below place the decimal point / choose
+/// exponential notation the way V8 does. Let the shortest digits be `d[0..k]`
+/// and the decimal exponent `e` (value = `0.d[0..k] × 10^e`, equivalently
+/// `d[0].d[1..k] × 10^(e-1)`):
+///   * `k <= e <= 21`   → the digits followed by `e - k` zeros (plain integer);
+///   * `0 < e < k` (and `e <= 21`) → `d[0..e].d[e..k]` (point inside the digits);
+///   * `-6 < e <= 0`    → `0.` then `-e` zeros then the digits (small decimal);
+///   * otherwise        → `d[0][.d[1..k]]e±(e-1)` (exponential).
+fn js_number_string(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    let x = match n.as_f64() {
+        Some(x) if x.is_finite() => x,
+        // serde_json never holds NaN/±Infinity (from_f64 rejects them), so this
+        // is unreachable in practice; fall back to serde's rendering.
+        _ => return n.to_string(),
+    };
+    if x == 0.0 {
+        return "0".to_string(); // JS renders both 0 and -0 as "0"
+    }
+    let neg = x.is_sign_negative();
+
+    // Shortest round-trip digits + decimal exponent, from ryu's rendering. ryu
+    // emits either decimal ("1234.5678", "0.0001", and an integral float padded
+    // with a cosmetic ".0" such as "100.0") or scientific ("1e20", "1.5e-7").
+    let mut buf = ryu::Buffer::new();
+    let rendered = buf.format(x.abs());
+    let (mantissa, sci_exp) = match rendered.split_once(['e', 'E']) {
+        Some((m, e)) => (m.to_string(), e.parse::<i32>().unwrap_or(0)),
+        None => (rendered.to_string(), 0),
+    };
+    // Drop a trailing "." + all-zero fraction: that zero is ryu's float marker,
+    // not a significant digit (`100.0` has digits "100", not "1000").
+    let mantissa = match mantissa.split_once('.') {
+        Some((int, frac)) if frac.chars().all(|c| c == '0') => int.to_string(),
+        _ => mantissa,
+    };
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let frac_len = mantissa.split_once('.').map(|(_, f)| f.len()).unwrap_or(0) as i32;
+    let k = digits.len() as i32;
+    // e = (position of the decimal point) such that value = 0.digits × 10^e:
+    // the integer formed by `digits` is scaled by 10^(sci_exp - frac_len), so
+    // e = k + sci_exp - frac_len.
+    let e = k + sci_exp - frac_len;
+
+    let body = if e > 21 || e <= -6 {
+        // Exponential: one digit, an optional fraction, then e±(e-1).
+        let mut s = String::new();
+        s.push_str(&digits[..1]);
+        if k > 1 {
+            s.push('.');
+            s.push_str(&digits[1..]);
+        }
+        s.push('e');
+        let m = e - 1;
+        if m >= 0 {
+            s.push('+');
+        }
+        s.push_str(&m.to_string());
+        s
+    } else if e <= 0 {
+        // Small decimal: 0.000…digits.
+        let mut s = String::from("0.");
+        s.push_str(&"0".repeat((-e) as usize));
+        s.push_str(&digits);
+        s
+    } else if e >= k {
+        // Plain integer: digits then trailing zeros.
+        let mut s = digits.clone();
+        s.push_str(&"0".repeat((e - k) as usize));
+        s
+    } else {
+        // Point inside the digits.
+        let mut s = String::new();
+        s.push_str(&digits[..e as usize]);
+        s.push('.');
+        s.push_str(&digits[e as usize..]);
+        s
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
     }
 }
 
@@ -591,14 +696,63 @@ mod tests {
         assert_eq!(coerce_u(Some(&json!(1e21))), Some(1)); // "1e+21" → 1
         assert_eq!(coerce_u(Some(&json!(1e100))), Some(1)); // "1e+100" → 1
         assert_eq!(coerce_u(Some(&json!(1e-7))), Some(1)); // "1e-7" → 1
-                                                           // NOTE: serde_json renders small sub-1 decimals in exponent form where
-                                                           // JS uses a plain decimal (`0.000001` → serde `"1e-6"` vs JS
-                                                           // `"0.000001"`), so the leading integer differs (`1` vs Node's `0`).
-                                                           // That is a `js_stringify` number-formatting divergence, not the
-                                                           // fast-path saturation this test pins; assert the actual behaviour.
-        assert_eq!(coerce_u(Some(&json!(0.000001))), Some(1)); // serde "1e-6" → 1
+                                                           // A small sub-1 decimal is stringified the ECMAScript way — `0.000001`
+                                                           // → `"0.000001"` (NOT serde_json's `"1e-6"`) — so `parseInt` reads the
+                                                           // leading `0`, exactly as Node's `coerceInt(0.000001)` → `0`.
+        assert_eq!(coerce_u(Some(&json!(0.000001))), Some(0)); // "0.000001" → 0
                                                                // A float within range still truncates like parseInt.
         assert_eq!(coerce_u(Some(&json!(7.9))), Some(7));
+    }
+
+    #[test]
+    fn js_number_string_matches_ecmascript_number_to_string() {
+        // The normalizer's `String(number)` must reproduce ECMAScript
+        // `Number::toString`, not serde_json's JSON rendering. serde_json pads an
+        // integral float with `.0` and switches to exponential at different
+        // thresholds; each case below is a divergence serde_json gets wrong.
+        let cases: &[(&str, &str)] = &[
+            // Integral floats drop the `.0`.
+            ("100.0", "100"),
+            ("1.0", "1"),
+            ("9007199254740992.0", "9007199254740992"),
+            ("123456789.0", "123456789"),
+            // Small decimals stay decimal down to 1e-6 inclusive (serde says "1e-6").
+            ("0.000001", "0.000001"),
+            ("1e-5", "0.00001"),
+            ("0.0001", "0.0001"),
+            // …but exponential below 1e-6.
+            ("0.0000001", "1e-7"),
+            ("5e-324", "5e-324"),
+            // Large magnitudes stay decimal up to 1e21 exclusive…
+            ("1e15", "1000000000000000"),
+            ("1e16", "10000000000000000"),
+            ("1e20", "100000000000000000000"),
+            ("9.99e20", "999000000000000000000"),
+            // …and exponential at 1e21 and beyond.
+            ("1e21", "1e+21"),
+            ("9.99e21", "9.99e+21"),
+            ("1e100", "1e+100"),
+            ("1.7976931348623157e308", "1.7976931348623157e+308"),
+            // Ordinary decimals, signs, and integers.
+            ("7.9", "7.9"),
+            ("0.1", "0.1"),
+            ("0.30000000000000004", "0.30000000000000004"),
+            ("1234.5678", "1234.5678"),
+            ("-0.000001", "-0.000001"),
+            ("-1e21", "-1e+21"),
+            ("7", "7"),
+            ("-3", "-3"),
+            ("0", "0"),
+            ("-0.0", "0"),
+        ];
+        for (input, want) in cases {
+            let v: Value = serde_json::from_str(input).unwrap();
+            let n = match &v {
+                Value::Number(n) => n,
+                _ => panic!("{input} is not a number"),
+            };
+            assert_eq!(&js_number_string(n), want, "String({input})");
+        }
     }
 
     #[test]
