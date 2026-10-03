@@ -622,8 +622,19 @@ fn tokenize_script(s: &str) -> Vec<ScriptToken> {
                     i += 1; // consume closing quote
                 }
             } else {
-                text.push(bytes[i] as char);
-                i += 1;
+                // Unquoted run: copy the raw substring so multi-byte UTF-8 is
+                // preserved. Casting each `u8` to `char` would reinterpret a
+                // continuation byte as its own Latin-1 code point and mojibake
+                // any non-ASCII token.
+                let seg_start = i;
+                while i < s.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && bytes[i] != b'\''
+                    && bytes[i] != b'"'
+                {
+                    i += 1;
+                }
+                text.push_str(&s[seg_start..i]);
             }
         }
         toks.push(ScriptToken {
@@ -829,6 +840,25 @@ mod tests {
             "sh",
             &["-c".into(), "exec env X='1 2' claude-code-acp".into()]
         ));
+    }
+
+    #[test]
+    fn tokenize_script_preserves_non_ascii_unquoted_tokens() {
+        // Regression: the unquoted-run copy must not cast each byte to `char`,
+        // which reinterprets a multi-byte UTF-8 sequence as separate Latin-1
+        // code points (`café-acp` -> `cafÃ©-acp`) and corrupts a spawned command.
+        let toks = tokenize_script("café-acp --flag");
+        assert_eq!(toks[0].text, "café-acp");
+        assert_eq!(toks[1].text, "--flag");
+        // A word mixing unquoted and quoted non-ASCII segments joins intact.
+        let mixed = tokenize_script("naïve'-wörld'-acp");
+        assert_eq!(mixed[0].text, "naïve-wörld-acp");
+        // The nested-shell injection path re-emits the inner script text, so a
+        // non-ASCII unquoted command must survive the round-trip, not mojibake.
+        assert_eq!(
+            inject_selector_into_script("sh -c /café/nano-coder"),
+            "sh -c '/café/nano-coder --acp'"
+        );
     }
 
     #[test]
