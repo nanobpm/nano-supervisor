@@ -1280,6 +1280,9 @@ pub(crate) const AGENT_RESULT_KEY: &str = "io.nanobpm.agentResult";
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
 
 /// The Node plugin's cap on the prior output echoed into the re-emit nudge.
+/// The plugin slices the tail with `.slice(-24000)`, so the cap counts UTF-16
+/// code units (an astral character is a surrogate pair and costs two), not
+/// Unicode scalar values.
 const NUDGE_CONTEXT_CAP_CHARS: usize = 24_000;
 
 /// What one agent invocation produced (the Node plugin's `result` object).
@@ -1801,10 +1804,10 @@ fn cap_stdout_tail(s: String) -> (String, bool) {
 /// The re-emit nudge prompt — the Node plugin's `buildResultNudgePrompt` (with a
 /// result file, which this worker always provides).
 fn build_result_nudge_prompt(prior_stdout: &str) -> String {
-    let chars: Vec<char> = prior_stdout.chars().collect();
-    let ctx: String = chars[chars.len().saturating_sub(NUDGE_CONTEXT_CAP_CHARS)..]
-        .iter()
-        .collect();
+    // The Node plugin echoes the prior output's TAIL via `.slice(-24000)`, which
+    // counts UTF-16 code units, not scalar values. Cut by code units so an
+    // astral-heavy tail keeps Node's intended length (an emoji costs two units).
+    let ctx = crate::acp::tail_utf16(prior_stdout, NUDGE_CONTEXT_CAP_CHARS);
     [
         "You already completed the task in your previous turn, but you did NOT emit a",
         "machine-readable result, so the orchestrator cannot read your status and the",
@@ -2262,6 +2265,34 @@ mod tests {
         let p = build_result_nudge_prompt(&long);
         assert!(p.ends_with(&"x".repeat(NUDGE_CONTEXT_CAP_CHARS)));
         assert!(!p.contains(&"x".repeat(NUDGE_CONTEXT_CAP_CHARS + 1)));
+    }
+
+    #[test]
+    fn nudge_prompt_tail_counts_utf16_units_not_chars() {
+        // The Node plugin's `.slice(-24000)` counts UTF-16 code units: an emoji
+        // is a surrogate pair (two units), so an astral-heavy tail keeps half as
+        // many CHARACTERS as a chars()-based cut would.
+        let emoji = "\u{1F600}".repeat(NUDGE_CONTEXT_CAP_CHARS); // 2 units each
+        let p = build_result_nudge_prompt(&emoji);
+        let kept = NUDGE_CONTEXT_CAP_CHARS / 2; // whole pairs only, never split
+        assert!(p.ends_with(&"\u{1F600}".repeat(kept)));
+        assert!(!p.contains(&"\u{1F600}".repeat(kept + 1)));
+    }
+
+    #[test]
+    fn tail_utf16_never_splits_a_surrogate_pair() {
+        // An astral character costs two UTF-16 units. When it does not fit whole
+        // in the remaining budget it is dropped entirely (JS `slice` would keep a
+        // lone surrogate, which a Rust String cannot represent), never split.
+        let s = format!("{}\u{1F600}", "a".repeat(10)); // 10 units + 2 units
+        let tail = crate::acp::tail_utf16(&s, 1);
+        assert_eq!(tail, ""); // the emoji (2 units) does not fit in 1 unit
+        let tail = crate::acp::tail_utf16(&s, 2);
+        assert_eq!(tail, "\u{1F600}"); // exactly the emoji
+        let tail = crate::acp::tail_utf16(&s, 3);
+        assert_eq!(tail, "a\u{1F600}"); // one BMP char + the emoji
+        let tail = crate::acp::tail_utf16(&s, 12);
+        assert_eq!(tail, s); // the whole string fits
     }
 
     #[test]

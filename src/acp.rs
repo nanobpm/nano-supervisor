@@ -488,6 +488,29 @@ pub(crate) fn truncate_utf16(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
+/// Keep at most the last `max` UTF-16 code units of `s` — the TAIL — the way
+/// the Node plugin's `s.slice(-max)` does. This is the from-the-end analogue of
+/// [`truncate_utf16`]: JavaScript counts code UNITS, so an astral character (an
+/// emoji) is a surrogate pair and costs two units via `char::len_utf16()`. A
+/// `chars()` tail cut instead counts scalar values, keeping roughly twice the
+/// intended UTF-16 length for astral-heavy output. The cut never splits a
+/// surrogate pair: a character is included only when it fits whole within the
+/// remaining budget, matching how `slice` rounds a boundary that lands mid-pair
+/// up to the first complete character.
+pub(crate) fn tail_utf16(s: &str, max: usize) -> String {
+    let mut units = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices().rev() {
+        let w = c.len_utf16();
+        if units + w > max {
+            start = i + c.len_utf8();
+            break;
+        }
+        units += w;
+    }
+    s[start..].to_string()
+}
+
 /// Extract the prompt response's `_meta.outcome` object (plugin 1.70.1),
 /// validated and canonicalized the way the Node plugin does before it uses one.
 ///
