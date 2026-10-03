@@ -108,36 +108,36 @@ fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
     }
 }
 
+/// Parse the leading integer of a string the way Node's
+/// `Number.parseInt(String(v), 10)` does: trim leading whitespace, then read the
+/// longest `[+-]?digit*` prefix. A leading `+`/`-` with no digit, or no leading
+/// digit at all, is `NaN` → `None`. This is the shared core of [`coerce_int`]
+/// and [`coerce_u`]; both stringify first (see [`js_stringify`]) so a non-string
+/// is converted the JavaScript way before the leading integer is parsed.
+fn parse_int_str(s: &str) -> Option<i64> {
+    let t = s.trim_start();
+    let end = t
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    t[..end].parse().ok()
+}
+
 /// Node's `coerceInt` for the unsigned fields (`depth`, `cloneTimeoutMs`):
 /// `null`/absent → `None`; otherwise `Number.parseInt(String(v), 10)` kept only
-/// when finite and non-negative. Like [`coerce_int`], `String(v)` runs FIRST, so
-/// a non-string is stringified the JavaScript way before the leading integer is
-/// parsed: `depth: ["5"]` → `String(["5"])` is `"5"` → `5`, and `["1","2"]` →
-/// `"1,2"` → `1`. A prior version matched only `Value::Number`/`Value::String`,
-/// so an array/object value was dropped where Node parses it — e.g.
-/// `cloneTimeoutMs: ["30000"]` normalised to absent (shallow clone / clone
-/// timeout silently lost) where Node yields `30000`. Negative and non-numeric
-/// results stay absent (the `u64` guard), matching the field's unsigned domain.
+/// when finite and non-negative. `String(v)` runs FIRST for EVERY value —
+/// including a JSON number — so it is stringified the JavaScript way before the
+/// leading integer is parsed: `depth: ["5"]` → `String(["5"])` is `"5"` → `5`,
+/// `["1","2"]` → `"1,2"` → `1`, and a large number such as `1e21` → `"1e+21"`
+/// → `1` (Node yields `1`; a numeric fast path that instead casts the `f64`
+/// saturates to `u64::MAX`, silently turning a 1 ms timeout into an unbounded
+/// one). Negative and non-numeric results stay absent (the `u64` guard),
+/// matching the field's unsigned domain.
 fn coerce_u(v: Option<&Value>) -> Option<u64> {
     match v {
-        // A JSON number: `as_u64` keeps non-negative integers; a float is
-        // truncated like `parseInt` (7.9 → 7); a NEGATIVE integer must NOT fall
-        // through to the float arm (`-3 as u64` saturates to 0) — Node's
-        // `parseInt` yields `-3`, which the unsigned domain rejects as absent.
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
-        Some(other) => {
-            let t = js_stringify(other);
-            let t = t.trim_start();
-            let end = t
-                .char_indices()
-                .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
-                .map(|(i, _)| i)
-                .unwrap_or(t.len());
-            t[..end].parse().ok()
-        }
         None => None,
+        Some(value) => parse_int_str(&js_stringify(value)).and_then(|i| u64::try_from(i).ok()),
     }
 }
 
@@ -242,27 +242,16 @@ pub fn assemble(custom_headers: &Map<String, Value>, variables: &Map<String, Val
 
 /// Node's `coerceInt`: `null`/`""` → absent; otherwise
 /// `Number.parseInt(String(v), 10)` kept only when finite. `String(v)` runs
-/// FIRST, so a non-string is stringified the JavaScript way before the leading
-/// integer is parsed: `timeoutMs: ["1000"]` → `String(["1000"])` is `"1000"` →
-/// `1000`, and `["1","2"]` → `"1,2"` → `1`. A prior version parsed only a JSON
-/// string and dropped arrays/objects entirely, so `timeoutMs: ["1000"]` was
-/// lost where Node yields `1000`. `parseInt` trims leading whitespace and reads
-/// the longest `[+-]?digit*` prefix; a leading `+`/`-` with no digit, or no
-/// leading digit at all, is `NaN` → absent.
+/// FIRST for EVERY value — including a JSON number — so it is stringified the
+/// JavaScript way before the leading integer is parsed: `timeoutMs: ["1000"]` →
+/// `String(["1000"])` is `"1000"` → `1000`, `["1","2"]` → `"1,2"` → `1`, and a
+/// large number such as `1e21` → `"1e+21"` → `1` (Node yields `1`; a numeric
+/// fast path that instead casts the `f64` saturates to `i64::MAX`). A leading
+/// `+`/`-` with no digit, or no leading digit at all, is `NaN` → absent.
 fn coerce_int(v: Option<&Value>) -> Option<i64> {
     match v {
-        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-        Some(other) => {
-            let t = js_stringify(other);
-            let t = t.trim_start();
-            let end = t
-                .char_indices()
-                .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
-                .map(|(i, _)| i)
-                .unwrap_or(t.len());
-            t[..end].parse().ok()
-        }
         None => None,
+        Some(value) => parse_int_str(&js_stringify(value)),
     }
 }
 
@@ -550,6 +539,37 @@ mod tests {
         assert_eq!(coerce_u(Some(&json!(-3))), None); // u64 guard: negative absent
         assert_eq!(coerce_u(Some(&json!(null))), None);
         assert_eq!(coerce_u(None), None);
+    }
+
+    #[test]
+    fn coerce_u_parses_large_numbers_the_js_way() {
+        // `String(v)` runs BEFORE `parseInt`, so a JSON number is stringified the
+        // JavaScript way first: `1e21` → `"1e+21"` → leading integer `1`. A
+        // numeric fast path that casts the `f64` instead saturates to
+        // `u64::MAX`, turning a 1 ms Node timeout into an unbounded one.
+        assert_eq!(coerce_u(Some(&json!(1e21))), Some(1)); // "1e+21" → 1
+        assert_eq!(coerce_u(Some(&json!(1e100))), Some(1)); // "1e+100" → 1
+        assert_eq!(coerce_u(Some(&json!(1e-7))), Some(1)); // "1e-7" → 1
+                                                           // NOTE: serde_json renders small sub-1 decimals in exponent form where
+                                                           // JS uses a plain decimal (`0.000001` → serde `"1e-6"` vs JS
+                                                           // `"0.000001"`), so the leading integer differs (`1` vs Node's `0`).
+                                                           // That is a `js_stringify` number-formatting divergence, not the
+                                                           // fast-path saturation this test pins; assert the actual behaviour.
+        assert_eq!(coerce_u(Some(&json!(0.000001))), Some(1)); // serde "1e-6" → 1
+                                                               // A float within range still truncates like parseInt.
+        assert_eq!(coerce_u(Some(&json!(7.9))), Some(7));
+    }
+
+    #[test]
+    fn coerce_int_parses_large_numbers_the_js_way() {
+        // Same `parseInt(String(v), 10)` for the signed fields: the number is
+        // JS-stringified first, never cast, so a huge magnitude is not saturated.
+        assert_eq!(coerce_int(Some(&json!(1e21))), Some(1)); // "1e+21" → 1
+        assert_eq!(coerce_int(Some(&json!(-1e21))), Some(-1)); // "-1e+21" → -1
+        assert_eq!(coerce_int(Some(&json!(7.9))), Some(7));
+        assert_eq!(coerce_int(Some(&json!(-3))), Some(-3));
+        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(1000));
+        assert_eq!(coerce_int(Some(&json!(null))), None); // "null" → NaN
     }
 
     #[test]

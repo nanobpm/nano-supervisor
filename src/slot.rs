@@ -151,7 +151,38 @@ pub async fn run(
                 let _ = fatal.send(true);
                 return;
             }
-            handle(&jobs, &cfg, job).await;
+            // Run the job on its own task and ABORT it (not detach) when the slot
+            // is asked to drain. Awaiting `handle` directly would let a drain
+            // timeout that aborts the OUTER slot task drop `handle` mid-await —
+            // detaching its inner `execute`/agent, which could keep writing under
+            // `runs_dir` after `work::run` tears the namespace down and returns.
+            // Aborting this task cancels the whole per-job tree (the execute
+            // child processes are `kill_on_drop`), so no job outlives the slot.
+            let mut job_task = tokio::spawn(handle(jobs.clone(), cfg.clone(), job));
+            tokio::select! {
+                // Bias the drain watch: if SIGTERM lands in the same tick the job
+                // finishes, draining wins and the job task is aborted below.
+                biased;
+                _ = shutdown.changed() => {
+                    log(&format!(
+                        "slot {} draining; aborting in-flight job",
+                        cfg.worker_name
+                    ));
+                    job_task.abort();
+                    // Join the aborted task so the execute/agent is fully torn
+                    // down before the slot returns (the abort error is expected).
+                    let _ = job_task.await;
+                    return;
+                }
+                r = &mut job_task => {
+                    // Surface a panic in the job task rather than swallowing it.
+                    if let Err(e) = r {
+                        if !e.is_cancelled() {
+                            log(&format!("slot {} job task failed: {e:#}", cfg.worker_name));
+                        }
+                    }
+                }
+            }
             handled += 1;
         }
     }
@@ -173,7 +204,7 @@ fn reconcile_lost<T>(outcome: Option<T>, lost: bool) -> Option<T> {
     }
 }
 
-async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
+async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
     let started = Instant::now();
     // Validate the engine-supplied key BEFORE it is used to build any request
@@ -211,6 +242,10 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
 
     // Run the job on its own task so a panic fails only THIS job (the slot loop
     // survives). Race it against activation loss so a superseded worker stops.
+    // `handle` is itself spawned by `run` (below) and aborted when the slot
+    // drains, so this inner task is aborted through it — never detached (see
+    // `run`). Returning here (rather than aborting) leaves the task running so
+    // the slot can settle the job; only a drain/loss aborts it.
     let mut exec = tokio::spawn(execute(cfg.clone(), key.clone(), job.clone()));
     let raced = tokio::select! {
         r = &mut exec => Some(match r {
@@ -355,6 +390,52 @@ pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Canonicalize only the *existing* prefix of `dir`, leaving any not-yet-created
+/// trailing components unresolved. This resolves PLATFORM symlinks in a trusted
+/// base (macOS `/var` → `/private/var`, where the system temp dir lives) so the
+/// no-follow [`reject_symlink`] / [`reject_symlinked_ancestors`] checks do not
+/// reject a legitimate temp root — while a USER-planted symlink in the
+/// not-yet-created tail (e.g. the worker's own `rust-worker-<pid>` leaf) is left
+/// unresolved and so still rejected by those checks. A symlinked ancestor of the
+/// existing base is resolved here (the base is trusted), but a symlinked
+/// ancestor of the *canonical* base is still caught by the re-validation.
+pub(crate) fn canonicalize_existing_base(dir: &Path) -> Result<PathBuf> {
+    // Collect the leading components that already exist on disk.
+    let mut existing = PathBuf::new();
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut split = false;
+    for comp in dir.components() {
+        if split {
+            rest.push(comp.as_os_str());
+            continue;
+        }
+        let mut candidate = existing.clone();
+        candidate.push(comp.as_os_str());
+        if candidate.exists() {
+            existing = candidate;
+        } else {
+            // First component that does not (yet) exist: everything from here on
+            // is the unresolved tail.
+            split = true;
+            rest.push(comp.as_os_str());
+        }
+    }
+    // Canonicalize the existing prefix (resolves platform symlinks), then
+    // re-attach the unresolved tail. If nothing exists, fall back to the
+    // current directory as the anchor.
+    let base = if existing.as_os_str().is_empty() {
+        std::env::current_dir().context("resolving current directory for run-dir base")?
+    } else {
+        std::fs::canonicalize(&existing)
+            .with_context(|| format!("canonicalizing existing base {}", existing.display()))?
+    };
+    let mut out = base;
+    for comp in rest {
+        out.push(comp);
+    }
+    Ok(out)
 }
 
 /// Prepare a per-job run directory under `runs_dir` with the full symlink and
@@ -1078,6 +1159,22 @@ fn git_head(dir: &Path) -> Option<String> {
     }
 }
 
+/// The empty-job detector's "did the agent commit anything" signal, as a pure
+/// function of the pre/post HEAD and whether this job provisioned a repository.
+/// Mirrors Node's non-empty `gitResult.commits`: any HEAD advance is a commit,
+/// and — for a newly provisioned (initially HEAD-less) repository — the
+/// *appearance* of a first commit (`before` `None`, `after` `Some`) is a commit
+/// too, so a quiet pipe agent that made its first commit is not misread as an
+/// empty run and retried. A non-repository run dir (`before`/`after` both
+/// `None`) stays "no commits".
+fn detect_commits(before: Option<&str>, after: Option<&str>, provisioned: bool) -> bool {
+    match (before, after) {
+        (Some(b), Some(a)) => b != a,
+        (None, Some(_)) => provisioned,
+        _ => false,
+    }
+}
+
 async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
@@ -1214,11 +1311,19 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         // signals. A repository agent that advanced the checkout HEAD committed
         // real work, so it is NOT empty even with no stdout/result; failing it
         // would burn a retry. No `finalizeGit` push stage exists yet, so
-        // `pushed` is always false here.
-        let has_commits = match (start_head.as_deref(), git_head(&agent_cwd)) {
-            (Some(before), Some(after)) => before != after,
-            _ => false,
-        };
+        // `pushed` is always false here. A newly PROVISIONED repository starts
+        // with no baseline HEAD (`start_head` is `None`), so the agent's FIRST
+        // commit yields `(None, Some(after))` — treat that appearance of HEAD as
+        // a commit too (Node's non-empty `gitResult.commits`), or a quiet pipe
+        // agent that made its first commit would be misread as empty and
+        // retried. A NON-repository run dir (no checkout) reads `None`/`None`
+        // and stays "no commits".
+        let provisioned = env.repository.is_some();
+        let has_commits = detect_commits(
+            start_head.as_deref(),
+            git_head(&agent_cwd).as_deref(),
+            provisioned,
+        );
         result::detect_empty(
             raw_result.as_ref(),
             &run.stdout,
@@ -2512,6 +2617,65 @@ mod tests {
             outside.join("precious.txt").exists(),
             "sweep must not follow the inner symlink and delete its target's contents"
         );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn detect_commits_recognises_advance_and_first_commit() {
+        // An existing HEAD that advanced is a commit.
+        assert!(detect_commits(Some("aaa"), Some("bbb"), true));
+        // An unchanged HEAD is no commit.
+        assert!(!detect_commits(Some("aaa"), Some("aaa"), true));
+        // A newly provisioned (HEAD-less) repo that gains its first commit IS a
+        // commit — Node's non-empty `gitResult.commits` — so a quiet pipe agent
+        // that committed real work is not misread as an empty run and retried.
+        assert!(detect_commits(None, Some("aaa"), true));
+        // ...but only when the job actually provisioned a repository: a non-repo
+        // run dir (no checkout) that somehow reads a HEAD stays "no commits".
+        assert!(!detect_commits(None, Some("aaa"), false));
+        // No checkout before or after (a plain no-repository run): no commits.
+        assert!(!detect_commits(None, None, true));
+        assert!(!detect_commits(None, None, false));
+        // HEAD disappeared (agent force-reset to nothing): not a new commit.
+        assert!(!detect_commits(Some("aaa"), None, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_existing_base_resolves_platform_symlink_in_base() {
+        // A PLATFORM symlink in the existing base (macOS `/var` -> `/private/var`)
+        // must be resolved so the no-follow ancestor checks do not reject a
+        // legitimate temp root, while a not-yet-created leaf is left unresolved.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("nano-canon-{uniq}"));
+        let real = base.join("real-base");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link-base");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The not-yet-created worker leaf under a symlinked base resolves the
+        // base symlink but keeps the leaf literal (unresolved).
+        let requested = link.join("rust-worker-123");
+        let resolved = canonicalize_existing_base(&requested).unwrap();
+        let want = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("rust-worker-123");
+        assert_eq!(resolved, want);
+        // The leaf was NOT created or resolved through a planted link.
+        assert!(!resolved.exists());
+
+        // After the checks, the ancestor walk over the canonical path passes
+        // (the platform link is gone) and a real leaf can be created.
+        reject_symlink(&resolved).unwrap();
+        reject_symlinked_ancestors(&resolved).unwrap();
 
         std::fs::remove_dir_all(&base).ok();
     }

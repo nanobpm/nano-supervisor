@@ -102,22 +102,24 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
                 std::env::temp_dir().join(format!("nano-runs-{}", std::process::id()))
             }),
     };
-    // Validate the configured path WITHOUT following symlinks BEFORE creating or
-    // canonicalizing it: `create_dir_all` follows a pre-existing
-    // `rust-worker-<pid>` symlink (or a symlinked ancestor of `--runs-dir`), and
-    // canonicalizing right after would erase the evidence that the requested
-    // root was reached through one — letting a planted link redirect
-    // `sweep_root` so the startup reaper deletes matching worker trees outside
-    // the requested root. Reject a symlinked leaf / ancestor first (the same
-    // hardening `prepare_run_dir` applies to each job's run dir), then create
-    // and canonicalize. The canonical path is re-validated below so a platform
-    // symlink (macOS `/var` → `/private/var`) is only ever resolved, never
-    // followed into a redirected sweep root.
+    // Validate the configured path, but resolve PLATFORM symlinks in the trusted
+    // existing base FIRST: on macOS the system temp dir is `/var/folders/...` and
+    // `/var` is itself a symlink to `/private/var`, so a pre-canonicalization
+    // ancestor walk would reject the legitimate `tempfile::tempdir()` root the
+    // contract harness hands us via `C8CTL_NANO_HOME` (the Rust worker matrix
+    // includes `macos-latest`). Canonicalizing the existing base resolves only
+    // those platform links — it cannot follow a USER-planted descendant, because
+    // the worker-owned `rust-worker-<pid>` leaf does not exist yet and so is left
+    // unresolved. Then run the no-follow leaf/ancestor checks on the canonical
+    // path (a planted symlink at the not-yet-created leaf, or a symlinked
+    // ancestor of the real base, is still rejected) before creating it.
+    let runs_dir = slot::canonicalize_existing_base(&runs_dir)?;
     slot::reject_symlink(&runs_dir)?;
     slot::reject_symlinked_ancestors(&runs_dir)?;
     std::fs::create_dir_all(&runs_dir)?;
-    // Resolve platform symlinks in the path (macOS `/var` → `/private/var`):
-    // the run-dir sweep refuses any root with a symlinked ancestor.
+    // Re-canonicalize now that the leaf exists and re-validate: this catches a
+    // symlink swapped in at the leaf between the check above and the create, so
+    // the sweep root is only ever the resolved real directory, never a redirect.
     let runs_dir = std::fs::canonicalize(&runs_dir)?;
     slot::reject_symlink(&runs_dir)?;
     slot::reject_symlinked_ancestors(&runs_dir)?;
@@ -136,18 +138,26 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| runs_dir.clone());
-    // Startup reap, then on a cadence: run dirs older than `--reap-age`.
-    slot::sweep_stale_runs(&sweep_root, opts.reap_age, true);
+    // Startup reap, then on a cadence: run dirs older than `--reap-age`. Both
+    // sweeps are skipped under `--keep-runs`: that flag promises retained runs
+    // are kept, so the age-based reaper must not delete them at startup or on
+    // the cadence (only the immediate per-completion cleanup is already gated).
+    if !opts.keep_runs {
+        slot::sweep_stale_runs(&sweep_root, opts.reap_age, true);
+    }
     let reaper = {
         let dir = sweep_root.clone();
-        let (age, every) = (
+        let (age, every, keep) = (
             opts.reap_age,
             opts.reap_interval.max(Duration::from_millis(100)),
+            opts.keep_runs,
         );
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                slot::sweep_stale_runs(&dir, age, true);
+                if !keep {
+                    slot::sweep_stale_runs(&dir, age, true);
+                }
             }
         })
     };
