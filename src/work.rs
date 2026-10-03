@@ -131,51 +131,38 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
             }
         }
     };
-    // Validate the configured path, but resolve PLATFORM symlinks in the trusted
-    // anchor FIRST (see above): a pre-canonicalization ancestor walk over the
-    // whole path would reject the legitimate `tempfile::tempdir()` root the
-    // contract harness hands us via `C8CTL_NANO_HOME` (the Rust worker matrix
-    // includes `macos-latest`). So:
-    //   1. Reject any symlink in the OPERATOR-CONTROLLED tail on the ORIGINAL
-    //      path (below `anchor`) BEFORE canonicalizing — canonicalization
-    //      would otherwise FOLLOW a planted ancestor (e.g. `--runs-dir
-    //      /shared/link/runs` with `link` -> an attacker target) to its target,
-    //      and the no-follow checks below would then inspect only that canonical
-    //      target and pass, redirecting both the workspace and the stale-run
-    //      sweep despite the hardening.
-    //   2. Canonicalize ONLY THE PARENT of the worker namespace (resolving the
-    //      trusted anchor's platform links), then re-append the
-    //      `rust-worker-<pid>` leaf unresolved: the leaf is predictable, so a
-    //      same-UID attacker can pre-create it as a symlink — and
-    //      `canonicalize_existing_base` on the *whole* path would follow that
-    //      planted leaf to its target. Splitting the leaf off keeps it literal
-    //      so the no-follow checks below reject a planted (or swapped-in) link.
-    slot::reject_symlinked_ancestors_below(&runs_dir, &anchor)?;
-    let leaf = runs_dir
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| format!("rust-worker-{}", std::process::id()).into());
-    let parent = runs_dir
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("nano-runs-{}", std::process::id())));
-    let parent = slot::canonicalize_existing_base(&parent)?;
-    let runs_dir = parent.join(&leaf);
-    slot::reject_symlink(&runs_dir)?;
-    slot::reject_symlinked_ancestors(&runs_dir)?;
-    std::fs::create_dir_all(&runs_dir)?;
-    // Re-validate NO-FOLLOW now that the leaf exists: a same-UID process could
-    // swap the freshly created `rust-worker-<pid>` leaf for a symlink between the
-    // create above and first use. Do NOT re-`canonicalize` here — `canonicalize`
-    // FOLLOWS such a swapped leaf to the attacker-chosen target, and the checks
-    // would then inspect that (real) target and pass, redirecting the sweep/run
-    // root outside the configured workspace. `canonicalize_existing_base` already
-    // resolved the trusted platform symlinks in the existing base, so the leaf is
-    // the only thing left to recheck; `reject_symlink` inspects it with
-    // `symlink_metadata` (no-follow) and REJECTS a swapped-in link instead of
+    // Resolve the run root WITHOUT ever following a symlink in the
+    // OPERATOR-CONTROLLED tail. Canonicalize ONLY the trusted `anchor` (resolving
+    // its platform symlinks — the contract harness hands us a `C8CTL_NANO_HOME`
+    // under macOS's `/var` -> `/private/var`, and the Rust worker matrix includes
+    // `macos-latest`), then re-attach the tail (operator path + the predictable
+    // `rust-worker-<pid>` leaf) LITERALLY onto the canonical anchor.
+    //
+    // Canonicalizing any part of the tail is a TOCTOU hole (issue: "symlink
+    // replacement bypasses no-follow path validation"): between a no-follow check
+    // and a later `canonicalize`, a same-UID process can swap a tail ancestor
+    // (e.g. `--runs-dir /shared/link/runs` with `link` -> an attacker target, or
+    // the predictable leaf) for a symlink; `canonicalize` then FOLLOWS the swap
+    // and the no-follow checks afterwards inspect only the real target and pass,
+    // redirecting both the workspace and the recursive stale-run sweep. Because
+    // the tail is never canonicalized here, the no-follow checks below always run
+    // on the literal intended path and REJECT a planted/swapped link instead of
     // following it.
-    slot::reject_symlink(&runs_dir)?;
-    slot::reject_symlinked_ancestors(&runs_dir)?;
+    let canon_anchor = slot::canonicalize_existing_base(&anchor)?;
+    let runs_dir = match runs_dir.strip_prefix(&anchor) {
+        Ok(tail) => canon_anchor.join(tail),
+        Err(_) => runs_dir,
+    };
+    slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+    std::fs::create_dir_all(&runs_dir)?;
+    // Re-validate NO-FOLLOW now that the tail exists on disk: a same-UID process
+    // could swap the freshly created leaf (or any tail ancestor) for a symlink
+    // between the create above and first use. Do NOT `canonicalize` here —
+    // `canonicalize` FOLLOWS such a swap to the attacker-chosen target and the
+    // checks would then pass against it. `reject_symlinked_ancestors_below`
+    // inspects every component below the (already canonical) anchor with
+    // `symlink_metadata` (no-follow) and REJECTS a swapped-in link.
+    slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
     // Sweep at the SHARED parent of this worker's namespace, not the namespace
     // itself: a crashed worker leaves `rust-worker-<old-pid>` as a sibling of
     // the next launch's root, so sweeping only `runs_dir` could never discover

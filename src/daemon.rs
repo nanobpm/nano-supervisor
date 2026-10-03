@@ -280,12 +280,39 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
 /// default (non-ACP) mode — where the JSON-RPC handshake would fail. A hire that
 /// already selects ACP (an `acp`/`--acp` token, `--protocol acp`, or a `*-acp`
 /// adapter command) is returned unchanged, so the selector is never doubled.
+///
+/// A shell-wrapped hire (`sh -c "nano-coder"`) needs the selector injected INTO
+/// the `-c` script, not appended to the outer argv: `sh -c nano-coder --acp`
+/// lets POSIX `sh` swallow `--acp` as `$0`, so the inner agent never receives it
+/// and the ACP handshake fails. Mirror the recursive `-c` scan in
+/// [`scan_acp_tokens`]: when a short `-…c` flag carries the real command, append
+/// the selector to that script token so the wrapped agent starts in ACP mode.
 pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
     let mut args = hire.args.clone();
-    if !command_has_acp_selector(&hire.command, &args) {
+    if command_has_acp_selector(&hire.command, &args) {
+        return args;
+    }
+    if let Some(i) = shell_script_arg_index(&args) {
+        args[i] = format!("{} --acp", args[i].trim_end());
+    } else {
         args.push("--acp".to_string());
     }
     args
+}
+
+/// Index in `args` of a shell `-c` script token — the token following a short
+/// `-…c` flag (`-c`, `-ec`, `-lc`, …), i.e. the same shell-wrapper shape
+/// [`scan_acp_tokens`] recurses into. `None` for a plain (non-shell) command,
+/// whose selector is appended to the outer argv instead.
+fn shell_script_arg_index(args: &[String]) -> Option<usize> {
+    args.iter().enumerate().find_map(|(i, a)| {
+        let name = a.trim_matches(|c| c == '"' || c == '\'');
+        let is_shell_c = name.starts_with('-')
+            && !name.starts_with("--")
+            && name.len() >= 2
+            && name.ends_with('c');
+        (is_shell_c && i + 1 < args.len()).then_some(i + 1)
+    })
 }
 
 /// This machine's short hostname (first dot-label, lowercased), for worker names.
@@ -519,6 +546,45 @@ mod tests {
         assert_eq!(
             acp_spawn_args(&with_protocol),
             vec!["--protocol=acp".to_string()]
+        );
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_selector_into_shell_wrapper_script() {
+        // A shell-wrapped hire hides the real agent inside the `-c` script token.
+        // Appending `--acp` to the OUTER argv (`sh -c nano-coder --acp`) lets the
+        // shell swallow it as `$0`, so the inner agent never sees it. The selector
+        // must be injected INTO the script instead.
+        let mut wrapped = hire(Protocol::Acp, "sh", "none");
+        wrapped.args = vec!["-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&wrapped),
+            vec!["-c".to_string(), "nano-coder --acp".to_string()]
+        );
+
+        // Same for other short `-…c` shapes and prefixed inner commands — the
+        // whole class the selector scan recurses into.
+        let mut exec_prefixed = hire(Protocol::Acp, "bash", "none");
+        exec_prefixed.args = vec!["-lc".into(), "exec nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&exec_prefixed),
+            vec!["-lc".to_string(), "exec nano-coder --acp".to_string()]
+        );
+
+        let mut env_prefixed = hire(Protocol::Acp, "sh", "none");
+        env_prefixed.args = vec!["-ec".into(), "env X=1 nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&env_prefixed),
+            vec!["-ec".to_string(), "env X=1 nano-coder --acp".to_string()]
+        );
+
+        // A shell wrapper whose script ALREADY selects ACP is left untouched (the
+        // recursive scan sees the inner selector, so nothing is appended/injected).
+        let mut already = hire(Protocol::Acp, "sh", "none");
+        already.args = vec!["-c".into(), "nano-coder --acp".into()];
+        assert_eq!(
+            acp_spawn_args(&already),
+            vec!["-c".to_string(), "nano-coder --acp".to_string()]
         );
     }
 
