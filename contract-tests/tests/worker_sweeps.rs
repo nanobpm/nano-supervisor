@@ -80,6 +80,14 @@ fn startup_sweep_reaps_stale_runs() {
         std::fs::create_dir_all(&stale).expect("seed stale run dir");
         std::fs::create_dir_all(&live).expect("seed live run dir");
 
+        // The stale fixture is seeded immediately before this second worker
+        // starts, so its mtime is younger than any non-zero `--reap-age`; a
+        // `--reap-age 1000` startup sweep would RETAIN it and the fast
+        // `--max-jobs 1` run can exit before the first cadence tick, making the
+        // `!stale.exists()` assertion timing-dependent. Use a zero reap age so
+        // the startup sweep reaps the aged-out (any age) dead-worker tree
+        // deterministically; the cross-process live-owner check still spares the
+        // live-owned namespace regardless of age.
         let outcome2 = run_worker_job_in(
             &engine,
             &target,
@@ -90,7 +98,7 @@ fn startup_sweep_reaps_stale_runs() {
                 json!({ "write_result": { "ok": true } }),
             ],
             json!({ "prompt": "sweep second" }),
-            &["--reap-age", "1000", "--reap-interval", "1000"],
+            &["--reap-age", "0", "--reap-interval", "1000"],
             &[],
         );
         assert_eq!(

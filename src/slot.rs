@@ -221,6 +221,42 @@ fn job_panic_is_fatal(r: &Result<(), tokio::task::JoinError>, propagate: bool) -
     matches!(r, Err(e) if propagate && e.is_panic())
 }
 
+/// Reconcile the join outcome of the inner `execute` task into the job's settle
+/// result.
+///
+/// `handle` runs `execute` on its OWN spawned task (so a drain/loss can abort it
+/// without killing the slot loop). That extra task is a second place a per-job
+/// PANIC can hide: a panic surfaces here as `Err(JoinError)` on the *inner*
+/// handle, NOT as a panic of the `handle` task the slot loop's
+/// `job_panic_is_fatal` check guards. Downgrading it to a plain `anyhow::Error`
+/// (the old behaviour) let a standalone `work` process fail only the job and
+/// still exit 0 — the exact swallowed-crash the `propagate_job_panic` flag
+/// exists to prevent. So in standalone mode (`propagate == true`) re-raise a
+/// panic here, which panics the `handle` task; the slot loop then re-raises it
+/// again up to `work::run`'s join handle for a non-zero exit. The daemon
+/// (`propagate == false`) keeps its job-level resilience: the panic is
+/// downgraded to a failed job and the slot loop carries on. A cancellation is
+/// never a panic (`is_panic()` gates the re-raise), so a drain abort still
+/// downgrades cleanly.
+fn reconcile_exec_join<T>(
+    key: &str,
+    r: std::result::Result<Result<T>, tokio::task::JoinError>,
+    propagate: bool,
+) -> Result<T> {
+    match r {
+        Ok(inner) => inner,
+        Err(join) => {
+            if propagate && join.is_panic() {
+                log(&format!(
+                    "slot job {key} task panicked; propagating as a worker crash"
+                ));
+                std::panic::resume_unwind(join.into_panic());
+            }
+            Err(anyhow::anyhow!("slot task for job {key} panicked: {join}"))
+        }
+    }
+}
+
 /// Decide whether a raced job outcome is still ours to settle.
 ///
 /// [`handle`] races job execution against activation loss with `select!`. That
@@ -304,12 +340,7 @@ async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
     // drain/loss aborts it.
     let mut exec = AbortOnDrop(tokio::spawn(execute(cfg.clone(), key.clone(), job.clone())));
     let raced = tokio::select! {
-        r = &mut exec.0 => Some(match r {
-            Ok(inner) => inner,
-            Err(join) => Err(anyhow::anyhow!(
-                "slot task for job {key} panicked: {join}"
-            )),
-        }),
+        r = &mut exec.0 => Some(reconcile_exec_join(&key, r, cfg.propagate_job_panic)),
         // Drop the watch guard immediately; the abort/await happens below.
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
@@ -2491,6 +2522,54 @@ mod tests {
             !job_panic_is_fatal(&ok, true),
             "a clean completion is not a crash"
         );
+    }
+
+    #[tokio::test]
+    async fn exec_join_panic_reraised_in_standalone_but_downgraded_in_daemon() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // Daemon (`propagate == false`): a panic in the inner `execute` task is
+        // downgraded to a failed job (`Err`), never re-raised — the slot carries on.
+        let joined: std::result::Result<Result<()>, _> =
+            tokio::spawn(async { panic!("exec boom") }).await;
+        let downgraded = reconcile_exec_join("job-daemon", joined, false);
+        assert!(
+            downgraded.is_err(),
+            "daemon downgrades an inner-task panic to a failed job"
+        );
+
+        // Standalone work (`propagate == true`): the panic is re-raised so the
+        // `handle` task crashes and `work` can exit non-zero.
+        let joined2: std::result::Result<Result<()>, _> =
+            tokio::spawn(async { panic!("exec boom") }).await;
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            reconcile_exec_join("job-work", joined2, true)
+        }));
+        assert!(
+            crashed.is_err(),
+            "standalone work re-raises an inner-task panic as a worker crash"
+        );
+
+        // A cancellation (drain abort) is never a crash, even in work mode: it is
+        // downgraded like any non-panic join failure.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        task.abort();
+        let cancelled: std::result::Result<Result<()>, _> = task.await;
+        let not_a_crash = catch_unwind(AssertUnwindSafe(|| {
+            reconcile_exec_join("job-cancel", cancelled, true)
+        }));
+        assert!(
+            matches!(not_a_crash, Ok(Err(_))),
+            "a drain abort is downgraded, not re-raised, even in work mode"
+        );
+
+        // A clean completion passes the inner result straight through.
+        let clean: std::result::Result<Result<u8>, _> =
+            tokio::spawn(async { Ok(7u8) }).await;
+        assert_eq!(reconcile_exec_join("job-ok", clean, true).unwrap(), 7);
     }
 
     #[test]
