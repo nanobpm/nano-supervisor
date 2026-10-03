@@ -330,8 +330,7 @@ pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
     if command_has_acp_selector(&hire.command, &args) {
         return args;
     }
-    let command = hire.command.split_whitespace().next().unwrap_or("");
-    if is_shell_command(command) {
+    if effective_command_is_shell(&hire.command, &args) {
         if let Some(i) = shell_script_arg_index(&args) {
             args[i] = inject_selector_into_script(&args[i]);
             return args;
@@ -339,6 +338,26 @@ pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
     }
     args.push("--acp".to_string());
     args
+}
+
+/// Does the hire's EFFECTIVE program (the first token past any launch prefix)
+/// identify a POSIX shell? The outer argv a shell wrapper is spawned with can
+/// carry launch prefixes just like a `-c` script does — a launch-prefixed form
+/// such as `command = "env"`, `args = ["sh", "-c", "nano-coder"]` runs `sh` as
+/// the real program. Gating the `-c` injection on only `hire.command` would miss
+/// that: the selector would be appended to the OUTER argv (`env sh -c nano-coder
+/// --acp`), and POSIX `sh` swallows the trailing `--acp` as `$0`, so the inner
+/// agent never receives it and the ACP handshake fails. Mirror the launch-prefix
+/// resolution [`scan_acp_tokens`] and [`inject_selector_into_script`] already do
+/// so the whole class — prefixed outer argv AND prefixed inner script — is
+/// handled, not just the inner one.
+fn effective_command_is_shell(command: &str, args: &[String]) -> bool {
+    command
+        .split_whitespace()
+        .chain(args.iter().map(String::as_str))
+        .find(|t| !is_launch_prefix(t))
+        .map(is_shell_command)
+        .unwrap_or(false)
 }
 
 /// Index in `args` of the outer shell `-c` script token — the token following a
@@ -744,6 +763,50 @@ mod tests {
         assert_eq!(
             acp_spawn_args(&h),
             vec!["-c".to_string(), "config".to_string(), "--acp".to_string()]
+        );
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_when_shell_is_behind_a_launch_prefix() {
+        // A launch-prefixed outer argv (`command = "env"`, `args = ["sh", "-c",
+        // …]`) runs `sh` as the real program. The selector must still be injected
+        // INTO the `-c` script, not appended to the outer argv — `env sh -c
+        // nano-coder --acp` lets `sh` swallow `--acp` as `$0`, dropping it.
+        let mut env_prefixed = hire(Protocol::Acp, "env", "none");
+        env_prefixed.args = vec!["sh".into(), "-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&env_prefixed),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // `VAR=value` env assignments decorate the command the same way.
+        let mut assign_prefixed = hire(Protocol::Acp, "FOO=bar", "none");
+        assign_prefixed.args = vec!["bash".into(), "-lc".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&assign_prefixed),
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "nano-coder --acp".to_string()
+            ]
+        );
+
+        // A launch-prefixed NON-shell program is still just appended to — the
+        // prefix resolution must not mistake a non-shell for a shell wrapper.
+        let mut env_agent = hire(Protocol::Acp, "env", "none");
+        env_agent.args = vec!["nano-coder".into(), "-c".into(), "config".into()];
+        assert_eq!(
+            acp_spawn_args(&env_agent),
+            vec![
+                "nano-coder".to_string(),
+                "-c".to_string(),
+                "config".to_string(),
+                "--acp".to_string()
+            ]
         );
     }
 
