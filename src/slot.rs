@@ -156,8 +156,10 @@ pub async fn run(
             // timeout that aborts the OUTER slot task drop `handle` mid-await —
             // detaching its inner `execute`/agent, which could keep writing under
             // `runs_dir` after `work::run` tears the namespace down and returns.
-            // Aborting this task cancels the whole per-job tree (the execute
-            // child processes are `kill_on_drop`), so no job outlives the slot.
+            // Aborting this task drops `handle`, whose inner `execute` handle is
+            // wrapped in `AbortOnDrop` so that drop aborts (never detaches) it;
+            // the execute child processes are `kill_on_drop`, so the whole per-job
+            // tree is torn down and no job outlives the slot.
             let mut job_task = tokio::spawn(handle(jobs.clone(), cfg.clone(), job));
             tokio::select! {
                 // Bias the drain watch: if SIGTERM lands in the same tick the job
@@ -204,6 +206,28 @@ fn reconcile_lost<T>(outcome: Option<T>, lost: bool) -> Option<T> {
     }
 }
 
+/// A spawned task's [`JoinHandle`](tokio::task::JoinHandle) that **aborts** its
+/// task when dropped, instead of tokio's default of *detaching* it.
+///
+/// [`handle`] spawns the per-job `execute` task and is itself spawned by the
+/// slot loop ([`run`]), which `abort()`s the `handle` task when the slot drains
+/// (or when a drain timeout aborts the whole slot mid-await). Aborting `handle`
+/// drops its in-flight locals — including the inner `execute` handle. A bare
+/// `JoinHandle` drop would **detach** `execute`, leaving the agent running and
+/// still writing under `runs_dir` after `work::run` tore the namespace down and
+/// returned. Wrapping it so drop aborts the task guarantees the whole per-job
+/// tree (whose child processes are `kill_on_drop`) is torn down with the slot —
+/// no job outlives it. The explicit abort on the activation-loss path still
+/// works through `.0`; a second abort from this drop on an already-finished or
+/// already-aborted task is a harmless no-op.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
     let key = job.job_key.value().to_string();
     let started = Instant::now();
@@ -243,12 +267,13 @@ async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
     // Run the job on its own task so a panic fails only THIS job (the slot loop
     // survives). Race it against activation loss so a superseded worker stops.
     // `handle` is itself spawned by `run` (below) and aborted when the slot
-    // drains, so this inner task is aborted through it — never detached (see
-    // `run`). Returning here (rather than aborting) leaves the task running so
-    // the slot can settle the job; only a drain/loss aborts it.
-    let mut exec = tokio::spawn(execute(cfg.clone(), key.clone(), job.clone()));
+    // drains; the `AbortOnDrop` wrapper makes that cancellation abort this inner
+    // task too — never detach it (see `run`). Returning here (rather than
+    // aborting) leaves the task running so the slot can settle the job; only a
+    // drain/loss aborts it.
+    let mut exec = AbortOnDrop(tokio::spawn(execute(cfg.clone(), key.clone(), job.clone())));
     let raced = tokio::select! {
-        r = &mut exec => Some(match r {
+        r = &mut exec.0 => Some(match r {
             Ok(inner) => inner,
             Err(join) => Err(anyhow::anyhow!(
                 "slot task for job {key} panicked: {join}"
@@ -270,8 +295,8 @@ async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
         // the task. Aborting drops the execute future, whose child processes are
         // spawned `kill_on_drop`, so the clone/agent tree is torn down before we
         // return.
-        exec.abort();
-        let _ = exec.await;
+        exec.0.abort();
+        let _ = (&mut exec.0).await;
     }
     let elapsed = started.elapsed().as_secs_f32();
     let n = refreshes.load(Ordering::Relaxed);
@@ -616,6 +641,87 @@ impl Drop for ActiveRunGuard {
                 if *count == 0 {
                     map.remove(&self.0);
                 }
+            }
+        }
+    }
+}
+
+/// Per-run-dir **exclusive execution claims**.
+///
+/// The refcounted [`active_runs`] registry protects a run dir from the *sweep*,
+/// but it deliberately permits *overlapping* registrations (a retry registers
+/// while the superseded attempt's guard is still dropping). That is correct for
+/// sweep-protection but is NOT workspace ownership: [`execute`] *wipes and
+/// recreates* the run dir in [`prepare_run_dir`]. If a lease expires and the
+/// engine redelivers the job to a second slot before the first observes the
+/// fence, both attempts would otherwise mutate the same path — the retry's wipe
+/// could delete the first agent's live checkout/`result.json`, and the retry's
+/// fresh checkout could be polluted by the first agent's not-yet-killed writes
+/// (or its `remove_dir_all`/`create_dir_all` could race those writes and fail).
+///
+/// This map hands each run dir a single async mutex, so [`RunClaim::acquire`]
+/// gives exactly one attempt exclusive ownership of the workspace. A retry
+/// `await`s the claim and only wipes/runs once the superseded attempt has fully
+/// released it — which happens when that attempt's `execute` future drops, i.e.
+/// after its abort has torn the process tree down (`kill_on_drop`). So no two
+/// attempts ever own the workspace at once. The wait is bounded: the only way a
+/// second attempt for a key exists is lease expiry, which fences and tears down
+/// the first.
+fn run_claims() -> &'static Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII exclusive claim on a run dir (see [`run_claims`]). Held for the whole
+/// duration an attempt mutates its workspace; dropping it releases the claim and
+/// prunes the map entry when no other attempt references it, so the claim table
+/// cannot grow without bound across distinct job keys.
+struct RunClaim {
+    run_dir: PathBuf,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl RunClaim {
+    async fn acquire(run_dir: &Path) -> RunClaim {
+        // Clone-or-create the per-path lock under the brief std mutex, then await
+        // exclusive ownership of it. Acquiring the inner lock is NOT done while
+        // holding the std mutex, so a long-held claim never blocks claims on
+        // other run dirs.
+        let lock = {
+            let mut map = run_claims()
+                .lock()
+                // The map is only ever touched for these brief, panic-free entry
+                // ops, so poisoning is effectively impossible; recover the guard
+                // rather than panic (matching `active_runs`' fail-safe style) so a
+                // claim still enforces exclusivity even after unrelated poisoning.
+                .unwrap_or_else(|e| e.into_inner());
+            map.entry(run_dir.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = lock.lock_owned().await;
+        RunClaim {
+            run_dir: run_dir.to_path_buf(),
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for RunClaim {
+    fn drop(&mut self) {
+        // Release the lock FIRST so a waiter can proceed, then prune the map
+        // entry if nothing else references it. `strong_count == 1` means only the
+        // map holds the `Arc` (our owned guard — which also held a clone — is now
+        // dropped and no other attempt is parked on or owns it), so it is safe to
+        // remove. A concurrent `acquire` serialises on the same std mutex: if it
+        // cloned the `Arc` first the count is >= 2 and we leave the entry for it
+        // to prune later; if we remove first it simply inserts a fresh lock. Any
+        // waiter that already owns the lock keeps it alive via its own clone.
+        drop(self.guard.take());
+        let mut map = run_claims().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lock) = map.get(&self.run_dir) {
+            if Arc::strong_count(lock) == 1 {
+                map.remove(&self.run_dir);
             }
         }
     }
@@ -1204,6 +1310,12 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             cfg.runs_dir.display()
         )
     })?;
+    // Claim exclusive ownership of this run dir BEFORE wiping/preparing it, so a
+    // concurrent attempt for the same key (a lease-recovery redelivery to another
+    // slot) cannot wipe our live checkout or share the workspace. The claim is
+    // held for the whole job; a superseded attempt releases it when its aborted
+    // `execute` future drops, so the wait here is bounded.
+    let _claim = RunClaim::acquire(&run_dir).await;
     // Register this run dir as in-flight for the whole job so a concurrent
     // slot's retention sweep can never reap it.
     let _active = ActiveRunGuard::new(&run_dir);
@@ -2491,6 +2603,83 @@ mod tests {
         );
     }
 
+    fn claim_is_registered(run_dir: &Path) -> bool {
+        run_claims()
+            .lock()
+            .map(|m| m.contains_key(run_dir))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn run_claim_is_exclusive_per_run_dir() {
+        // Two attempts for the SAME run dir (a lease-recovery redelivery) must
+        // not own the workspace at once: the second `acquire` blocks until the
+        // first claim is released, so no concurrent wipe/mutate of the shared
+        // path is possible.
+        let run = std::path::absolute(std::env::temp_dir().join(format!(
+            "nano-claim-excl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )))
+        .unwrap();
+
+        let first = RunClaim::acquire(&run).await;
+
+        // A second acquire for the same dir cannot complete while the first is held.
+        let run2 = run.clone();
+        let second = tokio::spawn(async move { RunClaim::acquire(&run2).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second.is_finished(),
+            "a second claim on the same run dir must block while the first is held"
+        );
+
+        // Releasing the first lets the second proceed.
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second claim must unblock once the first is released")
+            .expect("claim task must not panic");
+        drop(second);
+
+        // Fully released: the map entry is pruned, so the claim table does not
+        // grow without bound across distinct keys.
+        assert!(
+            !claim_is_registered(&run),
+            "the claim map entry must be pruned once no attempt holds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_claim_does_not_block_other_run_dirs() {
+        // A long-held claim on one run dir must never block a claim on a
+        // different run dir (the per-path lock is acquired without holding the
+        // registry mutex).
+        let base = std::env::temp_dir().join(format!(
+            "nano-claim-indep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let a = std::path::absolute(base.join("run-a")).unwrap();
+        let b = std::path::absolute(base.join("run-b")).unwrap();
+
+        let held = RunClaim::acquire(&a).await;
+        // Acquiring a DIFFERENT dir must succeed promptly despite `a` being held.
+        let other = tokio::time::timeout(Duration::from_secs(5), RunClaim::acquire(&b))
+            .await
+            .expect("a claim on a different run dir must not block");
+        drop(other);
+        drop(held);
+        assert!(!claim_is_registered(&a));
+        assert!(!claim_is_registered(&b));
+    }
+
     #[test]
     fn reap_run_dir_removes_tree_and_tolerates_missing() {
         // The pinned reap (Linux) and the path-based fallback must both remove a
@@ -2708,6 +2897,59 @@ mod tests {
         // (the platform link is gone) and a real leaf can be created.
         reject_symlink(&resolved).unwrap();
         reject_symlinked_ancestors(&resolved).unwrap();
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_leaf_swapped_to_symlink_after_create_is_rejected_not_followed() {
+        // Regression for the run-dir setup in `work::run`: after the worker leaf
+        // is created, a same-UID process could swap it for a symlink before first
+        // use. The post-create re-validation must REJECT that swapped leaf
+        // (no-follow `reject_symlink`), not FOLLOW it to the attacker target as a
+        // bare `std::fs::canonicalize` would — which this test also demonstrates.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("nano-leafswap-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        // The attacker-chosen target the swapped leaf points at (outside the leaf).
+        let outside = base.join("attacker-target");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // The legitimate leaf is created, then swapped for a symlink to `outside`.
+        let leaf = base.join("rust-worker-123");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::remove_dir(&leaf).unwrap();
+        std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+
+        // The fix: no-follow re-validation rejects the swapped leaf.
+        assert!(
+            reject_symlink(&leaf).is_err(),
+            "a leaf swapped to a symlink after create must be rejected no-follow"
+        );
+
+        // The bug it replaced: `canonicalize` would FOLLOW the swap to the
+        // attacker target, and a subsequent no-follow check on that (real) target
+        // would pass — redirecting the run/sweep root outside the workspace.
+        let followed = std::fs::canonicalize(&leaf).unwrap();
+        assert_eq!(
+            followed,
+            std::fs::canonicalize(&outside).unwrap(),
+            "canonicalize follows the swapped leaf to the attacker target (the bug)"
+        );
+        assert!(
+            reject_symlink(&followed).is_ok(),
+            "the followed target is a real dir, so a post-canonicalize check would wrongly pass"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }

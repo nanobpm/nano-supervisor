@@ -128,10 +128,16 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     slot::reject_symlink(&runs_dir)?;
     slot::reject_symlinked_ancestors(&runs_dir)?;
     std::fs::create_dir_all(&runs_dir)?;
-    // Re-canonicalize now that the leaf exists and re-validate: this catches a
-    // symlink swapped in at the leaf between the check above and the create, so
-    // the sweep root is only ever the resolved real directory, never a redirect.
-    let runs_dir = std::fs::canonicalize(&runs_dir)?;
+    // Re-validate NO-FOLLOW now that the leaf exists: a same-UID process could
+    // swap the freshly created `rust-worker-<pid>` leaf for a symlink between the
+    // create above and first use. Do NOT re-`canonicalize` here — `canonicalize`
+    // FOLLOWS such a swapped leaf to the attacker-chosen target, and the checks
+    // would then inspect that (real) target and pass, redirecting the sweep/run
+    // root outside the configured workspace. `canonicalize_existing_base` already
+    // resolved the trusted platform symlinks in the existing base, so the leaf is
+    // the only thing left to recheck; `reject_symlink` inspects it with
+    // `symlink_metadata` (no-follow) and REJECTS a swapped-in link instead of
+    // following it.
     slot::reject_symlink(&runs_dir)?;
     slot::reject_symlinked_ancestors(&runs_dir)?;
     // Sweep at the SHARED parent of this worker's namespace, not the namespace
