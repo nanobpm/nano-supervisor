@@ -132,24 +132,34 @@ fn settlement_with_a_wrong_lease_token_is_rejected() {
         .as_str()
         .or_else(|| job["leaseToken"].as_str())
         .map(str::to_string);
-    let Some(_token) = token else {
+    let Some(token) = token else {
         skip!("engine issued no lease token for {job_type} (pre-0.0.24?)");
     };
+    // The fence is only meaningful if the wrong token differs from the real one.
+    assert_ne!(
+        token, "not-the-lease",
+        "test premise: the wrong token must differ from the real lease token"
+    );
 
     // A completion carrying a WRONG lease token must be rejected (the fence).
+    // Send ONLY the token field the activation returned — sending both
+    // `jobLeaseToken` and `leaseToken` can make a strict engine reject the body
+    // with a 400 schema error, which is NOT the lease fence. Assert the specific
+    // `409 Conflict` the engine answers for a token mismatch, so a schema or
+    // endpoint error cannot satisfy this test.
     let wrong = engine
         .http()
         .post(format!("{}/v2/jobs/{key}/completion", engine.url()))
         .json(&json!({
             "variables": {},
             "jobLeaseToken": "not-the-lease",
-            "leaseToken": "not-the-lease",
         }))
         .send()
         .expect("completion with wrong token");
-    assert!(
-        !wrong.status().is_success(),
-        "a completion with a wrong lease token must be rejected, got {}",
+    assert_eq!(
+        wrong.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a completion with a wrong lease token must be fenced with 409 Conflict, got {}",
         wrong.status()
     );
 }

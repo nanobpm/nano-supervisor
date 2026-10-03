@@ -474,6 +474,34 @@ fn update_is_effective_turn(update: &Value) -> bool {
     }
 }
 
+/// The human-readable text of an ACP `content` value the way the Node worker's
+/// `describeUpdate` reads it (plugin 1.70.1): a bare string is its own text, an
+/// array's block texts concatenate, and an object yields only its TOP-LEVEL
+/// `text` (`{"type":"text"}`). Unlike [`content_block_text`], a
+/// `{"type":"resource"}` block's NESTED `resource.text` is NOT read — Node's
+/// `describeUpdate` never emits it, so folding it into the captured output would
+/// produce substantive text (and a re-emit nudge / non-empty `output`) where the
+/// Node worker reports none. Keep `content_block_text` (which reads the resource
+/// shape) for TURN classification; use this only for the captured human output.
+fn human_output_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => {
+            let mut parts = String::new();
+            let mut any = false;
+            for item in items {
+                if let Some(t) = human_output_text(item) {
+                    parts.push_str(&t);
+                    any = true;
+                }
+            }
+            any.then_some(parts)
+        }
+        Value::Object(obj) => obj.get("text").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Serialise one ACP `session/update` into the short human-readable line the
 /// Node worker's `describeUpdate` produces for its captured output (plugin
 /// 1.70.1 parity). Node folds EVERY update into captured output — thought/user
@@ -489,11 +517,11 @@ fn describe_update(update: &Value) -> Option<String> {
         .unwrap_or("update");
     let line = match kind {
         "agent_message_chunk" | "user_message_chunk" => {
-            content_block_text(&update["content"]).unwrap_or_default()
+            human_output_text(&update["content"]).unwrap_or_default()
         }
         "agent_thought_chunk" => format!(
             "\u{1F4AD} {}",
-            content_block_text(&update["content"]).unwrap_or_default()
+            human_output_text(&update["content"]).unwrap_or_default()
         ),
         "tool_call" | "tool_call_update" => {
             let title = obj
@@ -1048,6 +1076,28 @@ mod tests {
         // A non-object update has no line (Node's `describeUpdate` yields "").
         assert_eq!(describe_update(&json!(null)), None);
         assert_eq!(describe_update(&json!("str")), None);
+    }
+
+    #[test]
+    fn describe_update_omits_nested_resource_text_like_node() {
+        // Plugin 1.70.1 `describeUpdate` reads only a content object's TOP-LEVEL
+        // `text`; it never emits a `{"type":"resource"}` block's nested
+        // `resource.text`. A resource-only chunk therefore yields an EMPTY output
+        // line (no re-emit nudge, empty `output`) even though the same block IS
+        // an effective transcript turn via `content_block_text`.
+        let resource = json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "resource", "resource": { "uri": "file://x", "text": "body" } } });
+        assert_eq!(describe_update(&resource), Some(String::new()));
+        // ... while turn classification still counts the resource text.
+        assert!(update_is_effective_turn(&resource));
+        // A top-level `text` object and a bare string still produce output.
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })),
+            Some("hi".to_string())
+        );
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "agent_message_chunk", "content": "go" })),
+            Some("go".to_string())
+        );
     }
 
     #[test]

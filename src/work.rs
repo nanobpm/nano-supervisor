@@ -209,10 +209,19 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     };
 
     let (_profile, jobs) = engine::connect(opts.profile.as_deref(), opts.job_api)?;
-    let worker_name = opts
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("{}-nano-{}", short_hostname(), hire.name));
+    let worker_name = opts.name.clone().unwrap_or_else(|| {
+        // Node parity: the default worker name must be unique per `work`
+        // PROCESS, not per (host, hire) — otherwise two concurrent workers on
+        // the same hire share a name, defeating per-process isolation and making
+        // broker ownership/logs ambiguous. Suffix the PID so same-profile workers
+        // stay distinct.
+        format!(
+            "{}-nano-{}-{}",
+            short_hostname(),
+            hire.name,
+            std::process::id()
+        )
+    });
     log(&format!(
         "worker {worker_name} for hire \"{}\" [{}] over job types {job_types:?}",
         hire.name, hire.rank
