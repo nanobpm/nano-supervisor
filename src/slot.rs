@@ -1071,7 +1071,11 @@ fn git_head(dir: &Path) -> Option<String> {
         return None;
     }
     let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if sha.is_empty() { None } else { Some(sha) }
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
 }
 
 async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {

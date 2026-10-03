@@ -108,11 +108,36 @@ fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
     }
 }
 
+/// Node's `coerceInt` for the unsigned fields (`depth`, `cloneTimeoutMs`):
+/// `null`/absent → `None`; otherwise `Number.parseInt(String(v), 10)` kept only
+/// when finite and non-negative. Like [`coerce_int`], `String(v)` runs FIRST, so
+/// a non-string is stringified the JavaScript way before the leading integer is
+/// parsed: `depth: ["5"]` → `String(["5"])` is `"5"` → `5`, and `["1","2"]` →
+/// `"1,2"` → `1`. A prior version matched only `Value::Number`/`Value::String`,
+/// so an array/object value was dropped where Node parses it — e.g.
+/// `cloneTimeoutMs: ["30000"]` normalised to absent (shallow clone / clone
+/// timeout silently lost) where Node yields `30000`. Negative and non-numeric
+/// results stay absent (the `u64` guard), matching the field's unsigned domain.
 fn coerce_u(v: Option<&Value>) -> Option<u64> {
     match v {
-        Some(Value::Number(n)) => n.as_u64(),
-        Some(Value::String(s)) => s.trim().parse().ok(),
-        _ => None,
+        // A JSON number: `as_u64` keeps non-negative integers; a float is
+        // truncated like `parseInt` (7.9 → 7); a NEGATIVE integer must NOT fall
+        // through to the float arm (`-3 as u64` saturates to 0) — Node's
+        // `parseInt` yields `-3`, which the unsigned domain rejects as absent.
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
+        Some(other) => {
+            let t = js_stringify(other);
+            let t = t.trim_start();
+            let end = t
+                .char_indices()
+                .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+                .map(|(i, _)| i)
+                .unwrap_or(t.len());
+            t[..end].parse().ok()
+        }
+        None => None,
     }
 }
 
@@ -316,11 +341,7 @@ fn normalize(raw: &Map<String, Value>, prompt: Option<&str>) -> Value {
     let strings = |v: Option<&Value>| -> Value {
         Value::Array(
             v.and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .map(|x| Value::String(js_stringify(x)))
-                        .collect()
-                })
+                .map(|a| a.iter().map(|x| Value::String(js_stringify(x))).collect())
                 .unwrap_or_default(),
         )
     };
@@ -510,6 +531,49 @@ mod tests {
         assert_eq!(coerce_int(Some(&json!([]))), None); // String([]) is "" → NaN
         assert_eq!(coerce_int(Some(&json!(7))), Some(7));
         assert_eq!(coerce_int(None), None);
+    }
+
+    #[test]
+    fn coerce_u_applies_node_string_v_to_unsigned_fields() {
+        // The unsigned sibling of `coerce_int` (`depth`, `cloneTimeoutMs`) must
+        // run the SAME `parseInt(String(v), 10)`: a non-string is JS-stringified
+        // before the leading integer is parsed, so an array is no longer dropped.
+        assert_eq!(coerce_u(Some(&json!(["5"]))), Some(5)); // depth: ["5"]
+        assert_eq!(coerce_u(Some(&json!(["30000"]))), Some(30000)); // cloneTimeoutMs
+        assert_eq!(coerce_u(Some(&json!(["1", "2"]))), Some(1)); // "1,2" → 1
+        assert_eq!(coerce_u(Some(&json!(" 42abc"))), Some(42));
+        assert_eq!(coerce_u(Some(&json!(7))), Some(7));
+        assert_eq!(coerce_u(Some(&json!(7.9))), Some(7)); // parseInt truncates
+        assert_eq!(coerce_u(Some(&json!("abc"))), None); // NaN → absent
+        assert_eq!(coerce_u(Some(&json!([]))), None); // String([]) is "" → NaN
+        assert_eq!(coerce_u(Some(&json!({}))), None); // "[object Object]" → NaN
+        assert_eq!(coerce_u(Some(&json!(-3))), None); // u64 guard: negative absent
+        assert_eq!(coerce_u(Some(&json!(null))), None);
+        assert_eq!(coerce_u(None), None);
+    }
+
+    #[test]
+    fn repository_depth_and_clone_timeout_survive_array_input() {
+        // End-to-end through `parse_repository`: the daemon-side clone spec must
+        // keep a `depth`/`cloneTimeoutMs` delivered as a single-element array,
+        // exactly as Node's shared coerceInt parses it (a dropped `depth` loses
+        // the shallow clone; a dropped `cloneTimeoutMs` loses the clone timeout).
+        let headers = json!({
+            "io.nanobpm.agentTask": {
+                "repository": {
+                    "url": "https://h/o/r.git",
+                    "depth": ["5"],
+                    "cloneTimeoutMs": ["30000"],
+                }
+            }
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let repo = env.repository.expect("repository should parse");
+        assert_eq!(repo.depth, Some(5));
+        assert_eq!(repo.clone_timeout_ms, Some(30000));
+        // And the normalized payload agrees (it already used coerce_int).
+        assert_eq!(env.normalized["repository"]["depth"], json!(5));
+        assert_eq!(env.normalized["repository"]["cloneTimeoutMs"], json!(30000));
     }
 
     #[test]
