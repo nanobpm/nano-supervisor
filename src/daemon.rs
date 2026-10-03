@@ -188,6 +188,21 @@ pub(crate) fn validate(hire: &Hire) -> Result<()> {
 pub(crate) fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
     let mut tokens: Vec<&str> = command.split_whitespace().collect();
     tokens.extend(args.iter().map(String::as_str));
+    scan_acp_tokens(&tokens)
+}
+
+/// Scan an argv token list for an ACP selector, recursing into shell `-c`
+/// scripts.
+///
+/// A whole-token scan alone misses a shell-wrapped selector: a `pipe` hire with
+/// command `sh` and args `["-c", "nano-coder --acp"]` keeps the script as ONE
+/// opaque token, so `--acp` hides inside it and the validator would run the ACP
+/// harness over the pipe path instead of exiting 78 (issue #275). Plugin 1.70.1
+/// recursively inspects `-c` scripts, so do the same here: when a short option
+/// ending in `c` (`-c`, `-ec`, `-lc`, …) is followed by a script token, split
+/// that script on whitespace and scan it too. Recursion depth is bounded by the
+/// finite nesting of quoted scripts.
+fn scan_acp_tokens(tokens: &[&str]) -> bool {
     for (i, tok) in tokens.iter().enumerate() {
         let name = tok.trim_matches(|c| c == '"' || c == '\'');
         let (opt, inline_val) = match name.split_once('=') {
@@ -212,11 +227,28 @@ pub(crate) fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
                 return true;
             }
         }
-        // The `*-acp` adapter suffix identifies the command token only.
+        // The `*-acp` adapter suffix identifies the command token only — the
+        // first token of this (sub)command, so it also catches a wrapped inner
+        // command like `sh -c "claude-code-acp"` when recursing.
         if i == 0 {
             let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
             if base.ends_with("-acp") {
                 return true;
+            }
+        }
+        // Shell wrapper: a short `-…c` flag (e.g. `-c`, `-ec`) hides the real
+        // agent invocation inside the following script token. Scan that script's
+        // own tokens so a shell-wrapped ACP selector is not missed.
+        if name.starts_with('-') && !name.starts_with("--") && name.len() >= 2 && name.ends_with('c')
+        {
+            if let Some(script) = tokens.get(i + 1).copied() {
+                let sub: Vec<&str> = script
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .split_whitespace()
+                    .collect();
+                if scan_acp_tokens(&sub) {
+                    return true;
+                }
             }
         }
     }
@@ -357,6 +389,58 @@ mod tests {
             "copilot",
             &["--allow-all".into()]
         ));
+    }
+
+    #[test]
+    fn acp_selector_detection_sees_shell_wrapped_commands() {
+        // A shell-wrapped selector keeps the script as one opaque arg token; the
+        // scan must recurse into `-c <script>` to find it (issue #275).
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "nano-coder --acp".into()]
+        ));
+        assert!(command_has_acp_selector(
+            "bash",
+            &["-c".into(), "nano-coder acp".into()]
+        ));
+        // The inner command's `*-acp` adapter suffix counts when wrapped too.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "claude-code-acp --foo".into()]
+        ));
+        // `--protocol acp` inside the script is caught.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "nano-coder --protocol acp".into()]
+        ));
+        // Combined short flags (`-ec`) that still take a script also recurse.
+        assert!(command_has_acp_selector(
+            "bash",
+            &["-ec".into(), "exec nano-coder --acp".into()]
+        ));
+        // Nested wrappers still resolve to the inner selector.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "sh -c 'nano-coder --acp'".into()]
+        ));
+        // A wrapped NON-ACP script is still accepted — no false positive.
+        assert!(!command_has_acp_selector(
+            "sh",
+            &["-c".into(), "nano-coder --pipe".into()]
+        ));
+    }
+
+    #[test]
+    fn rejects_shell_wrapped_acp_command_under_pipe() {
+        // The validator must reject a `pipe` hire that hides an ACP selector in a
+        // shell `-c` script, exactly as it rejects a bare `--acp` token.
+        let mut h = hire(Protocol::Pipe, "sh", "none");
+        h.args = vec!["-c".into(), "nano-coder --acp".into()];
+        assert!(validate(&h).is_err());
+        // An ACP hire with the same shell-wrapped selector is fine.
+        let mut ok = hire(Protocol::Acp, "sh", "none");
+        ok.args = vec!["-c".into(), "nano-coder --acp".into()];
+        assert!(validate(&ok).is_ok());
     }
 
     #[test]
