@@ -62,6 +62,19 @@ impl std::fmt::Display for HttpStatus {
 
 impl std::error::Error for HttpStatus {}
 
+/// Preserve an SDK error as a STRUCTURED [`anyhow`] link rather than flattening
+/// it to text. The old `anyhow::anyhow!("{e}")` rendering destroyed the typed
+/// [`camunda_orchestration_sdk::CamundaError`], so [`NanoHttp::status_of`] could
+/// only recover the status by substring-scanning the flattened message — and an
+/// `Api` error whose *body* echoes an `HTTP <status> ` marker (e.g. a 500 whose
+/// RFC 7807 body mentions "HTTP 404 ") was then misclassified by the ascending
+/// marker scan as the echoed status, treating a transient server error as a
+/// lease fence. Keeping the typed link lets `status_of` read the authoritative
+/// structured `status` and never reach the marker fallback.
+fn sdk_error(e: camunda_orchestration_sdk::CamundaError) -> anyhow::Error {
+    anyhow::Error::new(e)
+}
+
 #[derive(Clone)]
 pub struct NanoHttp {
     http: reqwest::Client,
@@ -84,18 +97,29 @@ impl NanoHttp {
     /// The HTTP status of a failing [`send`] error, if it was an HTTP error at
     /// all (as opposed to a transport/timeout failure, which carries no status).
     ///
-    /// A STRUCTURED [`HttpStatus`] anywhere in the chain is AUTHORITATIVE and is
-    /// returned verbatim. Only when no link carries one do we fall back to the
-    /// unambiguous `HTTP <status> ` marker [`send`] puts in the message — never
-    /// the bare digits, which a numeric job key in the interpolated `/jobs/{key}`
-    /// path could itself contain. Critically, the marker fallback must NOT run
-    /// when a structured status is present: `send` folds a bounded body excerpt
-    /// into the message, so a genuine 500 whose body echoes `HTTP 404 ` would
-    /// otherwise be misclassified as a 404 lease fence (the old scan was
-    /// ascending). Structured-first closes that whole class.
+    /// A STRUCTURED status anywhere in the chain is AUTHORITATIVE and is
+    /// returned verbatim — either our own [`HttpStatus`] (Nano backend) or the
+    /// SDK's [`camunda_orchestration_sdk::CamundaError::Api`] (SDK backend),
+    /// which the [`Jobs`] methods preserve as a structured link via
+    /// [`sdk_error`] rather than flattening to text. Only when no link carries
+    /// one do we fall back to the unambiguous `HTTP <status> ` marker [`send`]
+    /// puts in the message — never the bare digits, which a numeric job key in
+    /// the interpolated `/jobs/{key}` path could itself contain. Critically, the
+    /// marker fallback must NOT run when a structured status is present: `send`
+    /// folds a bounded body excerpt into the message, so a genuine 500 whose
+    /// body echoes `HTTP 404 ` would otherwise be misclassified as a 404 lease
+    /// fence (the old scan was ascending). Structured-first closes that whole
+    /// class.
     pub(crate) fn status_of(e: &anyhow::Error) -> Option<u16> {
         if let Some(h) = e.chain().find_map(|c| c.downcast_ref::<HttpStatus>()) {
             return Some(h.status);
+        }
+        if let Some(s) = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<camunda_orchestration_sdk::CamundaError>())
+            .and_then(|c| c.status())
+        {
+            return Some(s);
         }
         e.chain().find_map(|c| {
             let s = c.to_string();
@@ -177,10 +201,7 @@ impl Jobs {
                 if with_lease {
                     req.with_lease = Some(Some(true));
                 }
-                let r = c
-                    .activate_jobs(req)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let r = c.activate_jobs(req).await.map_err(sdk_error)?;
                 Ok(r.jobs
                     .into_iter()
                     .map(|j| {
@@ -234,7 +255,7 @@ impl Jobs {
                     job_update_request: body,
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(sdk_error)
             }
             Jobs::Nano(n) => {
                 let body = json!({ "changeset": { "timeout": timeout.as_millis() as i64 }, "leaseToken": lease });
@@ -269,9 +290,7 @@ impl Jobs {
                 let mut req = JobCompletionRequest::new();
                 req.variables = Some(Some(vars));
                 req.job_lease_token = token_of(lease);
-                c.complete_job(key, Some(req))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))
+                c.complete_job(key, Some(req)).await.map_err(sdk_error)
             }
             Jobs::Nano(n) => {
                 let body = json!({ "variables": vars, "leaseToken": lease });
@@ -306,9 +325,7 @@ impl Jobs {
                 req.retry_back_off = Some(0);
                 req.variables = vars;
                 req.job_lease_token = token_of(lease);
-                c.fail_job(key, Some(req))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))
+                c.fail_job(key, Some(req)).await.map_err(sdk_error)
             }
             Jobs::Nano(n) => {
                 let mut body = json!({ "retries": retries, "errorMessage": message, "retryBackOff": 0, "leaseToken": lease });
@@ -332,8 +349,7 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::validate_job_key;
-    use super::{HttpStatus, NanoHttp};
-    use anyhow::Context;
+    use super::{sdk_error, HttpStatus, NanoHttp};
 
     #[test]
     fn structured_status_wins_over_a_body_echoed_marker() {
@@ -365,6 +381,38 @@ mod tests {
         // A transport failure whose key merely contains fence digits is None.
         let transport = anyhow::anyhow!("connection reset").context("/jobs/14041234567890");
         assert_eq!(NanoHttp::status_of(&transport), None);
+    }
+
+    #[test]
+    fn sdk_api_status_is_authoritative_over_a_body_echoed_marker() {
+        // The SDK backend (`Jobs::extend`/`complete`/`fail`) preserves the typed
+        // `CamundaError` as a structured link via `sdk_error`. A genuine 500
+        // whose RFC 7807 body echoes "HTTP 404 " must resolve to 500, NOT the
+        // echoed 404 — otherwise the refresher treats a transient server error
+        // as a lease fence and abandons a live activation. The old
+        // `anyhow::anyhow!("{e}")` flattening destroyed the typed status and
+        // left only the ascending marker scan, which returned 404.
+        let e = sdk_error(camunda_orchestration_sdk::CamundaError::Api {
+            status: 500,
+            body: Some("upstream said HTTP 404 Not Found".into()),
+        })
+        .context("/jobs/2251799813685250");
+        assert_eq!(NanoHttp::status_of(&e), Some(500));
+        assert_ne!(NanoHttp::status_of(&e), Some(404));
+
+        // A real SDK 404 fence still resolves to 404.
+        let fence = sdk_error(camunda_orchestration_sdk::CamundaError::Api {
+            status: 404,
+            body: Some("job gone".into()),
+        })
+        .context("/jobs/2251799813685250");
+        assert_eq!(NanoHttp::status_of(&fence), Some(404));
+
+        // A non-HTTP SDK error (network/validation) carries no status.
+        let network = sdk_error(camunda_orchestration_sdk::CamundaError::Validation(
+            "bad request".into(),
+        ));
+        assert_eq!(NanoHttp::status_of(&network), None);
     }
 
     #[test]

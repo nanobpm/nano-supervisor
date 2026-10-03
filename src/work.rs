@@ -130,9 +130,10 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_else(|| format!("rust-worker-{}", std::process::id()).into());
-    let parent = runs_dir.parent().map(PathBuf::from).unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("nano-runs-{}", std::process::id()))
-    });
+    let parent = runs_dir
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("nano-runs-{}", std::process::id())));
     let parent = slot::canonicalize_existing_base(&parent)?;
     let runs_dir = parent.join(&leaf);
     slot::reject_symlink(&runs_dir)?;

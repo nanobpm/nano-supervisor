@@ -2467,18 +2467,30 @@ mod tests {
         // non-zero instead of swallowing the crash and exiting 0), tolerated in
         // the daemon (its explicit "one panicked job fails only that job" policy).
         let panicked = tokio::spawn(async { panic!("boom") }).await;
-        assert!(job_panic_is_fatal(&panicked, true), "work mode: a panic crashes the slot");
-        assert!(!job_panic_is_fatal(&panicked, false), "daemon: a panic is tolerated");
+        assert!(
+            job_panic_is_fatal(&panicked, true),
+            "work mode: a panic crashes the slot"
+        );
+        assert!(
+            !job_panic_is_fatal(&panicked, false),
+            "daemon: a panic is tolerated"
+        );
 
         // A cancellation (drain abort) is never a crash, even in work mode.
         let task = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
         task.abort();
         let cancelled = task.await;
-        assert!(!job_panic_is_fatal(&cancelled, true), "a drain abort is not a crash");
+        assert!(
+            !job_panic_is_fatal(&cancelled, true),
+            "a drain abort is not a crash"
+        );
 
         // A clean completion is never fatal.
         let ok = tokio::spawn(async {}).await;
-        assert!(!job_panic_is_fatal(&ok, true), "a clean completion is not a crash");
+        assert!(
+            !job_panic_is_fatal(&ok, true),
+            "a clean completion is not a crash"
+        );
     }
 
     #[test]

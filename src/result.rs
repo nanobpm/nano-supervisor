@@ -498,8 +498,7 @@ mod tests {
         // No file, an ineffective stdout object, but an effective ACP outcome:
         // the outcome is the selected effective result.
         let outcome = obj(json!({"status":"blocked","question":"why?"}));
-        let picked =
-            select_effective_result([None, Some(obj(json!({}))), Some(outcome)]).unwrap();
+        let picked = select_effective_result([None, Some(obj(json!({}))), Some(outcome)]).unwrap();
         assert_eq!(picked["status"], json!("blocked"));
     }
 

@@ -726,11 +726,18 @@ pub struct JobOutcome {
     engine: Engine,
     record_path: PathBuf,
     pub output: std::process::Output,
-    _home: TempHome,
+    home_path: PathBuf,
     _work: tempfile::TempDir,
 }
 
 impl JobOutcome {
+    /// The isolated `C8CTL_NANO_HOME` the worker ran under — the root of its
+    /// `agent-runs/rust-worker-<pid>` run namespaces. Tests that seed or inspect
+    /// run dirs (e.g. the stale-run sweep) use this to find the sweep root.
+    pub fn home(&self) -> &Path {
+        &self.home_path
+    }
+
     /// What the fake agent recorded (prompt, env, cwd, permissions, …).
     ///
     /// Panics with the worker's exit status and output when there is no record,
@@ -837,6 +844,33 @@ pub fn run_worker_job(
     worker_flags: &[&str],
     extra_env: &[(&str, &str)],
 ) -> JobOutcome {
+    run_worker_job_in(
+        engine,
+        target,
+        &TempHome::new(),
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+    )
+}
+
+/// [`run_worker_job`] against a caller-supplied [`TempHome`] instead of a fresh
+/// one, so a test can run the worker twice (or seed/inspect run dirs) under ONE
+/// shared home — e.g. the stale-run sweep, which must plant a dead-worker's run
+/// tree in the same `agent-runs` root the next worker's startup sweep walks.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_in(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> JobOutcome {
     let job_type = engine.unique_type(test);
     let process_id = format!("p-{job_type}");
     engine
@@ -855,7 +889,6 @@ pub fn run_worker_job(
         })
         .expect("create instance: no processInstanceKey");
 
-    let home = TempHome::new();
     let work = tempfile::Builder::new()
         .prefix("ns-run-")
         .tempdir()
@@ -869,7 +902,7 @@ pub fn run_worker_job(
     // vocabulary, which the Rust `work` mirrors). The Rust worker additionally
     // takes `--max-jobs 1` so it exits once the job is handled.
     let profile = format!("ctfake{}", rand_suffix());
-    hire_profile(*target, &home, &profile);
+    hire_profile(*target, home, &profile);
     let mut cmd = work_command(*target, &profile, &job_type, worker_flags);
     home.apply(&mut cmd);
     // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
@@ -902,7 +935,7 @@ pub fn run_worker_job(
         engine: engine.clone(),
         record_path,
         output,
-        _home: home,
+        home_path: home.path().to_path_buf(),
         _work: work,
     }
 }
