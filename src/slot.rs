@@ -222,23 +222,13 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         // Drop the watch guard immediately; the abort/await happens below.
         _ = lost_rx.wait_for(|lost| *lost) => None,
     };
-    // Stop the refresher and wait for it to fully exit BEFORE sampling the
-    // activation-loss watch, so the watch value cannot change under us. Signal a
-    // graceful stop and AWAIT the task — never `abort()`: aborting could cancel
-    // an in-flight `extend` in the window between our exec completing and the
-    // stop, dropping the very request that would report a 404/409 fence. The
-    // refresher would then never publish the loss, and we would settle the job
-    // with a stale lease — violating the no-settle-after-fencing guarantee. A
-    // graceful stop lets any in-flight extend run to completion and publish its
-    // result first; once the task is joined no further writes to the watch can
-    // happen, so the value we read below is final.
-    let _ = stop_tx.send(true);
-    let _ = refresher.await;
-    // Re-check the activation-loss watch after the select. `select!` can pick the
-    // `exec` branch even when the refresher set `lost` to true in the same tick
-    // (both futures are ready), which would otherwise settle the job with a stale
-    // lease after a 404/409 fence. Downgrade an outcome to "lost" whenever the
-    // activation was fenced, so we never `complete`/`fail` a job we no longer own.
+    // Pre-settlement fence check. `select!` can pick the `exec` branch even when
+    // the refresher set `lost` to true in the same tick (both futures ready), so
+    // re-check the watch before settling. The refresher is NOT stopped yet: a
+    // `complete`/`fail` request can take up to 30s while the recovery window may
+    // be ~1s, so stopping here would let the activation expire mid-settlement and
+    // fence the very request that settles the job. The refresher keeps the
+    // activation alive through settlement and is stopped only after it returns.
     let outcome = reconcile_lost(raced, *lost_rx.borrow());
     if outcome.is_none() {
         // We lost the activation: actually stop the agent instead of detaching
@@ -255,12 +245,18 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
         None => log(&format!(
             "job {key}: activation lost after {elapsed:.1}s; agent stopped, job NOT settled (the engine will redeliver it)"
         )),
-        Some(Ok(Settle::Complete(vars))) => match jobs.complete(&key, vars, &lease).await {
-            Ok(()) => log(&format!(
-                "job {key} completed in {elapsed:.1}s (refreshes={n})"
-            )),
-            Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
-        },
+        Some(Ok(Settle::Complete(vars))) => {
+            // Keep the refresher alive through the completion request so the
+            // activation cannot expire while `complete` is in flight.
+            let result = jobs.complete(&key, vars, &lease).await;
+            stop_refresher(stop_tx, refresher).await;
+            match result {
+                Ok(()) => log(&format!(
+                    "job {key} completed in {elapsed:.1}s (refreshes={n})"
+                )),
+                Err(e) => log(&format!("job {key}: complete failed: {e:#}")),
+            }
+        }
         Some(outcome) => {
             let (msg, vars) = match outcome {
                 Ok(Settle::Fail { message, vars }) => (message, vars),
@@ -271,7 +267,11 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
             };
             let retries = (job.retries - 1).max(0);
             let msg = truncate(&msg, 2000);
-            match jobs.fail(&key, retries, &msg, vars, &lease).await {
+            // Keep the refresher alive through the failure request so the
+            // activation cannot expire while `fail` is in flight.
+            let result = jobs.fail(&key, retries, &msg, vars, &lease).await;
+            stop_refresher(stop_tx, refresher).await;
+            match result {
                 Ok(()) => log(&format!(
                     "job {key} failed after {elapsed:.1}s (refreshes={n}, retries left {retries}): {msg}"
                 )),
@@ -281,6 +281,19 @@ async fn handle(jobs: &Jobs, cfg: &Arc<SlotConfig>, Job { job, lease }: Job) {
             }
         }
     }
+}
+
+/// Stop the lease refresher and wait for it to fully exit. Signal a graceful
+/// stop and AWAIT the task — never `abort()`: aborting could cancel an in-flight
+/// `extend`, dropping the very request that would report a 404/409 fence. A
+/// graceful stop lets any in-flight extend run to completion first; once the
+/// task is joined no further writes to the loss watch can happen.
+async fn stop_refresher(
+    stop_tx: watch::Sender<bool>,
+    refresher: tokio::task::JoinHandle<()>,
+) {
+    let _ = stop_tx.send(true);
+    let _ = refresher.await;
 }
 
 /// Restrict a directory to owner-only access (mode 0700) on Unix, so job data
@@ -618,27 +631,67 @@ fn sweep_stale_runs_pinned(
         }
         // Age from the directory's own mtime; keep it when the platform
         // withholds a modified time rather than risk deleting a fresh run.
-        let aged_out = meta
-            .modified
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age >= max_age);
-        if !aged_out {
+        if is_aged_out(meta.modified, now, max_age) {
+            let path = runs_dir.join(&name);
+            match root.remove_tree(&name) {
+                Ok(()) => log(&format!(
+                    "swept stale run dir {} (older than {}d)",
+                    path.display(),
+                    max_age.as_secs() / 86_400
+                )),
+                Err(e) => log(&format!(
+                    "failed to sweep stale run dir {}: {e:#}",
+                    path.display()
+                )),
+            }
             continue;
         }
-        let path = runs_dir.join(&name);
-        match root.remove_tree(&name) {
-            Ok(()) => log(&format!(
-                "swept stale run dir {} (older than {}d)",
-                path.display(),
-                max_age.as_secs() / 86_400
-            )),
-            Err(e) => log(&format!(
-                "failed to sweep stale run dir {}: {e:#}",
-                path.display()
-            )),
+        // A fresh top-level dir may be a worker NAMESPACE (`agent-runs/
+        // rust-worker-<pid>`) whose own mtime is recent but which holds stale
+        // run dirs — notably the `rust-worker-<old-pid>` of a crashed worker,
+        // which a per-worker sweep rooted at its own namespace could never
+        // reach. Descend one level (pinned, no-follow) and sweep its children.
+        if let Ok(child) = root.open_child_dir(&name) {
+            let child_abs = runs_abs.join(&name);
+            for sub in child.entry_names().map_err(PinError::Io)? {
+                let smeta = match child.symlink_metadata(&sub) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !smeta.is_dir || smeta.is_symlink {
+                    continue;
+                }
+                if is_active_run(&child_abs.join(&sub)) {
+                    continue;
+                }
+                if !is_aged_out(smeta.modified, now, max_age) {
+                    continue;
+                }
+                let path = child_abs.join(&sub);
+                match child.remove_tree(&sub) {
+                    Ok(()) => log(&format!(
+                        "swept stale run dir {} (older than {}d)",
+                        path.display(),
+                        max_age.as_secs() / 86_400
+                    )),
+                    Err(e) => log(&format!(
+                        "failed to sweep stale run dir {}: {e:#}",
+                        path.display()
+                    )),
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Whether a directory's `modified` time is older than `max_age`. Keep the dir
+/// when the platform withholds a modified time rather than risk deleting a
+/// fresh run.
+fn is_aged_out(modified: Option<SystemTime>, now: SystemTime, max_age: Duration) -> bool {
+    modified
+        .and_then(|m| now.duration_since(m).ok())
+        .is_some_and(|age| age >= max_age)
 }
 
 /// Path-based `sweep_stale_runs`: the pre-`openat2` fallback (non-Linux, or a
@@ -689,24 +742,52 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration) {
         }
         // Age from the directory's own mtime. If the platform withholds a
         // modified time, keep the dir rather than risk deleting a fresh run.
-        let aged_out = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age >= max_age);
-        if !aged_out {
+        if is_aged_out(meta.modified().ok(), now, max_age) {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => log(&format!(
+                    "swept stale run dir {} (older than {}d)",
+                    path.display(),
+                    max_age.as_secs() / 86_400
+                )),
+                Err(e) => log(&format!(
+                    "failed to sweep stale run dir {}: {e:#}",
+                    path.display()
+                )),
+            }
             continue;
         }
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => log(&format!(
-                "swept stale run dir {} (older than {}d)",
-                path.display(),
-                max_age.as_secs() / 86_400
-            )),
-            Err(e) => log(&format!(
-                "failed to sweep stale run dir {}: {e:#}",
-                path.display()
-            )),
+        // A fresh top-level dir may be a worker NAMESPACE holding stale run
+        // dirs (e.g. a crashed worker's `rust-worker-<old-pid>`); descend one
+        // level and sweep its children, still never following symlinks.
+        if let Ok(children) = std::fs::read_dir(&path) {
+            for child in children.flatten() {
+                let cpath = child.path();
+                let cmeta = match std::fs::symlink_metadata(&cpath) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !cmeta.is_dir() {
+                    continue;
+                }
+                let cabs = std::path::absolute(&cpath).unwrap_or_else(|_| cpath.clone());
+                if is_active_run(&cabs) {
+                    continue;
+                }
+                if !is_aged_out(cmeta.modified().ok(), now, max_age) {
+                    continue;
+                }
+                match std::fs::remove_dir_all(&cpath) {
+                    Ok(()) => log(&format!(
+                        "swept stale run dir {} (older than {}d)",
+                        cpath.display(),
+                        max_age.as_secs() / 86_400
+                    )),
+                    Err(e) => log(&format!(
+                        "failed to sweep stale run dir {}: {e:#}",
+                        cpath.display()
+                    )),
+                }
+            }
         }
     }
 }
@@ -993,11 +1074,14 @@ async fn run_agent(
                         "job {key}: acp turn ended ({}; {} update(s), {} tool call(s), {} permission(s) granted)",
                         o.stop_reason, o.updates, o.tool_calls, o.permissions_granted
                     ));
-                    let (stdout, truncated) = cap_stdout_tail(o.text);
+                    let (stdout, capped) = cap_stdout_tail(o.text);
+                    // `Agent::run` already bounds the transcript to 1 MiB while
+                    // reading; combine its truncation flag with this second cap
+                    // so a truncated ACP transcript is not misreported as whole.
                     RunResult {
                         ok: true,
                         stdout,
-                        truncated,
+                        truncated: capped || o.truncated,
                         exit_code: Some(0),
                         has_turns: o.updates > 0,
                         ..RunResult::default()
@@ -1026,17 +1110,20 @@ async fn run_agent(
             .await
             {
                 Ok(o) => {
-                    let (stdout, truncated) = cap_stdout_tail(o.stdout);
+                    let (stdout, capped) = cap_stdout_tail(o.stdout);
                     let error = o.idle_timed_out.then(|| {
                         format!(
                             "agent produced no output for {}s (idle timeout)",
                             cfg.idle_timeout.as_secs()
                         )
                     });
+                    // `pipe::run` already bounds stdout to 1 MiB while reading;
+                    // combine its truncation flag with this second cap so output
+                    // the collector dropped is not misreported as complete.
                     RunResult {
                         ok: o.exit_code == Some(0) && !o.idle_timed_out,
                         stdout,
-                        truncated,
+                        truncated: capped || o.truncated,
                         exit_code: o.exit_code,
                         timed_out: o.idle_timed_out,
                         error,
@@ -1507,20 +1594,30 @@ mod tests {
 
     #[test]
     fn acp_prompt_is_redacted_of_clone_credentials() {
-        // The ACP branch forwards the prompt verbatim, so a credential URL
-        // embedded in a task prompt must be scrubbed by the same `redact_url`
-        // path the pipe payload uses before it reaches the ACP agent. Build the
-        // userinfo at runtime so no credential-like literal is stored in source.
+        // The ACP first turn delivers the full JSON job payload verbatim as the
+        // `session/prompt` text (slot.rs: `run_agent` sends `payload.to_string()`),
+        // so a credential-bearing URL in the task prompt must be scrubbed when the
+        // payload is BUILT — `build_agent_payload` runs `redact_credential_urls`
+        // over every string. Build the userinfo at runtime so no credential-like
+        // literal is stored in source.
+        let cfg = cfg();
+        let job = ActivatedJobResult::default();
         let token = format!("{}-{}", "x-access", "token");
         let secret = format!("pat{}value", 1234);
         let prompt = format!("clone https://{token}:{secret}@github.com/o/r.git and build");
-        let safe_prompt = redact_url(&prompt);
+        let env = Envelope {
+            prompt: Some(prompt),
+            repository: None,
+            normalized: json!({}),
+        };
+        // This is exactly the string the ACP agent receives as its prompt.
+        let acp_stdin = build_agent_payload(&cfg, &job, &env).to_string();
         assert!(
-            !safe_prompt.contains(&secret),
-            "clone credential must not reach the ACP agent prompt: {safe_prompt}"
+            !acp_stdin.contains(&secret),
+            "clone credential must not reach the ACP agent prompt: {acp_stdin}"
         );
-        assert!(safe_prompt.contains("https://github.com/o/r.git"));
-        assert!(safe_prompt.contains("and build"));
+        assert!(acp_stdin.contains("https://github.com/o/r.git"));
+        assert!(acp_stdin.contains("and build"));
     }
 
     #[test]
@@ -1589,6 +1686,86 @@ mod tests {
         sweep_stale_runs(&root.join("does-not-exist"), Duration::ZERO);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_recurses_into_fresh_worker_namespaces() {
+        // A worker namespace (`agent-runs/rust-worker-<pid>`) can have a fresh
+        // mtime while holding a STALE run dir — e.g. a crashed worker's leftover
+        // that a per-worker sweep rooted at its own namespace could never reach.
+        // The sweep must descend one level and reap the stale child while keeping
+        // a fresh sibling.
+        let root = std::env::temp_dir().join(format!(
+            "nano-sweep-ns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        // A fresh namespace (its own mtime is now) holding one stale and one
+        // fresh run dir. Backdate the stale child so a positive window selects
+        // it alone.
+        let ns = root.join("rust-worker-99999");
+        let stale_child = ns.join("111");
+        let fresh_child = ns.join("222");
+        std::fs::create_dir_all(&stale_child).unwrap();
+        std::fs::create_dir_all(&fresh_child).unwrap();
+        std::fs::write(stale_child.join("result.json"), b"{}").unwrap();
+        if !backdate_mtime(&stale_child, Duration::from_secs(10 * 24 * 60 * 60)) {
+            // Cannot backdate a dir mtime on this platform: the selective case
+            // is untestable here, so just verify the recursion reaches a child
+            // at all (a zero window sweeps every aged child of a fresh ns).
+            sweep_stale_runs(&root, Duration::ZERO);
+            assert!(
+                !stale_child.exists(),
+                "a stale run dir inside a fresh namespace must be swept"
+            );
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        // The namespace itself stays fresh (just created), so a positive window
+        // must NOT reap it wholesale, but MUST still reach the stale child.
+        sweep_stale_runs(&root, Duration::from_secs(3 * 24 * 60 * 60));
+        assert!(
+            !stale_child.exists(),
+            "a stale run dir inside a fresh namespace must be swept"
+        );
+        assert!(
+            fresh_child.exists(),
+            "a fresh run dir inside a fresh namespace must be kept"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Backdate a directory's mtime by `age` (test-only). Returns false where
+    /// the platform cannot set a directory's mtime, so the caller can fall back.
+    #[cfg(unix)]
+    fn backdate_mtime(path: &Path, age: Duration) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let t = now.saturating_sub(age);
+        let ts = libc::timespec {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_nsec: t.subsec_nanos() as _,
+        };
+        // Set both atime and mtime; do not follow symlinks.
+        let times = [ts, ts];
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    fn backdate_mtime(_path: &Path, _age: Duration) -> bool {
+        false
     }
 
     #[test]

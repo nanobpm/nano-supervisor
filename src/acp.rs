@@ -26,6 +26,9 @@ pub struct Outcome {
     pub stop_reason: String,
     /// Concatenated `agent_message_chunk` text.
     pub text: String,
+    /// True when `bound_capture` dropped bytes from the transcript front, so the
+    /// caller's own cap does not misreport a truncated transcript as complete.
+    pub truncated: bool,
     pub updates: usize,
     pub tool_calls: usize,
     pub permissions_granted: usize,
@@ -35,6 +38,9 @@ pub struct Outcome {
 struct Shared {
     pending: HashMap<u64, oneshot::Sender<Result<Value>>>,
     text: String,
+    /// Set when `bound_capture` trims `text`, so the truncation survives to the
+    /// `Outcome` even though the trimmed length no longer reveals it.
+    truncated: bool,
     updates: usize,
     tool_calls: usize,
     permissions_granted: usize,
@@ -220,6 +226,7 @@ impl Agent {
         Ok(Outcome {
             stop_reason: done["stopReason"].as_str().unwrap_or("unknown").to_string(),
             text: s.text.clone(),
+            truncated: s.truncated,
             updates: s.updates,
             tool_calls: s.tool_calls,
             permissions_granted: s.permissions_granted,
@@ -402,7 +409,11 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
                         // `String`, so a verbose or misbehaving ACP agent could
                         // otherwise exhaust daemon memory (one unbounded buffer
                         // per slot). The tail is retained for result detection.
-                        crate::pipe::bound_capture(&mut s.text);
+                        // Record whether any bytes were dropped so the truncation
+                        // is reported even though the capped length hides it.
+                        if crate::pipe::bound_capture(&mut s.text) {
+                            s.truncated = true;
+                        }
                     }
                 }
                 Some("tool_call") => s.tool_calls += 1,

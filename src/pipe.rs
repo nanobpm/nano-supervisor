@@ -23,6 +23,9 @@ pub struct PipeOutcome {
     /// True when the run was cut short because the agent produced no output for
     /// longer than the idle timeout.
     pub idle_timed_out: bool,
+    /// True when `bound_capture` dropped bytes from the captured stdout front,
+    /// so the caller's own cap does not misreport truncated output as complete.
+    pub truncated: bool,
 }
 
 /// Spawn `program args…` in `cwd` with `env`, write `stdin_json` to its stdin,
@@ -94,6 +97,7 @@ pub async fn run(
     let mut reader = BufReader::new(stdout);
     let mut buf = [0u8; 64 * 1024];
     let mut collected = String::new();
+    let mut truncated = false;
     let mut last_activity = Instant::now();
     let mut idle_timed_out = false;
 
@@ -118,7 +122,9 @@ pub async fn run(
                     // so it survives chunk boundaries exactly; only split multibyte
                     // prose (a diagnostic fallback channel) may gain replacements.
                     collected.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    bound_capture(&mut collected);
+                    if bound_capture(&mut collected) {
+                        truncated = true;
+                    }
                 }
             },
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
@@ -140,6 +146,7 @@ pub async fn run(
         stdout: collected,
         exit_code,
         idle_timed_out,
+        truncated,
     })
 }
 
@@ -152,10 +159,12 @@ pub(crate) const MAX_STDOUT: usize = 1 << 20; // 1 MiB
 
 /// Keep `collected` within [`MAX_STDOUT`] by dropping from the front (oldest
 /// output) once it overflows. Retaining the tail preserves a trailing
-/// `::nano:result::` sentinel for result parsing.
-pub(crate) fn bound_capture(collected: &mut String) {
+/// `::nano:result::` sentinel for result parsing. Returns `true` when any bytes
+/// were dropped, so callers can report the truncation (the capped length alone
+/// no longer reveals it).
+pub(crate) fn bound_capture(collected: &mut String) -> bool {
     if collected.len() <= MAX_STDOUT {
-        return;
+        return false;
     }
     let overflow = collected.len() - MAX_STDOUT;
     // Advance to a char boundary at or past the overflow so we never split a
@@ -165,6 +174,7 @@ pub(crate) fn bound_capture(collected: &mut String) {
         cut += 1;
     }
     collected.replace_range(..cut, "");
+    true
 }
 
 async fn kill_tree(child: &mut tokio::process::Child, pgid: Option<u32>) {
@@ -184,7 +194,8 @@ mod tests {
     fn bound_capture_keeps_tail_within_limit() {
         let mut s = "x".repeat(MAX_STDOUT + 1000);
         s.push_str("::nano:result:: {}\n");
-        bound_capture(&mut s);
+        let dropped = bound_capture(&mut s);
+        assert!(dropped, "overflow must report truncation");
         assert!(s.len() <= MAX_STDOUT);
         // The trailing sentinel (what result parsing needs) is retained.
         assert!(s.ends_with("::nano:result:: {}\n"));
@@ -193,7 +204,8 @@ mod tests {
     #[test]
     fn bound_capture_leaves_small_output_untouched() {
         let mut s = "hello\nworld\n".to_string();
-        bound_capture(&mut s);
+        let dropped = bound_capture(&mut s);
+        assert!(!dropped, "in-bounds output must not report truncation");
         assert_eq!(s, "hello\nworld\n");
     }
 }

@@ -12,8 +12,10 @@ fn startup_sweep_reaps_stale_runs() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    // The reaper knobs (ms) and the boolean `--keep-runs` are accepted and the
-    // worker still services its job with the reaper running on a tight cadence.
+    // Drive the sweep wiring hard: a tight `--reap-age`/`--reap-interval` so the
+    // startup AND cadence reapers both run during the job, and NO `--keep-runs`
+    // so the worker manages its own per-worker run namespace (reaping the run
+    // dir on completion). The job must still complete with the reaper active.
     let outcome = run_worker_job(
         &engine,
         &target,
@@ -23,13 +25,7 @@ fn startup_sweep_reaps_stale_runs() {
             json!({ "write_result": { "ok": true } }),
         ],
         json!({ "prompt": "sweep first" }),
-        &[
-            "--reap-age",
-            "1000",
-            "--reap-interval",
-            "1000",
-            "--keep-runs",
-        ],
+        &["--reap-age", "1000", "--reap-interval", "1000"],
         &[],
     );
     assert_eq!(
@@ -37,6 +33,25 @@ fn startup_sweep_reaps_stale_runs() {
         "COMPLETED",
         "stderr:\n{}",
         outcome.stderr()
+    );
+    // The fake agent ran and wrote its result through the worker's own result
+    // channel, proving the run-dir lifecycle (provision → run → result → reap)
+    // stayed intact with the sweeps engaged.
+    assert!(
+        outcome.record_exists(),
+        "the agent never ran — the sweep must not remove a live run dir.\nstderr:\n{}",
+        outcome.stderr()
+    );
+    let result = outcome.result_file().unwrap_or_else(|| {
+        panic!(
+            "the agent's result file is gone — the worker reaped the run dir before reading the result.\nstderr:\n{}",
+            outcome.stderr()
+        )
+    });
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the worker must read the agent's result before any reap: {result}"
     );
 }
 

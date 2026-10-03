@@ -102,10 +102,22 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // Resolve platform symlinks in the path (macOS `/var` → `/private/var`):
     // the run-dir sweep refuses any root with a symlinked ancestor.
     let runs_dir = std::fs::canonicalize(&runs_dir)?;
+    // Sweep at the SHARED `agent-runs` parent, not this worker's own
+    // PID-namespaced dir: a crashed worker leaves `rust-worker-<old-pid>` as a
+    // sibling of the next launch's root, so sweeping only `runs_dir` could never
+    // discover it and repeated crashes would leak run trees despite `--reap-age`.
+    // The sweep recurses one level (worker namespaces, then their run dirs) and
+    // skips any in-flight run registered in `active_runs`. For an explicit
+    // `--runs-dir` the worker namespace is the dir itself, so sweep it directly.
+    let sweep_root = if opts.runs_dir.is_some() {
+        runs_dir.clone()
+    } else {
+        runs_dir.parent().map(PathBuf::from).unwrap_or_else(|| runs_dir.clone())
+    };
     // Startup reap, then on a cadence: run dirs older than `--reap-age`.
-    slot::sweep_stale_runs(&runs_dir, opts.reap_age);
+    slot::sweep_stale_runs(&sweep_root, opts.reap_age);
     let reaper = {
-        let dir = runs_dir.clone();
+        let dir = sweep_root.clone();
         let (age, every) = (
             opts.reap_age,
             opts.reap_interval.max(Duration::from_millis(100)),
@@ -152,9 +164,24 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         }
     }
     reaper.abort();
-    // Drop this worker's namespace on a clean exit, unless `--keep-runs`.
+    // Drop this worker's namespace on a clean exit, unless `--keep-runs`. Only
+    // remove it when EMPTY: `execute` intentionally retains failed run dirs for
+    // post-mortem and age-based reaping, so a recursive delete here would erase
+    // those diagnostics. An empty namespace means every run was reaped on
+    // completion, so removing it just cleans up the per-worker dir.
     if opts.runs_dir.is_none() && !opts.keep_runs {
-        let _ = std::fs::remove_dir_all(&runs_dir);
+        match std::fs::remove_dir(&runs_dir) {
+            Ok(()) => {}
+            // NotEmpty: retained failed runs survive for post-mortem/reaping.
+            // NotFound: already gone. Anything else is best-effort cleanup.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => log(&format!(
+                "could not remove worker namespace {}: {e:#}",
+                runs_dir.display()
+            )),
+        }
     }
     Ok(())
 }

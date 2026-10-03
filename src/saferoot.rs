@@ -143,7 +143,7 @@ impl DirHandle {
     /// Open a direct child directory relative to this handle, never following a
     /// symlink and never escaping this directory
     /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`).
-    fn open_child_dir(&self, name: &OsStr) -> io::Result<DirHandle> {
+    pub(crate) fn open_child_dir(&self, name: &OsStr) -> io::Result<DirHandle> {
         let c = cstr(name)?;
         let fd = openat2_raw(
             self.fd.as_raw_fd(),
