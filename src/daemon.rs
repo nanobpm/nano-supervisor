@@ -100,6 +100,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 with_lease: opts.with_lease,
                 require_lease: opts.with_lease,
                 max_jobs: None,
+                propagate_job_panic: false,
                 keep_runs: false,
             });
             handles.push(tokio::spawn(slot::run(

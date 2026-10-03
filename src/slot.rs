@@ -55,6 +55,12 @@ pub struct SlotConfig {
     pub require_lease: bool,
     /// Stop after handling this many jobs (`work --max-jobs`); `None` = forever.
     pub max_jobs: Option<usize>,
+    /// Propagate a per-job task PANIC as a slot crash instead of logging it and
+    /// carrying on. `true` for standalone `work` (a swallowed panic would let
+    /// the slot return `Ok(())` and the process exit 0, telling the supervisor
+    /// the worker stopped cleanly when it crashed); `false` for the `daemon`,
+    /// whose explicit policy is that one panicked job fails only that job.
+    pub propagate_job_panic: bool,
     /// Keep per-job run directories instead of reaping them (`--keep-runs`).
     pub keep_runs: bool,
 }
@@ -178,6 +184,21 @@ pub async fn run(
                 }
                 r = &mut job_task => {
                     // Surface a panic in the job task rather than swallowing it.
+                    // In standalone `work` mode a swallowed panic would let the
+                    // slot return `Ok(())` and the process exit 0 — the
+                    // supervisor-visible clean-exit failure `work::run`'s join
+                    // propagation exists to prevent — so re-raise it to crash the
+                    // slot task (its `JoinHandle` carries the panic up to
+                    // `work::run`, which exits non-zero). A cancellation (drain
+                    // abort) is never a crash, and the daemon keeps its explicit
+                    // per-job resilience policy (log and carry on).
+                    if job_panic_is_fatal(&r, cfg.propagate_job_panic) {
+                        log(&format!(
+                            "slot {} job task panicked; propagating as a worker crash",
+                            cfg.worker_name
+                        ));
+                        std::panic::resume_unwind(r.unwrap_err().into_panic());
+                    }
                     if let Err(e) = r {
                         if !e.is_cancelled() {
                             log(&format!("slot {} job task failed: {e:#}", cfg.worker_name));
@@ -188,6 +209,16 @@ pub async fn run(
             handled += 1;
         }
     }
+}
+
+/// Whether a finished per-job task's join outcome must crash the slot (so a
+/// standalone `work` process exits non-zero) rather than being logged and
+/// skipped. Only a PANIC in standalone work mode (`propagate == true`) is
+/// fatal: a cancellation (drain abort) never is, a clean completion never is,
+/// and the daemon (`propagate == false`) always keeps its job-level resilience.
+/// Pure/testable; the caller re-raises the panic when this returns `true`.
+fn job_panic_is_fatal(r: &Result<(), tokio::task::JoinError>, propagate: bool) -> bool {
+    matches!(r, Err(e) if propagate && e.is_panic())
 }
 
 /// Decide whether a raced job outcome is still ours to settle.
@@ -2048,6 +2079,7 @@ mod tests {
             with_lease: true,
             require_lease: true,
             max_jobs: None,
+            propagate_job_panic: false,
             keep_runs: false,
         }
     }
@@ -2427,6 +2459,26 @@ mod tests {
         ));
         // Already lost via the select's None branch stays lost.
         assert!(reconcile_lost(None::<Result<()>>, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn job_panic_is_fatal_only_for_a_panic_in_standalone_work_mode() {
+        // A per-job task PANIC: fatal in standalone `work` (so the process exits
+        // non-zero instead of swallowing the crash and exiting 0), tolerated in
+        // the daemon (its explicit "one panicked job fails only that job" policy).
+        let panicked = tokio::spawn(async { panic!("boom") }).await;
+        assert!(job_panic_is_fatal(&panicked, true), "work mode: a panic crashes the slot");
+        assert!(!job_panic_is_fatal(&panicked, false), "daemon: a panic is tolerated");
+
+        // A cancellation (drain abort) is never a crash, even in work mode.
+        let task = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        task.abort();
+        let cancelled = task.await;
+        assert!(!job_panic_is_fatal(&cancelled, true), "a drain abort is not a crash");
+
+        // A clean completion is never fatal.
+        let ok = tokio::spawn(async {}).await;
+        assert!(!job_panic_is_fatal(&ok, true), "a clean completion is not a crash");
     }
 
     #[test]

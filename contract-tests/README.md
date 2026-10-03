@@ -61,13 +61,13 @@ test. Keep this list current as tests are added:
 | Fix | Behavior | Test |
 | --- | --- | --- |
 | jwulf/c8ctl-plugin-nano#275 | Empty agent result → **fail**, never complete | `worker_result::empty_result_fails_never_completes`, `worker_result::empty_agent_turn_is_observably_empty` |
-| nanobpm/nano-bpm#1283 | Lease token name mismatch (`leaseToken` vs `jobLeaseToken`); leased commands go over Nano's dialect | `worker_lease::*` |
-| Last-activation guard | Losing the lease (404/409 on refresh) stops the agent and does **not** settle the job | `worker_lease::losing_the_lease_stops_the_agent_without_settling` |
+| nanobpm/nano-bpm#1283 | Lease token name mismatch (`leaseToken` vs `jobLeaseToken`): the worker takes a lease on every activation (engine 0.0.24 issues `jobLeaseToken`) | `worker_lease::*` |
+| Settlement fencing | Complete/fail are fenced by the lease token and land exactly once | `worker_lease::settling_commands_are_fenced_by_the_lease_token` |
 | Refresh cadence | Refresh the activation every third of `--recovery-window` | `worker_lease::leased_worker_refreshes_every_third_of_the_window` |
 | Nudge | Nudge an agent that stops without a result | `worker_result::stop_without_result_is_nudged` |
-| Finalize / fallback branch | No PR → fall back to a `nano/agent-work/…` branch | `worker_finalize::no_pr_falls_back_to_nano_agent_work_branch` |
+| Finalize / PR vs fallback | An agent-reported PR is forwarded; an **unprovisioned** run creates no fallback branch | `worker_finalize::agent_reported_pr_is_forwarded`, `worker_finalize::unprovisioned_run_creates_no_fallback_branch` |
 | Reclaim / reap sweeps | Startup and periodic sweeps reap stale runs (`--reap-age`, `--reap-interval`, `--keep-runs`) | `worker_sweeps::startup_sweep_reaps_stale_runs` |
-| Disk-space check | `--min-free-mb` gates taking work | `worker_sweeps::min_free_mb_gates_work` |
+| Disk-space check | `--min-free-mb` is the container disk floor; it does **not** gate host-sandbox runs (Node behaviour) | `worker_sweeps::min_free_mb_does_not_gate_host_runs` |
 | Checkpoint / resume | A job resumes after its worker is killed mid-run | `worker_resume::killed_worker_job_resumes_not_restarts` |
 
 Where the Node plugin's observed behavior looks like a bug, the test captures it

@@ -216,6 +216,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         with_lease: true,
         require_lease: false,
         max_jobs: opts.max_jobs,
+        propagate_job_panic: true,
         keep_runs: opts.keep_runs,
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

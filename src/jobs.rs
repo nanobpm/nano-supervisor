@@ -81,23 +81,26 @@ impl NanoHttp {
         })
     }
 
-    /// Whether a formatted error from [`send`] carries the given HTTP status.
-    /// Reads the STRUCTURED [`HttpStatus`] off the chain first, then falls back
-    /// to the unambiguous `HTTP <status> ` marker [`send`] puts in the message —
-    /// never the bare digits, which a numeric job key in the interpolated
-    /// `/jobs/{key}` path could itself contain.
-    pub(crate) fn is_status(e: &anyhow::Error, status: u16) -> bool {
-        e.chain().any(|c| {
-            c.downcast_ref::<HttpStatus>()
-                .is_some_and(|h| h.status == status)
-                || c.to_string().contains(&format!("HTTP {status} "))
-        })
-    }
-
     /// The HTTP status of a failing [`send`] error, if it was an HTTP error at
     /// all (as opposed to a transport/timeout failure, which carries no status).
+    ///
+    /// A STRUCTURED [`HttpStatus`] anywhere in the chain is AUTHORITATIVE and is
+    /// returned verbatim. Only when no link carries one do we fall back to the
+    /// unambiguous `HTTP <status> ` marker [`send`] puts in the message — never
+    /// the bare digits, which a numeric job key in the interpolated `/jobs/{key}`
+    /// path could itself contain. Critically, the marker fallback must NOT run
+    /// when a structured status is present: `send` folds a bounded body excerpt
+    /// into the message, so a genuine 500 whose body echoes `HTTP 404 ` would
+    /// otherwise be misclassified as a 404 lease fence (the old scan was
+    /// ascending). Structured-first closes that whole class.
     pub(crate) fn status_of(e: &anyhow::Error) -> Option<u16> {
-        (400..=599u16).find(|&s| Self::is_status(e, s))
+        if let Some(h) = e.chain().find_map(|c| c.downcast_ref::<HttpStatus>()) {
+            return Some(h.status);
+        }
+        e.chain().find_map(|c| {
+            let s = c.to_string();
+            (400..=599u16).find(|&st| s.contains(&format!("HTTP {st} ")))
+        })
     }
 
     async fn send(
@@ -329,6 +332,40 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::validate_job_key;
+    use super::{HttpStatus, NanoHttp};
+    use anyhow::Context;
+
+    #[test]
+    fn structured_status_wins_over_a_body_echoed_marker() {
+        // A genuine 500 whose bounded body excerpt happens to echo "HTTP 404 ":
+        // the structured `HttpStatus` must be authoritative, or the ascending
+        // marker scan would misclassify it as a 404 lease fence.
+        let e = anyhow::Error::new(HttpStatus {
+            status: 500,
+            message: "HTTP 500 Internal Server Error :: upstream said HTTP 404 Not Found".into(),
+        })
+        .context("/jobs/2251799813685250");
+        assert_eq!(NanoHttp::status_of(&e), Some(500));
+        assert_ne!(NanoHttp::status_of(&e), Some(404));
+
+        // A real 404 fence still resolves to 404 even with a body excerpt.
+        let fence = anyhow::Error::new(HttpStatus {
+            status: 404,
+            message: "HTTP 404 Not Found :: job gone".into(),
+        })
+        .context("/jobs/2251799813685250");
+        assert_eq!(NanoHttp::status_of(&fence), Some(404));
+    }
+
+    #[test]
+    fn marker_fallback_only_without_a_structured_status() {
+        // No structured link: the `HTTP <status> ` marker is the fallback.
+        let marker = anyhow::anyhow!("HTTP 409 Conflict").context("/jobs/9409");
+        assert_eq!(NanoHttp::status_of(&marker), Some(409));
+        // A transport failure whose key merely contains fence digits is None.
+        let transport = anyhow::anyhow!("connection reset").context("/jobs/14041234567890");
+        assert_eq!(NanoHttp::status_of(&transport), None);
+    }
 
     #[test]
     fn accepts_numeric_engine_keys() {
