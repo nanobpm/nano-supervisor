@@ -492,6 +492,21 @@ pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
     prepare_run_dir_path_based(runs_dir, run_dir)
 }
 
+/// `prepare_run_dir` dispatched to the blocking pool. Preparing a run dir wipes
+/// any stale prior-attempt checkout (a recursive removal); run inline on a Tokio
+/// worker thread that can block the executor long enough to starve the lease
+/// refresher (especially on a single-core host) and lose the very lease this job
+/// is running under. Use this from async contexts; `prepare_run_dir` remains for
+/// synchronous callers and tests.
+pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf) -> Result<()> {
+    // The wipe/create is synchronous; a panic in the blocking task surfaces as a
+    // `JoinError`, which we treat as the prepare failing (the run dir state is
+    // then unknown, so failing the job is the safe outcome).
+    tokio::task::spawn_blocking(move || prepare_run_dir(&runs_dir, &run_dir))
+        .await
+        .map_err(|e| anyhow::Error::new(e).context("prepare_run_dir blocking task panicked"))?
+}
+
 /// `prepare_run_dir` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
 /// runs root: the stale-wipe, create, and 0700 chmod of both the root and the
 /// job dir all happen *relative to that pinned handle*, so a same-UID actor
@@ -584,6 +599,29 @@ pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<(
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// `reap_run_dir` dispatched to the blocking pool. Reaping removes a job's whole
+/// checkout (a recursive removal); run inline on a Tokio worker thread it can
+/// block the executor long enough to starve the lease refresher (especially on a
+/// single-core host) and lose the lease before `complete_job` lands, redelivering
+/// the job. Use this from async contexts; `reap_run_dir` remains for synchronous
+/// callers and tests. Best-effort like the caller: a panic in the blocking task
+/// is logged and swallowed, never propagated.
+pub(crate) async fn reap_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf, key: &str) {
+    let label = run_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || reap_run_dir(&runs_dir, &run_dir)).await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log(&format!(
+            "job {key}: failed to reap run dir {}: {e:#}",
+            label.display()
+        )),
+        Err(join) => log(&format!(
+            "job {key}: reap_run_dir blocking task panicked for {}: {join}",
+            label.display()
+        )),
     }
 }
 
@@ -1346,7 +1384,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     if !cfg.keep_runs {
         sweep_stale_runs_blocking(cfg.runs_dir.clone(), FAILED_RUN_RETENTION, false).await;
     }
-    prepare_run_dir(&cfg.runs_dir, &run_dir)?;
+    prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?;
     let agent_cwd = match &env.repository {
         Some(repo) => {
             log(&format!(
@@ -1517,14 +1555,11 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
 
     // Reap the run directory unless `--keep-runs`. Only successful runs are
     // reaped here; a failed run is left for post-mortem and aged out by
-    // `sweep_stale_runs`. Best-effort, pinned no-follow (see `reap_run_dir`).
+    // `sweep_stale_runs`. Best-effort, pinned no-follow (see `reap_run_dir`), and
+    // dispatched to the blocking pool so a large checkout removal cannot stall
+    // the executor and starve the lease refresher before `complete_job` lands.
     if matches!(settle, Settle::Complete(_)) && !cfg.keep_runs {
-        if let Err(e) = reap_run_dir(&cfg.runs_dir, &run_dir) {
-            log(&format!(
-                "job {key}: failed to reap run dir {}: {e:#}",
-                run_dir.display()
-            ));
-        }
+        reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
     }
     Ok(settle)
 }
