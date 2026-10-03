@@ -237,15 +237,24 @@ fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
 /// and [`coerce_u`]; both stringify first (see [`js_stringify`]) so a non-string
 /// is converted the JavaScript way before the leading integer is parsed.
 ///
-/// The digit run is accumulated into an `f64`, not a fixed-width integer.
-/// `parseInt` yields a JavaScript Number (an IEEE-754 double), so a digit run of
-/// ANY magnitude stays a finite number in Node — `parseInt("9223372036854775808")`
-/// is `9223372036854776000`, not an error. Parsing into `i64` instead overflows
-/// to `None` past `i64::MAX`, silently DROPPING a field such as `cloneTimeoutMs`
-/// (the clone then runs on the default timeout) and rounding values above 2^53
-/// differently (`"9007199254740993"`). Accumulating into `f64` matches Node's
-/// double exactly: the result is finite for any digit run, and the f64's own
-/// rounding IS the JavaScript Number's rounding.
+/// The digit run is converted to an `f64` in ONE correctly-rounded parse of the
+/// whole token, not accumulated digit-by-digit. `parseInt` yields a JavaScript
+/// Number (an IEEE-754 double), so a digit run of ANY magnitude stays a finite
+/// number in Node — `parseInt("9223372036854775808")` is `9223372036854776000`,
+/// not an error. Parsing into `i64` instead overflows to `None` past `i64::MAX`,
+/// silently DROPPING a field such as `cloneTimeoutMs` (the clone then runs on
+/// the default timeout) and rounding values above 2^53 differently
+/// (`"9007199254740993"`). But the accumulation must also round the way the
+/// JavaScript Number does — ONCE, from the exact decimal value. Accumulating
+/// `acc * 10 + d` per digit re-rounds the intermediate after every multiply/add,
+/// which diverges from a single correctly-rounded conversion (`"24558181542885634"`
+/// accumulates to `24558181542885636` where Node's `parseInt` — and Rust's
+/// `str::parse::<f64>`, both correctly rounded to nearest-even — yield
+/// `24558181542885632`). `str::parse` is correctly rounded and saturates to
+/// `f64::INFINITY` beyond the double range, so the result matches Node's Number
+/// for a digit run of any length (including `Infinity`, which `coerce_int` /
+/// `coerce_u` then drop via the `is_finite` guard, exactly as Node drops a
+/// non-finite `parseInt` result downstream).
 fn parse_int_str(s: &str) -> Option<f64> {
     let t = s.trim_start();
     let end = t
@@ -254,24 +263,13 @@ fn parse_int_str(s: &str) -> Option<f64> {
         .map(|(i, _)| i)
         .unwrap_or(t.len());
     let tok = &t[..end];
-    let (neg, digits) = match tok.as_bytes().first() {
-        Some(b'-') => (true, &tok[1..]),
-        Some(b'+') => (false, &tok[1..]),
-        _ => (false, tok),
-    };
-    if digits.is_empty() {
+    let digits = tok.strip_prefix(['-', '+']).unwrap_or(tok);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None; // a bare sign, or no leading digit at all → NaN
     }
-    // Accumulate the leading integer as a double. Beyond ~17 significant digits
-    // the added digits no longer change the f64 (it is already at the limit of
-    // double precision), which is exactly how far JavaScript's Number can
-    // represent the value too — so this stays finite and identically-rounded
-    // where an integer accumulator would overflow.
-    let mut acc: f64 = 0.0;
-    for &d in digits.as_bytes() {
-        acc = acc * 10.0 + f64::from(d - b'0');
-    }
-    Some(if neg { -acc } else { acc })
+    // One correctly-rounded conversion of the whole `[+-]?digits` token — the
+    // same rounding V8 applies when `parseInt` produces its Number.
+    tok.parse::<f64>().ok()
 }
 
 /// Node's `coerceInt` for the unsigned fields (`depth`, `cloneTimeoutMs`):
@@ -824,6 +822,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_int_str_rounds_once_like_node_not_per_digit() {
+        // Regression: accumulating `acc * 10 + d` per digit re-rounds the
+        // intermediate after every multiply/add, which is NOT how JavaScript's
+        // `parseInt` rounds — the Number is the exact decimal value rounded
+        // ONCE to nearest-even. `"24558181542885634"` accumulates to
+        // `24558181542885636` digit-by-digit but is `24558181542885632` in Node
+        // (and in Rust's correctly-rounded `str::parse::<f64>`).
+        assert_eq!(
+            parse_int_str("24558181542885634"),
+            Some(24558181542885632.0)
+        );
+        assert_eq!(
+            coerce_u(Some(&json!("24558181542885634"))),
+            Some(24558181542885632)
+        );
+        assert_eq!(
+            coerce_int(Some(&json!("24558181542885634"))),
+            Some(json!(24558181542885632_i64)),
+        );
+        // The negative twin rounds toward the even midpoint the same way.
+        assert_eq!(
+            parse_int_str("-24558181542885634"),
+            Some(-24558181542885632.0)
+        );
+        // A digit run beyond the double range saturates to ±Infinity, exactly
+        // like Node's `parseInt("9".repeat(400))` → `Infinity`; the finite
+        // guards in `coerce_int`/`coerce_u` then drop it (Node's normalized
+        // envelope drops a non-finite Number too).
+        let huge = "9".repeat(400);
+        assert_eq!(parse_int_str(&huge), Some(f64::INFINITY));
+        assert!(coerce_int(Some(&json!(huge.clone()))).is_none());
+        assert!(coerce_u(Some(&json!(huge))).is_none());
+    }
+
+    #[test]
     fn coerce_int_preserves_the_finite_number_without_i64_clamping() {
         // parseInt keeps a finite JavaScript Number of ANY magnitude; the
         // normalized field must preserve that Number, NOT clamp it to
@@ -836,8 +869,8 @@ mod tests {
         );
         // Beyond i64 range the finite IEEE-754 double is kept, NOT clamped to
         // i64::MIN/MAX. (The exact low digits of such a huge magnitude follow
-        // `parse_int_str`'s double accumulation; what matters here is that the
-        // value is preserved rather than saturated.)
+        // `parse_int_str`'s single correctly-rounded conversion; what matters
+        // here is that the value is preserved rather than saturated.)
         let e20 = coerce_int(Some(&json!("100000000000000000000"))).unwrap();
         assert_eq!(e20.as_f64(), Some(1e20));
         assert_ne!(e20, json!(i64::MAX));

@@ -54,7 +54,13 @@ pub(crate) async fn refresh_loop(
                 log(&format!("job {key}: refresh failed ({failures}): {msg}"));
                 // 404 = gone, 409 = superseded by a newer (leased) activation: stop
                 // now. Otherwise tolerate one transient error before giving up.
-                if msg.contains("404") || msg.contains("409") || failures >= 2 {
+                // Read the STRUCTURED status off the error chain, never the bare
+                // digits: the Nano backend interpolates `/jobs/{key}` into the
+                // request path, so a numeric job key that merely CONTAINS
+                // "404"/"409" would otherwise misclassify a transient refresh
+                // error as a lease fence and abandon a live activation.
+                if matches!(crate::jobs::NanoHttp::status_of(&e), Some(404 | 409)) || failures >= 2
+                {
                     let _ = lost.send(true);
                     return;
                 }
@@ -75,4 +81,32 @@ pub fn log(msg: &str) {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     eprintln!("[{now:.3}] {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::jobs::NanoHttp;
+
+    #[test]
+    fn fence_status_comes_from_the_chain_not_bare_digits() {
+        // Real fence responses (Nano backend: an `HttpStatus` error carrying
+        // `HTTP 404 Not Found`, re-wrapped by `Jobs::extend` with the
+        // `/jobs/{key}` path context).
+        let not_found = anyhow::anyhow!("HTTP 404 Not Found").context("/jobs/2251799813685250");
+        assert_eq!(NanoHttp::status_of(&not_found), Some(404));
+        let conflict = anyhow::anyhow!("HTTP 409 Conflict").context("/jobs/2251799813685250");
+        assert_eq!(NanoHttp::status_of(&conflict), Some(409));
+        // A transient failure whose numeric job key merely CONTAINS the fence
+        // digits must NOT stop the loop after the first error.
+        let key_has_404 = anyhow::anyhow!("connection reset").context("/jobs/14041234567890");
+        assert_eq!(NanoHttp::status_of(&key_has_404), None);
+        let key_is_9409 = anyhow::anyhow!("timeout").context("/jobs/9409");
+        assert_eq!(NanoHttp::status_of(&key_is_9409), None);
+        // A non-fence HTTP status is reported but is not 404/409.
+        let server_error = anyhow::anyhow!("HTTP 500 Internal Server Error").context("/jobs/123");
+        assert_eq!(NanoHttp::status_of(&server_error), Some(500));
+        // A transport failure carries no status at all.
+        let transport = anyhow::anyhow!("/jobs/404: request failed: connection refused");
+        assert_eq!(NanoHttp::status_of(&transport), None);
+    }
 }

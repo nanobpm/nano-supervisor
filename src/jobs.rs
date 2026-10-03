@@ -44,6 +44,24 @@ pub enum Jobs {
     Nano(NanoHttp),
 }
 
+/// An HTTP error response from the Nano engine: carries the status code as a
+/// STRUCTURED value (the refresh loop reads it via [`NanoHttp::status_of`]) so
+/// fence detection never has to substring-match a message that also embeds the
+/// `/jobs/{key}` path — a numeric job key can itself contain "404"/"409".
+#[derive(Debug)]
+struct HttpStatus {
+    status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
 #[derive(Clone)]
 pub struct NanoHttp {
     http: reqwest::Client,
@@ -61,6 +79,25 @@ impl NanoHttp {
             base: format!("{base}/v2"),
             basic,
         })
+    }
+
+    /// Whether a formatted error from [`send`] carries the given HTTP status.
+    /// Reads the STRUCTURED [`HttpStatus`] off the chain first, then falls back
+    /// to the unambiguous `HTTP <status> ` marker [`send`] puts in the message —
+    /// never the bare digits, which a numeric job key in the interpolated
+    /// `/jobs/{key}` path could itself contain.
+    pub(crate) fn is_status(e: &anyhow::Error, status: u16) -> bool {
+        e.chain().any(|c| {
+            c.downcast_ref::<HttpStatus>()
+                .is_some_and(|h| h.status == status)
+                || c.to_string().contains(&format!("HTTP {status} "))
+        })
+    }
+
+    /// The HTTP status of a failing [`send`] error, if it was an HTTP error at
+    /// all (as opposed to a transport/timeout failure, which carries no status).
+    pub(crate) fn status_of(e: &anyhow::Error) -> Option<u16> {
+        (400..=599u16).find(|&s| Self::is_status(e, s))
     }
 
     async fn send(
@@ -85,12 +122,25 @@ impl NanoHttp {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            // Keep the status code in the message: the refresh loop keys off 404/409.
-            bail!(
-                "{path}: HTTP {} {}",
-                status.as_u16(),
-                text.chars().take(300).collect::<String>()
-            );
+            // Bail with the status as a STRUCTURED HttpStatus error (the
+            // refresh loop keys off the 404/409 fence statuses via
+            // `status_of`, and a bare-digit match would misclassify a job key
+            // containing those digits as a fence). The message keeps the
+            // unambiguous `HTTP <status> ` marker plus a bounded body excerpt;
+            // the path is added as context by the caller, so the formatted
+            // chain still reads `/jobs/{key}: HTTP 404 Not Found :: {body}`.
+            let mut msg = status
+                .canonical_reason()
+                .map(|r| format!("HTTP {} {r}", status.as_u16()))
+                .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+            if !text.is_empty() {
+                msg.push_str(" :: ");
+                msg.push_str(&text.chars().take(300).collect::<String>());
+            }
+            return Err(anyhow::Error::new(HttpStatus {
+                status: status.as_u16(),
+                message: msg,
+            }));
         }
         Ok(if text.is_empty() {
             Value::Null
@@ -149,7 +199,8 @@ impl Jobs {
                         body,
                         poll + Duration::from_secs(10),
                     )
-                    .await?;
+                    .await
+                    .with_context(|| "/jobs/activation".to_string())?;
                 let mut out = Vec::new();
                 for raw in v["jobs"].as_array().cloned().unwrap_or_default() {
                     let lease = raw["leaseToken"].as_str().map(String::from);
@@ -191,6 +242,12 @@ impl Jobs {
                     Duration::from_secs(15),
                 )
                 .await
+                // Re-wrap so the path context sits BELOW the structured HTTP
+                // status in the error chain: the refresh loop matches the
+                // chain for the unambiguous `HTTP 404 ` / `HTTP 409 ` status
+                // marker, and a bare `{path}: HTTP …` top line would put a job
+                // key containing those digits ahead of it.
+                .map_err(|e| e.context(format!("/jobs/{key}")))
                 .map(|_| ())
             }
         }
@@ -222,6 +279,7 @@ impl Jobs {
                     Duration::from_secs(30),
                 )
                 .await
+                .map_err(|e| e.context(format!("/jobs/{key}/completion")))
                 .map(|_| ())
             }
         }
@@ -261,6 +319,7 @@ impl Jobs {
                     Duration::from_secs(30),
                 )
                 .await
+                .map_err(|e| e.context(format!("/jobs/{key}/failure")))
                 .map(|_| ())
             }
         }
