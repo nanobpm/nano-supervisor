@@ -127,14 +127,19 @@ fn settlement_with_a_wrong_lease_token_is_rejected() {
         .expect("activated job has a key");
     // The engine must have issued a lease token (either the spec's
     // `jobLeaseToken` or the legacy `leaseToken`); without one there is nothing
-    // to fence with and the premise of this contract is unmet.
-    let token = job["jobLeaseToken"]
-        .as_str()
-        .or_else(|| job["leaseToken"].as_str())
-        .map(str::to_string);
-    let Some(token) = token else {
+    // to fence with and the premise of this contract is unmet. Record WHICH
+    // field the activation returned so the settlement below speaks the same
+    // dialect this engine actually exposed.
+    let token_field = if job["jobLeaseToken"].is_string() {
+        "jobLeaseToken"
+    } else if job["leaseToken"].is_string() {
+        "leaseToken"
+    } else {
         skip!("engine issued no lease token for {job_type} (pre-0.0.24?)");
     };
+    let token = job[token_field].as_str().map(str::to_string).expect(
+        "token_field was selected because job[token_field] is a string",
+    );
     // The fence is only meaningful if the wrong token differs from the real one.
     assert_ne!(
         token, "not-the-lease",
@@ -142,17 +147,17 @@ fn settlement_with_a_wrong_lease_token_is_rejected() {
     );
 
     // A completion carrying a WRONG lease token must be rejected (the fence).
-    // Send ONLY the token field the activation returned — sending both
-    // `jobLeaseToken` and `leaseToken` can make a strict engine reject the body
-    // with a 400 schema error, which is NOT the lease fence. Assert the specific
-    // `409 Conflict` the engine answers for a token mismatch, so a schema or
-    // endpoint error cannot satisfy this test.
+    // Send ONLY the token field the activation returned (`token_field`) —
+    // sending the other dialect's field, or both, can make a strict engine
+    // reject the body with a 400 schema error, which is NOT the lease fence.
+    // Assert the specific `409 Conflict` the engine answers for a token
+    // mismatch, so a schema or endpoint error cannot satisfy this test.
     let wrong = engine
         .http()
         .post(format!("{}/v2/jobs/{key}/completion", engine.url()))
         .json(&json!({
             "variables": {},
-            "jobLeaseToken": "not-the-lease",
+            token_field: "not-the-lease",
         }))
         .send()
         .expect("completion with wrong token");
