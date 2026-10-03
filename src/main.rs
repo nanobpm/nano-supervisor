@@ -55,7 +55,7 @@ enum Cmd {
         /// c8ctl connection profile (default: c8ctl's active profile, else CAMUNDA_* env).
         #[arg(long)]
         profile: Option<String>,
-        /// Worker name reported to the engine (default ‹host›-nano-‹hire›).
+        /// Worker name reported to the engine (default ‹host›-nano-‹hire›-‹pid›).
         #[arg(long)]
         name: Option<String>,
         /// Activation window in ms, refreshed every third while the agent runs (floored
