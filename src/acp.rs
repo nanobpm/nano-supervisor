@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +32,12 @@ pub struct Outcome {
     pub updates: usize,
     pub tool_calls: usize,
     pub permissions_granted: usize,
+    /// The prompt response's `_meta.outcome` object, if the agent emitted one.
+    /// Node parity (plugin 1.70.1): an explicit ACP outcome is an effective
+    /// fallback result (its `status`/`summary`/`question` vars) AND evidence the
+    /// run was non-empty, so it must survive to result selection / empty
+    /// detection rather than being discarded with the rest of the response.
+    pub outcome: Option<Map<String, Value>>,
 }
 
 #[derive(Default)]
@@ -230,6 +236,14 @@ impl Agent {
             updates: s.updates,
             tool_calls: s.tool_calls,
             permissions_granted: s.permissions_granted,
+            // Preserve the prompt response's `_meta.outcome` (plugin 1.70.1): a
+            // `blocked`/explicit outcome is a usable fallback result and proof
+            // the run did work, so it must not be dropped here.
+            outcome: done
+                .get("_meta")
+                .and_then(|m| m.get("outcome"))
+                .and_then(Value::as_object)
+                .cloned(),
         })
     }
 

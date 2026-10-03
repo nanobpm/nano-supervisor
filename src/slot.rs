@@ -1131,6 +1131,11 @@ struct RunResult {
     timed_out: bool,
     /// ACP `session/update` activity (the transcript turns Node counts).
     has_turns: bool,
+    /// The ACP prompt response's `_meta.outcome` (plugin 1.70.1). An explicit
+    /// outcome is an effective fallback result AND non-empty evidence, so it is
+    /// threaded through result selection and empty detection alongside the file
+    /// and stdout sources. `None` for the pipe protocol (no ACP outcome channel).
+    acp_outcome: Option<Map<String, Value>>,
 }
 
 /// Best-effort `git rev-parse HEAD` of a checkout, for the empty-job detector's
@@ -1246,8 +1251,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // Result-nudge (Node #678): a clean run that produced output but no usable
     // result gets exactly ONE bounded "emit your result now" turn, in a fresh
     // agent process in the same workspace, writing to the same result file.
-    let already = result::read_result_file(&result_file)
-        .or_else(|| result::parse_result_from_stdout(&first.stdout));
+    // Select the first EFFECTIVE result across file → stdout → ACP-outcome
+    // sources (plugin 1.70.1), not merely the first that parses, so a `{}`
+    // result file does not shadow a usable stdout sentinel or ACP outcome.
+    let already = result::select_effective_result([
+        result::read_result_file(&result_file),
+        result::parse_result_from_stdout(&first.stdout),
+        first.acp_outcome.clone(),
+    ]);
     let mut run = first;
     if run.ok
         && !run.stdout.trim().is_empty()
@@ -1280,9 +1291,18 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         // would mislabel such a run `truncated: false`.
         run.truncated = run.truncated || nudge.truncated || capped;
         run.has_turns = run.has_turns || nudge.has_turns;
-        let recovered = result::read_result_file(&result_file)
-            .or_else(|| result::parse_result_from_stdout(&run.stdout))
-            .is_some_and(|r| result::has_effective_result_vars(&r));
+        // Propagate the nudge's latest outcome (plugin 1.70.1): the second turn's
+        // explicit outcome supersedes the first's, and is the one that attests to
+        // this recovery attempt.
+        if nudge.acp_outcome.is_some() {
+            run.acp_outcome = nudge.acp_outcome;
+        }
+        let recovered = result::select_effective_result([
+            result::read_result_file(&result_file),
+            result::parse_result_from_stdout(&run.stdout),
+            run.acp_outcome.clone(),
+        ])
+        .is_some_and(|r| result::has_effective_result_vars(&r));
         log(&format!(
             "job {key}: no result on the first turn — {}",
             if recovered {
@@ -1293,10 +1313,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         ));
     }
 
-    // Read the agent's structured result (the file, else a stdout sentinel) and
-    // remove the result channel, as the Node plugin does.
-    let raw_result = result::read_result_file(&result_file)
-        .or_else(|| result::parse_result_from_stdout(&run.stdout));
+    // Read the agent's structured result, selecting the first EFFECTIVE source
+    // across file → stdout → ACP-outcome (plugin 1.70.1), and remove the result
+    // channel, as the Node plugin does.
+    let raw_result = result::select_effective_result([
+        result::read_result_file(&result_file),
+        result::parse_result_from_stdout(&run.stdout),
+        run.acp_outcome.clone(),
+    ]);
     let _ = std::fs::remove_file(&result_file);
     let envelope = build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref());
     let name = &cfg.hire.name;
@@ -1335,6 +1359,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             run.has_turns,
             has_commits,
             false,
+            run.acp_outcome.is_some(),
         )
     } {
         Settle::Fail {
@@ -1418,6 +1443,7 @@ async fn run_agent(
                         truncated: capped || o.truncated,
                         exit_code: Some(0),
                         has_turns: o.updates > 0,
+                        acp_outcome: o.outcome,
                         ..RunResult::default()
                     }
                 }
@@ -1462,6 +1488,7 @@ async fn run_agent(
                         timed_out: o.idle_timed_out,
                         error,
                         has_turns: false,
+                        acp_outcome: None,
                     }
                 }
                 Err(e) => RunResult {
