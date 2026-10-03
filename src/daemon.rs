@@ -191,6 +191,45 @@ pub(crate) fn command_has_acp_selector(command: &str, args: &[String]) -> bool {
     scan_acp_tokens(&tokens)
 }
 
+/// Does the basename of `name` identify a POSIX shell that reads its program
+/// from a `-c <script>` string argument? Only these commands treat a short
+/// `-…c` flag as a wrapped command line; a NON-shell agent's own `-c`/`-ec`
+/// option (a config flag, a `--continue` alias, …) carries plain text, not a
+/// script. Gating the `-c` shell-wrapper handling on this check stops a
+/// non-shell `-c` from being mistaken for a shell wrapper — which would either
+/// scan its argument for a selector (false-positive protocol mismatch) or
+/// rewrite that argument as a script when injecting `--acp`. Mirrors the
+/// reference worker, which descends only for actual shell wrappers.
+fn is_shell_command(name: &str) -> bool {
+    let base = name
+        .trim_matches(|c| c == '"' || c == '\'')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name);
+    matches!(
+        base,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash" | "mksh"
+    )
+}
+
+/// Is `name` a short shell `-…c` flag (`-c`, `-ec`, `-lc`, …) — a single-dash
+/// option ending in `c` that carries the shell's script as the next token?
+fn is_short_c_flag(name: &str) -> bool {
+    name.starts_with('-') && !name.starts_with("--") && name.len() >= 2 && name.ends_with('c')
+}
+
+/// `true` when a token only re-execs or decorates the real command (`exec`,
+/// `command`, `builtin`, `env`, or a `VAR=value` assignment), so the command
+/// name is the first token PAST any such prefix.
+fn is_launch_prefix(t: &str) -> bool {
+    let t = t.trim_matches(|c| c == '"' || c == '\'');
+    matches!(t, "exec" | "command" | "builtin" | "env")
+        || (!t.starts_with('-')
+            && t.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }))
+}
+
 /// Scan an argv token list for an ACP selector, recursing into shell `-c`
 /// scripts.
 ///
@@ -208,16 +247,14 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
     // only re-exec or decorate the real command (`sh -c "exec claude-code-acp"`,
     // `sh -c "env X=1 claude-code-acp"`), so the `*-acp` suffix check must look
     // past them instead of gating on the literal first token.
-    let is_env_assignment = |t: &str| {
-        !t.starts_with('-')
-            && t.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-    };
-    let command_pos = tokens.iter().position(|t| {
-        let t = t.trim_matches(|c| c == '"' || c == '\'');
-        !matches!(t, "exec" | "command" | "builtin" | "env") && !is_env_assignment(t)
-    });
+    let command_pos = tokens.iter().position(|t| !is_launch_prefix(t));
+    // The `-…c` shell-wrapper recursion below must fire ONLY when this level's
+    // command is an actual shell: a non-shell agent's own `-c` option (e.g.
+    // `agent -c "config --acp"`) is config text, not a script, so recursing into
+    // it would wrongly report a selector (a false protocol mismatch).
+    let command_is_shell = command_pos
+        .map(|p| is_shell_command(tokens[p].trim_matches(|c| c == '"' || c == '\'')))
+        .unwrap_or(false);
     for (i, tok) in tokens.iter().enumerate() {
         let name = tok.trim_matches(|c| c == '"' || c == '\'');
         let (opt, inline_val) = match name.split_once('=') {
@@ -254,12 +291,10 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
         }
         // Shell wrapper: a short `-…c` flag (e.g. `-c`, `-ec`) hides the real
         // agent invocation inside the following script token. Scan that script's
-        // own tokens so a shell-wrapped ACP selector is not missed.
-        if name.starts_with('-')
-            && !name.starts_with("--")
-            && name.len() >= 2
-            && name.ends_with('c')
-        {
+        // own tokens so a shell-wrapped ACP selector is not missed — but ONLY
+        // when this level's command is a real shell, so a non-shell `-c` option
+        // is not misread as a wrapper.
+        if command_is_shell && is_short_c_flag(name) {
             if let Some(script) = tokens.get(i + 1).copied() {
                 let sub: Vec<&str> = script
                     .trim_matches(|c| c == '"' || c == '\'')
@@ -285,34 +320,138 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
 /// the `-c` script, not appended to the outer argv: `sh -c nano-coder --acp`
 /// lets POSIX `sh` swallow `--acp` as `$0`, so the inner agent never receives it
 /// and the ACP handshake fails. Mirror the recursive `-c` scan in
-/// [`scan_acp_tokens`]: when a short `-…c` flag carries the real command, append
-/// the selector to that script token so the wrapped agent starts in ACP mode.
+/// [`scan_acp_tokens`]: when a short `-…c` flag carries the real command, inject
+/// the selector INTO the INNERMOST wrapped command (so nested wrappers like
+/// `sh -c "bash -c 'nano-coder'"` reach the real agent), re-quoting the inner
+/// script so it stays a single argument. A non-shell command's `-c` option is
+/// left alone and the selector appended to the outer argv instead.
 pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
     let mut args = hire.args.clone();
     if command_has_acp_selector(&hire.command, &args) {
         return args;
     }
-    if let Some(i) = shell_script_arg_index(&args) {
-        args[i] = format!("{} --acp", args[i].trim_end());
-    } else {
-        args.push("--acp".to_string());
+    let command = hire.command.split_whitespace().next().unwrap_or("");
+    if is_shell_command(command) {
+        if let Some(i) = shell_script_arg_index(&args) {
+            args[i] = inject_selector_into_script(&args[i]);
+            return args;
+        }
     }
+    args.push("--acp".to_string());
     args
 }
 
-/// Index in `args` of a shell `-c` script token — the token following a short
-/// `-…c` flag (`-c`, `-ec`, `-lc`, …), i.e. the same shell-wrapper shape
-/// [`scan_acp_tokens`] recurses into. `None` for a plain (non-shell) command,
-/// whose selector is appended to the outer argv instead.
+/// Index in `args` of the outer shell `-c` script token — the token following a
+/// short `-…c` flag (`-c`, `-ec`, `-lc`, …). The caller has already confirmed
+/// the command is a shell, so this only locates the wrapped script.
 fn shell_script_arg_index(args: &[String]) -> Option<usize> {
     args.iter().enumerate().find_map(|(i, a)| {
         let name = a.trim_matches(|c| c == '"' || c == '\'');
-        let is_shell_c = name.starts_with('-')
-            && !name.starts_with("--")
-            && name.len() >= 2
-            && name.ends_with('c');
-        (is_shell_c && i + 1 < args.len()).then_some(i + 1)
+        (is_short_c_flag(name) && i + 1 < args.len()).then_some(i + 1)
     })
+}
+
+/// Inject `--acp` into a shell `-c` script string, descending to the INNERMOST
+/// wrapped command. For `bash -c 'nano-coder'` this rewrites the inner script to
+/// `bash -c 'nano-coder --acp'`; for a plain command it appends `--acp`. The
+/// inner script is re-quoted so the appended selector stays part of that inner
+/// shell's single `-c` argument rather than leaking out as the next word (which
+/// the inner shell would consume as `$0`, dropping the selector again).
+fn inject_selector_into_script(script: &str) -> String {
+    let toks = tokenize_script(script);
+    let command_pos = toks.iter().position(|t| !is_launch_prefix(&t.text));
+    let command_is_shell = command_pos
+        .map(|p| is_shell_command(&toks[p].text))
+        .unwrap_or(false);
+    if command_is_shell {
+        if let Some(c_idx) = command_pos {
+            if let Some(script_tok) = toks
+                .iter()
+                .enumerate()
+                .skip(c_idx + 1)
+                .find_map(|(k, t)| {
+                    (is_short_c_flag(&t.text) && k + 1 < toks.len()).then_some(k + 1)
+                })
+                .map(|k| &toks[k])
+            {
+                let inner = inject_selector_into_script(&script_tok.text);
+                let requoted = requote_script_arg(&inner);
+                return format!(
+                    "{}{}{}",
+                    &script[..script_tok.start],
+                    requoted,
+                    &script[script_tok.end..]
+                );
+            }
+        }
+    }
+    format!("{} --acp", script.trim_end())
+}
+
+/// Re-quote an inner shell script so it is a single argument. A bare single word
+/// needs no quoting; anything containing whitespace is single-quoted with POSIX
+/// `'\''` escaping of embedded single quotes.
+fn requote_script_arg(s: &str) -> String {
+    if !s.is_empty() && !s.chars().any(char::is_whitespace) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// A single token of a shell script string with its byte span in the original
+/// string. `text` is the unquoted content; a fully-quoted token records its
+/// span (including the quotes) so it can be spliced back after rewriting.
+struct ScriptToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+/// Split a shell script string into whitespace-separated tokens, treating a
+/// leading `'`/`"` quote as spanning to its matching close quote (so a quoted
+/// inner script with spaces stays one token). Good enough for the simple hire
+/// command lines this handles; it is not a full shell parser.
+fn tokenize_script(s: &str) -> Vec<ScriptToken> {
+    let bytes = s.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        while i < s.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= s.len() {
+            break;
+        }
+        let start = i;
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            i += 1;
+            let content_start = i;
+            while i < s.len() && bytes[i] != q {
+                i += 1;
+            }
+            let content_end = i;
+            if i < s.len() {
+                i += 1; // consume closing quote
+            }
+            toks.push(ScriptToken {
+                text: s[content_start..content_end].to_string(),
+                start,
+                end: i,
+            });
+        } else {
+            while i < s.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            toks.push(ScriptToken {
+                text: s[start..i].to_string(),
+                start,
+                end: i,
+            });
+        }
+    }
+    toks
 }
 
 /// This machine's short hostname (first dot-label, lowercased), for worker names.
@@ -586,6 +725,56 @@ mod tests {
             acp_spawn_args(&already),
             vec!["-c".to_string(), "nano-coder --acp".to_string()]
         );
+    }
+
+    #[test]
+    fn acp_spawn_args_appends_for_non_shell_c_option() {
+        // A NON-shell agent whose own `-c` option carries config (not a script)
+        // must NOT have the selector injected into that option; it is appended to
+        // the outer argv so the agent still receives a top-level `--acp`.
+        let mut h = hire(Protocol::Acp, "agent", "none");
+        h.args = vec!["-c".into(), "config".into()];
+        assert_eq!(
+            acp_spawn_args(&h),
+            vec!["-c".to_string(), "config".to_string(), "--acp".to_string()]
+        );
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_into_innermost_nested_wrapper() {
+        // Nested shell wrappers must receive the selector in the INNERMOST
+        // command, re-quoted so it stays one argument — appending to only the
+        // outer script lets the inner shell consume `--acp` as `$0`.
+        let mut quoted = hire(Protocol::Acp, "sh", "none");
+        quoted.args = vec!["-c".into(), "bash -c 'nano-coder'".into()];
+        assert_eq!(
+            acp_spawn_args(&quoted),
+            vec!["-c".to_string(), "bash -c 'nano-coder --acp'".to_string()]
+        );
+
+        // An unquoted inner command gains quoting so the appended selector does
+        // not leak out as the inner shell's `$0`.
+        let mut bare = hire(Protocol::Acp, "sh", "none");
+        bare.args = vec!["-c".into(), "bash -c nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&bare),
+            vec!["-c".to_string(), "bash -c 'nano-coder --acp'".to_string()]
+        );
+    }
+
+    #[test]
+    fn acp_selector_scan_ignores_non_shell_c_option() {
+        // A non-shell agent's `-c` config argument must not be scanned as a shell
+        // script, or `agent -c "config --acp"` would be a false positive.
+        assert!(!command_has_acp_selector(
+            "agent",
+            &["-c".into(), "config --acp".into()]
+        ));
+        // The real shell wrapper is still detected.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "nano-coder --acp".into()]
+        ));
     }
 
     // A slot that flips the fatal watch (an unleased activation under

@@ -569,7 +569,13 @@ fn parse_repository(repo: &Map<String, Value>) -> Option<Repository> {
         url,
         ref_: repo.get("ref").and_then(as_str).filter(|s| !s.is_empty()),
         sha: repo.get("sha").and_then(as_str).filter(|s| !s.is_empty()),
-        depth: coerce_u(repo.get("depth")).map(|d| d as u32),
+        // A `u64 as u32` cast WRAPS, so a coerced depth at/above 2^32 (e.g.
+        // `4294967296`) silently becomes `0` and `provision` then omits
+        // `--depth` entirely — turning a bounded clone into a full one. Clamp
+        // with a checked conversion instead: an out-of-range depth saturates to
+        // `u32::MAX` (still a shallow bound git accepts) rather than wrapping to
+        // a value that drops the flag.
+        depth: coerce_u(repo.get("depth")).map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
         single_branch: coerce_bool(repo.get("singleBranch"), false),
         filter: repo
             .get("filter")
@@ -918,6 +924,21 @@ mod tests {
         // And the normalized payload agrees (it already used coerce_int).
         assert_eq!(env.normalized["repository"]["depth"], json!(5));
         assert_eq!(env.normalized["repository"]["cloneTimeoutMs"], json!(30000));
+    }
+
+    #[test]
+    fn repository_depth_at_or_above_u32_saturates_not_wraps() {
+        // A coerced depth at/above 2^32 must NOT wrap to 0 (which `provision`
+        // would treat as "no depth" and clone the full history); clamp it to
+        // `u32::MAX` so the shallow bound is preserved.
+        let headers = json!({
+            "io.nanobpm.agentTask": {
+                "repository": { "url": "https://h/o/r.git", "depth": 4294967296u64 }
+            }
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let repo = env.repository.expect("repository should parse");
+        assert_eq!(repo.depth, Some(u32::MAX));
     }
 
     #[test]
