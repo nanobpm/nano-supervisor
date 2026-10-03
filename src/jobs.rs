@@ -1,11 +1,16 @@
 //! The four job commands the worker needs, over one of two back ends:
 //!
-//! - `Sdk`: `camunda-orchestration-sdk` (Camunda spec field names).
-//! - `Nano`: raw HTTP in the Nano engine's dialect. The engine names the lease
-//!   token `leaseToken` (activation response *and* command bodies) where the
-//!   Camunda 8.10 spec, and therefore the SDK, says `jobLeaseToken`. With the
-//!   SDK the token is dropped on activation and never sent, so leased jobs can't
-//!   be settled (409). Remove this back end once the names agree.
+//! - `Sdk`: `camunda-orchestration-sdk` (Camunda spec field names). This is the
+//!   transport `Auto` resolves to — the same one the Node plugin uses. Nano
+//!   engine ≥ 0.0.24 returns the spec's `jobLeaseToken` (alongside its legacy
+//!   `leaseToken`), so the SDK round-trips the lease and CAN settle leased jobs.
+//! - `Nano`: raw HTTP in the Nano engine's legacy `leaseToken` dialect, kept as
+//!   an explicit fallback for OLDER engines (< 0.0.24) whose activation response
+//!   names the token `leaseToken` where the Camunda 8.10 spec — and therefore
+//!   the SDK — says `jobLeaseToken`. On those engines the SDK drops the token on
+//!   activation and never sends it, so leased jobs can't be settled over the SDK
+//!   (409). Remove this back end once the engines in the field all speak
+//!   `jobLeaseToken`.
 
 use std::collections::HashMap;
 use std::time::Duration;

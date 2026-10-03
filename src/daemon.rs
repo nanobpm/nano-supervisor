@@ -392,6 +392,21 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
         if matches!(opt, "acp" | "-acp" | "--acp") {
             return true;
         }
+        // An ACP-named SWITCH selects ACP too, not only an ACP-named command:
+        // plugin 1.70.1 recognizes long options whose base name ends in `-acp`
+        // (Qwen's `--experimental-acp`, `--experimental-acp=true`), so a hire
+        // carrying one runs the agent in ACP mode. Match the option NAME (the
+        // part before any `=value`) by basename, exactly as the command-token
+        // suffix check below does — but do NOT match a VALUE that merely ends
+        // in `-acp` (`--model=foo-acp`): the option name is `model`, not an ACP
+        // switch. Single-dash shorts are excluded (`-c` is a shell flag, not an
+        // ACP switch); only the `--long` form carries an ACP-mode switch name.
+        if opt.starts_with("--") {
+            let opt_base = opt.rsplit(['/', '\\']).next().unwrap_or(opt);
+            if opt_base.ends_with("-acp") {
+                return true;
+            }
+        }
         // `--protocol acp` / `--protocol=acp` selects the ACP harness too: the
         // value carries the selector, so inspect it (inline after `=`, else the
         // following token) rather than only matching bare `acp` tokens.
@@ -424,10 +439,16 @@ fn scan_acp_tokens(tokens: &[&str]) -> bool {
         // is not misread as a wrapper.
         if command_is_shell && is_short_c_flag(name) {
             if let Some(script) = tokens.get(i + 1).copied() {
-                let sub: Vec<&str> = script
-                    .trim_matches(|c| c == '"' || c == '\'')
-                    .split_whitespace()
-                    .collect();
+                let script = script.trim_matches(|c| c == '"' || c == '\'');
+                // Tokenize the script with the SAME quote-aware tokenizer the
+                // selector-injection path uses (`tokenize_script`), not a bare
+                // whitespace split: `sh -c "FOO='a b' claude-code-acp"` splits
+                // `'a b'` into two words under whitespace, landing the command
+                // scan on `b'` and missing the real `*-acp` adapter — a pipe
+                // hire then bypasses the protocol-mismatch guard. One shared
+                // tokenizer keeps detection and injection consistent.
+                let sub_toks = tokenize_script(script);
+                let sub: Vec<&str> = sub_toks.iter().map(|t| t.text.as_str()).collect();
                 if scan_acp_tokens(&sub) {
                     return true;
                 }
@@ -480,8 +501,15 @@ pub(crate) fn acp_spawn_args(hire: &Hire) -> Vec<String> {
 /// so the whole class — prefixed outer argv AND prefixed inner script — is
 /// handled, not just the inner one.
 fn effective_command_is_shell(command: &str, args: &[String]) -> bool {
-    let tokens: Vec<&str> = command
-        .split_whitespace()
+    // Tokenize `command` quote-aware (the same `tokenize_script` the `-c` script
+    // scan and the injection path use), not with a bare whitespace split: a
+    // command string carrying a quoted segment (`env FOO='a b' sh`) must resolve
+    // to the same effective command here as everywhere else, or the `-c`
+    // injection is gated on a different token than the selector scan used.
+    let cmd_toks = tokenize_script(command);
+    let tokens: Vec<&str> = cmd_toks
+        .iter()
+        .map(|t| t.text.as_str())
         .chain(args.iter().map(String::as_str))
         .collect();
     effective_command_index(&tokens, |t| t)
@@ -556,10 +584,16 @@ struct ScriptToken {
     end: usize,
 }
 
-/// Split a shell script string into whitespace-separated tokens, treating a
-/// leading `'`/`"` quote as spanning to its matching close quote (so a quoted
-/// inner script with spaces stays one token). Good enough for the simple hire
-/// command lines this handles; it is not a full shell parser.
+/// Split a shell script string into whitespace-separated tokens, honoring
+/// `'`/`"` quoting — including a quote that opens MID-token (`FOO='a b'` is one
+/// word whose quoted part spans the space), since a shell joins adjacent
+/// quoted/unquoted segments into a single word. A bare whitespace split would
+/// break `FOO='a b' claude-code-acp` into `FOO='a`, `b'`, `claude-code-acp`,
+/// landing the effective-command scan on `b'` and missing the real adapter.
+/// `text` is the token with its quotes stripped; `start`/`end` span the token
+/// (quotes included) in the original string so a rewritten token can be spliced
+/// back. Good enough for the simple hire command lines this handles; it is not
+/// a full shell parser (no `$()`/`\\` escapes).
 fn tokenize_script(s: &str) -> Vec<ScriptToken> {
     let bytes = s.as_bytes();
     let mut toks = Vec::new();
@@ -572,32 +606,31 @@ fn tokenize_script(s: &str) -> Vec<ScriptToken> {
             break;
         }
         let start = i;
-        if bytes[i] == b'\'' || bytes[i] == b'"' {
-            let q = bytes[i];
-            i += 1;
-            let content_start = i;
-            while i < s.len() && bytes[i] != q {
+        let mut text = String::new();
+        // Consume one shell word: run to the next UNQUOTED whitespace, splicing
+        // any quoted segment's content in without its quotes.
+        while i < s.len() && !bytes[i].is_ascii_whitespace() {
+            if bytes[i] == b'\'' || bytes[i] == b'"' {
+                let q = bytes[i];
+                i += 1;
+                let content_start = i;
+                while i < s.len() && bytes[i] != q {
+                    i += 1;
+                }
+                text.push_str(&s[content_start..i]);
+                if i < s.len() {
+                    i += 1; // consume closing quote
+                }
+            } else {
+                text.push(bytes[i] as char);
                 i += 1;
             }
-            let content_end = i;
-            if i < s.len() {
-                i += 1; // consume closing quote
-            }
-            toks.push(ScriptToken {
-                text: s[content_start..content_end].to_string(),
-                start,
-                end: i,
-            });
-        } else {
-            while i < s.len() && !bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            toks.push(ScriptToken {
-                text: s[start..i].to_string(),
-                start,
-                end: i,
-            });
         }
+        toks.push(ScriptToken {
+            text,
+            start,
+            end: i,
+        });
     }
     toks
 }
@@ -729,6 +762,88 @@ mod tests {
             "copilot",
             &["--allow-all".into()]
         ));
+    }
+
+    #[test]
+    fn acp_selector_detection_sees_acp_named_switch_options() {
+        // Plugin 1.70.1 recognizes ACP switches whose NAME ends in `-acp`
+        // (Qwen's `--experimental-acp`), so an agent invoked with one runs in
+        // ACP mode: an ACP hire must not get a second `--acp`, and a pipe hire
+        // carrying one must be rejected as a protocol mismatch.
+        assert!(command_has_acp_selector(
+            "qwen",
+            &["--experimental-acp".into()]
+        ));
+        // The `=value` form still names the ACP switch (the value is not the
+        // selector; the option name is).
+        assert!(command_has_acp_selector(
+            "qwen",
+            &["--experimental-acp=true".into()]
+        ));
+        // …including when shell-wrapped.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "qwen --experimental-acp".into()]
+        ));
+        // A pipe hire with an ACP-named switch fails the protocol-mismatch guard.
+        let mut h = hire(Protocol::Pipe, "qwen", "none");
+        h.args = vec!["--experimental-acp".into()];
+        assert!(validate(&h).is_err());
+        // …while an ACP hire with the same switch is accepted and NOT doubled.
+        let mut ok = hire(Protocol::Acp, "qwen", "none");
+        ok.args = vec!["--experimental-acp".into()];
+        assert!(validate(&ok).is_ok());
+        assert_eq!(acp_spawn_args(&ok), vec!["--experimental-acp".to_string()]);
+        // A VALUE that merely ends in `-acp` is not a switch: the option name
+        // (`--model`) decides, so `--model=foo-acp` stays a non-ACP hire.
+        assert!(!command_has_acp_selector(
+            "copilot",
+            &["--model=foo-acp".into()]
+        ));
+        // A non-ACP long option (`--allow-all`) is not an ACP switch either.
+        assert!(!command_has_acp_selector(
+            "copilot",
+            &["--allow-all".into()]
+        ));
+    }
+
+    #[test]
+    fn acp_selector_detection_is_quote_aware() {
+        // A bare whitespace split of `FOO='a b' claude-code-acp` breaks the
+        // quoted assignment into `FOO='a` / `b'`, landing the effective-command
+        // scan on `b'` and missing the real `*-acp` adapter — a pipe hire then
+        // bypasses the protocol-mismatch guard. The scan must tokenize the `-c`
+        // script quote-aware (mixed quoted/unquoted segments join into one word).
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "FOO='a b' claude-code-acp".into()]
+        ));
+        // …and a quoted non-ACP script still yields no selector (no false
+        // positive from a mis-split token).
+        assert!(!command_has_acp_selector(
+            "sh",
+            &["-c".into(), "FOO='a b' copilot".into()]
+        ));
+        // A mid-token quote around the selector itself still resolves.
+        assert!(command_has_acp_selector(
+            "sh",
+            &["-c".into(), "exec env X='1 2' claude-code-acp".into()]
+        ));
+    }
+
+    #[test]
+    fn acp_spawn_args_injects_when_command_string_is_quoted() {
+        // The injection path resolves the effective shell from `command` with the
+        // SAME quote-aware tokenizer as the selector scan, so a quoted command
+        // string (`env FOO='a b' sh`) still names `sh` the shell and gets `--acp`
+        // injected INTO the `-c` script — not appended to the outer argv where
+        // POSIX `sh` would swallow it as `$0`.
+        let mut h = hire(Protocol::Acp, "env FOO='a b' sh", "none");
+        h.args = vec!["-c".into(), "nano-coder".into()];
+        assert_eq!(
+            acp_spawn_args(&h),
+            vec!["-c".to_string(), "nano-coder --acp".to_string()]
+        );
     }
 
     #[test]

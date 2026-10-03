@@ -1136,6 +1136,15 @@ fn job_settlement(job: &serde_json::Value) -> Settlement {
     let retries = job["retries"].as_i64().unwrap_or(3);
     if state != "CREATED" && state != "ACTIVATED" && !state.is_empty() {
         Settlement::Terminal
+    } else if state == "ACTIVATED" {
+        // An ACTIVATED job is IN FLIGHT regardless of its retry count: the
+        // zero-backoff Node worker can reacquire a failed job before the harness
+        // polls it, so `ACTIVATED` with retries < 3 is a live second attempt,
+        // not a settled retriable failure. Treating it as `RetriableFailure`
+        // would reap/kill the worker and report settlement while that attempt is
+        // still active. Only a `CREATED` job below the retry budget is a settled
+        // retriable failure (it is waiting to be reacquired, not running).
+        Settlement::Pending
     } else if retries < 3 {
         Settlement::RetriableFailure
     } else {
@@ -1574,6 +1583,18 @@ mod unit {
         assert_eq!(
             job_settlement(&json!({ "state": "CREATED", "retries": 2 })),
             Settlement::RetriableFailure
+        );
+        // …but once the zero-backoff worker HAS reacquired it the job is
+        // ACTIVATED again — a live second attempt, still in flight even though
+        // its retries are below the budget. Reaping here would kill the worker
+        // mid-attempt and report settlement while it runs.
+        assert_eq!(
+            job_settlement(&json!({ "state": "ACTIVATED", "retries": 2 })),
+            Settlement::Pending
+        );
+        assert_eq!(
+            job_settlement(&json!({ "state": "ACTIVATED", "retries": 1 })),
+            Settlement::Pending
         );
         // Terminal states are no longer acquirable.
         for state in ["COMPLETED", "FAILED", "ERROR"] {

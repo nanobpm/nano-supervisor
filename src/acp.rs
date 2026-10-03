@@ -474,6 +474,46 @@ fn update_is_effective_turn(update: &Value) -> bool {
     }
 }
 
+/// Serialise one ACP `session/update` into the short human-readable line the
+/// Node worker's `describeUpdate` produces for its captured output (plugin
+/// 1.70.1 parity). Node folds EVERY update into captured output — thought/user
+/// text plus tool, plan, status, and unknown-update lines — not only agent
+/// message chunks, so a tool-only run is non-empty there. Returns `None` only
+/// for a non-object update (Node's `describeUpdate` yields `""` for one).
+fn describe_update(update: &Value) -> Option<String> {
+    let obj = update.as_object()?;
+    let kind = obj
+        .get("sessionUpdate")
+        .or_else(|| obj.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("update");
+    let line = match kind {
+        "agent_message_chunk" | "user_message_chunk" => {
+            content_block_text(&update["content"]).unwrap_or_default()
+        }
+        "agent_thought_chunk" => format!(
+            "\u{1F4AD} {}",
+            content_block_text(&update["content"]).unwrap_or_default()
+        ),
+        "tool_call" | "tool_call_update" => {
+            let title = obj
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .or_else(|| obj.get("toolCallId").and_then(Value::as_str))
+                .unwrap_or("tool");
+            let status = obj.get("status").and_then(Value::as_str);
+            match status {
+                Some(s) if !s.is_empty() => format!("\u{2699} [tool: {title} — {s}]\n"),
+                _ => format!("\u{2699} [tool: {title}]\n"),
+            }
+        }
+        "plan" => "\u{1F4CB} [plan updated]\n".to_string(),
+        other => format!("[{other}]\n"),
+    };
+    Some(line)
+}
+
 /// Process one JSON-RPC line: a response to one of our requests, a notification,
 /// or a request from the agent (permission prompts are auto-answered).
 fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Value>) -> bool {
@@ -505,28 +545,28 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
             if update_is_effective_turn(update) {
                 s.effective_turns += 1;
             }
-            match update["sessionUpdate"].as_str() {
-                Some("agent_message_chunk") => {
-                    // Extract every content shape the bridge persists (a bare
-                    // string, an array of blocks, a resource block — not only a
-                    // flat `{"text": …}`) so the accumulated transcript matches
-                    // what Node's bridge would persist for the same chunk.
-                    if let Some(t) = content_block_text(&update["content"]) {
-                        s.text.push_str(&t);
-                        // Bound the transcript the same way the pipe path bounds
-                        // stdout: `Agent::run` appends every chunk to this
-                        // `String`, so a verbose or misbehaving ACP agent could
-                        // otherwise exhaust daemon memory (one unbounded buffer
-                        // per slot). The tail is retained for result detection.
-                        // Record whether any bytes were dropped so the truncation
-                        // is reported even though the capped length hides it.
-                        if crate::pipe::bound_capture(&mut s.text) {
-                            s.truncated = true;
-                        }
-                    }
+            if update["sessionUpdate"].as_str() == Some("tool_call") {
+                s.tool_calls += 1;
+            }
+            // Fold EVERY update into the captured output text the way Node's
+            // `describeUpdate` does (plugin 1.70.1 parity): not only agent
+            // message chunks but thought/user text and tool, plan, status, and
+            // unknown-update lines. Node serializes each `session/update` into
+            // captured output, so a tool-only run is non-empty there while a
+            // status-only run is not failed as empty; capturing only message
+            // chunks here would diverge on both. The same 1 MiB bound applies.
+            if let Some(line) = describe_update(update) {
+                s.text.push_str(&line);
+                // Bound the transcript the same way the pipe path bounds stdout:
+                // `Agent::run` appends every update to this `String`, so a
+                // verbose or misbehaving ACP agent could otherwise exhaust daemon
+                // memory (one unbounded buffer per slot). The tail is retained
+                // for result detection. Record whether any bytes were dropped so
+                // the truncation is reported even though the capped length hides
+                // it.
+                if crate::pipe::bound_capture(&mut s.text) {
+                    s.truncated = true;
                 }
-                Some("tool_call") => s.tool_calls += 1,
-                _ => {}
             }
             true
         }
@@ -961,6 +1001,53 @@ mod tests {
                 "should NOT count as a turn: {u}"
             );
         }
+    }
+
+    #[test]
+    fn describe_update_mirrors_the_node_human_text_for_every_update_kind() {
+        // Plugin 1.70.1 `describeUpdate` folds EVERY `session/update` into the
+        // captured output, not only agent message chunks: thought/user text plus
+        // tool, plan, status, and unknown-update lines. `Outcome.text` must
+        // accumulate the same lines or a tool-only run reads empty here while
+        // Node reports it non-empty (and a status-only run is failed as empty).
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })),
+            Some("hi".to_string())
+        );
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "user_message_chunk", "content": "go" })),
+            Some("go".to_string())
+        );
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hmm" } })),
+            Some("\u{1F4AD} hmm".to_string())
+        );
+        // A tool call serializes a `⚙ [tool: …]` line (with its status when one
+        // is present), so a tool-only run is non-empty.
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read" })),
+            Some("\u{2699} [tool: read]\n".to_string())
+        );
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read", "status": "completed" })),
+            Some("\u{2699} [tool: read — completed]\n".to_string())
+        );
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed" })),
+            Some("\u{2699} [tool: c1 — completed]\n".to_string())
+        );
+        // A plan and an unknown/status update contribute a marker line too.
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "plan", "entries": [] })),
+            Some("\u{1F4CB} [plan updated]\n".to_string())
+        );
+        assert_eq!(
+            describe_update(&json!({ "sessionUpdate": "current_mode_update", "modeId": "x" })),
+            Some("[current_mode_update]\n".to_string())
+        );
+        // A non-object update has no line (Node's `describeUpdate` yields "").
+        assert_eq!(describe_update(&json!(null)), None);
+        assert_eq!(describe_update(&json!("str")), None);
     }
 
     #[test]
