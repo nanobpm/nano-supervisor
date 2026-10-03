@@ -75,7 +75,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     };
     let Some(hire) = hires.into_iter().find(|h| h.name == opts.hire) else {
         config_exit(&format!(
-            "No hire named \"{}\". List profiles with: c8ctl nano hire --list",
+            "No hire named \"{}\". List profiles with: c8 nano hire --list",
             opts.hire
         ));
     };

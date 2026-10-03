@@ -979,7 +979,9 @@ fn run_worker_job_with_home(
         // until the job has been handled, then reap the tree (see
         // `run_node_worker`).
         Target::Node => run_node_worker(cmd, &record_path, || {
-            engine.job(&job_type).is_some_and(|j| job_is_settled(&j))
+            engine
+                .job(&job_type)
+                .map_or(Settlement::Pending, |j| job_settlement(&j))
         }),
     };
     JobOutcome {
@@ -1108,12 +1110,44 @@ const NODE_NO_WORK_DEADLINE: Duration = Duration::from_secs(45);
 /// would let the harness start its reap/kill timer before the worker's
 /// completion or failure variables land, racing the engine-observable assertions.
 pub fn job_is_settled(job: &serde_json::Value) -> bool {
-    let state = job["state"].as_str().unwrap_or("");
-    let retries = job["retries"].as_i64().unwrap_or(3);
-    (state != "CREATED" && state != "ACTIVATED" && !state.is_empty()) || retries < 3
+    job_settlement(job) != Settlement::Pending
 }
 
-fn run_node_worker(mut cmd: Command, record_path: &Path, settled: impl Fn() -> bool) -> Output {
+/// How the engine has settled `job`, from the harness's polling view. The two
+/// settled kinds are NOT interchangeable for reaping: a terminal state is no
+/// longer acquirable, but a retry-left failure leaves the job `CREATED` and —
+/// because the worker fails with `retryBackOff: 0` — immediately re-activatable,
+/// so a still-running worker can reacquire and fail it AGAIN during any grace
+/// window, corrupting retry-count assertions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Settlement {
+    /// Not settled: still `CREATED`/`ACTIVATED` with the full retry budget.
+    Pending,
+    /// Failed with retries left (`CREATED`, below the BPMN default of 3). Still
+    /// acquirable with zero backoff — reap at once, do not grant a logging grace.
+    RetriableFailure,
+    /// Left `CREATED` for a terminal state (completed / failed out / error). No
+    /// longer acquirable, so a short post-settle logging grace is safe.
+    Terminal,
+}
+
+fn job_settlement(job: &serde_json::Value) -> Settlement {
+    let state = job["state"].as_str().unwrap_or("");
+    let retries = job["retries"].as_i64().unwrap_or(3);
+    if state != "CREATED" && state != "ACTIVATED" && !state.is_empty() {
+        Settlement::Terminal
+    } else if retries < 3 {
+        Settlement::RetriableFailure
+    } else {
+        Settlement::Pending
+    }
+}
+
+fn run_node_worker(
+    mut cmd: Command,
+    record_path: &Path,
+    settled: impl Fn() -> Settlement,
+) -> Output {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1145,11 +1179,28 @@ fn run_node_worker(mut cmd: Command, record_path: &Path, settled: impl Fn() -> b
         if settle_until.is_none() && record_path.exists() {
             settle_until = Some(Instant::now() + NODE_SETTLE_GRACE);
         }
-        // Once the engine shows the job settled, give the worker a moment to
-        // log the outcome, then reap — no need to sit out the whole grace.
-        if let Some(until) = settle_until {
-            if until > Instant::now() + NODE_POST_SETTLE && settled() {
-                settle_until = Some(Instant::now() + NODE_POST_SETTLE);
+        // Once the worker has handled the job (its agent recorded a run, so a
+        // settle window is open), poll the engine and decide how to reap based on
+        // the settlement kind: a terminal state is no longer acquirable so we
+        // grant a brief logging grace, but a retry-left failure is immediately
+        // re-activatable (zero backoff) and the still-running worker would
+        // reacquire and fail it again — so reap at once to pin the retry count.
+        if settle_until.is_some() {
+            match settled() {
+                Settlement::RetriableFailure => {
+                    #[cfg(unix)]
+                    kill_process_tree(child.id());
+                    let _ = child.kill();
+                    break child.wait().expect("wait killed node worker");
+                }
+                Settlement::Terminal => {
+                    if let Some(until) = settle_until {
+                        if until > Instant::now() + NODE_POST_SETTLE {
+                            settle_until = Some(Instant::now() + NODE_POST_SETTLE);
+                        }
+                    }
+                }
+                Settlement::Pending => {}
             }
         }
         let reap = match settle_until {
@@ -1503,5 +1554,39 @@ mod unit {
             host_port("http://localhost"),
             Some(("localhost".to_string(), 80))
         );
+    }
+
+    #[test]
+    fn job_settlement_classifies_retry_left_vs_terminal() {
+        use serde_json::json;
+        // Live, in-flight states are not settled.
+        assert_eq!(
+            job_settlement(&json!({ "state": "CREATED", "retries": 3 })),
+            Settlement::Pending
+        );
+        assert_eq!(
+            job_settlement(&json!({ "state": "ACTIVATED", "retries": 3 })),
+            Settlement::Pending
+        );
+        // A failure with retries left stays CREATED and is immediately
+        // re-activatable — it must be distinguished so the harness reaps at once
+        // instead of granting a grace window the worker could use to reacquire.
+        assert_eq!(
+            job_settlement(&json!({ "state": "CREATED", "retries": 2 })),
+            Settlement::RetriableFailure
+        );
+        // Terminal states are no longer acquirable.
+        for state in ["COMPLETED", "FAILED", "ERROR"] {
+            assert_eq!(
+                job_settlement(&json!({ "state": state, "retries": 0 })),
+                Settlement::Terminal,
+                "{state} must be terminal"
+            );
+        }
+        // `job_is_settled` stays true for both settled kinds (its callers only
+        // ask "has the worker finished with it?").
+        assert!(job_is_settled(&json!({ "state": "CREATED", "retries": 2 })));
+        assert!(job_is_settled(&json!({ "state": "COMPLETED", "retries": 0 })));
+        assert!(!job_is_settled(&json!({ "state": "CREATED", "retries": 3 })));
     }
 }

@@ -57,7 +57,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let all = state::read_hires_from(&config_path)?;
     if all.is_empty() {
         bail!(
-            "no hires found in {} — hire an agent first (c8ctl nano hire …)",
+            "no hires found in {} — hire an agent first (c8 nano hire …)",
             config_path.display()
         );
     }
@@ -479,34 +479,41 @@ pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) -> bool {
     // e.g. an unleased activation under --with-lease), so the daemon exits loudly
     // rather than lingering with the offending slot stopped.
     let mut fatal_rx = fatal.subscribe();
+    // A second subscription used only to re-read the watch's *final* value after
+    // the wait returns — `select!` reports whichever arm fired, not the channel's
+    // settled state, so a fatal flip published in the same tick an operator
+    // Ctrl-C/SIGTERM arrives could otherwise be masked by the signal arm winning.
+    let recheck_rx = fatal.subscribe();
     let slot_requested = async {
         let _ = fatal_rx.wait_for(|stop| *stop).await;
     };
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => {
-                return tokio::select! {
+    let signal_was_fatal = {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => false,
+                    _ = term.recv() => false,
+                    _ = slot_requested => true,
+                },
+                Err(_) => tokio::select! {
                     _ = tokio::signal::ctrl_c() => false,
                     _ = slot_requested => true,
-                };
+                },
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => false,
-            _ = term.recv() => false,
-            _ = slot_requested => true,
         }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => false,
-            _ = slot_requested => true,
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => false,
+                _ = slot_requested => true,
+            }
         }
-    }
+    };
+    // Fatal always wins: if a slot has published a fatal state by now, surface it
+    // even when an operator signal was the arm that woke us.
+    signal_was_fatal || *recheck_rx.borrow()
 }
 
 #[cfg(test)]
@@ -787,6 +794,24 @@ mod tests {
         assert!(
             wait_for_signal(&tx).await,
             "a slot-flipped watch must be reported as a fatal shutdown"
+        );
+    }
+
+    // A fatal state published *during* the wait — concurrently with (or racing)
+    // an operator Ctrl-C/SIGTERM — must still be reported. `select!` returns
+    // whichever arm fired, so the function rechecks the watch after waking; this
+    // guards that a fatal flip is never masked by the signal arm winning.
+    #[tokio::test]
+    async fn wait_for_signal_reports_fatal_flipped_during_wait() {
+        let (tx, _rx) = watch::channel(false);
+        let flipper = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = flipper.send(true);
+        });
+        assert!(
+            wait_for_signal(&tx).await,
+            "a fatal state published during the wait must be reported as fatal"
         );
     }
 }
