@@ -156,43 +156,6 @@ impl Target {
         }
     }
 
-    /// The **Rust**-target worker command for one job type, running `agent` for
-    /// at most `max_jobs` jobs:
-    /// `<bin> work --job-type <t> --agent <agent> --max-jobs <n>`. Tests add the
-    /// flags their area needs (`--with-lease`, `--recovery-window`, …). The
-    /// caller applies the per-test home (see [`TempHome::apply`]).
-    ///
-    /// This standalone flag-driven form is Rust-only: the Node plugin's `work`
-    /// takes a positional *hired profile* (`work <profile>`) and has no
-    /// `--agent`/`--max-jobs`, so it cannot be driven this way. The Node target
-    /// instead `hire`s an isolated profile pointing at the same fake-agent binary
-    /// and runs `work <profile>` with the flag-driven config translated to the
-    /// Node CLI's shapes — see [`run_worker_job`] (`node_hire` /
-    /// `node_work_command` / `translate_node_flags`). Calling this for
-    /// [`Target::Node`] would emit a command the Node plugin rejects, so it is
-    /// gated to the Rust target.
-    pub fn worker(self, job_type: &str, agent: &str, max_jobs: usize) -> Command {
-        debug_assert_eq!(
-            self,
-            Target::Rust,
-            "Target::worker builds the Rust standalone --job-type form; the Node \
-             target must go through the hired-profile path in run_worker_job"
-        );
-        let mj = max_jobs.to_string();
-        let mut c = self.cmd(&[
-            "work",
-            "--job-type",
-            job_type,
-            "--agent",
-            agent,
-            "--max-jobs",
-            &mj,
-        ]);
-        c.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        c
-    }
-
     /// Whether the target program is actually runnable here. When it is not
     /// (e.g. the Node plugin is not installed on a plain CI runner), tests skip
     /// cleanly rather than fail — the dedicated Node-target CI job is where they
@@ -268,7 +231,7 @@ impl TempHome {
     /// Apply the per-test hermetic environment to an already-built command: the
     /// private home, no launchd, no update notifier, and every inherited fleet
     /// variable cleared. Used by the worker harness, which builds its command
-    /// from [`Target::worker`] and then layers this home on top.
+    /// from [`Target::cmd`] and then layers this home on top.
     pub fn apply(&self, cmd: &mut Command) {
         apply_hermetic_env(cmd, self.path());
     }
@@ -386,6 +349,7 @@ macro_rules! skip {
 /// [`require_engine!`]; [`Engine::try_from_env`] instead returns a [`Skip`] both
 /// for a non-local engine and for an unreachable local one — used by the worker
 /// harness so those tests skip cleanly.
+#[derive(Clone)]
 pub struct Engine {
     url: String,
     http: reqwest::blocking::Client,
@@ -511,6 +475,54 @@ impl Engine {
             .send()?
             .error_for_status()?
             .json()
+    }
+
+    /// The (single) job of `job_type` as the engine reports it
+    /// (`POST /v2/jobs/search`): `state`, `retries`, `errorMessage`, `worker`, …
+    /// `None` when the engine has no such job (or the search fails).
+    pub fn job(&self, job_type: &str) -> Option<serde_json::Value> {
+        let v: serde_json::Value = self
+            .http
+            .post(format!("{}/v2/jobs/search", self.url))
+            .json(&serde_json::json!({ "filter": { "type": job_type } }))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .ok()?;
+        v["items"].as_array()?.first().cloned()
+    }
+
+    /// The process instance's variables (`POST /v2/variables/search`), with each
+    /// JSON-encoded value parsed back into a value.
+    pub fn variables(
+        &self,
+        process_instance_key: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        let v: serde_json::Value = match self
+            .http
+            .post(format!("{}/v2/variables/search", self.url))
+            .json(&serde_json::json!({
+                "filter": { "processInstanceKey": process_instance_key },
+                "page": { "limit": 1000 },
+            }))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+        {
+            Ok(v) => v,
+            Err(_) => return out,
+        };
+        for item in v["items"].as_array().cloned().unwrap_or_default() {
+            let Some(name) = item["name"].as_str() else {
+                continue;
+            };
+            let raw = item["value"].as_str().unwrap_or("null");
+            let value = serde_json::from_str(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            out.insert(name.to_string(), value);
+        }
+        out
     }
 
     /// Raw REST client and base URL, for tests needing an endpoint not wrapped here.
@@ -692,18 +704,6 @@ pub fn fake_agent_path() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
-/// The `--agent` argument that runs the bundled `fake-agent` over ACP. The
-/// executable path is shell-quoted so a checkout path containing spaces (the
-/// `--agent` value is parsed with shell-style quoting) is preserved intact
-/// rather than split into a bogus program plus arguments.
-pub fn fake_agent_acp_arg() -> String {
-    let path = fake_agent_path();
-    let quoted = shlex::try_quote(&path.to_string_lossy())
-        .expect("fake-agent path is not shell-quotable")
-        .into_owned();
-    format!("{quoted} --acp")
-}
-
 /// Resolve the target CLI and a reachable local engine together, or a [`Skip`]
 /// reason. Engine-dependent worker tests start with this.
 pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
@@ -722,13 +722,31 @@ pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
 /// recording and the worker's own output. Temp dirs are held alive by the value.
 pub struct JobOutcome {
     pub job_type: String,
+    pub process_instance_key: String,
+    engine: Engine,
     record_path: PathBuf,
     pub output: std::process::Output,
-    _home: TempHome,
+    home_path: PathBuf,
+    /// Owns the worker's `C8CTL_NANO_HOME` when [`run_worker_job`] created a
+    /// fresh one, so the temp dir outlives the outcome and [`JobOutcome::home`]
+    /// never dangles. `None` when the caller supplied the home
+    /// ([`run_worker_job_in`]) — there the caller's `TempHome` keeps it alive.
+    _home: Option<TempHome>,
     _work: tempfile::TempDir,
 }
 
 impl JobOutcome {
+    /// The isolated `C8CTL_NANO_HOME` the worker ran under — the root of its
+    /// `agent-runs/rust-worker-<pid>` run namespaces. Tests that seed or inspect
+    /// run dirs (e.g. the stale-run sweep) use this to find the sweep root.
+    ///
+    /// The home directory is alive for as long as this outcome: [`run_worker_job`]
+    /// outcomes own their fresh `TempHome`, and [`run_worker_job_in`] outcomes
+    /// borrow the caller's (which the caller must keep alive).
+    pub fn home(&self) -> &Path {
+        &self.home_path
+    }
+
     /// What the fake agent recorded (prompt, env, cwd, permissions, …).
     ///
     /// Panics with the worker's exit status and output when there is no record,
@@ -771,6 +789,51 @@ impl JobOutcome {
         String::from_utf8_lossy(&self.output.stderr).to_string()
     }
 
+    /// The job as the engine reports it once the worker has settled it
+    /// (completed, failed, or thrown), polling briefly for the engine to catch
+    /// up. This is the engine-observable outcome both targets must agree on.
+    /// Returns the last-seen job (possibly still unsettled) after the wait.
+    pub fn settled_job(&self) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let job = self.engine.job(&self.job_type);
+            if let Some(j) = &job {
+                if job_is_settled(j) || Instant::now() >= deadline {
+                    return j.clone();
+                }
+            } else if Instant::now() >= deadline {
+                panic!("engine has no job of type {}", self.job_type);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// The job's engine state after settling (`COMPLETED`, `FAILED`, …; a job
+    /// failed with retries left reads `CREATED` with fewer `retries`).
+    pub fn job_state(&self) -> String {
+        self.settled_job()["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The process instance's variables once the job has settled — what the
+    /// worker's completion wrote back to the engine.
+    pub fn variables(&self) -> serde_json::Map<String, serde_json::Value> {
+        let _ = self.settled_job();
+        self.engine.variables(&self.process_instance_key)
+    }
+
+    /// What the agent was sent as its prompt, parsed as the worker's JSON job
+    /// payload (`{jobKey, jobType, prompt, task, variables, customHeaders,
+    /// profile, …}`). Panics if the prompt is not that payload.
+    pub fn payload(&self) -> serde_json::Value {
+        let prompt = self.record().prompts.first().cloned().unwrap_or_default();
+        serde_json::from_str(&prompt).unwrap_or_else(|e| {
+            panic!("the agent's prompt is not the JSON job payload ({e}): {prompt:?}")
+        })
+    }
+
     pub fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.output.stdout).to_string()
     }
@@ -790,16 +853,95 @@ pub fn run_worker_job(
     worker_flags: &[&str],
     extra_env: &[(&str, &str)],
 ) -> JobOutcome {
+    // Own the fresh home so it outlives the returned outcome: passing a
+    // temporary `&TempHome::new()` would drop it (deleting the temp dir and
+    // stopping any daemon) when this function returns, leaving
+    // `JobOutcome::home()` pointing at a removed directory.
+    let home = TempHome::new();
+    let mut outcome = run_worker_job_with_home(
+        engine,
+        target,
+        &home,
+        None,
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+    );
+    // The outcome cloned the home's path (it borrows nothing from `home`), so
+    // now that the `&home` borrow has ended, move the home into the outcome to
+    // keep the temp dir alive for the outcome's lifetime.
+    outcome._home = Some(home);
+    outcome
+}
+
+/// [`run_worker_job`] against a caller-supplied [`TempHome`] instead of a fresh
+/// one, so a test can run the worker twice (or seed/inspect run dirs) under ONE
+/// shared home — e.g. the stale-run sweep, which must plant a dead-worker's run
+/// tree in the same `agent-runs` root the next worker's startup sweep walks.
+///
+/// The caller keeps `home` alive; the returned [`JobOutcome`] borrows its path
+/// but does not own it, so the caller must keep the `TempHome` alive for as
+/// long as it uses the outcome's [`JobOutcome::home`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_in(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> JobOutcome {
+    run_worker_job_with_home(
+        engine,
+        target,
+        home,
+        None,
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+    )
+}
+
+/// Shared body of [`run_worker_job`] / [`run_worker_job_in`]. `owned_home` is
+/// `Some` when the worker ran under a home this harness created (so the outcome
+/// must own it to keep the temp dir alive) and `None` when the caller supplied
+/// `home` (and so keeps it alive).
+#[allow(clippy::too_many_arguments)]
+fn run_worker_job_with_home(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    owned_home: Option<TempHome>,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> JobOutcome {
     let job_type = engine.unique_type(test);
     let process_id = format!("p-{job_type}");
     engine
         .deploy_bpmn(&process_id, &bpmn::single_task(&process_id, &job_type))
         .expect("deploy bpmn");
-    engine
+    let instance = engine
         .create_instance(&process_id, vars)
         .expect("create instance");
+    let process_instance_key = instance["processInstanceKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            instance["processInstanceKey"]
+                .as_i64()
+                .map(|k| k.to_string())
+        })
+        .expect("create instance: no processInstanceKey");
 
-    let home = TempHome::new();
     let work = tempfile::Builder::new()
         .prefix("ns-run-")
         .tempdir()
@@ -807,31 +949,14 @@ pub fn run_worker_job(
     let record_path = work.path().join("record.json");
     let script_json = serde_json::to_string(&serde_json::Value::Array(script.to_vec())).unwrap();
 
-    let agent = fake_agent_acp_arg();
-    // Build the worker command for the selected target. The Rust worker takes its
-    // whole configuration from flags (`--job-type`/`--agent`/`--max-jobs` …) in
-    // one standalone process. The Node plugin instead runs a *hired profile*
-    // (`work <profile>`) — it has no `--agent`/`--max-jobs` — so we first `hire`
-    // an isolated profile that points at the same fake-agent binary over ACP,
-    // then `work` it with the flag-driven config translated to the Node CLI's
-    // shapes (see `node_hire` / `node_work_command` / `translate_node_flags`).
-    let mut cmd = match target {
-        Target::Rust => {
-            let mut c = target.worker(&job_type, &agent, 1);
-            // Keep per-job run dirs inside this test's temp dir rather than the
-            // developer's real state dir, unless the test chose its own.
-            if !worker_flags.contains(&"--runs-dir") {
-                c.arg("--runs-dir").arg(work.path().join("runs"));
-            }
-            c.args(worker_flags);
-            c
-        }
-        Target::Node => {
-            let profile = format!("ctfake{}", rand_suffix());
-            node_hire(*target, &home, &profile);
-            node_work_command(*target, &profile, &job_type, worker_flags)
-        }
-    };
+    // Both targets are driven identically, the way production runs them: hire
+    // an isolated profile bound to the fake agent over ACP, then run
+    // `work <profile> --job-type <t>` with the test's flags (in the Node CLI's
+    // vocabulary, which the Rust `work` mirrors). The Rust worker additionally
+    // takes `--max-jobs 1` so it exits once the job is handled.
+    let profile = format!("ctfake{}", rand_suffix());
+    hire_profile(*target, home, &profile);
+    let mut cmd = work_command(*target, &profile, &job_type, worker_flags);
     home.apply(&mut cmd);
     // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
     // allocates it inside the per-job run dir and hands it to the agent. The
@@ -853,150 +978,109 @@ pub fn run_worker_job(
         // The Node worker never self-exits (it has no `--max-jobs`), so run it
         // until the job has been handled, then reap the tree (see
         // `run_node_worker`).
-        Target::Node => run_node_worker(cmd, &record_path),
+        Target::Node => run_node_worker(cmd, &record_path, || {
+            engine.job(&job_type).is_some_and(|j| job_is_settled(&j))
+        }),
     };
     JobOutcome {
         job_type,
+        process_instance_key,
+        engine: engine.clone(),
         record_path,
         output,
-        _home: home,
+        home_path: home.path().to_path_buf(),
+        _home: owned_home,
         _work: work,
     }
 }
 
-/// Hire an isolated Node worker profile that runs the bundled `fake-agent` over
-/// ACP. The profile is what `c8 nano work <profile>` drives — the Node plugin
-/// has no flag-driven `--agent`, so the agent binary is bound here at hire time.
+/// Hire an isolated worker profile that runs the bundled `fake-agent` over ACP.
+/// The profile is what `work <profile>` drives: the agent binary is bound at
+/// hire time, as in production.
 ///
 /// Rank `junior` with no extra capabilities yields the minimal job-type matrix
 /// (`["junior"]`), so the profile never subscribes to unrelated job types on its
-/// own; the caller adds the one test job type explicitly via `--job-type`. The
-/// fake agent speaks ACP, so `--protocol acp` matches (a `pipe` protocol against
-/// an ACP binary is rejected by the plugin's guard).
-fn node_hire(target: Target, home: &TempHome, profile: &str) {
+/// own; the caller adds the one test job type explicitly via `--job-type`.
+///
+/// Node hires through its CLI (`c8 nano hire`). The Rust binary has no `hire`
+/// command yet, so the harness writes the same `config.json` entry the Node CLI
+/// writes (the Rust worker reads Node's state format).
+fn hire_profile(target: Target, home: &TempHome, profile: &str) {
     let agent = fake_agent_path();
     let agent = agent.to_string_lossy();
-    let mut cmd = target.cmd(&[
-        "hire",
-        "--name",
-        profile,
-        "--rank",
-        "junior",
-        "--command",
-        &agent,
-        "--arg",
-        "--acp",
-        "--protocol",
-        "acp",
-    ]);
-    home.apply(&mut cmd);
-    let out = cmd.output().expect("spawn node hire");
-    assert!(
-        out.status.success(),
-        "node hire of profile {profile:?} failed: status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
-
-/// Build the Node `work <profile>` command that services one test job type.
-///
-/// The positional profile (hired by [`node_hire`]) supplies the agent binding;
-/// `--job-type <t>` adds the unique test job type on top of the profile's rank
-/// matrix so the worker activates the deployed job. The remaining flags are the
-/// per-test knobs, translated from the Rust CLI's shapes by
-/// [`translate_node_flags`]. The caller applies the per-test home and env.
-fn node_work_command(
-    target: Target,
-    profile: &str,
-    job_type: &str,
-    worker_flags: &[&str],
-) -> Command {
-    let mut c = target.cmd(&["work", profile, "--job-type", job_type]);
-    for arg in translate_node_flags(worker_flags) {
-        c.arg(arg);
-    }
-    c.stdout(Stdio::piped()).stderr(Stdio::piped());
-    c
-}
-
-/// Translate the flag-driven worker knobs the tests express in the Rust CLI's
-/// vocabulary into the Node plugin's `work` flags. Most flags share their name,
-/// units, and shape across both targets and pass straight through; the few that
-/// differ are adapted here:
-///
-/// - `--with-lease` — Rust-only boolean; the Node worker manages leasing itself,
-///   so it is dropped.
-/// - `--reap-age` / `--reap-interval` — Rust takes a duration string (`"1s"`),
-///   the Node CLI an integer millisecond count, so the value is converted via
-///   [`duration_to_ms_string`].
-/// - `--keep-runs` — Rust keeps the N most-recent runs (takes a count); the Node
-///   flag is a boolean switch, so the count is consumed and the bare switch
-///   emitted.
-fn translate_node_flags(flags: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < flags.len() {
-        let f = flags[i];
-        match f {
-            "--with-lease" => {
-                i += 1;
-            }
-            "--reap-age" | "--reap-interval" => {
-                let v = flags.get(i + 1).copied().unwrap_or("");
-                out.push(f.to_string());
-                out.push(duration_to_ms_string(v));
-                i += 2;
-            }
-            "--keep-runs" => {
-                out.push(f.to_string());
-                i += 2; // consume (and drop) the Rust count value
-            }
-            _ => {
-                out.push(f.to_string());
-                if let Some(v) = flags.get(i + 1) {
-                    out.push((*v).to_string());
+    match target {
+        Target::Node => {
+            let mut cmd = target.cmd(&[
+                "hire",
+                "--name",
+                profile,
+                "--rank",
+                "junior",
+                "--command",
+                &agent,
+                "--arg",
+                "--acp",
+                "--protocol",
+                "acp",
+            ]);
+            home.apply(&mut cmd);
+            let out = cmd.output().expect("spawn node hire");
+            assert!(
+                out.status.success(),
+                "node hire of profile {profile:?} failed: status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+        Target::Rust => {
+            let config = serde_json::json!({
+                "hires": {
+                    profile: {
+                        "rank": "junior",
+                        "command": agent,
+                        "args": ["--acp"],
+                        "protocol": "acp",
+                        "sandbox": "none",
+                        "capabilities": [],
+                    }
                 }
-                i += 2;
-            }
+            });
+            std::fs::create_dir_all(home.path()).expect("create state home");
+            std::fs::write(
+                home.path().join("config.json"),
+                serde_json::to_vec_pretty(&config).unwrap(),
+            )
+            .expect("write config.json");
         }
     }
-    out
 }
 
-/// Convert a Rust-CLI duration (`"500ms"`, `"30s"`, `"5m"`, `"2h"`, or a bare ms
-/// count) to the integer millisecond string the Node CLI expects. Mirrors the
-/// worker's own `parse_duration`. An unparseable value is passed through
-/// unchanged so the Node CLI surfaces its own error rather than this masking it.
-fn duration_to_ms_string(s: &str) -> String {
-    let s = s.trim();
-    let (num, mult) = if let Some(v) = s.strip_suffix("ms") {
-        (v, 1u64)
-    } else if let Some(v) = s.strip_suffix('s') {
-        (v, 1_000)
-    } else if let Some(v) = s.strip_suffix('m') {
-        (v, 60_000)
-    } else if let Some(v) = s.strip_suffix('h') {
-        (v, 3_600_000)
-    } else {
-        (s, 1)
-    };
-    match num.trim().parse::<u64>() {
-        Ok(n) => match n.checked_mul(mult) {
-            Some(ms) => ms.to_string(),
-            None => s.to_string(),
-        },
-        Err(_) => s.to_string(),
+/// Build the `work <profile>` command that services one test job type: the
+/// hired profile supplies the agent binding and `--job-type <t>` adds the
+/// unique test job type on top of the profile's rank matrix. The caller applies
+/// the per-test home and env.
+fn work_command(target: Target, profile: &str, job_type: &str, worker_flags: &[&str]) -> Command {
+    let mut c = target.cmd(&["work", profile, "--job-type", job_type]);
+    if target == Target::Rust {
+        c.args(["--max-jobs", "1"]);
     }
+    c.args(worker_flags);
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    c
 }
 
 /// Grace period after the fake agent records its run, giving the Node worker
 /// time to finish logging the job's completion/nudge before we reap it. The
 /// agent flushes `record.json` at exit, which happens once the worker closes the
 /// ACP session — i.e. after the worker has handled the job — so a short settle
-/// window captures the trailing "completed"/"nudge" log line.
-const NODE_SETTLE_GRACE: Duration = Duration::from_secs(4);
+/// window captures the trailing "completed"/"nudge" log line. Capped here; the
+/// reaper cuts it short as soon as the engine reports the job settled.
+const NODE_SETTLE_GRACE: Duration = Duration::from_secs(15);
+
+/// After the engine reports the job settled, how long to let the Node worker
+/// finish logging before reaping it.
+const NODE_POST_SETTLE: Duration = Duration::from_millis(750);
 
 /// How long to wait for the Node worker to handle the job before giving up.
 /// The Node worker polls forever (no `--max-jobs`), so unlike the Rust path this
@@ -1016,7 +1100,20 @@ const NODE_NO_WORK_DEADLINE: Duration = Duration::from_secs(45);
 /// the job and never launched the agent, as in `min_free_mb_gates_work`) we reap
 /// anyway and return whatever was logged; unlike [`output_within`] this is an
 /// expected outcome, so it does NOT panic.
-fn run_node_worker(mut cmd: Command, record_path: &Path) -> Output {
+/// Whether the engine reports `job` as settled by a worker: it left `CREATED`
+/// for a TERMINAL state (completed / failed out / error thrown), or it was
+/// failed with retries left (still `CREATED`, but below the BPMN default of 3
+/// retries). `ACTIVATED` is explicitly NOT settled — it is the live, in-flight
+/// state between activation and completion/failure, so treating it as settled
+/// would let the harness start its reap/kill timer before the worker's
+/// completion or failure variables land, racing the engine-observable assertions.
+pub fn job_is_settled(job: &serde_json::Value) -> bool {
+    let state = job["state"].as_str().unwrap_or("");
+    let retries = job["retries"].as_i64().unwrap_or(3);
+    (state != "CREATED" && state != "ACTIVATED" && !state.is_empty()) || retries < 3
+}
+
+fn run_node_worker(mut cmd: Command, record_path: &Path, settled: impl Fn() -> bool) -> Output {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1047,6 +1144,13 @@ fn run_node_worker(mut cmd: Command, record_path: &Path) -> Output {
         // settle window so the worker can log the outcome, then reap.
         if settle_until.is_none() && record_path.exists() {
             settle_until = Some(Instant::now() + NODE_SETTLE_GRACE);
+        }
+        // Once the engine shows the job settled, give the worker a moment to
+        // log the outcome, then reap — no need to sit out the whole grace.
+        if let Some(until) = settle_until {
+            if until > Instant::now() + NODE_POST_SETTLE && settled() {
+                settle_until = Some(Instant::now() + NODE_POST_SETTLE);
+            }
         }
         let reap = match settle_until {
             Some(until) => Instant::now() >= until,
@@ -1398,71 +1502,6 @@ mod unit {
         assert_eq!(
             host_port("http://localhost"),
             Some(("localhost".to_string(), 80))
-        );
-    }
-
-    #[test]
-    fn duration_to_ms_translates_suffixes() {
-        assert_eq!(duration_to_ms_string("500ms"), "500");
-        assert_eq!(duration_to_ms_string("1s"), "1000");
-        assert_eq!(duration_to_ms_string("30s"), "30000");
-        assert_eq!(duration_to_ms_string("5m"), "300000");
-        assert_eq!(duration_to_ms_string("2h"), "7200000");
-        // A bare number is already milliseconds.
-        assert_eq!(duration_to_ms_string("250"), "250");
-        // Surrounding whitespace is tolerated.
-        assert_eq!(duration_to_ms_string(" 1s "), "1000");
-    }
-
-    #[test]
-    fn duration_to_ms_passes_unparseable_through() {
-        // Not a number: let the Node CLI report its own error rather than mask it.
-        assert_eq!(duration_to_ms_string("soon"), "soon");
-        assert_eq!(duration_to_ms_string("1x"), "1x");
-    }
-
-    #[test]
-    fn translate_node_flags_drops_with_lease() {
-        // Rust-only boolean; the Node worker manages leasing itself.
-        assert_eq!(
-            translate_node_flags(&["--with-lease", "--recovery-window", "3000"]),
-            vec!["--recovery-window".to_string(), "3000".to_string()]
-        );
-    }
-
-    #[test]
-    fn translate_node_flags_converts_reap_durations() {
-        assert_eq!(
-            translate_node_flags(&["--reap-age", "1s", "--reap-interval", "500ms"]),
-            vec![
-                "--reap-age".to_string(),
-                "1000".to_string(),
-                "--reap-interval".to_string(),
-                "500".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn translate_node_flags_keep_runs_becomes_boolean() {
-        // Rust `--keep-runs <n>` (a count) maps to the Node boolean switch: the
-        // count is consumed and the bare flag emitted.
-        assert_eq!(
-            translate_node_flags(&["--keep-runs", "1"]),
-            vec!["--keep-runs".to_string()]
-        );
-    }
-
-    #[test]
-    fn translate_node_flags_passes_shared_knobs_through() {
-        assert_eq!(
-            translate_node_flags(&["--recovery-window", "9000", "--min-free-mb", "999999999",]),
-            vec![
-                "--recovery-window".to_string(),
-                "9000".to_string(),
-                "--min-free-mb".to_string(),
-                "999999999".to_string(),
-            ]
         );
     }
 }

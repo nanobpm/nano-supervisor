@@ -1,55 +1,51 @@
-# Spike: one worker slot on camunda-orchestration-sdk (issue #1)
+# `work <hire>`: one worker for a hired profile
 
-`nano-supervisor spike` runs a single worker slot: poll one job type, keep the
-activation alive while an ACP agent works, complete or fail the job.
+`nano-supervisor work <hire>` is the Rust counterpart of the Node plugin's
+`c8 nano work <profile>`. It reads the hire (agent command, protocol, rank,
+capabilities, model, env) from the c8ctl-nano `config.json` — the same file
+`c8 nano hire` writes — polls the hire's rank×capability job types (plus any
+`--job-type`), and runs each job through the job core it shares with
+`nano-supervisor daemon` (`src/slot.rs`).
 
 ## Run it against a throwaway local cluster
 
-Never point this at a production engine: it takes any job of `--job-type`.
+Never point this at a production engine: it takes any job of its job types.
 
 ```sh
 c8 nano start                                   # local cluster on :8080
+c8 nano hire --name dev --rank junior --command nano-coder --arg --acp --protocol acp
 curl -F resources=@spike/spike.bpmn localhost:8080/v2/deployments
 curl -H 'content-type: application/json' localhost:8080/v2/process-instances \
   -d '{"processDefinitionId":"nano-supervisor-spike","variables":{"prompt":"Reply with exactly SPIKE-OK"}}'
 
 cargo build --release
-target/release/nano-supervisor spike --job-type spike:nano-supervisor --profile local \
-  --agent "nano-coder --acp" --recovery-window 9000 --max-jobs 1
+target/release/nano-supervisor work dev --job-type spike:nano-supervisor --profile local \
+  --recovery-window 9000 --max-jobs 1
 ```
 
 Connection: `--profile` (a c8ctl profile) > `CAMUNDA_REST_ADDRESS` env >
-c8ctl's remembered active profile.
+c8ctl's remembered active profile. Durations are in **milliseconds**, as in
+c8ctl. An unknown or unrunnable hire exits 78 (`EX_CONFIG`), like Node.
 
 `spike/sample.sh <pid> out.tsv` samples the worker's and its agent's RSS every 0.5 s.
 
-## What it does and doesn't do
+## Behaviour (mirrors the Node plugin)
 
-- Activates with `timeout = --recovery-window` and extends it every third of the
-  window (`update_job`). A 404/409 on refresh counts as a lost activation: the agent
-  is stopped and the job is not settled.
-- Passes a `jobLeaseToken` through if the engine issues one (`--with-lease` asks for
-  it; current Nano engines don't issue tokens).
-- Fails the job (retries − 1) on any error, including an agent that finishes with
-  no output.
-- No git, no result file / `::nano:result::`, no hub, no sandbox: those are
-  the port, not the spike.
-
-## Leases (`--with-lease`)
-
-The Nano engine issues leases (`withLease: true`) and fences complete, fail,
-throw-error and (token-bearing) update with 409. But it still names the token
-`leaseToken` / `jobLease`. Camunda 8.10 renamed both to `jobLeaseToken`
-(camunda/camunda `51b0d787e`), and the SDK follows the spec, so through the SDK
-the token is dropped on activation and never sent. Tracked in
-nanobpm/nano-bpm#1283.
-
-Until that lands, `--job-api auto` (the default) sends the job commands with
-`--with-lease` as raw HTTP in Nano's dialect (`src/jobs.rs`). `--job-api sdk`
-shows the mismatch: the worker refuses the job because it came back without a
-token. `--recovery-window` is in **milliseconds**, as in c8ctl.
-
-```sh
-CAMUNDA_REST_ADDRESS=http://localhost:8080 cargo run --release -- spike \
-  --job-type spike:nano-supervisor --with-lease --recovery-window 9000 --max-jobs 1
-```
+- **Payload.** The agent is prompted with the JSON job payload (`jobKey`,
+  `jobType`, `prompt`, the normalised `task` envelope, `variables`,
+  `customHeaders`, `profile`, …) and gets `AGENT_PROFILE`/`AGENT_RANK`/
+  `AGENT_MODEL`/`AGENT_CAPABILITIES`/`AGENT_JOB_TYPE`/`AGENT_RESULT_FILE`.
+- **Leases.** Every activation asks for a lease (engine 0.0.24 issues
+  `jobLeaseToken`, which the SDK carries) and is refreshed every third of
+  `--recovery-window`. A 404/409 on refresh is a lost activation: the agent is
+  stopped and the job is not settled.
+- **Result.** `AGENT_RESULT_FILE`, else the last `::nano:result::` line, else a
+  fenced JSON block. With no result but some output, the agent is re-invoked
+  once with the re-emit nudge.
+- **Complete.** Variables are the result's keys plus `output`, `exitCode`,
+  `truncated`, `agent` and the versioned `io.nanobpm.agentResult` envelope.
+- **Fail.** An empty result or a failed run fails the job with retries − 1 and
+  `agent "<hire>" produced an empty result: …` / `agent "<hire>" failed: …`.
+- **Housekeeping.** Run dirs live under `agent-runs/` in the state home and are
+  reaped by `--reap-age`/`--reap-interval`; `--keep-runs` keeps them.
+  `--min-free-mb` gates container sandboxes only, so host hires are not gated.

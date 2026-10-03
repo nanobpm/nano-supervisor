@@ -155,13 +155,11 @@ fn work_unknown_profile_exits_nonzero() {
     require_target!(target);
     let home = TempHome::with_target(target);
     let out = home.run(&["work", "nosuch"]);
-    // NODE-QUIRK: `work` on an unknown profile exits non-zero (exit 1), like the
-    // other validation-failure paths (e.g. an invalid `hire --rank`); many plain
-    // "not found" lookups instead print ✗ and still exit 0.
-    // https://github.com/nanobpm/nano-supervisor/issues/3
+    // `work` on an unknown hire is a non-restartable configuration error: it
+    // exits 78 (sysexits `EX_CONFIG`) so a supervisor does not restart-loop it.
     assert_eq!(
         out.code,
-        Some(1),
+        Some(78),
         "stdout={} stderr={}",
         out.stdout,
         out.stderr

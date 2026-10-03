@@ -65,15 +65,30 @@ fn worker_gives_agent_result_file_and_nano_env() {
         &[],
     );
     let record = outcome.record();
+    let env = &record.env;
     assert!(
-        record.env.contains_key("AGENT_RESULT_FILE"),
-        "worker must set AGENT_RESULT_FILE; env was {:?}",
-        record.env
+        env.contains_key("AGENT_RESULT_FILE"),
+        "worker must set AGENT_RESULT_FILE; env was {env:?}"
+    );
+    // The hired profile's identity, as the Node worker exports it.
+    assert_eq!(
+        env.get("AGENT_RANK").map(String::as_str),
+        Some("junior"),
+        "{env:?}"
+    );
+    assert_eq!(
+        env.get("AGENT_JOB_TYPE").map(String::as_str),
+        Some(outcome.job_type.as_str()),
+        "{env:?}"
     );
     assert!(
-        record.env.keys().any(|k| k.starts_with("NANO_")),
-        "worker must set NANO_* variables; env was {:?}",
-        record.env
+        env.get("AGENT_PROFILE")
+            .is_some_and(|p| p.starts_with("ctfake")),
+        "{env:?}"
+    );
+    assert!(
+        env.keys().any(|k| k.starts_with("NANO_")),
+        "worker must set NANO_* variables; env was {env:?}"
     );
     assert!(
         !record.cwd.is_empty(),

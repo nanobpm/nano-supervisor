@@ -26,6 +26,9 @@ pub struct FakeRecord {
     pub cwd: String,
     pub env: BTreeMap<String, String>,
     pub prompts: Vec<String>,
+    /// How many agent processes wrote this record (the nudge re-invokes).
+    #[serde(default)]
+    pub runs: usize,
     #[serde(default)]
     pub initialize: Option<Value>,
     #[serde(default)]

@@ -26,6 +26,14 @@ clap = { version = "4", features = ["derive"] }
 shlex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Shortest-round-trip f64 digit generation for the ECMAScript `Number::toString`
+# used by the envelope normalizer (src/envelope.rs): serde_json renders a float
+# with ryu's shortest digits but formats them the JSON way (trailing `.0`,
+# exponential outside ~[1e-6, 1e21)), which diverges from the Node plugin's
+# `String(number)`. ryu gives us the same shortest digits to reformat the
+# ECMAScript way. Already serde_json's own transitive dep, so no new code is
+# pulled in.
+ryu = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).
