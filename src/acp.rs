@@ -395,6 +395,42 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// Extract the text of an ACP `content` value the way the canonical transcript
+/// bridge's `content_block_text` does (contract-tests `hub/transcript.rs`): a
+/// bare string is its own text, an array's block texts concatenate, and an
+/// object yields its `text` (`{"type":"text"}`) or its nested `resource.text`
+/// (`{"type":"resource"}`). Anything else has no text. Message chunks carry all
+/// of these shapes, so both the transcript accumulator and the effective-turn
+/// classifier must read them all — a flat `content["text"]` lookup misses the
+/// string/array/resource shapes the bridge persists as turns.
+fn content_block_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => {
+            let mut parts = String::new();
+            let mut any = false;
+            for item in items {
+                if let Some(t) = content_block_text(item) {
+                    parts.push_str(&t);
+                    any = true;
+                }
+            }
+            any.then_some(parts)
+        }
+        Value::Object(obj) => match obj.get("type").and_then(Value::as_str) {
+            Some("text") => obj.get("text").and_then(Value::as_str).map(str::to_string),
+            Some("resource") => obj
+                .get("resource")
+                .and_then(Value::as_object)
+                .and_then(|r| r.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Does this `session/update` persist a transcript turn or carry a valid plan —
 /// the signals Node 1.70.1 counts as "the agent did work"? This mirrors the
 /// canonical transcript bridge's non-`Ignored` classification (a message chunk
@@ -413,11 +449,12 @@ fn update_is_effective_turn(update: &Value) -> bool {
     };
     match kind {
         // Reasoning (`agent_thought_chunk`) folds to an assistant turn; a chunk
-        // with no text content persists nothing, so it does not count.
+        // with no text content persists nothing, so it does not count. The
+        // bridge persists a chunk whose `content` is a bare string, an array of
+        // blocks, or a resource block too — not only a flat `{"text": …}` — so
+        // extract via `content_block_text` exactly as it does.
         "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" => {
-            update["content"]["text"]
-                .as_str()
-                .is_some_and(|t| !t.is_empty())
+            content_block_text(&update["content"]).is_some_and(|t| !t.is_empty())
         }
         "tool_call" => update["toolCallId"]
             .as_str()
@@ -470,8 +507,12 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
             }
             match update["sessionUpdate"].as_str() {
                 Some("agent_message_chunk") => {
-                    if let Some(t) = update["content"]["text"].as_str() {
-                        s.text.push_str(t);
+                    // Extract every content shape the bridge persists (a bare
+                    // string, an array of blocks, a resource block — not only a
+                    // flat `{"text": …}`) so the accumulated transcript matches
+                    // what Node's bridge would persist for the same chunk.
+                    if let Some(t) = content_block_text(&update["content"]) {
+                        s.text.push_str(&t);
                         // Bound the transcript the same way the pipe path bounds
                         // stdout: `Agent::run` appends every chunk to this
                         // `String`, so a verbose or misbehaving ACP agent could
@@ -788,8 +829,7 @@ mod tests {
         let over_limit = "\u{20ac}".repeat(OUTCOME_SUMMARY_MAX + 1);
         let done =
             json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } });
-        let out =
-            prompt_outcome(&done).expect("an overlong multibyte summary must be truncated");
+        let out = prompt_outcome(&done).expect("an overlong multibyte summary must be truncated");
         assert_eq!(
             out["summary"].as_str().unwrap().chars().count(),
             OUTCOME_SUMMARY_MAX
@@ -806,8 +846,7 @@ mod tests {
         let over_limit = "\u{1F600}".repeat(OUTCOME_SUMMARY_MAX + 1); // 😀
         let done =
             json!({ "_meta": { "outcome": { "status": "blocked", "summary": over_limit } } });
-        let out =
-            prompt_outcome(&done).expect("an overlong astral summary must be truncated");
+        let out = prompt_outcome(&done).expect("an overlong astral summary must be truncated");
         let summary = out["summary"].as_str().unwrap();
         // 4,000 emoji = 8,000 UTF-16 code units = 4,000 scalar values.
         assert_eq!(summary.chars().count(), OUTCOME_SUMMARY_MAX / 2);
@@ -874,11 +913,18 @@ mod tests {
     fn update_is_effective_turn_counts_only_persisted_turns_or_valid_plans() {
         // Persisted transcript turns: a message/thought/user chunk WITH text, a
         // tool_call with an id, and a TERMINAL tool_call_update with an id. A
-        // plan counts only when it carries at least one entry.
+        // plan counts only when it carries at least one entry. Message chunks
+        // count under EVERY content shape the canonical bridge's
+        // `content_block_text` extracts: a `{"type":"text"}` object, a bare
+        // string, an array of blocks, and a `{"type":"resource"}` block.
         let effective = [
             json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } }),
             json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hmm" } }),
             json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "go" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": "hi" }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": [ { "type": "text", "text": "a" }, { "type": "text", "text": "b" } ] }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": [ "a", { "type": "resource", "resource": { "uri": "file://x", "text": "b" } } ] }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "resource", "resource": { "uri": "file://x", "text": "body" } } }),
             json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read" }),
             json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed", "rawOutput": {} }),
             json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed" }),
@@ -888,11 +934,16 @@ mod tests {
             assert!(update_is_effective_turn(u), "should count as a turn: {u}");
         }
 
-        // Ignored/intermediate updates: an empty or text-less chunk, a tool_call
-        // without an id, an in_progress/unknown tool_call_update, an id-less
-        // terminal update, an empty plan, a bare status, and any unknown update.
+        // Ignored/intermediate updates: an empty or text-less chunk (under any
+        // content shape), a tool_call without an id, an in_progress/unknown
+        // tool_call_update, an id-less terminal update, an empty plan, a bare
+        // status, and any unknown update.
         let ignored = [
             json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": "" }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": [] }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": [ { "type": "image", "data": "…" } ] }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "resource", "resource": { "uri": "file://x" } } }),
             json!({ "sessionUpdate": "agent_message_chunk" }),
             json!({ "sessionUpdate": "tool_call", "title": "read" }),
             json!({ "sessionUpdate": "tool_call", "toolCallId": "" }),
@@ -905,7 +956,50 @@ mod tests {
             json!({ "foo": "bar" }),
         ];
         for u in &ignored {
-            assert!(!update_is_effective_turn(u), "should NOT count as a turn: {u}");
+            assert!(
+                !update_is_effective_turn(u),
+                "should NOT count as a turn: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_block_text_matches_the_canonical_bridge_shapes() {
+        // Every shape the canonical transcript bridge's `content_block_text`
+        // extracts — a bare string, an array of blocks (concatenated), a text
+        // object, and a resource object's nested text — plus the shapes it
+        // rejects (no text anywhere).
+        assert_eq!(
+            content_block_text(&json!("hello")).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            content_block_text(&json!({ "type": "text", "text": "hi" })).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            content_block_text(
+                &json!([{ "type": "text", "text": "a" }, "b", { "type": "resource", "resource": { "text": "c" } }])
+            )
+            .as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            content_block_text(
+                &json!({ "type": "resource", "resource": { "uri": "file://x", "text": "body" } })
+            )
+            .as_deref(),
+            Some("body")
+        );
+        for v in [
+            json!([]),
+            json!([{ "type": "image", "data": "…" }]),
+            json!({ "type": "image", "data": "…" }),
+            json!({ "type": "resource", "resource": { "uri": "file://x" } }),
+            json!(42),
+            json!(null),
+        ] {
+            assert_eq!(content_block_text(&v), None, "no text expected: {v}");
         }
     }
 }
