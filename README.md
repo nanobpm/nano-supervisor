@@ -13,8 +13,10 @@ Both workers run the same leased activation + lease-refresh fencing
 (`src/jobs.rs`, `src/slot.rs`). Every activation asks for a lease (engine ≥
 0.0.24 issues `jobLeaseToken`, which the SDK carries) and is refreshed every
 third of `--recovery-window`. A 404/409 on refresh is a lost activation: the
-agent is stopped and the job is **not** settled, so no job is ever settled
-without its lease.
+agent is stopped and the job is **not** settled, so a *leased* activation is
+never settled after losing its lease. (This says nothing about unleased runs:
+`work`, and `daemon --no-lease`, settle activations the engine never leased —
+see below.)
 
 The two workers differ only in what they do when the engine issues **no** token:
 

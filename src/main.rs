@@ -168,6 +168,16 @@ fn clamp_recovery_window(ms: u64) -> Duration {
     Duration::from_millis(ms).max(MIN_RECOVERY_WINDOW)
 }
 
+/// Resolve whether the `daemon` should lease each activation, from the parsed
+/// CLI flags. Leasing is the default; `--no-lease` is the only opt-out, so the
+/// decision derives solely from `!no_lease`. The legacy `--with-lease` is a
+/// hidden, deprecated no-op (leasing is already implied) kept so existing
+/// invocations keep working — it is intentionally not consulted here, which also
+/// makes `--no-lease` win when both are passed.
+fn daemon_leases(no_lease: bool) -> bool {
+    !no_lease
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -222,7 +232,7 @@ async fn main() -> Result<()> {
         } => {
             let opts = daemon::DaemonOptions {
                 profile,
-                with_lease: !no_lease,
+                with_lease: daemon_leases(no_lease),
                 slots: slots.max(1),
                 only: hire,
                 recovery_window: clamp_recovery_window(recovery_window),
@@ -311,7 +321,8 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_recovery_window, MIN_RECOVERY_WINDOW};
+    use super::{clamp_recovery_window, daemon_leases, Cli, Cmd, MIN_RECOVERY_WINDOW};
+    use clap::Parser;
     use std::time::Duration;
 
     #[test]
@@ -325,6 +336,69 @@ mod tests {
         assert_eq!(
             clamp_recovery_window(300_000),
             Duration::from_millis(300_000)
+        );
+    }
+
+    /// Parse a `daemon` invocation and return its `(no_lease, with_lease)` flags.
+    fn parse_daemon_flags(args: &[&str]) -> (bool, bool) {
+        match Cli::parse_from(args).cmd {
+            Cmd::Daemon {
+                no_lease,
+                with_lease,
+                ..
+            } => (no_lease, with_lease),
+            _ => panic!("expected the `daemon` subcommand for args {args:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_leases_by_default() {
+        // The central default inversion: a bare `daemon` must fence (lease) with
+        // neither opt-out nor the legacy flag supplied.
+        let (no_lease, with_lease) = parse_daemon_flags(&["nano-supervisor", "daemon"]);
+        assert!(!no_lease, "bare `daemon` must not set --no-lease");
+        assert!(!with_lease, "bare `daemon` must not set the legacy --with-lease");
+        assert!(
+            daemon_leases(no_lease),
+            "bare `daemon` must lease by default"
+        );
+    }
+
+    #[test]
+    fn daemon_no_lease_opts_out() {
+        let (no_lease, _) = parse_daemon_flags(&["nano-supervisor", "daemon", "--no-lease"]);
+        assert!(no_lease, "--no-lease must parse as set");
+        assert!(
+            !daemon_leases(no_lease),
+            "--no-lease must run the daemon unfenced"
+        );
+    }
+
+    #[test]
+    fn daemon_legacy_with_lease_still_accepted() {
+        // Backward compatibility: the hidden, deprecated `--with-lease` must
+        // still parse and is a no-op — leasing is already the default.
+        let (no_lease, with_lease) =
+            parse_daemon_flags(&["nano-supervisor", "daemon", "--with-lease"]);
+        assert!(with_lease, "legacy --with-lease must still be accepted");
+        assert!(!no_lease);
+        assert!(
+            daemon_leases(no_lease),
+            "legacy --with-lease must keep leasing on"
+        );
+    }
+
+    #[test]
+    fn daemon_no_lease_wins_over_legacy_with_lease() {
+        // Leasing derives solely from `!no_lease`, so if both flags are passed
+        // the opt-out wins and the daemon runs unfenced.
+        let (no_lease, with_lease) =
+            parse_daemon_flags(&["nano-supervisor", "daemon", "--with-lease", "--no-lease"]);
+        assert!(no_lease);
+        assert!(with_lease);
+        assert!(
+            !daemon_leases(no_lease),
+            "--no-lease must win when combined with the legacy --with-lease"
         );
     }
 }
