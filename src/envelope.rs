@@ -32,34 +32,267 @@ pub struct Repository {
 pub struct Envelope {
     pub prompt: Option<String>,
     pub repository: Option<Repository>,
-    /// The raw merged `io.nanobpm.agentTask` object, forwarded verbatim to the
-    /// pipe agent as `task` so it sees the full envelope.
-    pub raw: Value,
+    /// The schema-v1 normalized envelope — exactly the Node plugin's
+    /// `normalizeTaskEnvelope` output — forwarded to the agent as the payload's
+    /// `task`.
+    pub normalized: Value,
 }
 
+/// Node's `str(v) = (v == null ? undefined : String(v))`: `null`/absent drops
+/// the field, every other value is its JavaScript `String(v)`. Arrays join with
+/// "," (`String(["x"])` is `"x"`) and a plain object is `"[object Object]"` —
+/// NOT JSON — so `promptFile: ["x"]` normalizes to `"x"` and `ref: ["a","b"]`
+/// to `"a,b"`, exactly as the plugin delivers them. A prior version used
+/// `Value::to_string()` (JSON), so `promptFile: ["x"]` became the literal
+/// `["x"]` — a divergence from the field-for-field Node parity this normalize
+/// claims.
 fn as_str(v: &Value) -> Option<String> {
     match v {
-        Value::String(s) => Some(s.clone()),
         Value::Null => None,
-        other => Some(other.to_string()),
+        other => Some(js_stringify(other)),
     }
 }
 
-fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
+/// JavaScript's `String(v)` for the value shapes `coerceBool` can meet. Node's
+/// `coerceBool` stringifies ANY non-boolean/non-null value before matching, so
+/// arrays and objects coerce by their JS stringification — not by a hard
+/// default: `String([])` is `""` (false), `String(["on"])` is `"on"` (true),
+/// `String(["a","b"])` is `"a,b"`, and `String({})` is `"[object Object]"`.
+/// Matching that exactly is load-bearing: a prior version returned the field
+/// default for every array/object, so `branch.push: []` normalised to `true`
+/// (the default) where Node yields `false`, and `allowPr: ["on"]` normalised to
+/// `false` where Node yields `true`.
+fn js_stringify(v: &Value) -> String {
     match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => {
-            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => js_number_string(n),
+        Value::String(s) => s.clone(),
+        // `Array.prototype.toString` is `join(",")`: empty → `""`, nested
+        // arrays/objects recurse through the same `String()` conversion —
+        // except null/undefined ELEMENTS, which join renders as the empty
+        // string (String([null]) is `""`, String([1,null,2]) is `"1,,2"`),
+        // unlike a top-level String(null) → `"null"`.
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_stringify(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        // A plain object has no custom `toString`, so it stringifies to the
+        // invariant `"[object Object]"` regardless of its contents.
+        Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// ECMAScript's `Number::toString` (what Node's `String(number)` and
+/// `Number.prototype.toString()` produce) for a JSON number. This is the
+/// string `parseInt`/`String(v)` actually consume in the plugin, so the
+/// normalizer must reproduce it exactly — serde_json's own `Number::to_string`
+/// is NOT it: it renders an integral float with a trailing `.0` (`100.0`,
+/// `9007199254740992.0`) where JS drops it (`"100"`, `"9007199254740992"`), and
+/// it switches to exponential notation at different thresholds (`1e-6` → serde
+/// `"1e-6"` vs JS `"0.000001"`; `1e20` → serde `"1e+20"` vs JS
+/// `"100000000000000000000"`). Those divergences change the value `coerceInt`
+/// derives (`String(0.000001)` parses to `0` in Node but `1` from serde's
+/// `"1e-6"`) and the text a string field receives.
+///
+/// An integer is a plain-digit fast path ONLY while it is an exact IEEE-754
+/// double — i.e. its magnitude is `<= 2^53` (`Number.MAX_SAFE_INTEGER` rounded
+/// up to the first unsafe power of two). Within that range serde_json's digits
+/// and `String(Number)` agree, so it passes through unchanged. A larger integer
+/// is NOT exactly representable as the double JS parses it to, and ECMAScript
+/// renders the SHORTEST decimal that round-trips to that rounded double — e.g.
+/// the JSON integer `9007199254740993` becomes the Number `9007199254740992`
+/// (`"9007199254740992"`), and `9223372036854775808` prints as
+/// `"9223372036854776000"`, not its exact digits. So an unsafe-magnitude
+/// integer must fall through to the `f64` path below; the plain-digit fast path
+/// would otherwise emit the exact (and therefore wrong) digits.
+///
+/// Only a float (or an unsafe-magnitude integer) needs reformatting: ryu yields
+/// the same shortest round-trip digits serde_json used, and the ECMAScript
+/// `Number::toString` rules below place the decimal point / choose exponential
+/// notation the way V8 does. Let the shortest digits be `d[0..k]` and the
+/// decimal exponent `e` (value = `0.d[0..k] × 10^e`, equivalently
+/// `d[0].d[1..k] × 10^(e-1)`):
+///   * `k <= e <= 21`   → the digits followed by `e - k` zeros (plain integer);
+///   * `0 < e < k` (and `e <= 21`) → `d[0..e].d[e..k]` (point inside the digits);
+///   * `-6 < e <= 0`    → `0.` then `-e` zeros then the digits (small decimal);
+///   * otherwise        → `d[0][.d[1..k]]e±(e-1)` (exponential).
+fn js_number_string(n: &serde_json::Number) -> String {
+    // 2^53: the largest magnitude at which every integer is still an exact
+    // double, so serde_json's plain digits equal `String(Number)`.
+    const MAX_EXACT_INT: u64 = 1 << 53;
+    if let Some(i) = n.as_i64() {
+        if i.unsigned_abs() <= MAX_EXACT_INT {
+            return i.to_string();
         }
+    } else if let Some(u) = n.as_u64() {
+        if u <= MAX_EXACT_INT {
+            return u.to_string();
+        }
+    }
+    let x = match n.as_f64() {
+        Some(x) if x.is_finite() => x,
+        // serde_json never holds NaN/±Infinity (from_f64 rejects them), so this
+        // is unreachable in practice; fall back to serde's rendering.
+        _ => return n.to_string(),
+    };
+    if x == 0.0 {
+        return "0".to_string(); // JS renders both 0 and -0 as "0"
+    }
+    let neg = x.is_sign_negative();
+
+    // Shortest round-trip digits + decimal exponent, from ryu's rendering. ryu
+    // emits either decimal ("1234.5678", "0.0001", and an integral float padded
+    // with a cosmetic ".0" such as "100.0") or scientific ("1e20", "1.5e-7").
+    let mut buf = ryu::Buffer::new();
+    let rendered = buf.format(x.abs());
+    let (mantissa, sci_exp) = match rendered.split_once(['e', 'E']) {
+        Some((m, e)) => (m.to_string(), e.parse::<i32>().unwrap_or(0)),
+        None => (rendered.to_string(), 0),
+    };
+    // Drop a trailing "." + all-zero fraction: that zero is ryu's float marker,
+    // not a significant digit (`100.0` has digits "100", not "1000").
+    let mantissa = match mantissa.split_once('.') {
+        Some((int, frac)) if frac.chars().all(|c| c == '0') => int.to_string(),
+        _ => mantissa,
+    };
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let frac_len = mantissa.split_once('.').map(|(_, f)| f.len()).unwrap_or(0) as i32;
+    let k = digits.len() as i32;
+    // e = (position of the decimal point) such that value = 0.digits × 10^e:
+    // the integer formed by `digits` is scaled by 10^(sci_exp - frac_len), so
+    // e = k + sci_exp - frac_len.
+    let e = k + sci_exp - frac_len;
+
+    let body = if e > 21 || e <= -6 {
+        // Exponential: one digit, an optional fraction, then e±(e-1).
+        let mut s = String::new();
+        s.push_str(&digits[..1]);
+        if k > 1 {
+            s.push('.');
+            s.push_str(&digits[1..]);
+        }
+        s.push('e');
+        let m = e - 1;
+        if m >= 0 {
+            s.push('+');
+        }
+        s.push_str(&m.to_string());
+        s
+    } else if e <= 0 {
+        // Small decimal: 0.000…digits.
+        let mut s = String::from("0.");
+        s.push_str(&"0".repeat((-e) as usize));
+        s.push_str(&digits);
+        s
+    } else if e >= k {
+        // Plain integer: digits then trailing zeros.
+        let mut s = digits.clone();
+        s.push_str(&"0".repeat((e - k) as usize));
+        s
+    } else {
+        // Point inside the digits.
+        let mut s = String::new();
+        s.push_str(&digits[..e as usize]);
+        s.push('.');
+        s.push_str(&digits[e as usize..]);
+        s
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// Node's `coerceBool`: booleans pass through; `null`/absent yields the default;
+/// any other value is stringified (JavaScript `String(v)`, see [`js_stringify`])
+/// and matched against the true-set (`true`/`1`/`yes`/`on`) and the false-set
+/// (`false`/`0`/`no`/`off`/empty), with anything unrecognised falling back to
+/// the default. Matching Node here is load-bearing: a prior version only
+/// recognised `true`/`1`/`yes` and returned `false` (not the default) for every
+/// other string, so `"on"` normalised to false and an unrecognised string on a
+/// default-`true` field (e.g. `push`) flipped to false.
+fn coerce_bool(v: Option<&Value>, default: bool) -> bool {
+    let s = match v {
+        None | Some(Value::Null) => return default,
+        Some(Value::Bool(b)) => return *b,
+        Some(other) => js_stringify(other).trim().to_ascii_lowercase(),
+    };
+    match s.as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" | "" => false,
         _ => default,
     }
 }
 
+/// Parse the leading integer of a string the way Node's
+/// `Number.parseInt(String(v), 10)` does: trim leading whitespace, then read the
+/// longest `[+-]?digit*` prefix. A leading `+`/`-` with no digit, or no leading
+/// digit at all, is `NaN` → `None`. This is the shared core of [`coerce_int`]
+/// and [`coerce_u`]; both stringify first (see [`js_stringify`]) so a non-string
+/// is converted the JavaScript way before the leading integer is parsed.
+///
+/// The digit run is converted to an `f64` in ONE correctly-rounded parse of the
+/// whole token, not accumulated digit-by-digit. `parseInt` yields a JavaScript
+/// Number (an IEEE-754 double), so a digit run of ANY magnitude stays a finite
+/// number in Node — `parseInt("9223372036854775808")` is `9223372036854776000`,
+/// not an error. Parsing into `i64` instead overflows to `None` past `i64::MAX`,
+/// silently DROPPING a field such as `cloneTimeoutMs` (the clone then runs on
+/// the default timeout) and rounding values above 2^53 differently
+/// (`"9007199254740993"`). But the accumulation must also round the way the
+/// JavaScript Number does — ONCE, from the exact decimal value. Accumulating
+/// `acc * 10 + d` per digit re-rounds the intermediate after every multiply/add,
+/// which diverges from a single correctly-rounded conversion (`"24558181542885634"`
+/// accumulates to `24558181542885636` where Node's `parseInt` — and Rust's
+/// `str::parse::<f64>`, both correctly rounded to nearest-even — yield
+/// `24558181542885632`). `str::parse` is correctly rounded and saturates to
+/// `f64::INFINITY` beyond the double range, so the result matches Node's Number
+/// for a digit run of any length (including `Infinity`, which `coerce_int` /
+/// `coerce_u` then drop via the `is_finite` guard, exactly as Node drops a
+/// non-finite `parseInt` result downstream).
+fn parse_int_str(s: &str) -> Option<f64> {
+    let t = s.trim_start();
+    let end = t
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    let tok = &t[..end];
+    let digits = tok.strip_prefix(['-', '+']).unwrap_or(tok);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None; // a bare sign, or no leading digit at all → NaN
+    }
+    // One correctly-rounded conversion of the whole `[+-]?digits` token — the
+    // same rounding V8 applies when `parseInt` produces its Number.
+    tok.parse::<f64>().ok()
+}
+
+/// Node's `coerceInt` for the unsigned fields (`depth`, `cloneTimeoutMs`):
+/// `null`/absent → `None`; otherwise `Number.parseInt(String(v), 10)` kept only
+/// when finite and non-negative. `String(v)` runs FIRST for EVERY value —
+/// including a JSON number — so it is stringified the JavaScript way before the
+/// leading integer is parsed: `depth: ["5"]` → `String(["5"])` is `"5"` → `5`,
+/// `["1","2"]` → `"1,2"` → `1`, and a large number such as `1e21` → `"1e+21"`
+/// → `1` (Node yields `1`; a numeric fast path that instead casts the `f64`
+/// saturates to `u64::MAX`, silently turning a 1 ms timeout into an unbounded
+/// one). Negative and non-numeric results stay absent (the `u64` guard),
+/// matching the field's unsigned domain.
 fn coerce_u(v: Option<&Value>) -> Option<u64> {
     match v {
-        Some(Value::Number(n)) => n.as_u64(),
-        Some(Value::String(s)) => s.trim().parse().ok(),
-        _ => None,
+        None => None,
+        // parseInt yields a double; truncate toward zero (parseInt drops any
+        // fraction) and keep only a finite, non-negative result in `u64` range.
+        // `f64 -> u64` is a saturating cast, so a finite-but-huge value clamps
+        // to `u64::MAX` rather than wrapping — and it is still PRESENT (not
+        // dropped), which is the parity fix.
+        Some(value) => parse_int_str(&js_stringify(value))
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f.trunc() as u64),
     }
 }
 
@@ -154,11 +387,172 @@ pub fn assemble(custom_headers: &Map<String, Value>, variables: &Map<String, Val
         .and_then(Value::as_object)
         .and_then(parse_repository);
 
+    let normalized = normalize(&raw_obj, prompt.as_deref());
     Envelope {
         prompt,
         repository,
-        raw,
+        normalized,
     }
+}
+
+/// Node's `coerceInt`: `null`/`""` → absent; otherwise
+/// `Number.parseInt(String(v), 10)` kept only when finite. `String(v)` runs
+/// FIRST for EVERY value — including a JSON number — so it is stringified the
+/// JavaScript way before the leading integer is parsed: `timeoutMs: ["1000"]` →
+/// `String(["1000"])` is `"1000"` → `1000`, `["1","2"]` → `"1,2"` → `1`, and a
+/// large number such as `1e21` → `"1e+21"` → `1` (Node yields `1`; a numeric
+/// fast path that instead casts the `f64` saturates to `i64::MAX`). A leading
+/// `+`/`-` with no digit, or no leading digit at all, is `NaN` → absent.
+///
+/// The result is returned as a JSON numeric [`Value`], NOT an `i64`: `parseInt`
+/// yields a JavaScript Number (a double), and Node places that Number verbatim
+/// in the normalized envelope. Narrowing it to `i64` would clamp a finite-but-
+/// huge magnitude — `coerceInt("100000000000000000000")` is `1e20` in Node, not
+/// `i64::MAX` — silently changing a normalized field. [`finite_int_double_to_json`]
+/// preserves the finite Number instead of saturating.
+fn coerce_int(v: Option<&Value>) -> Option<Value> {
+    let f = parse_int_str(&js_stringify(v?)).filter(|f| f.is_finite())?;
+    Some(finite_int_double_to_json(f))
+}
+
+/// Represent `parseInt`'s finite, integer-valued double as a JSON number WITHOUT
+/// narrowing, mirroring Node placing `coerceInt`'s Number verbatim in the
+/// normalized envelope. A magnitude within `i64` range is emitted as that exact
+/// integer (covering every realistic timeout/depth value, and matching Node's
+/// `String(Number)` byte-for-byte up to `2^53`); a larger magnitude is kept as
+/// the finite IEEE-754 double itself — the very Number Node holds — rather than
+/// being clamped to `i64::MIN`/`MAX`, which would silently corrupt the value.
+fn finite_int_double_to_json(f: f64) -> Value {
+    let t = f.trunc();
+    // `i64::MAX as f64` rounds UP to 2^63, so compare against that power of two
+    // with a strict `<`: 2^63 itself is out of `i64` range and would saturate.
+    const I64_SUP: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    if t >= i64::MIN as f64 && t < I64_SUP {
+        Value::from(t as i64)
+    } else {
+        // Beyond `i64` range: preserve the finite Number (`from_f64` only
+        // rejects NaN/±Inf, already filtered out) instead of a saturating clamp.
+        serde_json::Number::from_f64(t)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// Insert `key` only when the value is present — mirrors `JSON.stringify`
+/// dropping `undefined` fields in the Node plugin.
+fn put(m: &mut Map<String, Value>, key: &str, v: Option<Value>) {
+    if let Some(v) = v {
+        m.insert(key.to_string(), v);
+    }
+}
+
+/// Normalize the merged envelope to schema v1, field for field as the Node
+/// plugin's `normalizeTaskEnvelope` (so the agent sees an identical `task`).
+fn normalize(raw: &Map<String, Value>, prompt: Option<&str>) -> Value {
+    let s = |v: Option<&Value>| v.and_then(as_str).map(Value::String);
+    let int = coerce_int;
+    let mut env = Map::new();
+    env.insert("schemaVersion".into(), Value::from(1));
+
+    if let Some(repo) = raw.get("repository").and_then(Value::as_object) {
+        if repo
+            .get("url")
+            .and_then(as_str)
+            .is_some_and(|u| !u.is_empty())
+        {
+            let mut r = Map::new();
+            let provider = repo
+                .get("provider")
+                .and_then(as_str)
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "github".into())
+                .to_lowercase();
+            r.insert("provider".into(), Value::String(provider));
+            put(&mut r, "url", s(repo.get("url")));
+            put(&mut r, "ref", s(repo.get("ref")));
+            put(&mut r, "sha", s(repo.get("sha")));
+            put(&mut r, "depth", int(repo.get("depth")));
+            r.insert(
+                "singleBranch".into(),
+                Value::Bool(coerce_bool(repo.get("singleBranch"), false)),
+            );
+            put(&mut r, "filter", s(repo.get("filter")));
+            put(&mut r, "baseRef", s(repo.get("baseRef")));
+            put(&mut r, "baseSha", s(repo.get("baseSha")));
+            put(&mut r, "cloneTimeoutMs", int(repo.get("cloneTimeoutMs")));
+            r.insert(
+                "submodules".into(),
+                Value::Bool(coerce_bool(repo.get("submodules"), false)),
+            );
+            put(&mut r, "authRef", s(repo.get("authRef")));
+            env.insert("repository".into(), Value::Object(r));
+        }
+    }
+
+    let empty = Map::new();
+    let branch = raw
+        .get("branch")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let mut b = Map::new();
+    put(&mut b, "base", s(branch.get("base")));
+    put(&mut b, "create", s(branch.get("create")));
+    b.insert(
+        "push".into(),
+        Value::Bool(coerce_bool(branch.get("push"), true)),
+    );
+    env.insert("branch".into(), Value::Object(b));
+
+    let setup = raw
+        .get("setup")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    // Node: `Array.isArray(setup.commands) ? setup.commands.map(String) : []`.
+    // Every element is `String(x)`, so a nested array joins with "," and an
+    // object is `"[object Object]"` — via the shared `js_stringify`, never JSON.
+    let strings = |v: Option<&Value>| -> Value {
+        Value::Array(
+            v.and_then(Value::as_array)
+                .map(|a| a.iter().map(|x| Value::String(js_stringify(x))).collect())
+                .unwrap_or_default(),
+        )
+    };
+    let mut st = Map::new();
+    st.insert("commands".into(), strings(setup.get("commands")));
+    st.insert(
+        "env".into(),
+        setup
+            .get("env")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
+    st.insert("secretRefs".into(), strings(setup.get("secretRefs")));
+    env.insert("setup".into(), Value::Object(st));
+
+    let task = raw.get("task").and_then(Value::as_object).unwrap_or(&empty);
+    let mut t = Map::new();
+    put(
+        &mut t,
+        "prompt",
+        prompt.map(|p| Value::String(p.to_string())),
+    );
+    put(&mut t, "promptFile", s(task.get("promptFile")));
+    put(&mut t, "maxIterations", int(task.get("maxIterations")));
+    put(&mut t, "timeoutMs", int(task.get("timeoutMs")));
+    put(&mut t, "idleTimeoutMs", int(task.get("idleTimeoutMs")));
+    put(
+        &mut t,
+        "recoveryWindowMs",
+        int(task.get("recoveryWindowMs")),
+    );
+    t.insert(
+        "allowPr".into(),
+        Value::Bool(coerce_bool(task.get("allowPr"), false)),
+    );
+    put(&mut t, "prBase", s(task.get("prBase")));
+    env.insert("task".into(), Value::Object(t));
+    Value::Object(env)
 }
 
 fn parse_repository(repo: &Map<String, Value>) -> Option<Repository> {
@@ -175,7 +569,13 @@ fn parse_repository(repo: &Map<String, Value>) -> Option<Repository> {
         url,
         ref_: repo.get("ref").and_then(as_str).filter(|s| !s.is_empty()),
         sha: repo.get("sha").and_then(as_str).filter(|s| !s.is_empty()),
-        depth: coerce_u(repo.get("depth")).map(|d| d as u32),
+        // A `u64 as u32` cast WRAPS, so a coerced depth at/above 2^32 (e.g.
+        // `4294967296`) silently becomes `0` and `provision` then omits
+        // `--depth` entirely — turning a bounded clone into a full one. Clamp
+        // with a checked conversion instead: an out-of-range depth saturates to
+        // `u32::MAX` (still a shallow bound git accepts) rather than wrapping to
+        // a value that drops the flag.
+        depth: coerce_u(repo.get("depth")).map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
         single_branch: coerce_bool(repo.get("singleBranch"), false),
         filter: repo
             .get("filter")
@@ -198,6 +598,403 @@ fn parse_repository(repo: &Map<String, Value>) -> Option<Repository> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalized_matches_node_normalize_task_envelope() {
+        // The shape the Node plugin forwards as the payload's `task` for a job
+        // carrying only a `prompt` variable (captured from plugin 1.69.x).
+        let vars = json!({ "prompt": "do it" });
+        let env = assemble(&Map::new(), vars.as_object().unwrap());
+        assert_eq!(
+            env.normalized,
+            json!({
+                "schemaVersion": 1,
+                "branch": { "push": true },
+                "setup": { "commands": [], "env": {}, "secretRefs": [] },
+                "task": { "prompt": "do it", "allowPr": false },
+            })
+        );
+    }
+
+    #[test]
+    fn coerce_bool_matches_node_true_false_sets() {
+        let v = |x: Value| coerce_bool(Some(&x), false);
+        // Whole true-set, case/whitespace-insensitive (incl. the formerly-missing "on").
+        for t in ["true", "1", "yes", "on", "ON", " On ", "YES"] {
+            assert!(v(json!(t)), "{t:?} should coerce true");
+        }
+        // Whole false-set, including empty string.
+        for f in ["false", "0", "no", "off", "", "OFF", " No "] {
+            assert!(!v(json!(f)), "{f:?} should coerce false");
+        }
+        // Booleans pass through; numbers stringify (1/0 recognised).
+        assert!(coerce_bool(Some(&json!(true)), false));
+        assert!(!coerce_bool(Some(&json!(false)), true));
+        assert!(coerce_bool(Some(&json!(1)), false));
+        assert!(!coerce_bool(Some(&json!(0)), true));
+        // Unrecognised value falls back to the DEFAULT (not hard-false) — the
+        // divergence that previously flipped a default-`true` field to false.
+        assert!(coerce_bool(Some(&json!("maybe")), true));
+        assert!(!coerce_bool(Some(&json!("maybe")), false));
+        assert!(coerce_bool(Some(&json!(2)), true));
+        // Absent / null yields the default.
+        assert!(coerce_bool(None, true));
+        assert!(!coerce_bool(Some(&Value::Null), false));
+    }
+
+    #[test]
+    fn coerce_bool_matches_node_js_stringification_for_arrays_and_objects() {
+        // Node stringifies ANY non-boolean value with `String(v)` before
+        // matching, so arrays/objects coerce by their JS stringification rather
+        // than a hard default. `String([])` is `""` (false), `String(["on"])`
+        // is `"on"` (true), `String({})` is `"[object Object]"` (unrecognised →
+        // default). A prior version returned the field default for every
+        // array/object, so `push: []` normalised to `true` and `allowPr:
+        // ["on"]` to `false` — both wrong.
+        // Empty array → "" → false regardless of the default.
+        assert!(!coerce_bool(Some(&json!([])), true));
+        assert!(!coerce_bool(Some(&json!([])), false));
+        // Single-element arrays stringify to the element: "on"/"true" → true,
+        // "off" → false (the false-set wins over a `true` default).
+        assert!(coerce_bool(Some(&json!(["on"])), false));
+        assert!(coerce_bool(Some(&json!(["true"])), false));
+        assert!(!coerce_bool(Some(&json!(["off"])), true));
+        // Multi-element arrays join with "," — "a,b" is unrecognised → default.
+        assert!(coerce_bool(Some(&json!(["a", "b"])), true));
+        assert!(!coerce_bool(Some(&json!(["a", "b"])), false));
+        // A plain object stringifies to "[object Object]" → unrecognised → default.
+        assert!(coerce_bool(Some(&json!({})), true));
+        assert!(!coerce_bool(Some(&json!({})), false));
+        // Nested values recurse through String(): [["on"]] → "on" → true.
+        assert!(coerce_bool(Some(&json!([["on"]])), false));
+        // Array.prototype.join renders null/undefined ELEMENTS as the empty
+        // string (unlike a top-level String(null) → "null", which coerce_bool
+        // pre-filters to the default anyway): String([null]) is "" (false),
+        // String([1,null,2]) is "1,,2" (unrecognised → default), and
+        // String([null,"on"]) is ",on" (unrecognised → default). A prior
+        // version joined null as the literal "null", so `push: [null]`
+        // normalised to `true` (the default) where Node yields `false`.
+        assert!(!coerce_bool(Some(&json!([null])), true));
+        assert!(!coerce_bool(Some(&json!([null])), false));
+        assert!(coerce_bool(Some(&json!([1, null, 2])), true));
+        assert!(!coerce_bool(Some(&json!([1, null, 2])), false));
+        assert!(coerce_bool(Some(&json!([null, "on"])), true));
+        assert!(!coerce_bool(Some(&json!([null, "on"])), false));
+        // Nested arrays recurse through join: [[null,"on"]] → ",on" → default.
+        assert!(coerce_bool(Some(&json!([[null, "on"]])), true));
+        assert!(!coerce_bool(Some(&json!([[null, "on"]])), false));
+    }
+
+    #[test]
+    fn string_and_int_fields_apply_node_string_v() {
+        // Node's `str(v) = String(v)` and `coerceInt(v) = parseInt(String(v),10)`
+        // run on EVERY value shape, not just strings — a "previously missed"
+        // parity gap where arrays were JSON-serialised or dropped instead of
+        // JS-stringified.
+        // String fields: String(["x"]) is "x"; String(["a","b"]) is "a,b";
+        // String({}) is "[object Object]" (NOT JSON); String(null) drops the field.
+        assert_eq!(as_str(&json!(["x"])).as_deref(), Some("x"));
+        assert_eq!(as_str(&json!(["a", "b"])).as_deref(), Some("a,b"));
+        assert_eq!(as_str(&json!({"k": 1})).as_deref(), Some("[object Object]"));
+        assert_eq!(as_str(&json!("s")).as_deref(), Some("s"));
+        assert_eq!(as_str(&json!(42)).as_deref(), Some("42"));
+        assert!(as_str(&json!(null)).is_none());
+        // Int fields: parseInt(String(["1000"])) → 1000 (was dropped); a
+        // multi-element array parses only its leading integer ("1,2" → 1); a
+        // non-numeric-leading value is NaN → absent.
+        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(json!(1000)));
+        assert_eq!(coerce_int(Some(&json!(["1", "2"]))), Some(json!(1)));
+        assert_eq!(coerce_int(Some(&json!(" 42abc"))), Some(json!(42)));
+        assert_eq!(coerce_int(Some(&json!("abc"))), None);
+        assert_eq!(coerce_int(Some(&json!([]))), None); // String([]) is "" → NaN
+        assert_eq!(coerce_int(Some(&json!(7))), Some(json!(7)));
+        assert_eq!(coerce_int(None), None);
+    }
+
+    #[test]
+    fn coerce_u_applies_node_string_v_to_unsigned_fields() {
+        // The unsigned sibling of `coerce_int` (`depth`, `cloneTimeoutMs`) must
+        // run the SAME `parseInt(String(v), 10)`: a non-string is JS-stringified
+        // before the leading integer is parsed, so an array is no longer dropped.
+        assert_eq!(coerce_u(Some(&json!(["5"]))), Some(5)); // depth: ["5"]
+        assert_eq!(coerce_u(Some(&json!(["30000"]))), Some(30000)); // cloneTimeoutMs
+        assert_eq!(coerce_u(Some(&json!(["1", "2"]))), Some(1)); // "1,2" → 1
+        assert_eq!(coerce_u(Some(&json!(" 42abc"))), Some(42));
+        assert_eq!(coerce_u(Some(&json!(7))), Some(7));
+        assert_eq!(coerce_u(Some(&json!(7.9))), Some(7)); // parseInt truncates
+        assert_eq!(coerce_u(Some(&json!("abc"))), None); // NaN → absent
+        assert_eq!(coerce_u(Some(&json!([]))), None); // String([]) is "" → NaN
+        assert_eq!(coerce_u(Some(&json!({}))), None); // "[object Object]" → NaN
+        assert_eq!(coerce_u(Some(&json!(-3))), None); // u64 guard: negative absent
+        assert_eq!(coerce_u(Some(&json!(null))), None);
+        assert_eq!(coerce_u(None), None);
+    }
+
+    #[test]
+    fn coerce_u_parses_large_numbers_the_js_way() {
+        // `String(v)` runs BEFORE `parseInt`, so a JSON number is stringified the
+        // JavaScript way first: `1e21` → `"1e+21"` → leading integer `1`. A
+        // numeric fast path that casts the `f64` instead saturates to
+        // `u64::MAX`, turning a 1 ms Node timeout into an unbounded one.
+        assert_eq!(coerce_u(Some(&json!(1e21))), Some(1)); // "1e+21" → 1
+        assert_eq!(coerce_u(Some(&json!(1e100))), Some(1)); // "1e+100" → 1
+        assert_eq!(coerce_u(Some(&json!(1e-7))), Some(1)); // "1e-7" → 1
+                                                           // A small sub-1 decimal is stringified the ECMAScript way — `0.000001`
+                                                           // → `"0.000001"` (NOT serde_json's `"1e-6"`) — so `parseInt` reads the
+                                                           // leading `0`, exactly as Node's `coerceInt(0.000001)` → `0`.
+        assert_eq!(coerce_u(Some(&json!(0.000001))), Some(0)); // "0.000001" → 0
+                                                               // A float within range still truncates like parseInt.
+        assert_eq!(coerce_u(Some(&json!(7.9))), Some(7));
+    }
+
+    #[test]
+    fn js_number_string_matches_ecmascript_number_to_string() {
+        // The normalizer's `String(number)` must reproduce ECMAScript
+        // `Number::toString`, not serde_json's JSON rendering. serde_json pads an
+        // integral float with `.0` and switches to exponential at different
+        // thresholds; each case below is a divergence serde_json gets wrong.
+        let cases: &[(&str, &str)] = &[
+            // Integral floats drop the `.0`.
+            ("100.0", "100"),
+            ("1.0", "1"),
+            ("9007199254740992.0", "9007199254740992"),
+            ("123456789.0", "123456789"),
+            // Small decimals stay decimal down to 1e-6 inclusive (serde says "1e-6").
+            ("0.000001", "0.000001"),
+            ("1e-5", "0.00001"),
+            ("0.0001", "0.0001"),
+            // …but exponential below 1e-6.
+            ("0.0000001", "1e-7"),
+            ("5e-324", "5e-324"),
+            // Large magnitudes stay decimal up to 1e21 exclusive…
+            ("1e15", "1000000000000000"),
+            ("1e16", "10000000000000000"),
+            ("1e20", "100000000000000000000"),
+            ("9.99e20", "999000000000000000000"),
+            // …and exponential at 1e21 and beyond.
+            ("1e21", "1e+21"),
+            ("9.99e21", "9.99e+21"),
+            ("1e100", "1e+100"),
+            ("1.7976931348623157e308", "1.7976931348623157e+308"),
+            // Ordinary decimals, signs, and integers.
+            ("7.9", "7.9"),
+            ("0.1", "0.1"),
+            ("0.30000000000000004", "0.30000000000000004"),
+            ("1234.5678", "1234.5678"),
+            ("-0.000001", "-0.000001"),
+            ("-1e21", "-1e+21"),
+            ("7", "7"),
+            ("-3", "-3"),
+            ("0", "0"),
+            ("-0.0", "0"),
+            // Integer-typed JSON numbers (i64/u64, no `.0`) beyond the safe
+            // range (|v| > 2^53) are NOT exactly representable as the double JS
+            // parses them to, so `String(Number)` renders the shortest decimal
+            // that round-trips to that rounded double — NOT the exact digits
+            // serde_json's integer fast path would emit. These must match V8.
+            ("9007199254740992", "9007199254740992"), // 2^53: still exact
+            ("9007199254740993", "9007199254740992"), // 2^53+1 rounds down
+            ("9223372036854775807", "9223372036854776000"), // i64::MAX
+            ("9223372036854775808", "9223372036854776000"), // 2^63 (u64, > i64::MAX)
+            ("18446744073709551615", "18446744073709552000"), // u64::MAX
+            ("-9007199254740993", "-9007199254740992"), // negative, unsafe
+        ];
+        for (input, want) in cases {
+            let v: Value = serde_json::from_str(input).unwrap();
+            let n = match &v {
+                Value::Number(n) => n,
+                _ => panic!("{input} is not a number"),
+            };
+            assert_eq!(&js_number_string(n), want, "String({input})");
+        }
+    }
+
+    #[test]
+    fn coerce_u_keeps_finite_numbers_beyond_i64_range() {
+        // parseInt yields a finite JavaScript Number for a digit run of ANY
+        // magnitude, so a decimal outside `i64` range must stay PRESENT — not
+        // overflow to `None` and silently drop the field (a dropped
+        // `cloneTimeoutMs` makes the clone run on the default timeout).
+        // `"9223372036854775808"` is past `i64::MAX`; Node parseInt yields the
+        // finite `9223372036854776000`, so the field survives (saturating to
+        // `u64` on the typed path) instead of being dropped.
+        assert!(coerce_u(Some(&json!("9223372036854775808"))).is_some());
+        // Above 2^53 the value rounds the JavaScript-double way, exactly as
+        // Node's `parseInt("9007199254740993")` → `9007199254740992`.
+        assert_eq!(
+            coerce_u(Some(&json!("9007199254740993"))),
+            Some(9007199254740992)
+        );
+    }
+
+    #[test]
+    fn parse_int_str_rounds_once_like_node_not_per_digit() {
+        // Regression: accumulating `acc * 10 + d` per digit re-rounds the
+        // intermediate after every multiply/add, which is NOT how JavaScript's
+        // `parseInt` rounds — the Number is the exact decimal value rounded
+        // ONCE to nearest-even. `"24558181542885634"` accumulates to
+        // `24558181542885636` digit-by-digit but is `24558181542885632` in Node
+        // (and in Rust's correctly-rounded `str::parse::<f64>`).
+        assert_eq!(
+            parse_int_str("24558181542885634"),
+            Some(24558181542885632.0)
+        );
+        assert_eq!(
+            coerce_u(Some(&json!("24558181542885634"))),
+            Some(24558181542885632)
+        );
+        assert_eq!(
+            coerce_int(Some(&json!("24558181542885634"))),
+            Some(json!(24558181542885632_i64)),
+        );
+        // The negative twin rounds toward the even midpoint the same way.
+        assert_eq!(
+            parse_int_str("-24558181542885634"),
+            Some(-24558181542885632.0)
+        );
+        // A digit run beyond the double range saturates to ±Infinity, exactly
+        // like Node's `parseInt("9".repeat(400))` → `Infinity`; the finite
+        // guards in `coerce_int`/`coerce_u` then drop it (Node's normalized
+        // envelope drops a non-finite Number too).
+        let huge = "9".repeat(400);
+        assert_eq!(parse_int_str(&huge), Some(f64::INFINITY));
+        assert!(coerce_int(Some(&json!(huge.clone()))).is_none());
+        assert!(coerce_u(Some(&json!(huge))).is_none());
+    }
+
+    #[test]
+    fn coerce_int_preserves_the_finite_number_without_i64_clamping() {
+        // parseInt keeps a finite JavaScript Number of ANY magnitude; the
+        // normalized field must preserve that Number, NOT clamp it to
+        // i64::MIN/MAX (which would silently change the value). Within i64 range
+        // the exact integer is kept — rounding above 2^53 the double way, like
+        // Node's parseInt("9007199254740993") → 9007199254740992.
+        assert_eq!(
+            coerce_int(Some(&json!("9007199254740993"))),
+            Some(json!(9007199254740992_i64)),
+        );
+        // Beyond i64 range the finite IEEE-754 double is kept, NOT clamped to
+        // i64::MIN/MAX. (The exact low digits of such a huge magnitude follow
+        // `parse_int_str`'s single correctly-rounded conversion; what matters
+        // here is that the value is preserved rather than saturated.)
+        let e20 = coerce_int(Some(&json!("100000000000000000000"))).unwrap();
+        assert_eq!(e20.as_f64(), Some(1e20));
+        assert_ne!(e20, json!(i64::MAX));
+        let neg_e20 = coerce_int(Some(&json!("-100000000000000000000"))).unwrap();
+        assert_eq!(neg_e20.as_f64(), Some(-1e20));
+        assert_ne!(neg_e20, json!(i64::MIN));
+        // A magnitude just past i64::MAX (2^63) is preserved as a double rather
+        // than saturated to i64::MAX (2^63 - 1).
+        let past = coerce_int(Some(&json!("9223372036854775808"))).unwrap();
+        assert!(past.as_f64().unwrap() >= 9223372036854775808.0);
+        assert_ne!(past, json!(i64::MAX));
+    }
+
+    #[test]
+    fn coerce_int_parses_large_numbers_the_js_way() {
+        // Same `parseInt(String(v), 10)` for the signed fields: the number is
+        // JS-stringified first, never cast, so a huge magnitude is not saturated.
+        assert_eq!(coerce_int(Some(&json!(1e21))), Some(json!(1))); // "1e+21" → 1
+        assert_eq!(coerce_int(Some(&json!(-1e21))), Some(json!(-1))); // "-1e+21" → -1
+        assert_eq!(coerce_int(Some(&json!(7.9))), Some(json!(7)));
+        assert_eq!(coerce_int(Some(&json!(-3))), Some(json!(-3)));
+        assert_eq!(coerce_int(Some(&json!(["1000"]))), Some(json!(1000)));
+        assert_eq!(coerce_int(Some(&json!(null))), None); // "null" → NaN
+    }
+
+    #[test]
+    fn repository_depth_and_clone_timeout_survive_array_input() {
+        // End-to-end through `parse_repository`: the daemon-side clone spec must
+        // keep a `depth`/`cloneTimeoutMs` delivered as a single-element array,
+        // exactly as Node's shared coerceInt parses it (a dropped `depth` loses
+        // the shallow clone; a dropped `cloneTimeoutMs` loses the clone timeout).
+        let headers = json!({
+            "io.nanobpm.agentTask": {
+                "repository": {
+                    "url": "https://h/o/r.git",
+                    "depth": ["5"],
+                    "cloneTimeoutMs": ["30000"],
+                }
+            }
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let repo = env.repository.expect("repository should parse");
+        assert_eq!(repo.depth, Some(5));
+        assert_eq!(repo.clone_timeout_ms, Some(30000));
+        // And the normalized payload agrees (it already used coerce_int).
+        assert_eq!(env.normalized["repository"]["depth"], json!(5));
+        assert_eq!(env.normalized["repository"]["cloneTimeoutMs"], json!(30000));
+    }
+
+    #[test]
+    fn repository_depth_at_or_above_u32_saturates_not_wraps() {
+        // A coerced depth at/above 2^32 must NOT wrap to 0 (which `provision`
+        // would treat as "no depth" and clone the full history); clamp it to
+        // `u32::MAX` so the shallow bound is preserved.
+        let headers = json!({
+            "io.nanobpm.agentTask": {
+                "repository": { "url": "https://h/o/r.git", "depth": 4294967296u64 }
+            }
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let repo = env.repository.expect("repository should parse");
+        assert_eq!(repo.depth, Some(u32::MAX));
+    }
+
+    #[test]
+    fn normalize_applies_string_v_to_promptfile_timeout_and_commands() {
+        // End-to-end through `normalize`: `promptFile: ["x"]` → "x",
+        // `timeoutMs: ["1000"]` → 1000, and a non-string setup command is
+        // String()-mapped (a nested array joins with ",").
+        let raw = json!({
+            "task": { "prompt": "p", "promptFile": ["x"], "timeoutMs": ["1000"] },
+            "setup": { "commands": ["echo hi", ["a", "b"], 7] },
+        });
+        let n = normalize(raw.as_object().unwrap(), None);
+        assert_eq!(n["task"]["promptFile"], json!("x"));
+        assert_eq!(n["task"]["timeoutMs"], json!(1000));
+        assert_eq!(n["setup"]["commands"], json!(["echo hi", "a,b", "7"]));
+    }
+
+    #[test]
+    fn on_normalizes_true_across_bool_fields() {
+        // "on" must normalize to true for every coerced boolean field (Node parity).
+        let headers = json!({
+            "io.nanobpm.agentTask.repository.url": "https://h/o/r.git",
+            "io.nanobpm.agentTask.repository.singleBranch": "on",
+            "io.nanobpm.agentTask.repository.submodules": "on",
+            "io.nanobpm.agentTask.task.allowPr": "on",
+            "io.nanobpm.agentTask.task.prompt": "p",
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let n = &env.normalized;
+        assert_eq!(n["repository"]["singleBranch"], true);
+        assert_eq!(n["repository"]["submodules"], true);
+        assert_eq!(n["task"]["allowPr"], true);
+        // And the typed envelope agrees.
+        let repo = env.repository.unwrap();
+        assert!(repo.single_branch);
+        assert!(repo.submodules);
+    }
+
+    #[test]
+    fn normalized_coerces_header_strings() {
+        let headers = json!({
+            "io.nanobpm.agentTask.repository.url": "https://h/o/r.git",
+            "io.nanobpm.agentTask.repository.depth": "5",
+            "io.nanobpm.agentTask.branch.push": "false",
+            "io.nanobpm.agentTask.task.allowPr": "true",
+            "io.nanobpm.agentTask.task.prompt": "p",
+        });
+        let env = assemble(headers.as_object().unwrap(), &Map::new());
+        let n = &env.normalized;
+        assert_eq!(n["repository"]["provider"], "github");
+        assert_eq!(n["repository"]["depth"], 5);
+        assert_eq!(n["repository"]["singleBranch"], false);
+        assert_eq!(n["branch"]["push"], false);
+        assert_eq!(n["task"]["allowPr"], true);
+        assert_eq!(n["task"]["prompt"], "p");
+    }
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()

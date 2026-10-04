@@ -50,11 +50,18 @@ fn job_prompt_variable_becomes_the_agent_prompt() {
         &[],
         &[],
     );
-    let record = outcome.record();
+    // The agent is prompted with the JSON job payload (the Node plugin's
+    // `buildAgentPayload`), carrying the job's `prompt` both at the top level
+    // and inside the normalised task envelope.
+    let payload = outcome.payload();
+    assert_eq!(payload["prompt"], prompt, "payload: {payload:#}");
     assert_eq!(
-        record.first_prompt(),
-        Some(prompt),
-        "the agent should be prompted with the job's `prompt` variable; worker stderr:\n{}",
-        outcome.stderr()
+        payload["task"]["task"]["prompt"], prompt,
+        "payload: {payload:#}"
     );
+    assert_eq!(payload["task"]["schemaVersion"], 1, "payload: {payload:#}");
+    assert_eq!(payload["jobType"], outcome.job_type.as_str());
+    assert_eq!(payload["variables"]["prompt"], prompt);
+    assert!(payload["jobKey"].is_string(), "payload: {payload:#}");
+    assert_eq!(payload["profile"]["rank"], "junior", "payload: {payload:#}");
 }

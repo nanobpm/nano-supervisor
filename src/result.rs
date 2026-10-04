@@ -15,7 +15,8 @@ pub const RESULT_SENTINEL: &str = "::nano:result::";
 const MAX_RESULT_FILE_BYTES: u64 = 1_048_576; // 1 MiB
 
 /// Keys the harness owns — an agent's returned result can never overwrite these
-/// (nor anything in the reserved `io.nanobpm.*` namespace).
+/// (nor anything in the reserved `io.nanobpm.*` namespace). Exactly the Node
+/// plugin's `RESERVED_RESULT_KEYS`.
 const RESERVED_RESULT_KEYS: &[&str] = &[
     "output",
     "exitCode",
@@ -32,14 +33,6 @@ const RESERVED_RESULT_KEYS: &[&str] = &[
     "branchMismatch",
     "scanError",
     "worldMarker",
-    // Host-stamped completion vars (set by the harness in `slot::execute` /
-    // `worker::run` AFTER the effectiveness check). They must be reserved so an
-    // agent cannot return e.g. `{"agentWorker":"x"}` — a value the host would
-    // overwrite anyway — to make `has_effective_result_vars` return true and slip
-    // an otherwise-empty result past the empty-result guard.
-    "agentResult",
-    "agentWorker",
-    "agentStopReason",
 ];
 
 const PROTO_POLLUTION_KEYS: &[&str] = &["__proto__", "constructor", "prototype"];
@@ -240,6 +233,31 @@ pub fn has_effective_result_vars(obj: &Map<String, Value>) -> bool {
     sanitize_result_vars(obj).values().any(|v| !v.is_null())
 }
 
+/// Select the agent's result across ordered candidate sources, mirroring the
+/// Node plugin 1.70.1. The plugin walks file → stdout → ACP-outcome in order and
+/// keeps going until a source yields EFFECTIVE result vars, rather than stopping
+/// at the first source that merely *parses*. A result file of `{}` (or
+/// reserved-/null-only data) must therefore not shadow a usable stdout sentinel
+/// or ACP outcome written in the same run. When no source is effective, the
+/// first present candidate is returned unchanged so empty detection still has a
+/// shape to inspect (and so a value-less sentinel is still surfaced, not lost).
+pub fn select_effective_result<I>(candidates: I) -> Option<Map<String, Value>>
+where
+    I: IntoIterator<Item = Option<Map<String, Value>>>,
+{
+    let mut first: Option<Map<String, Value>> = None;
+    for candidate in candidates {
+        let Some(obj) = candidate else { continue };
+        if has_effective_result_vars(&obj) {
+            return Some(obj);
+        }
+        if first.is_none() {
+            first = Some(obj);
+        }
+    }
+    first
+}
+
 /// Remove from `stdout` only the value-less result markers (an empty /
 /// reserved-only / null-valued `::nano:result::` sentinel or ```` ```json ````
 /// fence). Substantive prose survives, so it still attests real work.
@@ -278,26 +296,56 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
     result
 }
 
-/// The empty-job detector. A run that produced NOTHING — no effective result
-/// vars and no substantive stdout (after value-less result markers/fences are
-/// stripped) — did no work: completing it would silently drop whatever the job
-/// carried, so the caller FAILS the job (preserving retries) instead. Note that
-/// neither raw ACP `session/update` activity (tool-call/status notifications
-/// without any assistant text) nor a lone value-less `::nano:result::` marker
-/// counts as work — both leave nothing substantive behind and so are failed
-/// rather than settled empty. Returns a reason when the run is empty.
-pub fn detect_empty(result_vars: Option<&Map<String, Value>>, stdout: &str) -> Option<String> {
+/// The empty-job detector — the Node plugin's `detectEmptyAgentJob`. A run that
+/// produced NOTHING — no effective result vars, no substantive stdout (after
+/// value-less result markers/fences are stripped), no transcript turns (ACP
+/// `session/update` activity) and no repository work — did no work: completing
+/// it would silently drop whatever the job carried, so the caller FAILS the job
+/// instead. Returns the Node plugin's reason text when the run is empty.
+///
+/// `has_commits` / `has_pushed` are the plugin's `gitResult.commits.length > 0`
+/// and `gitResult.pushed === true` signals: a repository agent that commits or
+/// pushes real work but emits no stdout/result is NOT empty and must complete,
+/// not be failed into a retry. The Rust worker has no `finalizeGit` push stage
+/// yet, so the caller derives `has_commits` from a pre/post `rev-parse` of the
+/// checkout HEAD (any advance = a commit) and passes `has_pushed: false`.
+///
+/// `has_outcome` is the plugin's ACP-outcome signal: an agent that emitted an
+/// explicit prompt outcome (e.g. `blocked`) did work and reported it, so the run
+/// is NOT empty even when the outcome carried no effective vars of its own.
+pub fn detect_empty(
+    result_vars: Option<&Map<String, Value>>,
+    stdout: &str,
+    has_turns: bool,
+    has_commits: bool,
+    has_pushed: bool,
+    has_outcome: bool,
+) -> Option<String> {
     if result_vars.is_some_and(has_effective_result_vars) {
         return None;
     }
     if !stdout_stripped_of_empty_result(stdout).trim().is_empty() {
         return None;
     }
+    if has_turns {
+        return None;
+    }
+    // Node: `if ((gitResult?.commits?.length ?? 0) > 0) return null;` then
+    // `if (gitResult?.pushed === true) return null;` — repository work alone
+    // (commits or a push) is evidence the run was not a no-op husk.
+    if has_commits || has_pushed {
+        return None;
+    }
+    // Plugin 1.70.1: any explicit ACP prompt outcome also counts as evidence the
+    // run did real work, so a blocked/outcome-bearing turn is not failed as empty.
+    if has_outcome {
+        return None;
+    }
     Some(
-        "agent produced nothing — no result vars and no substantive output (only tool/status \
-         activity or a value-less result marker). This is the signature of a protocol-mismatched \
-         or no-op harness; completing the job would silently drop what it carried, so it is failed \
-         (retries preserved) instead of completed."
+        "agent exited 0 but produced nothing — no result vars, no output, no transcript turns, \
+         no commits and no push. This is the signature of a protocol-mismatched or no-op harness \
+         (e.g. an ACP-mode binary driven over protocol \"pipe\"): completing the job would silently \
+         drop what it carried, so it is failed (retries preserved) instead of completed."
             .to_string(),
     )
 }
@@ -344,7 +392,7 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_sentinel() {
         let out = "::nano:result:: {}\n";
-        assert!(detect_empty(None, out).is_some());
+        assert!(detect_empty(None, out, false, false, false, false).is_some());
     }
 
     #[test]
@@ -355,7 +403,7 @@ mod tests {
         // at offset 0 and leave the fence residue behind.
         let out = "```json\n```\n";
         assert!(
-            detect_empty(None, out).is_some(),
+            detect_empty(None, out, false, false, false, false).is_some(),
             "empty fence should not count as work"
         );
     }
@@ -363,19 +411,19 @@ mod tests {
     #[test]
     fn empty_when_only_valueless_fence() {
         let out = "```json\n{}\n```\n";
-        assert!(detect_empty(None, out).is_some());
+        assert!(detect_empty(None, out, false, false, false, false).is_some());
     }
 
     #[test]
     fn not_empty_with_prose_fence() {
         // A non-empty, non-result fenced block is genuine output and is kept.
         let out = "```\nsome code the agent wrote\n```\n";
-        assert!(detect_empty(None, out).is_none());
+        assert!(detect_empty(None, out, false, false, false, false).is_none());
     }
 
     #[test]
     fn not_empty_with_substantive_stdout() {
-        assert!(detect_empty(None, "did real work\n").is_none());
+        assert!(detect_empty(None, "did real work\n", false, false, false, false).is_none());
     }
 
     #[test]
@@ -384,13 +432,87 @@ mod tests {
         // assistant text) and no structured result produced nothing to settle;
         // with no substantive stdout it must be failed, not silently completed.
         // (Finding: tool-only ACP updates must not bypass empty-run detection.)
-        assert!(detect_empty(None, "").is_some());
+        assert!(detect_empty(None, "", false, false, false, false).is_some());
+        // Transcript turns (ACP session/update activity) count as work, as in Node.
+        assert!(detect_empty(None, "", true, false, false, false).is_none());
     }
 
     #[test]
     fn not_empty_with_effective_vars() {
         let o = obj(json!({"status":"done"}));
-        assert!(detect_empty(Some(&o), "").is_none());
+        assert!(detect_empty(Some(&o), "", false, false, false, false).is_none());
+    }
+
+    #[test]
+    fn not_empty_with_commits_or_push() {
+        // Node's `gitResult.commits.length > 0` / `gitResult.pushed === true`:
+        // a repository agent that committed or pushed real work is NOT empty
+        // even with no result vars, no stdout and no transcript turns — failing
+        // it would burn a retry (the advisory this regression pins).
+        assert!(
+            detect_empty(None, "", false, true, false, false).is_none(),
+            "a commit alone must mark the run non-empty"
+        );
+        assert!(
+            detect_empty(None, "", false, false, true, false).is_none(),
+            "a push alone must mark the run non-empty"
+        );
+        // …but with neither, the otherwise-empty run is still failed.
+        assert!(detect_empty(None, "", false, false, false, false).is_some());
+    }
+
+    #[test]
+    fn not_empty_with_explicit_outcome() {
+        // Plugin 1.70.1: an explicit ACP prompt outcome is evidence of real work
+        // even when it carried no effective vars of its own, so the run is not
+        // failed as empty (the advisory this regression pins).
+        assert!(
+            detect_empty(None, "", false, false, false, true).is_none(),
+            "an explicit ACP outcome must mark the run non-empty"
+        );
+    }
+
+    #[test]
+    fn select_effective_skips_valueless_file_for_stdout() {
+        // A `{}` (ineffective) result file must not shadow a usable stdout
+        // sentinel or ACP outcome: selection walks on to the first EFFECTIVE
+        // source (plugin 1.70.1), not merely the first that parses.
+        let file = obj(json!({}));
+        let stdout = obj(json!({"status":"ok"}));
+        let picked = select_effective_result([Some(file), Some(stdout.clone()), None]).unwrap();
+        assert_eq!(picked["status"], json!("ok"));
+    }
+
+    #[test]
+    fn select_effective_prefers_first_effective_source() {
+        // When an earlier source is already effective, it wins — later sources
+        // (even if also effective) do not override it.
+        let file = obj(json!({"status":"file"}));
+        let stdout = obj(json!({"status":"stdout"}));
+        let picked = select_effective_result([Some(file), Some(stdout)]).unwrap();
+        assert_eq!(picked["status"], json!("file"));
+    }
+
+    #[test]
+    fn select_effective_uses_acp_outcome_fallback() {
+        // No file, an ineffective stdout object, but an effective ACP outcome:
+        // the outcome is the selected effective result.
+        let outcome = obj(json!({"status":"blocked","question":"why?"}));
+        let picked = select_effective_result([None, Some(obj(json!({}))), Some(outcome)]).unwrap();
+        assert_eq!(picked["status"], json!("blocked"));
+    }
+
+    #[test]
+    fn select_effective_returns_first_present_when_none_effective() {
+        // With no effective source, the first present candidate is still
+        // returned (so a value-less sentinel is surfaced, not silently lost).
+        let picked = select_effective_result([None, Some(obj(json!({}))), None]).unwrap();
+        assert!(picked.is_empty());
+    }
+
+    #[test]
+    fn select_effective_none_when_no_candidates() {
+        assert!(select_effective_result([None, None]).is_none());
     }
 
     #[test]

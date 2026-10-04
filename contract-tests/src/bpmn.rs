@@ -1,6 +1,9 @@
 //! Tiny BPMN generator: one process with a single service task, so an engine
 //! test can deploy a fresh process with a unique job type and create an instance
 //! carrying whatever variables the test needs. Mirrors `spike/spike.bpmn`.
+//! The task carries the canonical external-agent marker
+//! (`<zeebe:agentDefinition agentType="external"/>`), as every production agent task does:
+//! the Node worker opens an AgentInstance for it, and without it takes an error path.
 
 /// A one-task process definition `process_id` whose service task has
 /// `jobType = job_type`. Deploy it, then create an instance to enqueue one job.
@@ -17,6 +20,7 @@ pub fn single_task(process_id: &str, job_type: &str) -> String {
     <bpmn:serviceTask id="task" name="work">
       <bpmn:extensionElements>
         <zeebe:taskDefinition type="{job_type}"/>
+        <zeebe:agentDefinition agentType="external"/>
       </bpmn:extensionElements>
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>

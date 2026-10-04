@@ -275,7 +275,7 @@ pub fn watch(agent_pid: u32) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        crate::worker::log(&format!(
+        crate::runtime::log(&format!(
             "warning: parent-death watchdog failed to spawn for pid {agent_pid}: {e}"
         ));
     }

@@ -1,11 +1,10 @@
 //! nano-supervisor — job worker.
 //!
-//! `nano-supervisor work` (alias `spike`) runs ONE worker slot: poll a job type
-//! through `camunda-orchestration-sdk`, keep each activation alive, drive an
-//! agent over ACP, and complete/fail the job. It exists to measure memory and to
-//! decide between the SDK's `JobWorker` and our own slot loop (see issue #1), and
-//! is the Rust target the black-box contract-test suite drives (`NS_TARGET=rust`,
-//! issues #3/#4) alongside `c8 nano work` (Node).
+//! `nano-supervisor work <hire>` runs ONE worker for a hired profile — the Rust
+//! counterpart of the Node plugin's `c8 nano work <profile>`, and the Rust target
+//! the black-box contract-test suite drives (`NS_TARGET=rust`) alongside it.
+//! `nano-supervisor daemon` runs N slots per hire over one engine connection.
+//! Both share one job core ([`slot`]) that mirrors the Node plugin's behaviour.
 
 mod acp;
 mod daemon;
@@ -19,23 +18,24 @@ mod provision;
 mod result;
 // Linux-only: `openat2(RESOLVE_NO_SYMLINKS)` pinned-handle hardening for the
 // run-dir sweep/provision paths. Other Unix platforms use the path-based checks.
+mod runtime;
 #[cfg(target_os = "linux")]
 mod saferoot;
 mod slot;
 mod state;
-mod worker;
+mod work;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
     name = "nano-supervisor",
     version,
-    about = "Rust supervisor and job workers for Nano BPM agents (spike)"
+    about = "Rust supervisor and job workers for Nano BPM agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,20 +44,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run one worker slot for a job type.
-    #[command(visible_alias = "spike")]
+    /// Run one worker for a hired profile — the Rust `c8 nano work <profile>`.
     Work {
-        /// Job type to service.
-        #[arg(long)]
-        job_type: String,
+        /// The hired profile (from config.json) to run.
+        hire: String,
+        /// Extra job type to service on top of the hire's rank×capability
+        /// matrix (repeatable).
+        #[arg(long = "job-type")]
+        job_type: Vec<String>,
         /// c8ctl connection profile (default: c8ctl's active profile, else CAMUNDA_* env).
         #[arg(long)]
         profile: Option<String>,
-        /// Agent command, parsed with shell-style quoting, e.g. "nano-coder
-        /// --acp" or "'/path with spaces/agent' --acp".
-        #[arg(long, default_value = "nano-coder --acp")]
-        agent: String,
-        /// Worker name reported to the engine (default ‹host›-spike-‹pid›).
+        /// Worker name reported to the engine (default ‹host›-nano-‹hire›-‹pid›).
         #[arg(long)]
         name: Option<String>,
         /// Activation window in ms, refreshed every third while the agent runs (floored
@@ -70,29 +68,35 @@ enum Cmd {
         /// Long-poll window for each activation request, in ms.
         #[arg(long, default_value_t = 30_000)]
         poll_timeout: u64,
-        /// Directory for per-job working directories.
-        #[arg(long)]
-        runs_dir: Option<PathBuf>,
-        /// Ask the engine for job leases (fails loudly if the engine doesn't issue them).
-        #[arg(long)]
-        with_lease: bool,
-        /// Exit after this many jobs.
-        #[arg(long)]
-        max_jobs: Option<usize>,
-        /// Keep the N most recent per-job run directories; older ones are reaped.
-        #[arg(long)]
-        keep_runs: Option<usize>,
-        /// Refuse to take work when free disk under the run directory is below this (MiB).
+        /// Per-git-operation timeout while provisioning a repo, in ms.
+        #[arg(long, default_value_t = 120_000)]
+        clone_timeout: u64,
+        /// Reap run directories older than this (ms, or e.g. `30s`), at startup and
+        /// every --reap-interval.
+        #[arg(long, value_parser = parse_duration, default_value = "3600000")]
+        reap_age: Duration,
+        /// Run-directory reaper cadence (ms, or e.g. `60s`).
+        #[arg(long, value_parser = parse_duration, default_value = "300000")]
+        reap_interval: Duration,
+        /// Keep per-job run directories instead of removing them.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value = "false")]
+        keep_runs: bool,
+        /// Free-disk admission floor in MiB — container sandboxes only (accepted
+        /// for parity with the Node plugin; host jobs are not gated).
         #[arg(long)]
         min_free_mb: Option<u64>,
-        /// Reap run directories older than this, on startup and each sweep (e.g. `30s`, `500ms`).
-        #[arg(long, value_parser = parse_duration)]
-        reap_age: Option<Duration>,
-        /// Sweep the run directory for stale directories on this cadence (e.g. `60s`).
-        #[arg(long, value_parser = parse_duration)]
-        reap_interval: Option<Duration>,
-        /// Job command transport: `sdk`, `nano` (raw HTTP, Nano's `leaseToken`
-        /// field), or `auto` (= `nano` with --with-lease, else `sdk`).
+        /// Directory for per-job working directories (default: a per-worker
+        /// namespace under the state home's `agent-runs/`).
+        #[arg(long)]
+        runs_dir: Option<PathBuf>,
+        /// Override the config.json path (default: the c8ctl-nano state home).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Exit after handling this many jobs.
+        #[arg(long)]
+        max_jobs: Option<usize>,
+        /// Job command transport: `sdk` (default via `auto`) or `nano` (raw HTTP,
+        /// legacy `leaseToken` dialect for engines older than 0.0.24).
         #[arg(long, default_value = "auto")]
         job_api: String,
     },
@@ -130,8 +134,8 @@ enum Cmd {
         /// Ask the engine for job leases (fails loudly if the engine doesn't issue them).
         #[arg(long)]
         with_lease: bool,
-        /// Job command transport: `sdk`, `nano`, or `auto` (= `nano` with
-        /// --with-lease, else `sdk`).
+        /// Job command transport: `sdk` (default via `auto`) or `nano` (raw HTTP,
+        /// legacy `leaseToken` dialect for engines older than 0.0.24).
         #[arg(long, default_value = "auto")]
         job_api: String,
     },
@@ -168,57 +172,42 @@ fn clamp_recovery_window(ms: u64) -> Duration {
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Work {
+            hire,
             job_type,
             profile,
-            agent,
             name,
             recovery_window,
             idle_timeout,
             poll_timeout,
-            runs_dir,
-            with_lease,
-            max_jobs,
-            keep_runs,
-            min_free_mb,
+            clone_timeout,
             reap_age,
             reap_interval,
+            keep_runs,
+            min_free_mb,
+            runs_dir,
+            config,
+            max_jobs,
             job_api,
         } => {
-            // Shell-style split so an executable path or argument containing
-            // spaces can be preserved by quoting it (plain unquoted commands
-            // behave exactly like whitespace splitting).
-            let Some(mut parts) = shlex::split(&agent).map(Vec::into_iter) else {
-                bail!("--agent has unbalanced quotes: {agent:?}")
-            };
-            let Some(program) = parts.next() else {
-                bail!("--agent is empty")
-            };
-            let (_resolved, jobs) = engine::connect(
-                profile.as_deref(),
-                engine::JobApi::parse(&job_api)?,
-                with_lease,
-            )?;
-            let opts = worker::WorkerOptions {
-                job_type,
-                name_generated: name.is_none(),
-                worker_name: name.unwrap_or_else(default_name),
-                agent_program: program,
-                agent_args: parts.collect(),
+            work::run(work::WorkOptions {
+                hire,
+                job_types: job_type,
+                profile,
+                job_api: engine::JobApi::parse(&job_api)?,
+                name,
                 recovery_window: clamp_recovery_window(recovery_window),
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
-                runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
-                with_lease,
+                clone_timeout: Duration::from_millis(clone_timeout),
+                runs_dir,
+                config_path: config,
                 max_jobs,
                 keep_runs,
                 min_free_mb,
                 reap_age,
                 reap_interval,
-            };
-            tokio::select! {
-                r = worker::run(jobs, opts) => r,
-                _ = tokio::signal::ctrl_c() => { worker::log("interrupted"); Ok(()) }
-            }
+            })
+            .await
         }
         Cmd::Daemon {
             profile,
@@ -296,18 +285,6 @@ fn current_user_id() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "shared".to_string())
-}
-
-fn default_name() -> String {
-    let host = std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "host".into());
-    format!("{host}-spike-{}", std::process::id())
 }
 
 /// Parse a duration flag: a bare number is milliseconds, or a `ms`/`s`/`m`/`h`

@@ -40,7 +40,7 @@ Never point this at a production engine: it takes any job matching a hire's matr
 ```sh
 c8 nano start                                   # local cluster on :8080
 # hire an agent first (persists into config.json):
-c8ctl nano hire --name coder --rank senior --command copilot --capabilities pr-review
+c8 nano hire --name coder --rank senior --command copilot --capabilities pr-review
 
 cargo build --release
 target/release/nano-supervisor daemon --profile local --with-lease --slots 1

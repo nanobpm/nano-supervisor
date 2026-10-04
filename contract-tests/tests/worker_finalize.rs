@@ -26,32 +26,28 @@ fn agent_reported_pr_is_forwarded() {
         &[],
         &[],
     );
-    assert_eq!(outcome.result_file().unwrap()["pr"], "nanobpm/x#7");
-    // The agent's own result file is necessary but not sufficient: a worker that
-    // ignored the reported PR would still leave that file intact. Assert the
-    // *worker's* behaviour from its log — it forwarded the reported PR (which is
-    // exactly the branch that sets the `agentPr` completion variable) and took
-    // the "no fallback branch" path, so no `nano/agent-work/...` fallback was
-    // created.
-    let logs = outcome.stderr();
-    assert!(
-        logs.contains("agent reported PR nanobpm/x#7; forwarding it (no fallback branch)"),
-        "worker must forward the agent-reported PR (setting agentPr), not invent a fallback: {logs}"
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "stderr:\n{}",
+        outcome.stderr()
     );
+    // The agent's PR reaches the process as a result variable; the worker does
+    // not invent a branch of its own.
+    let vars = outcome.variables();
+    assert_eq!(vars["pr"], "nanobpm/x#7", "{vars:#?}");
+    assert_eq!(vars["status"], "opened", "{vars:#?}");
     assert!(
-        !logs.contains("nano/agent-work/"),
-        "worker must not create a fallback branch when the agent reported a PR: {logs}"
+        !vars.contains_key("branch"),
+        "no fallback branch: {vars:#?}"
     );
 }
 
-/// An agent that commits but opens no PR falls back to a `nano/agent-work/...`
-/// branch so the work is never lost. The agent provisions a real git repo with
-/// a commit and a reachable `origin` in its run dir, so the worker's finalize
-/// path genuinely creates **and pushes** the fallback branch (rather than
-/// short-circuiting on a non-repo cwd and logging the branch name from the
-/// "not created" path).
+/// The fallback `nano/agent-work/…` branch is only created for a repository
+/// the worker provisioned. A job without a `repository` runs in a scratch dir;
+/// even if the agent commits there, the worker pushes nothing.
 #[test]
-fn no_pr_falls_back_to_nano_agent_work_branch() {
+fn unprovisioned_run_creates_no_fallback_branch() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
@@ -61,18 +57,25 @@ fn no_pr_falls_back_to_nano_agent_work_branch() {
         &target,
         "finalize-fallback",
         &[
-            // Provision a repo with a commit and a local bare `origin` the
-            // fallback push can actually reach, all inside the run dir.
             json!({ "shell": "git init -q && git init -q --bare origin.git && git remote add origin origin.git && git -c user.email=t@example.com -c user.name=tester commit -q --allow-empty -m 'agent work'" }),
             json!({ "emit": "committed but opened no PR" }),
+            json!({ "write_result": { "status": "committed" } }),
         ],
         json!({ "prompt": "just commit" }),
         &[],
         &[],
     );
-    let logs = outcome.stderr();
-    assert!(
-        logs.contains("pushed fallback branch nano/agent-work/"),
-        "the worker should create AND push a nano/agent-work/ fallback branch; stderr:\n{logs}"
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "stderr:\n{}",
+        outcome.stderr()
     );
+    let vars = outcome.variables();
+    for k in ["branch", "commits", "pushed", "pullRequest"] {
+        assert!(
+            !vars.contains_key(k),
+            "unexpected `{k}` for an unprovisioned run: {vars:#?}"
+        );
+    }
 }

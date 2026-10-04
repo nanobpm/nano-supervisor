@@ -1,42 +1,49 @@
-//! **Leases**: `--with-lease`, the refresh cadence (every third of
-//! `--recovery-window`), and fencing on complete, fail and throw-error. Losing
-//! the lease stops the agent and does **not** settle the job — the engine hands
-//! it out again. All of this needs a live engine and skips without one.
+//! **Leases**: the worker takes a lease on every activation (engine 0.0.24
+//! issues `jobLeaseToken`), refreshes it every third of `--recovery-window`, and
+//! fences complete/fail with it. Observed at the engine: a long run still
+//! completes exactly once. All of this needs a live engine and skips without one.
 
 use contract_tests::{require_engine_and_target, run_worker_job, skip, Skip};
 use serde_json::json;
 
-/// With a lease, the worker refreshes the activation roughly every third of the
-/// recovery window while the agent works.
+/// A job whose agent runs longer than the activation window still completes,
+/// exactly once: the worker refreshes the activation so the engine never times
+/// it out and re-dispatches it.
 #[test]
 fn leased_worker_refreshes_every_third_of_the_window() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    // A 3s window means a refresh ~every 1s; the agent works for ~2.5s.
     let outcome = run_worker_job(
         &engine,
         &target,
         "lease-refresh",
         &[
-            json!({ "sleep_ms": 2500 }),
+            json!({ "sleep_ms": 4500 }),
             json!({ "emit": "done" }),
             json!({ "write_result": { "ok": true } }),
         ],
         json!({ "prompt": "take your time" }),
-        &["--with-lease", "--recovery-window", "3000"],
+        &["--recovery-window", "3000"],
         &[],
     );
-    let logs = outcome.stderr();
-    assert!(
-        logs.contains("refresh") || logs.contains("refreshes="),
-        "the worker should refresh the lease while the agent works; stderr:\n{logs}"
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "a refreshed activation must survive past its window; stderr:\n{}",
+        outcome.stderr()
     );
+    assert_eq!(
+        outcome.record().runs,
+        1,
+        "the job must not be re-dispatched"
+    );
+    assert_eq!(outcome.variables()["ok"], true);
 }
 
-/// Every settling command carries the lease token, so a superseded worker is
-/// fenced (409) rather than silently settling someone else's activation.
+/// Settling under a lease is accepted: the fenced completion lands and carries
+/// the result.
 #[test]
 fn settling_commands_are_fenced_by_the_lease_token() {
     let (engine, target) = match require_engine_and_target() {
@@ -52,40 +59,113 @@ fn settling_commands_are_fenced_by_the_lease_token() {
             json!({ "write_result": { "ok": true } }),
         ],
         json!({ "prompt": "complete under lease" }),
-        &["--with-lease", "--recovery-window", "9000"],
+        &["--recovery-window", "9000"],
         &[],
     );
-    let logs = outcome.stderr();
-    assert!(
-        logs.contains("lease"),
-        "a leased run should mention the lease in its log; stderr:\n{logs}"
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "stderr:\n{}",
+        outcome.stderr()
     );
+    assert_eq!(outcome.variables()["ok"], true);
 }
 
-/// Losing the activation (404/409 on refresh) stops the agent and leaves the job
-/// unsettled: the log says so and no completion is emitted.
+/// The lease token is an actual FENCE, not a no-op: a settlement that carries a
+/// WRONG token is rejected, while the worker's token-bearing settlement (the
+/// test above) succeeds. `settling_commands_are_fenced_by_the_lease_token`
+/// alone cannot prove this — an unfenced completion is also accepted, so it
+/// passes even if activation never requested a lease or completion omitted the
+/// token. Here we activate a job directly over REST, observe its lease token,
+/// and confirm the engine rejects a completion whose token does not match.
 #[test]
-fn losing_the_lease_stops_the_agent_without_settling() {
-    let (engine, target) = match require_engine_and_target() {
+fn settlement_with_a_wrong_lease_token_is_rejected() {
+    let (engine, _target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    // The agent would run long, but the test infrastructure is expected to revoke
-    // the activation out from under it; here we only assert the log contract.
-    let outcome = run_worker_job(
-        &engine,
-        &target,
-        "lease-lost",
-        &[json!({ "sleep_ms": 4000 }), json!({ "emit": "late" })],
-        json!({ "prompt": "run long" }),
-        &["--with-lease", "--recovery-window", "3000"],
-        &[],
+    // Deploy a job and activate it WITH a lease, straight over REST.
+    let job_type = engine.unique_type("lease-fence-reject");
+    let process_id = format!("p-{job_type}");
+    engine
+        .deploy_bpmn(
+            &process_id,
+            &contract_tests::bpmn::single_task(&process_id, &job_type),
+        )
+        .expect("deploy bpmn");
+    engine
+        .create_instance(&process_id, json!({}))
+        .expect("create instance");
+
+    let activated = engine
+        .http()
+        .post(format!("{}/v2/jobs/activation", engine.url()))
+        .json(&json!({
+            "type": job_type,
+            "timeout": 30000,
+            "maxJobsToActivate": 1,
+            "worker": "lease-fence-probe",
+            "requestTimeout": 5000,
+            "withLease": true,
+        }))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json::<serde_json::Value>())
+        .expect("activate with lease");
+    let job = activated["jobs"]
+        .as_array()
+        .and_then(|j| j.first())
+        .cloned();
+    let Some(job) = job else {
+        skip!("no activatable job for {job_type}");
+    };
+    let key = job["jobKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| job["jobKey"].as_i64().map(|k| k.to_string()))
+        .or_else(|| job["key"].as_str().map(str::to_string))
+        .expect("activated job has a key");
+    // The engine must have issued a lease token (either the spec's
+    // `jobLeaseToken` or the legacy `leaseToken`); without one there is nothing
+    // to fence with and the premise of this contract is unmet. Record WHICH
+    // field the activation returned so the settlement below speaks the same
+    // dialect this engine actually exposed.
+    let token_field = if job["jobLeaseToken"].is_string() {
+        "jobLeaseToken"
+    } else if job["leaseToken"].is_string() {
+        "leaseToken"
+    } else {
+        skip!("engine issued no lease token for {job_type} (pre-0.0.24?)");
+    };
+    let token = job[token_field]
+        .as_str()
+        .map(str::to_string)
+        .expect("token_field was selected because job[token_field] is a string");
+    // The fence is only meaningful if the wrong token differs from the real one.
+    assert_ne!(
+        token, "not-the-lease",
+        "test premise: the wrong token must differ from the real lease token"
     );
-    let logs = outcome.stderr();
-    if logs.contains("activation lost") {
-        assert!(
-            logs.contains("NOT settled"),
-            "a lost activation must not settle the job; stderr:\n{logs}"
-        );
-    }
+
+    // A completion carrying a WRONG lease token must be rejected (the fence).
+    // Send ONLY the token field the activation returned (`token_field`) —
+    // sending the other dialect's field, or both, can make a strict engine
+    // reject the body with a 400 schema error, which is NOT the lease fence.
+    // Assert the specific `409 Conflict` the engine answers for a token
+    // mismatch, so a schema or endpoint error cannot satisfy this test.
+    let wrong = engine
+        .http()
+        .post(format!("{}/v2/jobs/{key}/completion", engine.url()))
+        .json(&json!({
+            "variables": {},
+            token_field: "not-the-lease",
+        }))
+        .send()
+        .expect("completion with wrong token");
+    assert_eq!(
+        wrong.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a completion with a wrong lease token must be fenced with 409 Conflict, got {}",
+        wrong.status()
+    );
 }

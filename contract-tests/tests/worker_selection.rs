@@ -23,10 +23,9 @@ fn worker_takes_its_configured_job_type() {
         &[],
         &[],
     );
-    let record = outcome.record();
     assert_eq!(
-        record.first_prompt(),
-        Some("pick me"),
+        outcome.payload()["prompt"],
+        "pick me",
         "the worker should activate its configured job type and prompt the agent \
          with that job's `prompt`; worker stderr:\n{}",
         outcome.stderr()
@@ -67,10 +66,9 @@ fn worker_ignores_other_job_types() {
         &[],
         &[],
     );
-    let record = outcome.record();
     assert_eq!(
-        record.first_prompt(),
-        Some("mine only"),
+        outcome.payload()["prompt"],
+        "mine only",
         "the worker took the wrong job; it must only take its own job type"
     );
     // The worker taking only its own job is necessary but not sufficient: a
