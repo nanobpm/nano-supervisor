@@ -6,13 +6,14 @@
 //! fetch a base ref so `git diff base...HEAD` works. Push/finalize is a later
 //! issue; the agent (or a future finalize step) owns committing and pushing.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
 use crate::envelope::Repository;
+use crate::safecwd::CwdHandle;
 
 /// Upper bound on the size of a git metadata file (`config`, `FETCH_HEAD`, …)
 /// the credential scrubber will read into memory. These files are influenced by
@@ -21,13 +22,29 @@ use crate::envelope::Repository;
 /// git config/FETCH_HEAD while still bounding a hostile one.
 const MAX_SCRUB_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Clone `repo` into `<workdir>/repo` and return the checkout path. `default_timeout`
-/// caps each git invocation (overridden per-repo by `cloneTimeoutMs`).
+/// The checkout directory name, relative to the pinned run dir. A single
+/// literal component: it is passed to git as a *relative* clone destination
+/// (resolved against the pinned run-dir cwd) and to [`CwdHandle::open_child`]
+/// (opened fd-relative), so it must never carry a separator or a parent
+/// component.
+const CHECKOUT_DIR: &str = "repo";
+
+/// Clone `repo` into the `repo` child of the pinned run directory `workdir` and
+/// return the pinned checkout handle. `default_timeout` caps each git
+/// invocation (overridden per-repo by `cloneTimeoutMs`).
+///
+/// Every git step runs *through the capability*: the clone executes with its
+/// cwd bound to the pinned run dir and a RELATIVE `repo` destination (an
+/// absolute destination would be re-resolved by the kernel at spawn, so a
+/// same-UID actor swapping an ancestor after preparation could redirect the
+/// clone's writes outside the validated tree, #35), and the follow-on
+/// `set-url`/fetch/checkout steps bind the checkout pinned fd-relative to that
+/// same run dir — no path is ever re-resolved.
 pub async fn provision(
     repo: &Repository,
-    workdir: &Path,
+    workdir: &CwdHandle,
     default_timeout: Duration,
-) -> Result<PathBuf> {
+) -> Result<CwdHandle> {
     if repo.url.trim().is_empty() {
         bail!("repository has no url to clone");
     }
@@ -42,7 +59,14 @@ pub async fn provision(
         .map(Duration::from_millis)
         .unwrap_or(default_timeout);
 
-    let workspace = workdir.join("repo");
+    // The checkout's path, for the scrub/removal helpers (which operate on
+    // files, not cwds) and for messages. Recovered through the pinned fd so it
+    // names the real prepared inode even after an ancestor rename; these
+    // helpers re-validate each file no-follow before rewriting it.
+    let workspace = workdir
+        .path()
+        .context("recovering the pinned run dir path")?
+        .join(CHECKOUT_DIR);
     // Lift any `user:token@` credential out of the URL so it is delivered to git
     // out of band (via the credential helper in `git()`) instead of embedded in
     // argv, where it would sit in world-readable `/proc/<git-pid>/cmdline` for
@@ -75,9 +99,13 @@ pub async fn provision(
     // option (e.g. `--upload-pack`).
     args.push("--".into());
     args.push(fetch_url.clone());
-    args.push(workspace.to_string_lossy().into_owned());
+    // The destination is the RELATIVE `repo`, resolved by the clone child
+    // against its pinned run-dir cwd — an absolute `<workdir>/repo` would be
+    // re-resolved by the kernel at spawn, letting a same-UID actor redirect the
+    // clone's writes by swapping an ancestor after preparation (#35).
+    args.push(CHECKOUT_DIR.into());
 
-    if let Err(e) = git(&args, None, timeout, cred.as_ref()).await {
+    if let Err(e) = git(&args, Some(workdir), timeout, cred.as_ref()).await {
         // A failed clone can still leave a *partially populated* checkout — most
         // notably a `--recurse-submodules` clone whose submodule step failed
         // after the superproject was created — with the credential-bearing URL
@@ -88,6 +116,14 @@ pub async fn provision(
         remove_partial_checkout(&workspace).await;
         return Err(e).context("git clone failed");
     }
+
+    // The clone wrote through the pinned run dir, so the checkout it created is
+    // a direct child of that pinned inode; pin it fd-relative (never following
+    // a symlink at the child) so every follow-on git step binds the same inode
+    // the clone wrote, even if a path component is swapped afterwards.
+    let checkout = workdir
+        .open_child(std::ffi::OsStr::new(CHECKOUT_DIR))
+        .context("pinning the freshly cloned checkout")?;
 
     // `git clone` now runs with a credential-free `fetch_url` in argv, so the
     // persisted `<workspace>/.git/config` origin already carries no `user:token@`
@@ -107,7 +143,7 @@ pub async fn provision(
             "--".into(),
             scrubbed_origin,
         ],
-        Some(&workspace),
+        Some(&checkout),
         timeout,
         None,
     )
@@ -148,7 +184,7 @@ pub async fn provision(
                 fetch_url.clone(),
                 sha.clone(),
             ],
-            Some(&workspace),
+            Some(&checkout),
             timeout,
             cred.as_ref(),
         )
@@ -162,7 +198,7 @@ pub async fn provision(
         }
         git(
             &["checkout".into(), "--detach".into(), sha.clone()],
-            Some(&workspace),
+            Some(&checkout),
             timeout,
             None,
         )
@@ -189,7 +225,7 @@ pub async fn provision(
                 fetch_url.clone(),
                 base.clone(),
             ],
-            Some(&workspace),
+            Some(&checkout),
             timeout,
             cred.as_ref(),
         )
@@ -205,7 +241,7 @@ pub async fn provision(
         return Err(e).context("scrubbing fetch metadata credentials failed");
     }
 
-    Ok(workspace)
+    Ok(checkout)
 }
 
 /// Best-effort removal of a partially provisioned checkout after a git step
@@ -531,7 +567,7 @@ fn scheme_of(prefix: &str) -> &str {
 
 async fn git(
     args: &[String],
-    cwd: Option<&Path>,
+    cwd: Option<&CwdHandle>,
     timeout: Duration,
     cred: Option<&GitCredential>,
 ) -> Result<()> {
@@ -566,19 +602,16 @@ async fn git(
     // mutate the workspace while a retry starts.
     cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
-        // Enter the checkout through a pinned, no-follow directory handle
-        // (`fchdir` in the child's `pre_exec`) rather than re-resolving `dir` as
-        // a path at spawn time: the run dir can sit under a world-writable
-        // ancestor, so a same-UID actor could otherwise swap a component for a
-        // symlink between provisioning and this `fetch`/`checkout`/`set-url` and
-        // redirect git outside the validated tree (#35). A refused (symlinked)
-        // component fails the git step closed, which the callers already treat
-        // as a provisioning failure.
-        let cwd_handle = crate::safecwd::CwdHandle::open(dir)
-            .with_context(|| format!("pinning git working directory {}", dir.display()))?;
-        cwd_handle
-            .apply(&mut cmd)
-            .with_context(|| format!("binding git working directory {}", dir.display()))?;
+        // Enter the working directory through the pinned, no-follow capability
+        // (`fchdir` in the child's `pre_exec`) rather than re-resolving a path
+        // at spawn time: the run dir can sit under a world-writable ancestor,
+        // so a same-UID actor could otherwise swap a component for a symlink
+        // between provisioning and this `clone`/`fetch`/`checkout`/`set-url`
+        // and redirect git outside the validated tree (#35). The caller holds
+        // the handle open from preparation, so the bind targets the prepared
+        // inode even across a post-prepare replacement of the path.
+        dir.apply(&mut cmd)
+            .context("binding git working directory")?;
     }
     // Never prompt for credentials interactively (would hang the slot).
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -985,5 +1018,117 @@ mod tests {
         assert!(got.contains("https://github.com/o/r.git"));
         assert!(got.contains("branch 'main' of"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A `file://` source repo with one commit, for provisioning tests.
+    #[cfg(unix)]
+    fn make_source_repo(base: &std::path::Path) -> String {
+        let src = base.join("src-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(src.join("f.txt"), b"hello").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        format!("file://{}", src.display())
+    }
+
+    #[cfg(unix)]
+    fn repo_envelope(url: String) -> Repository {
+        Repository {
+            provider: "github".into(),
+            url,
+            ref_: None,
+            sha: None,
+            depth: None,
+            single_branch: false,
+            filter: None,
+            base_ref: None,
+            base_sha: None,
+            submodules: false,
+            clone_timeout_ms: None,
+        }
+    }
+
+    /// The clone must write into the PINNED run dir: it runs with its cwd bound
+    /// to the pinned handle and a RELATIVE `repo` destination, so an ancestor
+    /// swapped for a symlink after the pin cannot redirect the clone's writes
+    /// into the attacker's tree — the checkout lands in the pinned inode (the
+    /// moved-aside real dir), and the returned handle names that same inode
+    /// (#35). Before the fix the clone ran with `cwd=None` and an ABSOLUTE
+    /// `<workdir>/repo` destination, which the kernel re-resolved at spawn —
+    /// straight into the swapped-in attacker path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn clone_writes_into_the_pinned_run_dir_after_an_ancestor_swap() {
+        let base = std::env::temp_dir().join(format!(
+            "nano-provision-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (macOS /var).
+        let base = std::fs::canonicalize(&base).unwrap();
+        let url = make_source_repo(&base);
+
+        // The prepared run dir, pinned as at provisioning.
+        let ancestor = base.join("ancestor");
+        let run = ancestor.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let workdir = CwdHandle::open(&run).unwrap();
+
+        // Attacker swaps the ancestor for a symlink to their tree AFTER the
+        // pin, before the clone: an absolute destination path would now
+        // resolve into the attacker tree; the pinned fd must not.
+        let moved = base.join("ancestor-moved");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join("run")).unwrap();
+        std::os::unix::fs::symlink(&evil, &ancestor).unwrap();
+
+        let checkout = provision(&repo_envelope(url), &workdir, Duration::from_secs(60))
+            .await
+            .expect("provision through the pinned run dir");
+
+        // The clone landed in the PINNED inode (now at `moved/run/repo`), not
+        // the attacker tree the original path would resolve to.
+        let real_checkout = moved.join("run").join(CHECKOUT_DIR);
+        assert!(
+            real_checkout.join("f.txt").exists(),
+            "clone must land in the pinned run dir"
+        );
+        assert!(
+            !evil.join("run").join(CHECKOUT_DIR).join("f.txt").exists(),
+            "clone must not write into the swapped-in attacker tree"
+        );
+        // And the returned handle binds that same pinned checkout inode.
+        let landed = checkout.path().expect("checkout path");
+        assert_eq!(
+            std::fs::canonicalize(landed).unwrap(),
+            std::fs::canonicalize(real_checkout).unwrap(),
+            "the returned checkout handle must name the pinned inode"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

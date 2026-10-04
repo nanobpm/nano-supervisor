@@ -562,6 +562,34 @@ pub(crate) fn canonicalize_existing_base(dir: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// The per-job run directory, prepared once and carried as a pinned, no-follow
+/// capability: every later step that needs to *enter* or *name* the run dir
+/// derives it from this handle (fd-relative `open_child` / fd-recovered
+/// `path()`), never by re-resolving the path — so a same-UID actor swapping or
+/// replacing a path component after preparation cannot redirect a launch or
+/// the ACP session workspace outside the validated tree (#35).
+pub(crate) struct PreparedRun {
+    /// The pinned run directory (opened no-follow, held by fd).
+    cwd: crate::safecwd::CwdHandle,
+}
+
+impl PreparedRun {
+    /// The pinned run directory itself, for a job with no repository (the
+    /// agent and the HEAD probe run in the run dir directly).
+    pub(crate) fn agent_cwd(&self) -> &crate::safecwd::CwdHandle {
+        &self.cwd
+    }
+
+    /// Pin the freshly cloned `<run>/repo` checkout *relative to the pinned
+    /// run dir*, so the agent and the HEAD probes bind the same inode the
+    /// clone wrote even if a path component is swapped afterwards.
+    pub(crate) fn checkout_cwd(&self) -> Result<crate::safecwd::CwdHandle> {
+        self.cwd
+            .open_child(std::ffi::OsStr::new("repo"))
+            .context("pinning the provisioned checkout")
+    }
+}
+
 /// Prepare a per-job run directory under `runs_dir` with the full symlink and
 /// permission hardening, wiping any stale prior-attempt contents. Shared by the
 /// `daemon` and `work` (both run jobs through [`execute`]) so every run gets
@@ -1419,7 +1447,7 @@ struct RunResult {
 /// therefore runs under [`GIT_HEAD_TIMEOUT`]: a git that has not exited by then
 /// is killed and reaped, and the read reports `None` ("no commits" — the safe
 /// default above) instead of hanging settlement.
-fn git_head(dir: &Path) -> Option<String> {
+fn git_head(dir: &crate::safecwd::CwdHandle) -> Option<String> {
     git_head_timeout(dir, GIT_HEAD_TIMEOUT)
 }
 
@@ -1432,7 +1460,7 @@ fn git_head(dir: &Path) -> Option<String> {
 /// under. Use this from async contexts; `git_head` remains for synchronous
 /// callers and tests. Best-effort like the probe itself: a panicked or
 /// cancelled blocking task reads as `None` ("no commits"), the safe default.
-pub(crate) async fn git_head_blocking(dir: PathBuf) -> Option<String> {
+pub(crate) async fn git_head_blocking(dir: crate::safecwd::CwdHandle) -> Option<String> {
     tokio::task::spawn_blocking(move || git_head(&dir))
         .await
         .ok()
@@ -1449,7 +1477,7 @@ const GIT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the bounded `git rev-parse` probe to exit.
 const GIT_HEAD_POLL: Duration = Duration::from_millis(10);
 
-fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
+fn git_head_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut cmd = Command::new("git");
@@ -1465,20 +1493,15 @@ fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // Enter the checkout through a pinned, no-follow directory handle (`fchdir`
-    // in the child's `pre_exec`) rather than re-resolving `dir` as a path at
-    // spawn time: the run dir can sit under a world-writable ancestor, so a
-    // same-UID actor could swap a component for a symlink between provisioning
-    // and this probe and redirect `git rev-parse` to an attacker repo, spoofing
-    // the pre/post HEAD that is the empty-job detector's only "did the agent
-    // commit" signal (#35, as for the git()/agent launches). A refused
-    // (symlinked) component fails the probe closed, which reads as the safe
-    // `None` ("no commits") default like any other probe failure.
-    let handle = crate::safecwd::CwdHandle::open(dir).ok()?;
-    handle.apply_std(&mut cmd).ok()?;
-    let mut child = cmd
-        .spawn()
-        .ok()?;
+    // Enter the checkout through the pinned run-dir capability (`fchdir` in the
+    // child's `pre_exec`) rather than re-resolving a path at spawn time: the
+    // handle was opened no-follow at provisioning, so a same-UID actor swapping
+    // a path component between provisioning and this probe cannot redirect
+    // `git rev-parse` to an attacker repo and spoof the pre/post HEAD that is
+    // the empty-job detector's only "did the agent commit" signal (#35, as for
+    // the git()/agent launches).
+    dir.apply_std(&mut cmd).ok()?;
+    let mut child = cmd.spawn().ok()?;
     // Bounded wait: poll `try_wait` so a git wedged on agent-planted blocking
     // metadata (e.g. `.git/HEAD` a FIFO) is killed and reaped at the deadline
     // rather than waited on forever. Killing also guarantees no git child is
@@ -1553,15 +1576,24 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // *before* joining it to a path (a malformed `../` key must never make
     // `remove_dir_all` / `create_dir_all` operate outside `runs_dir`).
     crate::jobs::validate_job_key(&key)?;
-    // Absolute, so the agent (whose cwd is inside `run_dir`) and the worker
-    // resolve `AGENT_RESULT_FILE` identically. Purely lexical — the symlink
-    // hardening in `prepare_run_dir` still inspects the real on-disk structure.
-    let run_dir = std::path::absolute(cfg.runs_dir.join(&key)).with_context(|| {
-        format!(
-            "resolving absolute run dir under {}",
-            cfg.runs_dir.display()
-        )
-    })?;
+    // Absolute AND lexically normalized, so the agent (whose cwd is inside
+    // `run_dir`) and the worker resolve `AGENT_RESULT_FILE` identically, and so
+    // every launch backend resolves the same path: `std::path::absolute` (and a
+    // parent-relative `--runs-dir ../runs`) preserves interior `..`, which the
+    // Linux `openat2` no-follow open accepts but the portable `O_NOFOLLOW`
+    // chain resolves fd-relative — NOT path resolution — so a renamed ancestor
+    // would silently redirect the descent. Normalizing at this input boundary
+    // (trusted prefix only; the not-yet-created job-dir tail stays literal)
+    // gives both backends one identical, parent-free path (#35). Purely lexical
+    // — the symlink hardening in `prepare_run_dir` still inspects the real
+    // on-disk structure.
+    let run_dir =
+        crate::safecwd::normalize_run_path(&cfg.runs_dir.join(&key)).with_context(|| {
+            format!(
+                "resolving absolute run dir under {}",
+                cfg.runs_dir.display()
+            )
+        })?;
     // Claim exclusive ownership of this run dir BEFORE wiping/preparing it, so a
     // concurrent attempt for the same key (a lease-recovery redelivery to another
     // slot) cannot wipe our live checkout or share the workspace. The claim is
@@ -1581,6 +1613,16 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         sweep_stale_runs_blocking(cfg.runs_dir.clone(), FAILED_RUN_RETENTION, false).await;
     }
     prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?;
+    // Pin the prepared run dir ONCE and carry the capability through
+    // provisioning, the agent launches, and the HEAD probes: re-resolving the
+    // path at each launch would accept a same-UID actor's post-prepare
+    // replacement of the job dir (or an ancestor) with an ordinary directory
+    // tree — no-follow resolution sees no symlink in that case, but the launch
+    // would bind a different inode from the one preparation validated (#35).
+    let prepared = PreparedRun {
+        cwd: crate::safecwd::CwdHandle::open(&run_dir)
+            .with_context(|| format!("pinning run dir {}", run_dir.display()))?,
+    };
     let agent_cwd = match &env.repository {
         Some(repo) => {
             log(&format!(
@@ -1588,11 +1630,12 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
                 redact_url(&repo.url),
                 repo.provider
             ));
-            crate::provision::provision(repo, &run_dir, cfg.clone_timeout)
+            crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
                 .await
-                .context("provisioning repository")?
+                .context("provisioning repository")?;
+            prepared.checkout_cwd()?
         }
-        None => run_dir.clone(),
+        None => prepared.agent_cwd().clone(),
     };
     // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
     // the empty-job detector can tell whether the agent committed anything.
@@ -1796,7 +1839,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
 async fn run_agent(
     cfg: &SlotConfig,
     key: &str,
-    cwd: &Path,
+    cwd: &crate::safecwd::CwdHandle,
     stdin: &str,
     env: &[(String, String)],
 ) -> RunResult {
@@ -1817,10 +1860,17 @@ async fn run_agent(
                     }
                 }
             };
+            // Name the pinned directory for the log line, recovered through
+            // the fd so a post-prepare rename cannot put a stale pathname in
+            // the log; fall back to the raw handle debug if it cannot be read.
+            let whereami = cwd
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<pinned run dir>".to_string());
             log(&format!(
                 "job {key}: acp agent pid {} in {}",
                 agent.pid().unwrap_or(0),
-                cwd.display()
+                whereami
             ));
             let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
             agent.shutdown().await;
@@ -1855,7 +1905,11 @@ async fn run_agent(
             }
         }
         Protocol::Pipe => {
-            log(&format!("job {key}: pipe agent in {}", cwd.display()));
+            let whereami = cwd
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<pinned run dir>".to_string());
+            log(&format!("job {key}: pipe agent in {whereami}"));
             match crate::pipe::run(
                 &cfg.hire.command,
                 &cfg.hire.args,
@@ -3315,7 +3369,7 @@ mod tests {
             "-m",
             "x",
         ]);
-        let head = git_head(&base);
+        let head = git_head(&crate::safecwd::CwdHandle::open(&base).unwrap());
         assert!(
             head.as_deref()
                 .is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
@@ -3330,21 +3384,23 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nano-git-head-nogit-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         std::fs::create_dir_all(&base).unwrap();
-        assert_eq!(git_head(&base), None);
+        let base = std::fs::canonicalize(&base).unwrap();
+        assert_eq!(
+            git_head(&crate::safecwd::CwdHandle::open(&base).unwrap()),
+            None
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn git_head_refuses_a_symlinked_ancestor() {
-        // The #35 class, for the HEAD probe: an agent-controlled run dir can sit
-        // under a world-writable ancestor, so a same-UID actor could swap an
-        // ancestor for a symlink to an attacker repo between provisioning and
-        // this probe. Resolving the cwd through the pinned no-follow handle must
-        // refuse that path (fail closed → `None` "no commits"), never follow the
-        // symlink and report the attacker's HEAD. Before the fix the probe used
-        // `current_dir(dir)`, re-resolved the symlink at spawn, and returned the
-        // attacker's sha.
+        // The #35 class, for the HEAD probe: the probe now binds a pinned
+        // handle, so a run dir REACHED THROUGH a symlinked ancestor cannot even
+        // be pinned — `CwdHandle::open` refuses the path (fail closed) and the
+        // caller reads the safe `None` ("no commits"). Before the fix the probe
+        // used `current_dir(dir)`, re-resolved the symlink at spawn, and
+        // returned the attacker's sha.
         let base = std::env::temp_dir().join(format!(
             "nano-git-head-symlink-{}-{}",
             std::process::id(),
@@ -3385,10 +3441,90 @@ mod tests {
         // `<base>/link` therefore reaches the attacker repo only through it.
         let link = base.join("link");
         std::os::unix::fs::symlink(&evil, &link).unwrap();
+        assert!(
+            crate::safecwd::CwdHandle::open(&link).is_err(),
+            "a run dir reached through a symlinked ancestor must be refused at pin time"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_head_stays_in_the_pinned_inode_after_an_ancestor_swap() {
+        // The carried-capability guarantee: the probe binds the handle pinned
+        // at provisioning, so swapping an ancestor for a symlink to an attacker
+        // repo AFTER the pin cannot redirect the probe — it still reads the
+        // real checkout's HEAD, never the attacker's.
+        let base = std::env::temp_dir().join(format!(
+            "nano-git-head-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        let base = std::fs::canonicalize({
+            std::fs::create_dir_all(&base).unwrap();
+            &base
+        })
+        .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        let commit = |dir: &Path, msg: &str| {
+            git(dir, &["init", "-q"]);
+            git(
+                dir,
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    msg,
+                ],
+            );
+        };
+        // The real checkout, pinned as at provisioning.
+        let ancestor = base.join("ancestor");
+        let real = ancestor.join("run");
+        std::fs::create_dir_all(&real).unwrap();
+        commit(&real, "real");
+        let handle = crate::safecwd::CwdHandle::open(&real).unwrap();
+
+        // Attacker swaps the ancestor for a symlink to their own repo.
+        let moved = base.join("ancestor-moved");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join("run")).unwrap();
+        commit(&evil.join("run"), "evil");
+        std::os::unix::fs::symlink(&evil, &ancestor).unwrap();
+
+        // The probe still reads the REAL checkout's HEAD (the pinned inode,
+        // now at `moved/run`), not the attacker's the path would resolve to.
+        let real_head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(moved.join("run"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
         assert_eq!(
-            git_head(&link),
-            None,
-            "a run dir reached through a symlinked ancestor must be refused, not followed"
+            git_head(&handle).as_deref(),
+            Some(real_head.as_str()),
+            "the probe must read the pinned inode's HEAD, not the swapped-in attacker repo"
         );
         std::fs::remove_dir_all(&base).ok();
     }
@@ -3417,7 +3553,8 @@ mod tests {
         assert!(mk.status.success(), "mkfifo failed");
 
         let started = Instant::now();
-        let head = git_head_timeout(&base, Duration::from_millis(300));
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let head = git_head_timeout(&handle, Duration::from_millis(300));
         let elapsed = started.elapsed();
         assert_eq!(head, None, "a wedged probe must read as no commits");
         assert!(
@@ -3455,7 +3592,8 @@ mod tests {
         assert!(mk.status.success(), "mkfifo failed");
 
         let started = Instant::now();
-        let probe = tokio::spawn(git_head_blocking(base.clone()));
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let probe = tokio::spawn(git_head_blocking(handle));
         // Yield so the probe is dispatched to the blocking pool before the
         // concurrent task starts.
         tokio::task::yield_now().await;

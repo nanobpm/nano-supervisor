@@ -38,7 +38,57 @@
 //! `current_dir(path)` behaviour; those targets are not supported daemon hosts.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Lexically normalize a run-directory path: resolve every `.`/`..` component
+/// **without touching the filesystem** (no symlink is ever followed), so the
+/// result is an absolute path free of parent components.
+///
+/// This runs at the run-path *input boundary* (the slot resolving
+/// `<runs_dir>/<key>`), not on the untrusted tail: `..` between existing
+/// directories is resolved against the trusted current directory lexically,
+/// which is exactly how the kernel resolves it (a parent component traverses
+/// the *directory entry*, never a symlink), while the not-yet-created job-dir
+/// tail is left literal. Normalizing here keeps a parent-relative
+/// `--runs-dir ../runs` working on every backend — the Linux `openat2`
+/// resolution accepts interior `..`, but the portable `O_NOFOLLOW` chain
+/// resolves it against its pinned parent fd, which is *not* path resolution
+/// (a renamed ancestor would silently redirect the descent) — and gives both
+/// backends one identical, already-normalized path.
+///
+/// A relative input is anchored at the current directory first (the same
+/// anchor the launch backends resolve a relative path against). Like the
+/// kernel, a `..` at the filesystem root is a no-op (clamps at `/`); only a
+/// RELATIVE input that climbs above its anchor is refused (the anchor is the
+/// process cwd, so that can only mean malformed input).
+pub(crate) fn normalize_run_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let anchored: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in anchored.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir => {
+                // `out` always holds at least the root/prefix here (the input
+                // was anchored), so a `pop` that empties it means a `..` AT the
+                // root: the kernel clamps that to `/`, so keep the root rather
+                // than error — a parent-relative `--runs-dir` is legitimate.
+                let _ = out.pop();
+                if out.as_os_str().is_empty() {
+                    out.push(Component::RootDir.as_os_str());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// A directory resolved no-follow and pinned by its fd, used to launch a child
 /// with its cwd set to the validated inode (via `fchdir` in `pre_exec`) rather
@@ -50,6 +100,28 @@ pub(crate) struct CwdHandle {
     path: std::path::PathBuf,
     #[cfg(unix)]
     fd: std::os::unix::io::OwnedFd,
+}
+
+#[cfg(unix)]
+impl Clone for CwdHandle {
+    /// A second handle to the SAME pinned inode (a close-on-exec dup of the
+    /// fd), so the capability can be carried by several consumers (the agent
+    /// launch, the HEAD probes) without re-resolving the path.
+    fn clone(&self) -> Self {
+        // `dup_fd` only fails on a genuine fd-table/OS error; treat that like
+        // any other fd-ownership failure here (there is no `TryClone`).
+        let fd = self.dup_fd().expect("dup the pinned directory fd");
+        CwdHandle { fd }
+    }
+}
+
+#[cfg(not(unix))]
+impl Clone for CwdHandle {
+    fn clone(&self) -> Self {
+        CwdHandle {
+            path: self.path.clone(),
+        }
+    }
 }
 
 impl CwdHandle {
@@ -120,6 +192,115 @@ impl CwdHandle {
     pub(crate) fn apply_std(&self, cmd: &mut std::process::Command) -> io::Result<()> {
         cmd.current_dir(&self.path);
         Ok(())
+    }
+
+    /// Pin a direct child directory of this handle, never following a symlink
+    /// at the child and never leaving this directory. Because the open is
+    /// anchored on the pinned fd, a rename or symlink swap of any *ancestor*
+    /// cannot redirect it, and a same-UID actor replacing the child itself
+    /// between provisioning and this open is bound to whatever the name
+    /// resolves to *now* — so the launch that then binds the returned handle
+    /// can never land in a tree swapped in afterwards. `name` must be a single
+    /// path component.
+    #[cfg(unix)]
+    pub(crate) fn open_child(&self, name: &std::ffi::OsStr) -> io::Result<CwdHandle> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.contains(&b'/')
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "open_child expects a single path component",
+            ));
+        }
+        let c = CString::new(name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
+        Ok(CwdHandle {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn open_child(&self, name: &std::ffi::OsStr) -> io::Result<CwdHandle> {
+        let path = self.path.join(name);
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing symlinked working directory",
+            ));
+        }
+        Ok(CwdHandle { path })
+    }
+
+    /// The absolute path of the pinned directory *right now*, recovered through
+    /// the fd (`fchdir` + `getcwd`) rather than remembered from resolution
+    /// time, so it still names the pinned inode after an ancestor rename. Used
+    /// where a path string is genuinely required — the ACP `session/new` `cwd`
+    /// — so the value sent to the agent is the same directory the launch bound,
+    /// never a pre-swap pathname. On non-Unix hosts this is the (leaf-validated)
+    /// path the handle was opened from.
+    #[cfg(unix)]
+    pub(crate) fn path(&self) -> io::Result<PathBuf> {
+        use std::os::unix::io::AsRawFd;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // Save the process cwd, fchdir into the pinned fd, read getcwd, then
+        // restore — all plain libc, no Rust state the restore could race.
+        // SAFETY: `saved`/`self.fd` are valid fds; `buf` is writable for its
+        // length and NUL-terminated by `getcwd` on success.
+        unsafe {
+            let saved = libc::open(
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            );
+            if saved < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let body = (|| {
+                if libc::fchdir(self.fd.as_raw_fd()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getcwd(buf.as_mut_ptr().cast(), buf.len()).is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })();
+            // ALWAYS restore the process cwd before propagating any error: a
+            // failed `getcwd` with the process left inside the pinned dir
+            // would silently redirect every later relative resolution.
+            let restore = libc::fchdir(saved);
+            libc::close(saved);
+            if restore != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            body?;
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(
+            std::ffi::OsStr::from_bytes(&buf[..len]).to_os_string(),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn path(&self) -> io::Result<PathBuf> {
+        Ok(self.path.clone())
     }
 
     /// A close-on-exec dup of the pinned fd, moved into each `pre_exec` closure
@@ -297,14 +478,30 @@ fn open_nofollow_chain(path: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
                 let next = openat_dir(dir.as_raw_fd(), &c, step_flags)?;
                 cur = Some(next);
             }
-            // `..` could climb out of the validated prefix; refuse it rather
-            // than resolve it. The run-dir paths this is used for are
-            // normalized absolute paths that never contain `..`.
+            // `..` is resolved against the pinned parent fd — matching the
+            // `openat2` backend, which resolves interior `..` against the real
+            // parent directory — so both backends enforce one consistent
+            // interior-parent policy. Callers pass run paths already
+            // lexically normalized by `normalize_run_path`, so this only ever
+            // sees a `..` a caller constructed by hand; resolving it here
+            // (rather than refusing) keeps the two backends from diverging on
+            // the same input. Note this is *fd-relative* traversal, not path
+            // resolution: the kernel's `..` lookup on the pinned fd follows
+            // the directory entry, never a symlink.
             Component::ParentDir => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "refusing `..` in a validated working directory",
-                ));
+                let dir = match cur.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        let c = CString::new(".".as_bytes()).unwrap();
+                        cur = Some(open_dir(&c, base_flags)?);
+                        cur.as_ref().unwrap()
+                    }
+                };
+                let c = CString::new("..".as_bytes()).unwrap();
+                // No O_NOFOLLOW: `..` is never a symlink, and the lookup is
+                // anchored on the pinned parent fd.
+                let next = openat_dir(dir.as_raw_fd(), &c, base_flags)?;
+                cur = Some(next);
             }
             Component::Prefix(_) => {
                 return Err(io::Error::new(
@@ -315,6 +512,30 @@ fn open_nofollow_chain(path: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
         }
     }
     cur.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty working directory path"))
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn normalize_run_path_resolves_parents_lexically() {
+        // Interior `..` collapses without touching the filesystem.
+        let got = normalize_run_path(Path::new("/a/b/../c/./d")).unwrap();
+        assert_eq!(got, PathBuf::from("/a/c/d"));
+        // A leading `..` on an absolute path clamps at the root like the kernel.
+        let got = normalize_run_path(Path::new("/a/../../b")).unwrap();
+        assert_eq!(got, PathBuf::from("/b"));
+        // A relative input is anchored at the current directory.
+        let got = normalize_run_path(Path::new("x/../y")).unwrap();
+        assert_eq!(got, std::env::current_dir().unwrap().join("y"));
+        // A `..` run that climbs past the root clamps at `/` like the kernel
+        // (the relative form is anchored at the cwd first, so it can never
+        // actually escape — this is the absolute-path clamp applied uniformly).
+        let got = normalize_run_path(Path::new("/../../../../../../..")).unwrap();
+        assert_eq!(got, PathBuf::from("/"));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -435,5 +656,96 @@ mod tests {
             "launch must not land in the attacker-controlled target"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `open_child` pins the child *relative to the pinned parent fd*, so
+    /// swapping an ancestor for a symlink after the parent was opened cannot
+    /// redirect the descent — the child handle still names the real inode.
+    #[test]
+    fn open_child_survives_an_ancestor_swap() {
+        let base = scratch("child-swap");
+        let ancestor = base.join("ancestor");
+        let run = ancestor.join("run");
+        std::fs::create_dir_all(run.join("repo")).unwrap();
+        std::fs::write(run.join("repo").join("real-marker"), b"real").unwrap();
+
+        let run_handle = CwdHandle::open(&run).expect("open run dir");
+
+        // Swap the ancestor for a symlink to an attacker tree.
+        let moved = base.join("ancestor-moved");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join("run").join("repo")).unwrap();
+        std::fs::write(
+            evil.join("run").join("repo").join("evil-marker"),
+            b"attacker",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&evil, &ancestor).unwrap();
+
+        // The child open is anchored on the pinned run-dir fd, so it lands in
+        // the real inode even though the path now resolves to the attacker.
+        let child = run_handle.open_child(std::ffi::OsStr::new("repo")).unwrap();
+        let landed = std::fs::canonicalize(child_cwd(&child)).unwrap();
+        assert_eq!(
+            landed,
+            std::fs::canonicalize(moved.join("run").join("repo")).unwrap(),
+            "open_child must stay under the pinned parent after an ancestor swap"
+        );
+        assert!(landed.join("real-marker").exists());
+        assert!(!landed.join("evil-marker").exists());
+
+        // And the handle still reports the pinned inode's current path.
+        let reported = child.path().expect("path of pinned child");
+        assert_eq!(
+            std::fs::canonicalize(reported).unwrap(),
+            std::fs::canonicalize(moved.join("run").join("repo")).unwrap(),
+            "path() must name the pinned inode, not a pre-swap pathname"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn open_child_refuses_a_symlinked_child() {
+        let base = scratch("child-link");
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, run.join("repo")).unwrap();
+        let run_handle = CwdHandle::open(&run).expect("open run dir");
+        assert!(
+            run_handle.open_child(std::ffi::OsStr::new("repo")).is_err(),
+            "a symlinked child must be refused"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn interior_parent_resolves_against_the_pinned_parent() {
+        // Both backends accept an interior `..` and resolve it identically —
+        // against the real parent directory, never through a symlink. The
+        // walked-through `x` must EXIST: the chain opens each component to pin
+        // it before the `..` climbs back to the real parent.
+        let base = scratch("dotdot");
+        let run = base.join("a").join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::create_dir_all(base.join("a").join("x")).unwrap();
+        std::fs::write(run.join("marker"), b"real").unwrap();
+        let via_parent = base.join("a").join("x").join("..").join("run");
+        let handle = CwdHandle::open(&via_parent).expect("open via interior ..");
+        let landed = std::fs::canonicalize(child_cwd(&handle)).unwrap();
+        assert_eq!(landed, std::fs::canonicalize(&run).unwrap());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn parent_dir_at_the_root_clamps_like_the_kernel() {
+        // `..` at `/` is a no-op for the kernel (`/..` == `/`); the chain must
+        // match so a normalized path can never diverge between backends. This
+        // is the fd-relative walk resolving `..` against the pinned root fd.
+        let handle = CwdHandle::open(Path::new("/..")).expect("/.. must clamp to /");
+        let landed = std::fs::canonicalize(child_cwd(&handle)).unwrap();
+        assert_eq!(landed, std::fs::canonicalize(Path::new("/")).unwrap());
     }
 }

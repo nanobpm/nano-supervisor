@@ -130,6 +130,15 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
             }
         }
     };
+    // Collapse `.`/`..` in the OPERATOR-SUPPLIED runs root lexically (never
+    // touching the filesystem): a parent-relative `--runs-dir ../runs`
+    // otherwise reaches the launch backends with an interior `..`, which the
+    // Linux `openat2` no-follow open accepts but the portable `O_NOFOLLOW`
+    // chain resolves fd-relative — NOT path resolution — so the two backends
+    // would diverge on the same input (#35). Normalizing here, at the input
+    // boundary, keeps a parent-relative runs dir working identically on every
+    // backend; the per-job path is normalized again in `slot::execute`.
+    let runs_dir = crate::safecwd::normalize_run_path(&runs_dir)?;
     // Resolve the run root WITHOUT ever following a symlink in the
     // OPERATOR-CONTROLLED tail. Canonicalize ONLY the trusted `anchor` (resolving
     // its platform symlinks — the contract harness hands us a `C8CTL_NANO_HOME`
