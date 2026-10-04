@@ -146,18 +146,23 @@ impl DirHandle {
     /// relative one. Resolved with `RESOLVE_NO_SYMLINKS` and NOT
     /// `RESOLVE_BENEATH` (the anchor is the walk's base, not a descent).
     ///
-    /// Opened `O_PATH`: the anchor and the intermediate ancestors it seeds are
-    /// only ever used as a *dirfd* for `mkdirat` / `openat2` / `fstatat`, which
-    /// an `O_PATH` handle supports with only search (`x`) permission — never a
-    /// read of the directory. This matches how the kernel traversed ancestors in
-    /// the old whole-path resolution (search, not read), so a legitimately
-    /// non-readable ancestor (e.g. mode `0o300`) no longer fails the walk.
-    fn open_anchor(absolute: bool) -> Result<DirHandle, PinError> {
+    /// `opath` selects the handle kind. `true` (`O_PATH`): the anchor and the
+    /// intermediate ancestors it seeds are only ever used as a *dirfd* for
+    /// `mkdirat` / `openat2` / `fstatat`, which an `O_PATH` handle supports
+    /// with only search (`x`) permission — never a read of the directory. This
+    /// matches how the kernel traversed ancestors in the old whole-path
+    /// resolution (search, not read), so a legitimately non-readable ancestor
+    /// (e.g. mode `0o300`) no longer fails the walk. `false` (`O_RDONLY`): a
+    /// readable handle for the case where the anchor IS the requested root
+    /// (a path with no components, e.g. `.` or `/`), which the caller stats /
+    /// enumerates / `fchmod`s — all impossible on an `O_PATH` fd.
+    fn open_anchor(absolute: bool, opath: bool) -> Result<DirHandle, PinError> {
         let anchor: &CStr = if absolute { c"/" } else { c"." };
+        let access = if opath { libc::O_PATH } else { libc::O_RDONLY };
         match openat2_raw(
             libc::AT_FDCWD,
             anchor,
-            (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            (access | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             RESOLVE_NO_SYMLINKS,
         ) {
             Ok(fd) => Ok(DirHandle { fd }),
@@ -191,6 +196,12 @@ impl DirHandle {
     /// root is opened readable, since the caller stats / enumerates / `fchmod`s
     /// it (which `O_PATH` cannot do). This preserves the old behaviour where
     /// only the runs root itself needed read permission.
+    ///
+    /// A path with no components at all (`.` or `/`) is the anchor itself, so
+    /// it is opened READABLE — the returned handle is the root the caller
+    /// operates on, and an `O_PATH` handle would fail every stat / enumerate /
+    /// `fchmod` with `EBADF` (previously `--runs-dir .` broke every job's
+    /// preparation exactly this way).
     pub(crate) fn create_root_nofollow(path: &Path) -> Result<DirHandle, PinError> {
         use std::path::Component;
         // Collect the directory components to create/open, rejecting `..` and
@@ -212,8 +223,18 @@ impl DirHandle {
                 }
             }
         }
-        let mut handle = DirHandle::open_anchor(path.is_absolute())?;
-        let last = names.len().saturating_sub(1);
+        // A path with no components (`.` or `/`) IS the anchor itself: open it
+        // READABLE, since the returned handle is the root the caller stats /
+        // enumerates / `fchmod`s — an `O_PATH` anchor would fail every such
+        // operation (`EBADF`), so e.g. `--runs-dir .` would break every job's
+        // preparation. Only an anchor that seeds a component walk (below) is
+        // `O_PATH` (search-only), so a legitimately non-readable intermediate
+        // ancestor (e.g. mode `0o300`) does not fail the walk.
+        if names.is_empty() {
+            return DirHandle::open_anchor(path.is_absolute(), false);
+        }
+        let mut handle = DirHandle::open_anchor(path.is_absolute(), true)?;
+        let last = names.len() - 1;
         for (i, name) in names.into_iter().enumerate() {
             handle.mkdirat_ignore_existing(name, 0o777)?;
             // Re-open through a handle (no-follow, beneath the parent): a
@@ -622,6 +643,42 @@ mod tests {
 
         // Restore perms so the scratch tree can be removed.
         std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // A runs-root path with NO components (`.` or `/`) is the anchor itself, so
+    // `create_root_nofollow` must return a READABLE handle for it — the caller
+    // stats / enumerates / `fchmod`s the root, and an `O_PATH` handle would
+    // fail every one of those with `EBADF` (previously `--runs-dir .` broke
+    // every job's preparation exactly this way). Regression test: establish the
+    // current directory as the root and prepare a child through the returned
+    // handle, exactly as `prepare_run_dir_pinned` does.
+    #[test]
+    fn create_root_nofollow_returns_readable_handle_for_empty_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch_root("create-empty");
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+
+        // `.` has no `Normal` components: the handle must be the anchor itself,
+        // opened readable — so the full `prepare_child_dir` sequence (stat,
+        // mkdir, pin, fchmod of child AND root) succeeds through it.
+        let handle = DirHandle::create_root_nofollow(Path::new("."))
+            .expect("`.` must establish as a readable root handle");
+        handle
+            .prepare_child_dir(OsStr::new("job1"), 0o700)
+            .expect("prepare a child through the returned handle (fchmod must not EBADF)");
+        assert!(base.join("job1").is_dir(), "the child must be created");
+        // The root itself is restricted too — proof the handle is not O_PATH.
+        let mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the root fchmod must have taken effect");
+        // Idempotent re-prepare wipes the stale child, again through the handle.
+        handle
+            .prepare_child_dir(OsStr::new("job1"), 0o700)
+            .expect("re-prepare must wipe and recreate");
+        assert!(base.join("job1").is_dir());
+
+        std::env::set_current_dir(original_cwd).unwrap();
         std::fs::remove_dir_all(&base).ok();
     }
 }
