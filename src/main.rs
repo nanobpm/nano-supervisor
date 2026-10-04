@@ -28,7 +28,7 @@ mod work;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -290,10 +290,21 @@ fn default_runs_dir() -> PathBuf {
 ///
 /// A relative path stays relative (`.`/`..` still resolve against the cwd at
 /// use time, exactly as the fallback treated them); only the infix `.`/`..`
-/// are folded. A `..` that would climb above the base (a leading `..` on a
-/// relative path, or past `/` on an absolute one) is rejected rather than
-/// silently clamped, so an operator mistake surfaces as a clear error instead
-/// of a surprising location.
+/// are folded. A leading `..` on a relative path cannot be folded lexically
+/// (it climbs above the cwd), so it is resolved against the current directory
+/// — the same target the non-Linux fallback resolves it to — yielding an
+/// absolute, `..`-free path. Only a `..` that climbs past the filesystem root
+/// (`/..`) is rejected, since that escapes any base.
+///
+/// Two invariants keep the downstream no-follow layer consistent:
+/// * The result is never empty. A cwd-equivalent input (`.`, `sub/..`, `/`)
+///   normalizes to `.` (or `/`), because an empty path would diverge between
+///   `create_root_nofollow` (which opens the anchor, i.e. the cwd) and
+///   `open_root_nofollow` (which `openat2`s the literal path and fails an
+///   empty one with `ENOENT`) — breaking the sweep / completion-cleanup while
+///   preparation still worked.
+/// * The result never contains `..`, so the pinned-handle walk (which refuses
+///   `..`) accepts it on every platform.
 fn normalize_runs_dir(path: &Path) -> Result<PathBuf> {
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -301,14 +312,33 @@ fn normalize_runs_dir(path: &Path) -> Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if !out.pop() {
-                    return Err(anyhow::anyhow!(
-                        "--runs-dir {} climbs above its base with `..`",
-                        path.display()
-                    ));
+                    // A `..` with nothing to pop. On a relative path this is a
+                    // leading `..` that climbs above the cwd: anchor the path
+                    // at the current directory and re-fold, so `--runs-dir
+                    // ../runs` keeps working (the non-Linux fallback always
+                    // resolved it against the cwd). On an absolute path the
+                    // `..` climbs past `/`, which escapes any base — reject it
+                    // rather than silently clamp.
+                    if path.is_absolute() {
+                        return Err(anyhow::anyhow!(
+                            "--runs-dir {} climbs above its base with `..`",
+                            path.display()
+                        ));
+                    }
+                    let cwd = std::env::current_dir()
+                        .context("resolving current directory for a parent-relative --runs-dir")?;
+                    return normalize_runs_dir(&cwd.join(path));
                 }
             }
             other => out.push(other.as_os_str()),
         }
+    }
+    // Never hand back an empty path (see the invariant above): a `.`/`sub/..`
+    // that folds to nothing means the current directory, which `.` expresses
+    // without the empty-path divergence. An absolute root (`/`) keeps its
+    // RootDir component, so `out` is only empty for a relative cwd-equivalent.
+    if out.as_os_str().is_empty() {
+        out.push(".");
     }
     Ok(out)
 }
@@ -413,13 +443,63 @@ mod tests {
         );
     }
 
-    // A `..` that climbs above the base is rejected, not silently clamped:
-    // `/../x` would escape `/`, and a leading `../x` would climb above the cwd
-    // — both surface as a clear operator error rather than a surprise location.
+    // A cwd-equivalent `--runs-dir` (`.`, `sub/..`) folds to nothing, which must
+    // surface as `.` — never an empty path. An empty path would diverge
+    // downstream: `create_root_nofollow("")` opens the cwd anchor (so
+    // preparation works) while `open_root_nofollow("")` fails `ENOENT` (so the
+    // sweep / completion cleanup break). `.` keeps every consumer consistent.
     #[test]
-    fn normalize_runs_dir_rejects_climbing_above_base() {
+    fn normalize_runs_dir_never_returns_empty() {
+        assert_eq!(
+            normalize_runs_dir(Path::new(".")).unwrap(),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("sub/..")).unwrap(),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("./")).unwrap(),
+            PathBuf::from(".")
+        );
+        // An absolute root keeps its RootDir component, so it is not empty.
+        assert_eq!(
+            normalize_runs_dir(Path::new("/")).unwrap(),
+            PathBuf::from("/")
+        );
+    }
+
+    // A leading `..` on a relative path climbs above the cwd and cannot be
+    // folded lexically, so it is resolved against the current directory — the
+    // same target the non-Linux `create_dir_all` fallback always resolved it
+    // to. This keeps `--runs-dir ../runs` working on Linux (the pinned-handle
+    // walk refuses a literal `..`), restoring the pre-hardening behaviour.
+    #[test]
+    fn normalize_runs_dir_resolves_leading_parent_against_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let parent = cwd.parent().unwrap_or(&cwd).to_path_buf();
+        assert_eq!(
+            normalize_runs_dir(Path::new("../runs")).unwrap(),
+            parent.join("runs")
+        );
+        // A leading `..` after infix components: `a/../../x` → `<parent>/x`.
+        assert_eq!(
+            normalize_runs_dir(Path::new("a/../../x")).unwrap(),
+            parent.join("x")
+        );
+        // The result is absolute and `..`-free, so the no-follow walk accepts it.
+        let out = normalize_runs_dir(Path::new("../runs")).unwrap();
+        assert!(out.is_absolute());
+        assert!(!out
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)));
+    }
+
+    // Only a `..` that climbs past the filesystem root (`/..`) escapes every
+    // base, so it — and it alone — is rejected rather than silently clamped.
+    #[test]
+    fn normalize_runs_dir_rejects_climbing_above_root() {
         assert!(normalize_runs_dir(Path::new("/../x")).is_err());
-        assert!(normalize_runs_dir(Path::new("../x")).is_err());
-        assert!(normalize_runs_dir(Path::new("a/../../x")).is_err());
+        assert!(normalize_runs_dir(Path::new("/a/../../../x")).is_err());
     }
 }
