@@ -1775,8 +1775,12 @@ const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// them regardless of their group.
 /// Shells out to `kill(1)` so no libc dependency is needed; failures are ignored
 /// (a process may already be gone).
+///
+/// `pub` (but `#[doc(hidden)]`) so the offline contract tests can install the
+/// same panic-safe process-tree cleanup the harness uses internally.
 #[cfg(target_os = "linux")]
-fn kill_process_tree(pid: u32) {
+#[doc(hidden)]
+pub fn kill_process_tree(pid: u32) {
     use std::collections::HashMap;
     // Map ppid -> children, from every /proc/<pid>/stat (field 4 = ppid).
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -1819,7 +1823,8 @@ fn read_ppid(pid: u32) -> Option<u32> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn kill_process_tree(pid: u32) {
+#[doc(hidden)]
+pub fn kill_process_tree(pid: u32) {
     use std::collections::HashMap;
     // No /proc on macOS/BSD, so reconstruct the tree from `ps`. A plain
     // group-kill of the worker is NOT enough: the worker runs agents in their

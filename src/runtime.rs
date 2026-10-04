@@ -18,6 +18,25 @@ const ACTIVATION_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// while the gateway is unreachable (the incident behind nanobpm/nano-supervisor#23).
 const ACTIVATION_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// The hard ceiling on one lease-`extend` request. The tuned reqwest client
+/// carries no per-request timeout, so without this an extend to a stalled
+/// (not refused) engine can hang for the kernel's whole TCP retransmit
+/// window — far past the lease deadline — while the job keeps running on a
+/// dead activation. Bounding the request is what makes the reserve in
+/// `refresh_budget` meaningful: `REQUEST_MARGIN` is sized from THIS bound, so
+/// a retry that starts before the deadline also FINISHES (or is abandoned)
+/// before it. A timeout surfaces as a transient error (never a 404/409), so
+/// the caller's `failures >= 2` fence still applies.
+const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The lease time `refresh_budget` reserves for the extend request that
+/// follows the sleep: the request's whole bounded lifetime (`EXTEND_TIMEOUT`)
+/// plus slack for scheduling and the response body. A retry that merely
+/// STARTS before the deadline but can still be in flight when the lease
+/// expires loses the in-flight work it was protecting, so the reserve must
+/// cover the request's maximum latency, not just its dispatch.
+const REQUEST_MARGIN: Duration = EXTEND_TIMEOUT.saturating_add(Duration::from_secs(2));
+
 /// The activation-failure backoff for a streak of `failures` consecutive
 /// failures (1 = the first), with full jitter: `random(0, min(max, base *
 /// 2^(failures-1)))`. Full jitter spreads a fleet's retries across the whole
@@ -75,6 +94,11 @@ fn rand_fraction() -> f64 {
 /// once the budget is exhausted rather than letting the activation lapse
 /// silently. The deadline is reset by the caller after each successful extend.
 ///
+/// The reserve (`REQUEST_MARGIN`) covers the request's WHOLE bounded lifetime
+/// (`EXTEND_TIMEOUT` plus slack): the sleep is clamped so the retry that
+/// follows it can finish — not merely start — before the deadline. A lease
+/// with less than the reserve left yields no budget.
+///
 /// Returns `None` when the lease has already effectively expired (the caller
 /// should make one last immediate attempt, whose 404/409 then fences the job).
 /// Pure and testable.
@@ -92,10 +116,10 @@ fn refresh_budget(
         let capped = exp.min(window.max(every));
         Duration::from_millis((capped.as_millis() as u64 as f64 * rand_fraction()) as u64)
     };
-    // The lease time left after `now`, less a margin to issue the request. A
-    // failed extend can take up to ~30s to time out; leave room for the attempt
-    // that follows this sleep to actually reach the engine before the deadline.
-    const REQUEST_MARGIN: Duration = Duration::from_millis(500);
+    // The lease time left after `now`, less the reserve for the request that
+    // follows this sleep: an extend can take up to `EXTEND_TIMEOUT` to finish
+    // (or be abandoned), so the retry must START at least that far ahead of
+    // the deadline to have finished — not merely started — before it.
     let remaining = deadline
         .checked_duration_since(now)?
         .checked_sub(REQUEST_MARGIN);
@@ -161,7 +185,27 @@ pub(crate) async fn refresh_loop(
         // publishes a 404/409 fence on `lost` before we return. Cancelling
         // mid-extend would drop the very request that detects the fence, letting
         // the caller settle a job whose activation was already revoked.
-        match jobs.extend(&key, window, &lease).await {
+        //
+        // It IS, however, bounded by `EXTEND_TIMEOUT`: the HTTP client carries
+        // no per-request timeout, so an extend to a stalled (not refused)
+        // engine would otherwise hang for the kernel's whole TCP retransmit
+        // window — long past the lease deadline — with the job still running
+        // on a dead activation. The timeout is what lets `refresh_budget`'s
+        // reserve guarantee a retry FINISHES before the deadline rather than
+        // merely starting before it. Dropping the request future at the
+        // timeout cancels it like any other dropped in-flight call; the
+        // resulting error is transient (never a 404/409), so the
+        // `failures >= 2` fence below still applies — and because the sleep
+        // was clamped to `deadline - REQUEST_MARGIN`, that fence is published
+        // before the lease expires.
+        let extended = tokio::time::timeout(EXTEND_TIMEOUT, jobs.extend(&key, window, &lease))
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "extend request exceeded the {EXTEND_TIMEOUT:?} budget"
+                ))
+            });
+        match extended {
             Ok(()) => {
                 failures = 0;
                 count.fetch_add(1, Ordering::Relaxed);
@@ -256,17 +300,32 @@ mod tests {
 
         // The regression: late in the lease, a jittered window-sized delay would
         // land AFTER expiry. The budget must clamp the sleep to what remains
-        // (less the request margin), never the full window.
+        // (less the request reserve), never the full window. 40s left > the 32s
+        // reserve, so there IS a budget — but it must leave room for the retry's
+        // whole bounded lifetime, not just its dispatch.
         let now = Instant::now();
-        let deadline = now + Duration::from_secs(5); // only 5s left on the lease
+        let deadline = now + Duration::from_secs(40);
         for failures in [1, 2, 5, 20] {
             let w = refresh_budget(now, deadline, every, window, failures)
                 .expect("budget while the lease is still live");
             assert!(
-                now + w <= deadline,
-                "retry sleep {w:?} (failures={failures}) overruns the lease deadline"
+                now + w + crate::runtime::EXTEND_TIMEOUT <= deadline,
+                "retry sleep {w:?} (failures={failures}) leaves the extend no time to FINISH \
+                 before the lease deadline"
             );
         }
+
+        // A lease with less than the request reserve left has no budget for a
+        // retry that could still finish in time: the caller makes one last
+        // immediate attempt instead of sleeping into a request that outlives
+        // the lease.
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        assert_eq!(
+            refresh_budget(now, deadline, every, window, 1),
+            None,
+            "a lease with less than the extend reserve left has no usable refresh budget"
+        );
 
         // A lease that has already expired yields no budget: the caller makes a
         // final immediate attempt instead of sleeping past the deadline.

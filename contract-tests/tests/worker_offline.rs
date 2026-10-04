@@ -102,6 +102,49 @@ fn signal_process(pid: u32, sig: i32) {
     unsafe { libc::kill(pid as libc::pid_t, sig) };
 }
 
+/// RAII guard that kills a spawned worker — and its whole agent subtree — on
+/// drop unless explicitly disarmed.
+///
+/// Dropping a `std::process::Child` does NOT terminate the process, so a
+/// panicking assertion (or a `wait_for_settled` timeout) would otherwise leak
+/// the worker — and any agent descendants — still polling the shared engine
+/// after the test ends. This guard installs the harness's panic-safe
+/// process-tree cleanup; `kill()` performs the normal explicit reap and
+/// disarms the drop.
+struct WorkerKillGuard {
+    child: Option<std::process::Child>,
+}
+
+impl WorkerKillGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Borrow the child (liveness checks, stderr reader setup).
+    fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("worker already reaped")
+    }
+
+    /// Normal-path reap: kill the worker's whole process tree, wait for it,
+    /// and disarm so drop is a no-op.
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            contract_tests::kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for WorkerKillGuard {
+    fn drop(&mut self) {
+        // A panic unwound before the explicit reap — kill the worker and its
+        // agents so they do not outlive the test against the shared engine.
+        self.kill();
+    }
+}
+
 /// Whether the worker's stderr capture shows it made at least one activation
 /// (a job pickup or an empty poll) since it was last drained — i.e. it is
 /// talking to the engine again after a freeze.
@@ -131,19 +174,20 @@ fn offline_worker_bounds_its_reconnect_rate_and_stays_up() {
     let engine_url = format!("http://127.0.0.1:{}", closed_port());
     let job_type = format!("ct-offline-{}", contract_tests::rand_suffix());
     // A short poll timeout so each failed activation cycle is quick; the
-    // backoff (not the poll) is what must bound the retry rate.
-    let mut child = spawn_worker(
+    // backoff (not the poll) is what must bound the retry rate. The guard
+    // reaps the worker (and any agents) even if an assertion below panics.
+    let mut child = WorkerKillGuard::new(spawn_worker(
         target,
         &home,
         &engine_url,
         &job_type,
         &["--poll-timeout", "500"],
         &[],
-    );
+    ));
     // Drain stderr on a reader thread so the observation window below is owned
     // by the MAIN thread's deadline, never by a blocking pipe read (see
     // `spawn_stderr_reader`).
-    let stderr_rx = spawn_stderr_reader(&mut child);
+    let stderr_rx = spawn_stderr_reader(child.child());
 
     // Observe the worker through several backoff cycles. With the bounded
     // backoff (1s base doubling to a 30s ceiling, full jitter) a 12s outage
@@ -161,9 +205,12 @@ fn offline_worker_bounds_its_reconnect_rate_and_stays_up() {
     // engine is transient, so the slot must not crash or give up. Reap it
     // BEFORE reading the capture so a failure never leaks the process (and so
     // the reader thread's pipe closes, ending its `read_to_end`).
-    let alive = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-    let _ = child.kill();
-    let _ = child.wait();
+    let alive = child
+        .child()
+        .try_wait()
+        .map(|s| s.is_none())
+        .unwrap_or(false);
+    child.kill();
     // Collect the reader thread's capture (ready now that the child is reaped;
     // the short timeout just guards a wedged pipe).
     let buf = stderr_rx
@@ -201,6 +248,15 @@ fn offline_worker_bounds_its_reconnect_rate_and_stays_up() {
 /// waiting job. Killing the worker and starting a fresh one (the previous
 /// version) would pass even if an existing worker NEVER reconnects — the very
 /// regression this test exists to catch.
+///
+/// A bare freeze is NOT enough to prove a reconnect, though: the frozen
+/// engine's listening socket stays in the kernel, so the worker's in-flight
+/// long-poll can simply pend through the freeze and complete after SIGCONT —
+/// the test would pass without any activation ever failing. So while the
+/// engine is frozen the worker's existing engine connections are reset
+/// (`ss -K`, which makes the kernel RST them: the same teardown a gateway
+/// restart delivers), and the test asserts the worker actually OBSERVED an
+/// activation failure (its bounded-retry instrumentation) before recovering.
 #[test]
 fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
     let (engine, target) = match require_engine_and_target() {
@@ -216,124 +272,169 @@ fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
 
     #[cfg(unix)]
     {
-        // Deploy the job to the LIVE engine first so it is WAITING while the worker
-        // is offline — the outage must not strand it.
-        let job_type = engine.unique_type("offline-recovery");
-        let process_id = format!("p-{job_type}");
-        engine
-            .deploy_bpmn(&process_id, &bpmn::single_task(&process_id, &job_type))
-            .expect("deploy bpmn");
-        let instance = engine
-            .create_instance(&process_id, json!({ "prompt": "recover after outage" }))
-            .expect("create instance");
-        // The instance key is not needed beyond creating the waiting job: the
-        // engine-observable settled state (queried by job type) is the assertion.
-        let _process_instance_key = instance["processInstanceKey"]
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| {
-                instance["processInstanceKey"]
-                    .as_i64()
-                    .map(|k| k.to_string())
-            })
-            .expect("create instance: no processInstanceKey");
+        // Resetting the worker's in-flight connections (so the freeze genuinely
+        // forces a reconnect, rather than a pended request surviving it) needs
+        // `ss -K`, which only exists on Linux.
+        #[cfg(not(target_os = "linux"))]
+        skip!("forcing the reconnect needs `ss -K` to RST the worker's stalled connections (linux only)");
 
-        // Resolve the engine PID while it is still responsive, then freeze the
-        // engine BEFORE the worker starts polling. Spawning the worker first
-        // (against a LIVE engine) raced: it could activate and COMPLETE the
-        // waiting job in the window before the freeze, so the later assertions
-        // would pass on pre-outage work without ever exercising reconnection.
-        let engine_pid = engine_process_pid(&engine);
+        #[cfg(target_os = "linux")]
+        {
+            // Deploy the job to the LIVE engine first so it is WAITING while the worker
+            // is offline — the outage must not strand it.
+            let job_type = engine.unique_type("offline-recovery");
+            let process_id = format!("p-{job_type}");
+            engine
+                .deploy_bpmn(&process_id, &bpmn::single_task(&process_id, &job_type))
+                .expect("deploy bpmn");
+            let instance = engine
+                .create_instance(&process_id, json!({ "prompt": "recover after outage" }))
+                .expect("create instance");
+            // The instance key is not needed beyond creating the waiting job: the
+            // engine-observable settled state (queried by job type) is the assertion.
+            let _process_instance_key = instance["processInstanceKey"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    instance["processInstanceKey"]
+                        .as_i64()
+                        .map(|k| k.to_string())
+                })
+                .expect("create instance: no processInstanceKey");
 
-        // The job must be genuinely WAITING before the outage: then the only way
-        // it can reach COMPLETED is the post-resume reconnect this test asserts.
-        // The job search is eventually consistent, so poll for it to appear
-        // (bounded) rather than assuming it is indexed the instant the instance
-        // is created.
-        let pre = {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                if let Some(job) = engine.job(&job_type) {
-                    break job;
+            // Resolve the engine PID while it is still responsive, then freeze the
+            // engine BEFORE the worker starts polling. Spawning the worker first
+            // (against a LIVE engine) raced: it could activate and COMPLETE the
+            // waiting job in the window before the freeze, so the later assertions
+            // would pass on pre-outage work without ever exercising reconnection.
+            let engine_pid = engine_process_pid(&engine);
+
+            // The job must be genuinely WAITING before the outage: then the only way
+            // it can reach COMPLETED is the post-resume reconnect this test asserts.
+            // The job search is eventually consistent, so poll for it to appear
+            // (bounded) rather than assuming it is indexed the instant the instance
+            // is created.
+            let pre = {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if let Some(job) = engine.job(&job_type) {
+                        break job;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the waiting job never became visible before the outage"
+                    );
+                    std::thread::sleep(Duration::from_millis(250));
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "the waiting job never became visible before the outage"
-                );
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        };
-        assert!(
-            !contract_tests::job_is_settled(&pre),
-            "the job must still be pending before the outage; got {pre}"
-        );
+            };
+            assert!(
+                !contract_tests::job_is_settled(&pre),
+                "the job must still be pending before the outage; got {pre}"
+            );
 
-        // Phase 1 — engine DOWN. Freeze the engine and immediately arm an RAII
-        // guard that resumes it on ANY unwind: a panicking assertion below must
-        // never leave the shared test engine stopped (later contract tests would
-        // then skip, time out, or hang).
-        signal_process(engine_pid, libc::SIGSTOP);
-        let mut resume_guard = EngineResumeGuard::arm(engine_pid);
+            // Phase 1 — engine DOWN. Freeze the engine and immediately arm an RAII
+            // guard that resumes it on ANY unwind: a panicking assertion below must
+            // never leave the shared test engine stopped (later contract tests would
+            // then skip, time out, or hang).
+            signal_process(engine_pid, libc::SIGSTOP);
+            let mut resume_guard = EngineResumeGuard::arm(engine_pid);
 
-        // Only now start the worker. Its very first poll hits the frozen engine
-        // and stalls, so it cannot pick up — let alone complete — the job until
-        // we resume. It must stay alive (not crash, not give up) for the freeze.
-        let home = TempHome::new();
-        let work = tempfile::Builder::new()
-            .prefix("ns-run-")
-            .tempdir()
+            // Only now start the worker. Its very first poll hits the frozen engine
+            // and stalls, so it cannot pick up — let alone complete — the job until
+            // we resume. It must stay alive (not crash, not give up) for the
+            // freeze. The kill guard reaps the worker (and any agents) even if an
+            // assertion below panics.
+            let home = TempHome::new();
+            let work = tempfile::Builder::new()
+                .prefix("ns-run-")
+                .tempdir()
+                .unwrap();
+            let record_path = work.path().join("record.json");
+            let script_json = serde_json::to_string(&serde_json::Value::Array(vec![
+                json!({ "emit": "recovered" }),
+                json!({ "write_result": { "ok": true } }),
+            ]))
             .unwrap();
-        let record_path = work.path().join("record.json");
-        let script_json = serde_json::to_string(&serde_json::Value::Array(vec![
-            json!({ "emit": "recovered" }),
-            json!({ "write_result": { "ok": true } }),
-        ]))
-        .unwrap();
-        let mut child = spawn_worker(
-            target,
-            &home,
-            engine.url(),
-            &job_type,
-            &[],
-            &[
-                ("NS_FAKE_SCRIPT", script_json.as_str()),
-                ("NS_FAKE_RECORD", record_path.to_str().expect("record path")),
-            ],
-        );
-        let stderr_rx = spawn_stderr_reader(&mut child);
+            let mut child = WorkerKillGuard::new(spawn_worker(
+                target,
+                &home,
+                engine.url(),
+                &job_type,
+                // A short long-poll so the RST below is observed quickly: with
+                // the 30s default a poll issued right at spawn could still be
+                // in flight when the freeze ends, and the worker would not
+                // touch the reset connection (and back off) inside the window.
+                &["--poll-timeout", "2000"],
+                &[
+                    ("NS_FAKE_SCRIPT", script_json.as_str()),
+                    ("NS_FAKE_RECORD", record_path.to_str().expect("record path")),
+                ],
+            ));
+            let stderr_rx = spawn_stderr_reader(child.child());
 
-        let freeze = Duration::from_secs(6);
-        std::thread::sleep(freeze);
-        let alive_down = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-        assert!(
-            alive_down,
-            "the worker must stay up through an engine outage (it exits only when killed)"
-        );
+            let freeze = Duration::from_secs(6);
+            std::thread::sleep(freeze);
+            let alive_down = child
+                .child()
+                .try_wait()
+                .map(|s| s.is_none())
+                .unwrap_or(false);
+            assert!(
+                alive_down,
+                "the worker must stay up through an engine outage (it exits only when killed)"
+            );
 
-        // Phase 2 — engine UP: resume the SAME engine (disarming the guard; the
-        // explicit resume is the normal path). The SAME worker must reconnect,
-        // activate the waiting job, run the agent, and settle it.
-        resume_guard.resume();
-        let outcome = wait_for_settled(&engine, &job_type, Duration::from_secs(60));
+            // A bare freeze does NOT force a reconnect: the frozen engine's
+            // listening socket stays in the kernel, so the worker's stalled
+            // long-poll can simply complete after SIGCONT and the test would pass
+            // without any activation ever failing. RST the worker's existing
+            // engine connections while the engine is still frozen — the kernel
+            // tears them down exactly as a gateway restart would — so the next
+            // activation MUST establish a fresh connection. The failure surfaces
+            // to the worker at its next request/response touch, which the bounded
+            // backoff then retries.
+            kill_worker_engine_connections(&engine);
 
-        // Reap the worker before asserting on its capture.
-        let _ = child.kill();
-        let _ = child.wait();
-        let buf = stderr_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_default();
-        let stderr_text = String::from_utf8_lossy(&buf);
+            // Give the worker a moment to touch the reset connection and log
+            // its bounded retry BEFORE the engine returns: the assertion below
+            // pins that the failure was observed during the outage, not after.
+            std::thread::sleep(Duration::from_secs(3));
 
-        assert_eq!(
-            outcome["state"].as_str().unwrap_or(""),
-            "COMPLETED",
-            "after the outage the SAME worker must reconnect and complete the waiting job; \
+            // Phase 2 — engine UP: resume the SAME engine (disarming the guard; the
+            // explicit resume is the normal path). The SAME worker must reconnect,
+            // activate the waiting job, run the agent, and settle it.
+            resume_guard.resume();
+            let outcome = wait_for_settled(&engine, &job_type, Duration::from_secs(60));
+
+            // Reap the worker before asserting on its capture.
+            child.kill();
+            let buf = stderr_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_default();
+            let stderr_text = String::from_utf8_lossy(&buf);
+
+            assert_eq!(
+                outcome["state"].as_str().unwrap_or(""),
+                "COMPLETED",
+                "after the outage the SAME worker must reconnect and complete the waiting job; \
              engine job: {outcome}; worker stderr:\n{stderr_text}"
-        );
-        assert!(
+            );
+            assert!(
             stderr_has_activity(&stderr_text),
             "the SAME worker must show it reconnected and ran the job after the freeze; stderr:\n{stderr_text}"
         );
+            // The point of the connection reset above: prove the worker actually
+            // OBSERVED the outage — an activation failed and the bounded backoff
+            // retried — rather than coasting through the freeze on a pended
+            // long-poll. Without this the test cannot distinguish "reconnected"
+            // from "never disconnected".
+            assert!(
+                stderr_text.contains("retrying in"),
+                "the SAME worker must have observed an activation failure and backed off during \
+             the outage (otherwise the pended long-poll survived the freeze and no reconnect \
+             was exercised); stderr:\n{stderr_text}"
+            );
+        }
     }
 }
 
@@ -392,6 +493,35 @@ fn engine_process_pid(engine: &contract_tests::Engine) -> u32 {
         }
     }
     panic!("could not resolve the engine PID for {url}; the freeze/resume recovery test needs it");
+}
+
+/// RST every established loopback connection TO the engine's port, so a worker
+/// whose long-poll pended through a SIGSTOP freeze cannot resume on that stale
+/// connection — its next request/response touch fails and it must reconnect,
+/// exactly as if the gateway had restarted. Uses `ss -K` (kernel
+/// `SO_DESTROY`), which is Linux-only; the caller skips elsewhere.
+///
+/// Run this while the engine is still frozen: the RST is generated by the
+/// LOCAL kernel, so the stopped engine process does not need to act, and no
+/// NEW connection can complete its handshake until the engine is resumed.
+#[cfg(target_os = "linux")]
+fn kill_worker_engine_connections(engine: &contract_tests::Engine) {
+    let url = engine.url().to_string();
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("engine url has a port");
+    let out = std::process::Command::new("ss")
+        .args(["-K", "dst", "127.0.0.1", "dport", "=", &port.to_string()])
+        .output()
+        .expect("spawn `ss -K` to reset the worker's stalled engine connections");
+    assert!(
+        out.status.success(),
+        "`ss -K dport = {port}` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// PIDs of processes listening on loopback TCP `port` (via `lsof`, then `fuser`).
@@ -469,21 +599,23 @@ fn offline_fleet_bounds_its_aggregate_reconnect_rate() {
     // `TempHome`: `hire_fake_agent` writes the hired profile into the home's
     // `config.json`, so sharing one home would leave only the last-hired profile
     // and the other workers would fail to start. Keep the homes alive (the Vec)
-    // for the whole test. Each worker's stderr drains on its own reader thread.
+    // for the whole test. Each worker's stderr drains on its own reader thread,
+    // and each is wrapped in a kill guard so a panicking assertion below cannot
+    // leak a worker (or its agents) against the shared engine.
     let mut homes = Vec::new();
     let mut children = Vec::new();
     let mut readers = Vec::new();
     for _ in 0..FLEET {
         let home = TempHome::new();
-        let mut child = spawn_worker(
+        let mut child = WorkerKillGuard::new(spawn_worker(
             target,
             &home,
             &engine_url,
             &job_type,
             &["--poll-timeout", "500"],
             &[],
-        );
-        readers.push(spawn_stderr_reader(&mut child));
+        ));
+        readers.push(spawn_stderr_reader(child.child()));
         children.push(child);
         homes.push(home);
     }
@@ -497,9 +629,12 @@ fn offline_fleet_bounds_its_aggregate_reconnect_rate() {
     let mut all_alive = true;
     let mut combined = String::new();
     for (mut child, rx) in children.into_iter().zip(readers) {
-        all_alive &= child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-        let _ = child.kill();
-        let _ = child.wait();
+        all_alive &= child
+            .child()
+            .try_wait()
+            .map(|s| s.is_none())
+            .unwrap_or(false);
+        child.kill();
         let buf = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
         let text = String::from_utf8_lossy(&buf);
         total_retries += text.matches("retrying in").count();
