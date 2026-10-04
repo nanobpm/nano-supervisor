@@ -90,6 +90,13 @@ pub(crate) fn normalize_run_path(path: &Path) -> io::Result<PathBuf> {
     Ok(out)
 }
 
+/// Serializes the last-resort `fchdir`-based `CwdHandle::path()` recovery
+/// (Unix hosts without procfs or `F_GETPATH`), which mutates the process-global
+/// cwd. Real daemon hosts (Linux/macOS) never reach it — they recover the path
+/// without changing the cwd at all.
+#[cfg(unix)]
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A directory resolved no-follow and pinned by its fd, used to launch a child
 /// with its cwd set to the validated inode (via `fchdir` in `pre_exec`) rather
 /// than by re-resolving a path at spawn time.
@@ -250,18 +257,92 @@ impl CwdHandle {
     }
 
     /// The absolute path of the pinned directory *right now*, recovered through
-    /// the fd (`fchdir` + `getcwd`) rather than remembered from resolution
-    /// time, so it still names the pinned inode after an ancestor rename. Used
-    /// where a path string is genuinely required — the ACP `session/new` `cwd`
-    /// — so the value sent to the agent is the same directory the launch bound,
-    /// never a pre-swap pathname. On non-Unix hosts this is the (leaf-validated)
-    /// path the handle was opened from.
+    /// the fd rather than remembered from resolution time, so it still names
+    /// the pinned inode after an ancestor rename. Used where a path string is
+    /// genuinely required — the ACP `session/new` `cwd` — so the value sent to
+    /// the agent is the same directory the launch bound, never a pre-swap
+    /// pathname. On non-Unix hosts this is the (leaf-validated) path the handle
+    /// was opened from.
+    ///
+    /// Recovery MUST NOT mutate the process-global cwd on a real daemon host:
+    /// the supervisor runs a multi-threaded Tokio runtime (`main`), so a
+    /// transient `fchdir` into the pinned dir would make any *other* thread's
+    /// concurrent relative-path operation resolve against the pinned run dir
+    /// instead of the real cwd. Linux reads the fd's current name straight from
+    /// `/proc/self/fd/<fd>` and macOS via `fcntl(F_GETPATH)` — neither touches
+    /// the cwd. The `fchdir`/`getcwd` dance survives only as a last-resort
+    /// fallback for other Unix hosts, and there it is serialized by a
+    /// process-wide lock so at least concurrent `path()` calls cannot interleave.
     #[cfg(unix)]
     pub(crate) fn path(&self) -> io::Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(p) = self.path_via_proc() {
+                return Ok(p);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(p) = self.path_via_fgetpath() {
+                return Ok(p);
+            }
+        }
+        self.path_via_fchdir()
+    }
+
+    /// Linux: recover the pinned fd's current name from procfs — no cwd change.
+    /// Returns `None` (so the caller falls back to the locked `fchdir` path) if
+    /// procfs is unavailable or the link is not a plain absolute path, e.g. a
+    /// deleted directory whose link carries a trailing `" (deleted)"`.
+    #[cfg(all(unix, target_os = "linux"))]
+    fn path_via_proc(&self) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let link = format!("/proc/self/fd/{}", self.fd.as_raw_fd());
+        let target = std::fs::read_link(link).ok()?;
+        let bytes = target.as_os_str().as_bytes();
+        if !target.is_absolute() || bytes.ends_with(b" (deleted)") {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// macOS: recover the pinned fd's current name via `fcntl(F_GETPATH)` — no
+    /// cwd change. Returns `None` on failure so the caller falls back.
+    #[cfg(all(unix, target_os = "macos"))]
+    fn path_via_fgetpath(&self) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::io::AsRawFd;
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
-        // Save the process cwd, fchdir into the pinned fd, read getcwd, then
-        // restore — all plain libc, no Rust state the restore could race.
+        // SAFETY: `buf` is writable for its (PATH_MAX) length; `F_GETPATH`
+        // writes a NUL-terminated absolute path into it and changes no cwd.
+        let rc = unsafe {
+            libc::fcntl(
+                self.fd.as_raw_fd(),
+                libc::F_GETPATH,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&b| b == 0)?;
+        Some(PathBuf::from(
+            std::ffi::OsStr::from_bytes(&buf[..len]).to_os_string(),
+        ))
+    }
+
+    /// Last-resort recovery for Unix hosts without procfs/`F_GETPATH`: save the
+    /// process cwd, `fchdir` into the pinned fd, read `getcwd`, then restore.
+    /// This mutates the PROCESS-GLOBAL cwd, so it is serialized by a process-
+    /// wide lock — that only prevents two `path()` calls from interleaving, not
+    /// an unrelated thread's relative-path op, which is exactly why the
+    /// no-cwd-change paths above are preferred on every real daemon host.
+    #[cfg(unix)]
+    fn path_via_fchdir(&self) -> io::Result<PathBuf> {
+        use std::os::unix::io::AsRawFd;
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
         // SAFETY: `saved`/`self.fd` are valid fds; `buf` is writable for its
         // length and NUL-terminated by `getcwd` on success.
         unsafe {
@@ -747,5 +828,67 @@ mod tests {
         let handle = CwdHandle::open(Path::new("/..")).expect("/.. must clamp to /");
         let landed = std::fs::canonicalize(child_cwd(&handle)).unwrap();
         assert_eq!(landed, std::fs::canonicalize(Path::new("/")).unwrap());
+    }
+
+    /// `path()` must recover the pinned inode's name WITHOUT ever mutating the
+    /// process-global cwd: the supervisor runs a multi-threaded runtime, so a
+    /// transient `fchdir` into the pinned dir would make a concurrent thread's
+    /// relative-path op resolve against the run dir instead of the real cwd.
+    /// A watcher thread samples `getcwd` in a tight loop while the main thread
+    /// hammers `path()`; the cwd must never move. (Red against the old
+    /// `fchdir`-every-call implementation, which transiently changed it.)
+    #[test]
+    fn path_never_mutates_the_process_cwd() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let base = scratch("path-no-chdir");
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let handle = CwdHandle::open(&run).expect("open run dir");
+
+        let before = std::env::current_dir().expect("cwd");
+        let stop = Arc::new(AtomicBool::new(false));
+        let moved = {
+            let stop = Arc::clone(&stop);
+            let expected = before.clone();
+            std::thread::spawn(move || {
+                let mut seen_change = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+                    // SAFETY: `buf` is writable for its length; `getcwd`
+                    // NUL-terminates it on success.
+                    let ok = unsafe { !libc::getcwd(buf.as_mut_ptr().cast(), buf.len()).is_null() };
+                    if ok {
+                        let len = buf.iter().position(|&b| b == 0).unwrap_or(0);
+                        use std::os::unix::ffi::OsStrExt;
+                        let now = Path::new(std::ffi::OsStr::from_bytes(&buf[..len]));
+                        if now != expected {
+                            seen_change = true;
+                        }
+                    }
+                }
+                seen_change
+            })
+        };
+
+        for _ in 0..5000 {
+            let p = handle.path().expect("recover pinned path");
+            assert_eq!(
+                std::fs::canonicalize(&p).unwrap(),
+                std::fs::canonicalize(&run).unwrap(),
+                "path() must name the pinned inode"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let observed_change = moved.join().expect("watcher");
+        assert!(
+            !observed_change,
+            "path() transiently changed the process-global cwd"
+        );
+        let after = std::env::current_dir().expect("cwd");
+        assert_eq!(before, after, "process cwd must be unchanged after path()");
+        std::fs::remove_dir_all(&base).ok();
     }
 }
