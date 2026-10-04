@@ -566,7 +566,19 @@ async fn git(
     // mutate the workspace while a retry starts.
     cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        // Enter the checkout through a pinned, no-follow directory handle
+        // (`fchdir` in the child's `pre_exec`) rather than re-resolving `dir` as
+        // a path at spawn time: the run dir can sit under a world-writable
+        // ancestor, so a same-UID actor could otherwise swap a component for a
+        // symlink between provisioning and this `fetch`/`checkout`/`set-url` and
+        // redirect git outside the validated tree (#35). A refused (symlinked)
+        // component fails the git step closed, which the callers already treat
+        // as a provisioning failure.
+        let cwd_handle = crate::safecwd::CwdHandle::open(dir)
+            .with_context(|| format!("pinning git working directory {}", dir.display()))?;
+        cwd_handle
+            .apply(&mut cmd)
+            .with_context(|| format!("binding git working directory {}", dir.display()))?;
     }
     // Never prompt for credentials interactively (would hang the slot).
     cmd.env("GIT_TERMINAL_PROMPT", "0");

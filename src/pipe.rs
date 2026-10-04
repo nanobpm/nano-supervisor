@@ -39,7 +39,18 @@ pub async fn run(
     idle: Duration,
 ) -> Result<PipeOutcome> {
     let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(cwd);
+    cmd.args(args);
+    // Enter the working directory through a pinned, no-follow directory handle
+    // (`fchdir` in the child's `pre_exec`) rather than by re-resolving `cwd` as a
+    // path at spawn time: on a shared host a same-UID actor could otherwise swap
+    // an ancestor component for a symlink between provisioning and this launch
+    // and redirect the agent's cwd outside the validated run tree (#35). A
+    // refused (symlinked) component fails the launch closed.
+    let cwd_handle = crate::safecwd::CwdHandle::open(cwd)
+        .with_context(|| format!("pinning agent working directory {}", cwd.display()))?;
+    cwd_handle
+        .apply(&mut cmd)
+        .with_context(|| format!("binding agent working directory {}", cwd.display()))?;
     // Strip the daemon's own engine-connection secrets from the inherited
     // environment before layering the agent env, so the agent can never read or
     // exfiltrate the credentials the daemon uses to talk to the engine.

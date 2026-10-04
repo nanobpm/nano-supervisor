@@ -19,6 +19,10 @@ mod result;
 // Linux-only: `openat2(RESOLVE_NO_SYMLINKS)` pinned-handle hardening for the
 // run-dir sweep/provision paths. Other Unix platforms use the path-based checks.
 mod runtime;
+// Cross-platform validated-cwd capability: launch git / the agent through a
+// pinned, no-follow directory handle (`fchdir`) instead of re-resolving the run
+// dir path at spawn time, closing the provisioning→launch symlink TOCTOU (#35).
+mod safecwd;
 #[cfg(target_os = "linux")]
 mod saferoot;
 mod slot;
