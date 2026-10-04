@@ -617,7 +617,10 @@ mod tests {
                 OsString::from("ccc")
             ]
         );
-        assert_eq!(strict, best_effort, "strict and best-effort agree on a healthy dir");
+        assert_eq!(
+            strict, best_effort,
+            "strict and best-effort agree on a healthy dir"
+        );
 
         // Idempotent on a reused handle, exactly like the best-effort variant.
         let mut again = handle.entry_names_strict().expect("second strict list");
@@ -642,15 +645,24 @@ mod tests {
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let target = outside.join("config");
-        std::fs::write(&target, "url = https://x-access-token:s3cr3tPAT@h/o/r.git\n").unwrap();
+        std::fs::write(
+            &target,
+            "url = https://x-access-token:s3cr3tPAT@h/o/r.git\n",
+        )
+        .unwrap();
 
         let handle = DirHandle::open_root_nofollow(&dir).expect("pin parent");
 
         // Triage: a real `config` regular file is present.
         let leaf = dir.join("config");
         std::fs::write(&leaf, "url = https://h/o/r.git\n").unwrap();
-        let meta = handle.symlink_metadata(OsStr::new("config")).expect("stat config");
-        assert!(!meta.is_symlink && !meta.is_dir, "config stats as a regular file");
+        let meta = handle
+            .symlink_metadata(OsStr::new("config"))
+            .expect("stat config");
+        assert!(
+            !meta.is_symlink && !meta.is_dir,
+            "config stats as a regular file"
+        );
 
         // Swap it for a symlink to the outside target before the open.
         std::fs::remove_file(&leaf).unwrap();
@@ -693,8 +705,13 @@ mod tests {
         // Triage: a real `sub` directory is present.
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        let meta = handle.symlink_metadata(OsStr::new("sub")).expect("stat sub");
-        assert!(meta.is_dir && !meta.is_symlink, "sub stats as a real directory");
+        let meta = handle
+            .symlink_metadata(OsStr::new("sub"))
+            .expect("stat sub");
+        assert!(
+            meta.is_dir && !meta.is_symlink,
+            "sub stats as a real directory"
+        );
 
         // Swap it for a symlink to the outside dir before the open.
         std::fs::remove_dir(&sub).unwrap();

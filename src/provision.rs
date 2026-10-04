@@ -1178,12 +1178,17 @@ mod tests {
         if let Ok(root) = std::env::var(FD_LIMIT_CHILD_ENV) {
             // Count currently-open descriptors so the cap tracks the harness's
             // real baseline rather than a guessed absolute number.
-            let base = std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(32);
+            let base = std::fs::read_dir("/proc/self/fd")
+                .map(|d| d.count())
+                .unwrap_or(32);
             // Headroom covers the deepest ancestry chain of pinned dir handles
             // plus their readdir streams and the single open config file — a
             // small constant, and far below the sibling count the parent builds.
             let want = base as u64 + 24;
-            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             // SAFETY: plain libc rlimit get/set on a zeroed struct.
             unsafe {
                 if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
@@ -1215,7 +1220,11 @@ mod tests {
             let d = modules.join(format!("sub{i}"));
             std::fs::create_dir_all(&d).unwrap();
             let c = d.join("config");
-            std::fs::write(&c, format!("[remote \"origin\"]\n\turl = https://{token}@h/o/r{i}.git\n")).unwrap();
+            std::fs::write(
+                &c,
+                format!("[remote \"origin\"]\n\turl = https://{token}@h/o/r{i}.git\n"),
+            )
+            .unwrap();
             cfgs.push(c);
         }
 
@@ -1240,7 +1249,10 @@ mod tests {
         // filter that silently matched zero tests — then these still hold the PAT).
         for c in &cfgs {
             let got = std::fs::read_to_string(c).unwrap();
-            assert!(!got.contains("s3cr3tPAT"), "every wide-tree config scrubbed: {c:?}");
+            assert!(
+                !got.contains("s3cr3tPAT"),
+                "every wide-tree config scrubbed: {c:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
