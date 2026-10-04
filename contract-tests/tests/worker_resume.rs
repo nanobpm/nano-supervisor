@@ -71,9 +71,17 @@ fn job_writes_an_agent_instance_record() {
 }
 
 /// A job whose first worker is KILLED mid-run is picked up by a fresh worker
-/// once the activation lapses, and runs to completion — resume, observed at the
-/// engine (the job is redelivered, then completed) and at the agent (two runs:
-/// the killed attempt and the resumed one).
+/// once the activation lapses, and runs to completion — observed at the engine
+/// (the SAME job is redelivered, then completed) and at the agent (two runs:
+/// the killed attempt and the redelivered one).
+///
+/// Scope note: this pins the engine REDELIVERY contract (same `jobKey`, full
+/// retry budget, completion by the second attempt), not worker-side checkpoint
+/// restore. The Rust worker deliberately wipes every prior-attempt run
+/// directory before execution (`src/slot.rs` `execute`: "a retry starts from a
+/// clean slate"), so attempt-local filesystem state is NOT carried over by
+/// design; "resume" here means the engine hands the same job to a fresh worker,
+/// which is exactly what the assertions below observe.
 #[test]
 fn killed_worker_job_resumes_not_restarts() {
     let (engine, target) = match require_engine_and_target() {

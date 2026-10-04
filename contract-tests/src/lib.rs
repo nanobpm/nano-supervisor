@@ -930,6 +930,10 @@ impl JobOutcome {
                 rest = &rest[idx + "refreshes=".len()..];
             }
         }
+        // The scan walks stderr oldest-to-newest; reverse so callers get the
+        // documented newest-first order (`counts.first()` is the LATEST settle
+        // line even when several were logged).
+        out.reverse();
         out
     }
 }
@@ -1170,8 +1174,28 @@ pub fn with_worker_running<R>(
     };
     // `during` runs to completion while the worker is live; it can observe the
     // engine, watch the agent record, supersede the activation, or kill the
-    // worker (`run.kill_worker()`).
-    let during_result = during(&run);
+    // worker (`run.kill_worker()`). A PANIC in `during` must not leak the
+    // worker: unwinding would skip the reaper below, and dropping `Child` does
+    // not terminate it, leaving the worker and its fake-agent subtree alive to
+    // interfere with later tests. Catch the unwind, kill + reap the process
+    // tree, join the pipe threads (their reads end at EOF once the tree is
+    // dead), then resume the panic so the test still fails with its own
+    // message.
+    let during_result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| during(&run))) {
+            Ok(r) => r,
+            Err(payload) => {
+                #[cfg(unix)]
+                kill_process_tree(child.lock().unwrap().id());
+                let mut guard = child.lock().unwrap();
+                let _ = guard.kill();
+                let _ = guard.wait();
+                drop(guard);
+                let _ = out_h.join();
+                let _ = err_h.join();
+                std::panic::resume_unwind(payload);
+            }
+        };
 
     // Reap: the worker should exit on its own after `--max-jobs 1`; give it the
     // remainder of the watchdog window from launch, then kill.
@@ -1271,7 +1295,25 @@ pub fn with_worker_running_on<R>(
         record_path: record_path.clone(),
         child: std::sync::Arc::clone(&child),
     };
-    let during_result = during(&run);
+    let during_result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| during(&run))) {
+            Ok(r) => r,
+            Err(payload) => {
+                // Same panic-safety contract as `with_worker_running`: kill + reap
+                // the worker tree and join the pipe threads before resuming the
+                // panic, so a failed mid-run assertion cannot leak a live worker
+                // into later tests.
+                #[cfg(unix)]
+                kill_process_tree(child.lock().unwrap().id());
+                let mut guard = child.lock().unwrap();
+                let _ = guard.kill();
+                let _ = guard.wait();
+                drop(guard);
+                let _ = out_h.join();
+                let _ = err_h.join();
+                std::panic::resume_unwind(payload);
+            }
+        };
 
     let deadline = Instant::now() + WORKER_TEST_TIMEOUT;
     let status = loop {
@@ -2017,5 +2059,50 @@ mod unit {
         assert!(!job_is_settled(
             &json!({ "state": "CREATED", "retries": 3 })
         ));
+    }
+
+    #[test]
+    fn refresh_counts_are_newest_first() {
+        // The parser scans stderr oldest-to-newest but promises newest-first:
+        // with several settle lines (and several `refreshes=` markers on one
+        // line), `first()` must be the LATEST count, not the oldest.
+        let outcome = JobOutcome {
+            job_type: "t".into(),
+            process_instance_key: "1".into(),
+            engine: Engine {
+                url: "http://localhost:8080".into(),
+                http: reqwest::blocking::Client::new(),
+            },
+            record_path: PathBuf::from("/nonexistent-record.json"),
+            output: Output {
+                status: {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        std::process::ExitStatus::from_raw(0)
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::ExitStatusExt;
+                        std::process::ExitStatus::from_raw(0)
+                    }
+                },
+                stdout: Vec::new(),
+                stderr: b"job 1 completed in 1.0s (refreshes=1)\nnoise refreshes=2 and refreshes=3\njob 2 completed in 2.0s (refreshes=7)\n".to_vec(),
+            },
+            home_path: PathBuf::from("/nonexistent-home"),
+            _home: None,
+            _work: tempfile::tempdir().expect("tempdir"),
+        };
+        assert_eq!(
+            outcome.refresh_counts(),
+            vec![7, 3, 2, 1],
+            "the whole scan is reversed: the last line's counts first, so \
+             `first()` is the latest settle line's count"
+        );
+        // A worker without the refresh instrumentation yields an empty vec.
+        let mut silent = outcome;
+        silent.output.stderr = b"no settle lines here\n".to_vec();
+        assert!(silent.refresh_counts().is_empty());
     }
 }

@@ -150,6 +150,23 @@ fn worker_provisions_the_repository_into_the_run_dir() {
             origin.to_str().expect("origin path"),
         ],
     );
+    // Pin the seeded commit: the agent's script below writes a successful
+    // result ONLY when its cwd is a real clone of this origin at exactly this
+    // commit, so a worker that merely creates a `repo/` directory (or clones
+    // the wrong ref) can no longer pass the test.
+    let seed_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&seed)
+            .output()
+            .expect("spawn git rev-parse");
+        assert!(
+            out.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
 
     let repo_url = format!("file://{}", origin.display());
     let outcome = run_worker_job(
@@ -158,6 +175,11 @@ fn worker_provisions_the_repository_into_the_run_dir() {
         "env-repo-provision",
         &[
             json!({ "emit": "ok" }),
+            // Complete the job only if the checkout is genuinely provisioned:
+            // a `.git` must exist and HEAD must be the seeded commit. On any
+            // mismatch the script exits non-zero and never writes a result, so
+            // the job cannot COMPLETE.
+            json!({ "shell": format!("test -d .git && test \"$(git rev-parse HEAD)\" = '{seed_head}'") }),
             json!({ "write_result": { "ok": true } }),
         ],
         json!({
