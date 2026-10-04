@@ -604,14 +604,19 @@ pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf
         .map_err(|e| anyhow::Error::new(e).context("prepare_run_dir blocking task panicked"))?
 }
 
-/// `prepare_run_dir` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
-/// runs root: the stale-wipe, create, and 0700 chmod of both the root and the
-/// job dir all happen *relative to that pinned handle*, so a same-UID actor
-/// cannot swap `runs_dir` (or an ancestor) for a symlink between a check and the
-/// operation and redirect the remove/create outside the workspace. This is the
-/// atomic fix the path-based `reject_symlink` re-checks can only approximate.
-/// `run_dir` is always `<runs_dir>/<key>` (a single, engine-validated numeric
-/// component), so its `file_name()` is the child directory to prepare.
+/// `prepare_run_dir` via `openat2(RESOLVE_NO_SYMLINKS)` handles pinned to the
+/// runs root: the root itself is first *established as a private root* through
+/// no-follow directory handles ([`DirHandle::create_root_nofollow`] mkdir+opens
+/// every component relative to a pinned parent, never resolving the path as a
+/// string), then the stale-wipe, create, and 0700 chmod of both the root and
+/// the job dir all happen *relative to that pinned handle*. A same-UID actor
+/// therefore cannot swap `runs_dir` (or an ancestor) for a symlink between a
+/// check and the operation and redirect the create/remove outside the
+/// workspace — the no-follow open refuses the swapped component rather than
+/// following it. This is the atomic fix the path-based `reject_symlink`
+/// re-checks can only approximate. `run_dir` is always `<runs_dir>/<key>` (a
+/// single, engine-validated numeric component), so its `file_name()` is the
+/// child directory to prepare.
 #[cfg(target_os = "linux")]
 fn prepare_run_dir_pinned(
     runs_dir: &Path,
@@ -624,20 +629,15 @@ fn prepare_run_dir_pinned(
             format!("run dir {} has no final component", run_dir.display()),
         ))
     })?;
-    // Bootstrap: the runs root must exist before it can be opened no-follow. A
-    // symlinked component is still caught the instant we open it (openat2
-    // refuses it), so this only ever materialises real directories under an
-    // honest root; a planted symlink ancestor fails the open rather than being
-    // silently followed. But `create_dir_all` itself *follows* symlinks, so an
-    // attacker-planted symlinked ancestor could make the bootstrap materialise
-    // the root through it (in an attacker-chosen target) *before* the no-follow
-    // open ever runs. Reject a symlinked existing ancestor first so the create
-    // cannot be redirected out of the workspace.
-    if let Err(e) = reject_symlinked_ancestors(runs_dir) {
-        return Err(PinError::Io(std::io::Error::other(e.to_string())));
-    }
-    std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
-    let root = DirHandle::open_root_nofollow(runs_dir)?;
+    // Establish the runs root as a PRIVATE ROOT through no-follow directory
+    // handles: `create_root_nofollow` mkdir+opens every component relative to a
+    // pinned parent with `RESOLVE_NO_SYMLINKS`, so a planted or swapped symlink
+    // ancestor is refused by the open rather than followed. This replaces the
+    // former path-based bootstrap (`reject_symlinked_ancestors` + a
+    // symlink-following `create_dir_all`, then a separate `open_root_nofollow`),
+    // which left a check-then-create TOCTOU window the issue's path checks could
+    // only approximate. The returned handle is the pinned runs root.
+    let root = DirHandle::create_root_nofollow(runs_dir)?;
     root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
     Ok(())
 }

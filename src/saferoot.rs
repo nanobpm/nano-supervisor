@@ -141,6 +141,84 @@ impl DirHandle {
         }
     }
 
+    /// Open an anchor handle on an absolute/relative *root* for a component
+    /// walk: `/` for an absolute path, `.` (the current directory) for a
+    /// relative one. Resolved with `RESOLVE_NO_SYMLINKS` and NOT
+    /// `RESOLVE_BENEATH` (the anchor is the walk's base, not a descent).
+    fn open_anchor(absolute: bool) -> Result<DirHandle, PinError> {
+        let anchor: &CStr = if absolute { c"/" } else { c"." };
+        match openat2_raw(
+            libc::AT_FDCWD,
+            anchor,
+            (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            RESOLVE_NO_SYMLINKS,
+        ) {
+            Ok(fd) => Ok(DirHandle { fd }),
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => Err(PinError::Unsupported),
+            Err(e) => Err(PinError::Io(e)),
+        }
+    }
+
+    /// Establish `path` as a **private root** entirely through no-follow
+    /// directory handles and return a handle pinned to its final component.
+    ///
+    /// Unlike `create_dir_all(path)` followed by [`open_root_nofollow`], this
+    /// never resolves `path` as a string against the live filesystem: it opens
+    /// an anchor (`/` or `.`) with `RESOLVE_NO_SYMLINKS`, then for each path
+    /// component `mkdirat`s it (tolerating an existing directory) and re-opens
+    /// it relative to the parent handle with
+    /// `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`. Every component is therefore
+    /// *created and re-opened through a handle*, closing the check-then-create
+    /// TOCTOU that a path-based `reject_symlinked_ancestors` + `create_dir_all`
+    /// bootstrap leaves open — a same-UID actor cannot swap an ancestor for a
+    /// symlink in a window and redirect the `mkdir` outside the workspace,
+    /// because the very next open refuses any symlinked or escaping component
+    /// (`ELOOP`/`EXDEV` → [`PinError::Io`]).
+    ///
+    /// New components are created `0o777` (umask applies), matching
+    /// `create_dir_all`; the caller locks the leaf it owns to its final mode.
+    pub(crate) fn create_root_nofollow(path: &Path) -> Result<DirHandle, PinError> {
+        use std::path::Component;
+        let mut handle = DirHandle::open_anchor(path.is_absolute())?;
+        for comp in path.components() {
+            match comp {
+                // The anchor already accounts for the root / cwd base.
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => {
+                    handle.mkdirat_ignore_existing(name, 0o777)?;
+                    // Re-open through a handle (no-follow, beneath the parent):
+                    // a component swapped to a symlink after the `mkdirat` is
+                    // refused here rather than silently traversed.
+                    handle = handle.open_child_dir(name).map_err(PinError::Io)?;
+                }
+                // `..` and Windows prefixes have no business in a runs-root
+                // path; refuse rather than risk escaping the anchor.
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(PinError::Io(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "runs-root path contains an unsupported component",
+                    )));
+                }
+            }
+        }
+        Ok(handle)
+    }
+
+    /// `mkdirat` a direct child relative to this handle, treating an existing
+    /// directory as success (an existing non-directory surfaces later when the
+    /// no-follow re-open fails). Never follows a symlink: creation is relative
+    /// to the pinned parent fd.
+    fn mkdirat_ignore_existing(&self, name: &OsStr, mode: u32) -> io::Result<()> {
+        let c = cstr(name)?;
+        if unsafe { libc::mkdirat(self.fd.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// Open a direct child directory relative to this handle, never following a
     /// symlink and never escaping this directory
     /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`).
@@ -375,5 +453,96 @@ mod tests {
         assert!(handle.entry_names().unwrap().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // `create_root_nofollow` must materialise a deep path through no-follow
+    // handles and pin its leaf: every component is created and re-opened, and a
+    // pre-existing path is tolerated (idempotent).
+    #[test]
+    fn create_root_nofollow_builds_and_pins_nested_path() {
+        let base = scratch_root("create-nested");
+        let target = base.join("a").join("b").join("runs");
+
+        let handle = DirHandle::create_root_nofollow(&target).expect("create nested root");
+        assert!(target.is_dir(), "every component must be created");
+
+        // The returned handle is pinned to the leaf: a child created through it
+        // must appear under the real target path.
+        handle
+            .mkdirat_ignore_existing(OsStr::new("job42"), 0o700)
+            .expect("mkdir child through pinned leaf");
+        assert!(
+            target.join("job42").is_dir(),
+            "the handle must be pinned to the created leaf"
+        );
+
+        // Idempotent: a second establishment over an existing tree succeeds.
+        let again = DirHandle::create_root_nofollow(&target).expect("re-establish existing root");
+        assert!(again
+            .entry_names()
+            .unwrap()
+            .contains(&OsString::from("job42")));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // A symlinked ANCESTOR of the runs root must be refused, not followed: the
+    // no-follow re-open of the swapped component fails (ELOOP) and nothing is
+    // created inside the link's target. This is the TOCTOU the former
+    // path-based `create_dir_all` bootstrap could not close.
+    #[test]
+    fn create_root_nofollow_refuses_symlinked_ancestor() {
+        let base = scratch_root("create-symlink");
+        // Real tree the attacker would like the create redirected into.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // `link -> outside`; the runs root is requested as `<base>/link/runs`.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let target = link.join("runs");
+
+        let err = DirHandle::create_root_nofollow(&target)
+            .err()
+            .expect("a symlinked ancestor must be refused");
+        assert!(
+            matches!(err, PinError::Io(_)),
+            "a refused symlink is a security-relevant Io error, never Unsupported"
+        );
+        assert!(
+            !outside.join("runs").exists(),
+            "the runs root must not be materialised inside the symlink target"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The final component itself being a symlink is refused too (the leaf is
+    // re-opened no-follow just like every ancestor).
+    #[test]
+    fn create_root_nofollow_refuses_symlinked_leaf() {
+        let base = scratch_root("create-symlink-leaf");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link_runs = base.join("runs");
+        std::os::unix::fs::symlink(&outside, &link_runs).unwrap();
+
+        let err = DirHandle::create_root_nofollow(&link_runs)
+            .err()
+            .expect("a symlinked leaf must be refused");
+        assert!(matches!(err, PinError::Io(_)));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // `..` in a runs-root path is refused rather than allowed to climb out.
+    #[test]
+    fn create_root_nofollow_rejects_parent_component() {
+        let base = scratch_root("create-parent");
+        let target = base.join("a").join("..").join("escape");
+        let err = DirHandle::create_root_nofollow(&target)
+            .err()
+            .expect("a `..` component must be rejected");
+        assert!(matches!(err, PinError::Io(_)));
+        std::fs::remove_dir_all(&base).ok();
     }
 }
