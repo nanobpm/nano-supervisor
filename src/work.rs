@@ -118,9 +118,18 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         None => {
             let ns = format!("rust-worker-{}", std::process::id());
             match state::state_home() {
-                Some(h) => (h.join("agent-runs").join(&ns), h),
+                // Normalize the environment-derived state home (`$C8CTL_NANO_HOME`
+                // / `$HOME` / `$XDG_DATA_HOME`) BEFORE it becomes the anchor, so a
+                // `.`/leading-`..` in those variables is resolved consistently
+                // with an explicit `--runs-dir` (main::normalize_runs_dir) and a
+                // stray `..` fails closed here with a clear error instead of
+                // breaking every job's no-follow preparation on Linux.
+                Some(h) => {
+                    let h = crate::normalize_runs_dir(&h)?;
+                    (h.join("agent-runs").join(&ns), h)
+                }
                 None => {
-                    let t = std::env::temp_dir();
+                    let t = crate::normalize_runs_dir(&std::env::temp_dir())?;
                     // Use the SAME `rust-worker-<pid>` namespace prefix as the
                     // normal paths: the shared-parent sweeper recognises only
                     // that prefix (`slot::namespace_owner_liveness`), so a

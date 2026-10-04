@@ -210,12 +210,13 @@ impl DirHandle {
         // here: the walk pins an anchor (`/` or the cwd) and descends with
         // `RESOLVE_BENEATH`, so a parent traversal would either climb out of
         // that anchor (forbidden) or require re-resolution against the live
-        // path. Callers that accept an operator `--runs-dir` resolve any `..`
-        // lexically at the CLI boundary (`main::normalize_runs_dir`) BEFORE
-        // the path reaches this security layer, preserving the pre-hardening
-        // `../runs` behaviour the non-Linux `create_dir_all` fallback still
-        // has; this walk stays fail-closed so a `..` that slips past the
-        // boundary is refused, never silently followed.
+        // path. Callers that accept an operator `--runs-dir` resolve a leading
+        // `..` against the cwd (and reject any interior `..`) at the CLI
+        // boundary (`main::normalize_runs_dir`) BEFORE the path reaches this
+        // security layer, preserving the pre-hardening `../runs` behaviour the
+        // non-Linux `create_dir_all` fallback still has; this walk stays
+        // fail-closed so a `..` that slips past the boundary is refused, never
+        // silently followed.
         let mut names: Vec<&OsStr> = Vec::new();
         for comp in path.components() {
             match comp {
@@ -615,9 +616,10 @@ mod tests {
     // A `..` that reaches the security layer is still refused (fail-closed):
     // the walk can never honour a parent traversal without escaping its pinned
     // anchor. The pre-hardening `--runs-dir ../runs` behaviour is preserved at
-    // the CLI boundary (`main::normalize_runs_dir`), which folds `..`
-    // lexically before the path gets here — so this rejection only fires for a
-    // `..` that slipped past the boundary, never for a legitimate runs dir.
+    // the CLI boundary (`main::normalize_runs_dir`), which resolves a leading
+    // `..` against the cwd (and rejects any interior `..`) before the path gets
+    // here — so this rejection only fires for a `..` that slipped past the
+    // boundary, never for a legitimate runs dir.
     #[test]
     fn create_root_nofollow_rejects_parent_component() {
         let base = scratch_root("create-parent");
@@ -630,18 +632,18 @@ mod tests {
     }
 
     // The OTHER half of the parent-traversal contract: once the CLI boundary
-    // (`main::normalize_runs_dir`) has folded `..` lexically, the resulting
-    // `..`-free path — e.g. `--runs-dir ../runs` → `<parent>/runs` — must
-    // establish cleanly through the pinned walk. This is the regression test
-    // for "Linux rejects parent-traversal runs directories": the normalized
-    // form of a parent-traversal runs dir is accepted on Linux exactly as the
-    // non-Linux `create_dir_all` fallback accepts the raw form.
+    // (`main::normalize_runs_dir`) has resolved `--runs-dir ../runs` to an
+    // absolute, `..`-free `<parent>/runs`, that path must establish cleanly
+    // through the pinned walk. This is the regression test for "Linux rejects
+    // parent-traversal runs directories": the normalized form of a
+    // parent-traversal runs dir is accepted on Linux exactly as the non-Linux
+    // `create_dir_all` fallback accepts the raw form.
     #[test]
     fn create_root_nofollow_accepts_normalized_parent_traversal_target() {
         let base = scratch_root("create-parent-ok");
-        // `--runs-dir <base>/sub/../runs` normalizes lexically to
-        // `<base>/runs` (the `sub` component is cancelled by `..` before the
-        // path reaches this layer). Establish THAT.
+        // A leading-`..` runs dir (e.g. `--runs-dir ../runs`) normalizes to an
+        // absolute `..`-free path; `<base>/runs` is that already-normalized
+        // form. Establish THAT.
         let normalized = base.join("runs");
         let handle = DirHandle::create_root_nofollow(&normalized)
             .expect("a normalized parent-traversal target must establish");
