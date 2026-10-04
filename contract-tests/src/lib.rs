@@ -1145,6 +1145,7 @@ pub fn with_worker_running<R>(
     // it is live. The worker child is shared with the reaper below via an
     // Option-in-Mutex: `during` may kill the process (supersede tests do not;
     // the kill/resume test kills via its own handle), but the reap always waits.
+    let launch = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -1198,8 +1199,11 @@ pub fn with_worker_running<R>(
         };
 
     // Reap: the worker should exit on its own after `--max-jobs 1`; give it the
-    // remainder of the watchdog window from launch, then kill.
-    let deadline = Instant::now() + WORKER_TEST_TIMEOUT;
+    // remainder of the watchdog window from launch, then kill. The deadline is
+    // anchored to the pre-spawn `launch` instant (not `Instant::now()` here) so
+    // a slow `during` callback — e.g. the lease test polling for ~20s — cannot
+    // extend the worker's subprocess lifetime past the WORKER_TEST_TIMEOUT cap.
+    let deadline = launch + WORKER_TEST_TIMEOUT;
     let status = loop {
         if let Some(status) = child.lock().unwrap().try_wait().expect("try_wait worker") {
             break status;
@@ -1268,6 +1272,7 @@ pub fn with_worker_running_on<R>(
         cmd.env(k, v);
     }
 
+    let launch = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -1315,7 +1320,10 @@ pub fn with_worker_running_on<R>(
             }
         };
 
-    let deadline = Instant::now() + WORKER_TEST_TIMEOUT;
+    // Anchor the reap deadline to the pre-spawn `launch` instant (not
+    // `Instant::now()` here) so a slow `during` callback cannot push the
+    // worker's subprocess lifetime past the WORKER_TEST_TIMEOUT cap.
+    let deadline = launch + WORKER_TEST_TIMEOUT;
     let status = loop {
         if let Some(status) = child.lock().unwrap().try_wait().expect("try_wait worker") {
             break status;

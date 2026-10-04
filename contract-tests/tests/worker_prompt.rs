@@ -150,13 +150,18 @@ fn missing_secret_ref_fails_the_job() {
         ],
         json!({
             "prompt": "needs a secret",
-            "io.nanobpm.agentTask.setup.secretRefs": ["CT_DEFINITELY_MISSING_SECRET"],
+            "io.nanobpm.agentTask.setup.secretRefs": ["NS_DEFINITELY_MISSING_SECRET"],
         }),
         // Select the SAME host resolver the positive case uses so this exercises
         // the intended "host resolver cannot supply the requested key" path, and
         // not the separate "no resolver configured at all" failure. The resolver
-        // is active but `CT_DEFINITELY_MISSING_SECRET` is absent from the env
-        // below (`&[]`), so resolution must fail and the job must not run.
+        // is active but `NS_DEFINITELY_MISSING_SECRET` is absent from the env
+        // below (`&[]`), so resolution must fail and the job must not run. The
+        // `NS_` prefix is deliberate: `apply_hermetic_env` (see lib.rs
+        // `is_fleet_var`) ALWAYS strips inherited `NS_*` variables, so this name
+        // can never be supplied by an ambient developer/CI environment — a
+        // name under a non-stripped prefix (e.g. `CT_`) would let an inherited
+        // definition resolve the secret and make this negative test flaky.
         &["--secret-resolver", "host"],
         &[],
     );
