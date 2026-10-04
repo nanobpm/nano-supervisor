@@ -87,6 +87,10 @@ pub async fn run(
     ));
     let mut next = 0usize;
     let mut handled = 0usize;
+    // Consecutive activation failures, for the reconnect backoff below. Reset by
+    // any successful activation (even an empty batch — reaching the engine at
+    // all means the connection is healthy again).
+    let mut activation_failures = 0u32;
     loop {
         if cfg.max_jobs.is_some_and(|max| handled >= max) {
             log(&format!(
@@ -122,14 +126,34 @@ pub async fn run(
         let batch = match batch {
             Ok(b) => b,
             Err(e) => {
+                activation_failures = activation_failures.saturating_add(1);
+                // Bounded exponential backoff with full jitter, interruptible by
+                // the drain watch. A fixed 5s retry let a fleet of idle slots
+                // hammer an unreachable gateway — each attempt opening fresh TCP
+                // connections the kernel then holds in `TIME_WAIT` — until the
+                // host's ephemeral port range was exhausted and the gateway (and
+                // every other local client) became unreachable
+                // (nanobpm/nano-supervisor#23). The backoff bounds each slot to
+                // ~one reconnect attempt per 30s at the ceiling, and the jitter
+                // spreads a fleet's retries so a recovering gateway is not hit
+                // by every slot in the same tick. The engine is still polled
+                // promptly once it answers: the streak resets on the first
+                // successful activation.
+                let wait = crate::runtime::activation_backoff(activation_failures);
                 log(&format!(
-                    "slot {} activation of {job_type:?} failed: {e:#}; retrying in 5s",
-                    cfg.worker_name
+                    "slot {} activation of {job_type:?} failed ({activation_failures} in a row): {e:#}; retrying in {:.1}s",
+                    cfg.worker_name,
+                    wait.as_secs_f64()
                 ));
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => continue,
+                    _ = tokio::time::sleep(wait) => {}
+                }
                 continue;
             }
         };
+        activation_failures = 0;
         // Re-check the drain watch before touching the returned batch: `select!`
         // resolves the activation the instant it is ready, but a SIGTERM may have
         // set `shutdown` while `activate` was in flight. Starting these jobs now

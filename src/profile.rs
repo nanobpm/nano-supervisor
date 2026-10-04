@@ -133,7 +133,33 @@ pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
             opts = opts.with(k, v);
         }
     }
-    CamundaClient::new(opts).map_err(|e| anyhow::anyhow!("creating engine client: {e}"))
+    // One pooled HTTP client for the whole process (the SDK shares it across
+    // every slot's activate/extend/complete/fail). reqwest already pools and
+    // reuses keep-alive connections by default; these settings bound the pool's
+    // CHURN instead:
+    //
+    // - `pool_idle_timeout(30s)`: the engine's own keep-alive timeout can be
+    //   shorter than reqwest's 90s default, in which case a pooled connection
+    //   goes stale and the next request opens a fresh socket — each abandoned
+    //   one held by the kernel in `TIME_WAIT`. Dropping idle pool entries after
+    //   30s (the default long-poll window, so a poll response's connection is
+    //   reused for the immediately following poll) keeps the pool from
+    //   accumulating dead sockets between polls.
+    // - `tcp_keepalive(60s)`: keep long-lived idle connections (a 30s+ long
+    //   poll, a quiet fleet) fresh through NATs/LBs instead of discovering a
+    //   half-dead socket on the next request and reconnecting.
+    //
+    // The storm guard itself is the activation backoff in `slot::run`
+    // (nanobpm/nano-supervisor#23); this keeps the steady-state connection count
+    // low so a fleet of slots shares a handful of sockets rather than churning
+    // the ephemeral port range.
+    let http = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow::anyhow!("creating engine HTTP client: {e}"))?;
+    CamundaClient::new(opts.with_http_client(http))
+        .map_err(|e| anyhow::anyhow!("creating engine client: {e}"))
 }
 
 #[cfg(test)]

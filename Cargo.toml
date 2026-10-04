@@ -17,6 +17,11 @@ publish = false
 [dependencies]
 # 0.3.0 is the first release with job leases (`with_lease`, `job_lease_token`).
 camunda-orchestration-sdk = { version = "0.3.1", default-features = false, features = ["rustls"] }
+# Direct handle on the SDK's HTTP stack so `profile::client` can hand the SDK a
+# tuned `reqwest::Client` (bounded idle-pool churn + TCP keep-alive — the
+# connection-reuse half of nanobpm/nano-supervisor#23). Kept on the SDK's own
+# reqwest version so `CamundaOptions::with_http_client` takes this client type.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # Shell-style splitting for the `--agent` command string so an executable path
