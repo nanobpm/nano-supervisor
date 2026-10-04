@@ -69,6 +69,61 @@ fn pipe_writes_result_file() {
 }
 
 #[test]
+fn pipe_failing_shell_step_aborts_before_result() {
+    // A `shell` gate that fails MUST abort the turn: any later step (notably
+    // `write_result`) must NOT run, so a job whose precondition never held can
+    // never COMPLETE. Regression for the gate in worker_env.rs that only logged
+    // a non-zero exit and fell through to `write_result`.
+    let dir = tmp();
+    let result = dir.path().join("result.json");
+    let (_out, code) = FakeAgent::new()
+        .env("AGENT_RESULT_FILE", result.to_str().unwrap())
+        .step(json!({ "shell": "exit 3" }))
+        .write_result(json!({ "ok": true }))
+        .run_pipe("go");
+    assert_eq!(code, 3, "the failing shell step's exit code propagates");
+    assert!(
+        !result.exists(),
+        "write_result after a failed shell gate must not run"
+    );
+}
+
+#[test]
+fn pipe_failing_command_shell_step_aborts_before_result() {
+    // A command that cannot run (or `false`) is also a gate failure: it must
+    // abort with a non-zero code and skip the later `write_result`.
+    let dir = tmp();
+    let result = dir.path().join("result.json");
+    let (_out, code) = FakeAgent::new()
+        .env("AGENT_RESULT_FILE", result.to_str().unwrap())
+        .step(json!({ "shell": "false" }))
+        .write_result(json!({ "ok": true }))
+        .run_pipe("go");
+    assert_ne!(code, 0, "a failed gate must exit non-zero");
+    assert!(
+        !result.exists(),
+        "write_result after a failed shell gate must not run"
+    );
+}
+
+#[test]
+fn pipe_passing_shell_step_runs_result() {
+    // The gate's happy path: a succeeding `shell` step lets the turn continue,
+    // so a later `write_result` runs and the agent exits 0.
+    let dir = tmp();
+    let result = dir.path().join("result.json");
+    let (_out, code) = FakeAgent::new()
+        .env("AGENT_RESULT_FILE", result.to_str().unwrap())
+        .step(json!({ "shell": "true" }))
+        .write_result(json!({ "ok": true }))
+        .run_pipe("go");
+    assert_eq!(code, 0);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&result).unwrap()).unwrap();
+    assert_eq!(written["ok"], true);
+}
+
+#[test]
 fn pipe_prints_result_marker_line() {
     let (stdout, _code) = FakeAgent::new()
         .result_marker(json!({ "status": "opened" }))
