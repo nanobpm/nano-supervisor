@@ -40,6 +40,25 @@ fn leased_worker_refreshes_every_third_of_the_window() {
         "the job must not be re-dispatched"
     );
     assert_eq!(outcome.variables()["ok"], true);
+    // The refresh loop must actually have FIRED, not merely "not lost the job":
+    // parse the settle line's `refreshes=<n>` and require at least one refresh.
+    // A 4.5s agent run on a 3s recovery window cannot survive without one, so
+    // the COMPLETED state above already implies it — but only the parsed count
+    // pins the refresh loop itself (a worker that never refreshed yet completed
+    // by luck would pass the state assertions). The `refreshes=` instrumentation
+    // is the Rust worker's; the Node plugin logs no per-settle refresh count, so
+    // the count assertion is Rust-only while the engine-observable completion
+    // above stays the both-targets contract.
+    if target == contract_tests::Target::Rust {
+        let counts = outcome.refresh_counts();
+        let latest = counts.first().copied().unwrap_or(0);
+        assert!(
+            latest >= 1,
+            "a 4.5s run on a 3s recovery window must log refreshes>=1 at settle; \
+             counts: {counts:?}\nstderr:\n{}",
+            outcome.stderr()
+        );
+    }
 }
 
 /// Settling under a lease is accepted: the fenced completion lands and carries
@@ -167,5 +186,136 @@ fn settlement_with_a_wrong_lease_token_is_rejected() {
         reqwest::StatusCode::CONFLICT,
         "a completion with a wrong lease token must be fenced with 409 Conflict, got {}",
         wrong.status()
+    );
+}
+
+/// Induced activation loss: the worker is KILLED mid-run, its refresher dies
+/// with it, the activation's deadline lapses, and the engine redelivers the job
+/// to a fresh activation. The job is observably lost by the first (dead) worker
+/// — the engine hands it out again — and the dead worker's agent never settles
+/// it: the job survives with its full retry budget, ready to run again.
+///
+/// The inducement is real, not conditional: the worker runs a 30s agent on a 2s
+/// recovery window, the test SIGKILLs the worker once the agent is mid-run,
+/// waits out the lapsed deadline, and activates the job directly over REST —
+/// the engine's redelivery IS the induced loss.
+#[test]
+fn killed_workers_activation_is_lost_and_redelivered() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    // The kill/reactivate orchestration needs the scoped, mid-run harness; the
+    // Node plugin's worker is reaped differently by this suite (it never
+    // self-exits), so the kill contract is pinned for the Rust worker first.
+    if target != contract_tests::Target::Rust {
+        skip!("mid-run kill/redelivery orchestration is pinned for the Rust worker first");
+    }
+    let (outcome, redelivered) = contract_tests::with_worker_running(
+        &engine,
+        &target,
+        "lease-kill",
+        &[
+            // Long enough to still be running when the lapsed activation is
+            // redelivered (2s window + polling margin).
+            json!({ "sleep_ms": 30000 }),
+            json!({ "emit": "too late" }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({ "prompt": "be killed mid-run" }),
+        &["--recovery-window", "2000"],
+        &[],
+        |run| {
+            // Wait for the agent to be mid-run, then kill the worker outright —
+            // the refresher dies with it and the activation starts lapsing.
+            for _ in 0..50 {
+                if run.agent_started() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(
+                run.agent_started(),
+                "the agent never started — there is no mid-run worker to kill"
+            );
+            run.kill_worker();
+            // The activation's deadline (≈ kill time + 2s) must lapse before the
+            // engine will hand the job out again; poll for the redelivery.
+            let mut redelivered: Option<serde_json::Value> = None;
+            for _ in 0..60 {
+                let v: serde_json::Value = engine
+                    .http()
+                    .post(format!("{}/v2/jobs/activation", engine.url()))
+                    .json(&json!({
+                        "type": run.job_type,
+                        "timeout": 30000,
+                        "maxJobsToActivate": 1,
+                        "worker": "ct-redeliver",
+                        "requestTimeout": 0,
+                        "withLease": true,
+                    }))
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.json())
+                    .unwrap_or_else(|_| json!({ "jobs": [] }));
+                if let Some(job) = v["jobs"].as_array().and_then(|j| j.first()).cloned() {
+                    redelivered = Some(job);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            redelivered
+        },
+    );
+    let Some(redelivered) = redelivered else {
+        panic!(
+            "the engine never redelivered the job after the worker was killed — \
+             the induced-loss premise failed (the activation outlived its worker).\nstderr:\n{}",
+            outcome.stderr()
+        );
+    };
+    let redelivered_key = redelivered["jobKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| redelivered["jobKey"].as_i64().map(|k| k.to_string()))
+        .expect("redelivered activation carries a job key");
+
+    // The killed worker never settled: the job kept its full retry budget (a
+    // settle-fail would have consumed one) and was redelivered, not completed.
+    let job = engine.job(&outcome.job_type).expect("job exists");
+    assert_eq!(
+        job["retries"].as_i64().unwrap_or(-1),
+        3,
+        "a killed worker must not fail the job from beyond the grave: {job:#}"
+    );
+    assert_ne!(
+        job["state"].as_str().unwrap_or(""),
+        "COMPLETED",
+        "a killed worker must not complete the job: {job:#}"
+    );
+
+    // The redelivered activation is settleable by its new owner (the lease
+    // moved with the redelivery); complete it so the instance is not stranded.
+    let token_field = if redelivered["jobLeaseToken"].is_string() {
+        "jobLeaseToken"
+    } else {
+        "leaseToken"
+    };
+    let settled = engine
+        .http()
+        .post(format!(
+            "{}/v2/jobs/{redelivered_key}/completion",
+            engine.url()
+        ))
+        .json(&json!({
+            "variables": { "redelivered": true },
+            token_field: redelivered[token_field],
+        }))
+        .send()
+        .expect("redelivery completion");
+    assert!(
+        settled.status().is_success(),
+        "the redelivered activation must be settleable, got {}",
+        settled.status()
     );
 }
