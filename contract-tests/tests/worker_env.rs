@@ -95,3 +95,162 @@ fn worker_gives_agent_result_file_and_nano_env() {
         "agent must run in a working directory"
     );
 }
+
+/// End-to-end **repository provisioning**: a job whose envelope carries a
+/// `repository` is cloned before the agent runs, and the agent's working
+/// directory IS the checkout (`<run dir>/<checkout>`, with a `.git`, where the
+/// segment is target-specific — `workspace` for Node, `repo` for Rust). The
+/// repo is a
+/// local bare git repository seeded by the test — no network, no credentials.
+#[test]
+fn worker_provisions_the_repository_into_the_run_dir() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    // Seed a throwaway ORIGIN repository with one commit, served over the
+    // file:// transport so the clone needs no network or credentials.
+    let origin_dir = tempfile::tempdir().expect("origin tempdir");
+    let origin = origin_dir.path().join("origin.git");
+    let seed = origin_dir.path().join("seed");
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    std::fs::create_dir_all(&seed).expect("seed dir");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=tester",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ],
+    );
+    // Create a DISTINCT non-default branch at a distinct commit. Requesting this
+    // branch (below) proves `repository.ref` is honoured: a worker that ignores
+    // the field and performs a default clone lands on `main`'s HEAD, which is a
+    // different commit than this branch's HEAD, so the seeded-commit gate fails
+    // and the job cannot complete. HEAD is left back on `main` before the bare
+    // clone so the origin's default branch stays `main` (not the requested ref).
+    git(&seed, &["checkout", "-q", "-b", "ct-ref-target"]);
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=tester",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "ref-target",
+        ],
+    );
+    git(&seed, &["checkout", "-q", "main"]);
+    git(
+        &seed,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--",
+            ".",
+            origin.to_str().expect("origin path"),
+        ],
+    );
+    // Pin the seeded commit on the NON-DEFAULT branch: the agent's script below
+    // writes a successful result ONLY when its cwd is a real clone of this origin
+    // at exactly this commit, so a worker that merely creates a `repo/` directory
+    // (or clones the default `main` instead of the requested ref) can no longer
+    // pass the test.
+    let seed_head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "ct-ref-target"])
+            .current_dir(&seed)
+            .output()
+            .expect("spawn git rev-parse");
+        assert!(
+            out.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let repo_url = format!("file://{}", origin.display());
+    let outcome = run_worker_job(
+        &engine,
+        &target,
+        "env-repo-provision",
+        &[
+            json!({ "emit": "ok" }),
+            // Complete the job only if the checkout is genuinely provisioned:
+            // a `.git` must exist and HEAD must be the seeded commit. On any
+            // mismatch the script exits non-zero and never writes a result, so
+            // the job cannot COMPLETE.
+            json!({ "shell": format!("test -d .git && test \"$(git rev-parse HEAD)\" = '{seed_head}'") }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({
+            "prompt": "work in the repo",
+            // The reserved envelope namespace: the worker assembles the
+            // repository block from the `io.nanobpm.agentTask.*` variables.
+            "io.nanobpm.agentTask.repository.url": repo_url,
+            // Request the NON-DEFAULT branch so honouring `ref` is what lands the
+            // seeded commit — a default clone would check out `main` and fail.
+            "io.nanobpm.agentTask.repository.ref": "ct-ref-target",
+        }),
+        &[],
+        &[],
+    );
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "a provisioned job must complete; stderr:\n{}",
+        outcome.stderr()
+    );
+    let record = outcome.record();
+    // The agent ran INSIDE the provisioned checkout: its cwd is the clone and
+    // the checkout carries a `.git`. The run dir is reaped on a successful
+    // settle, so assert on the RECORDED cwd's shape (it must end in the
+    // worker's target-specific checkout segment), not on the post-reap
+    // filesystem.
+    let cwd = std::path::Path::new(&record.cwd);
+    let checkout = target.checkout_dir_name();
+    assert_eq!(
+        cwd.file_name().and_then(|n| n.to_str()),
+        Some(checkout),
+        "the agent must run in the provisioned checkout (<run dir>/{checkout}); cwd was {}",
+        record.cwd
+    );
+    assert!(
+        record.cwd.contains("agent-runs"),
+        "the checkout lives under the worker's agent-runs root; cwd was {}",
+        record.cwd
+    );
+    // The clone honoured the envelope's ref: the requested branch is the
+    // non-default `ct-ref-target`, and the payload the agent received carries
+    // the repository block.
+    let payload = outcome.payload();
+    assert_eq!(
+        payload["task"]["repository"]["url"].as_str().unwrap_or(""),
+        repo_url,
+        "payload: {payload:#}"
+    );
+}

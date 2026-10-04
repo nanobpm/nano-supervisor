@@ -156,6 +156,18 @@ impl Target {
         }
     }
 
+    /// The final path segment of the provisioned repository checkout under the
+    /// per-job run dir. The two workers name it differently — the Node worker
+    /// checks out into `<run dir>/workspace`, the Rust worker into
+    /// `<run dir>/repo` — so a cross-target test must assert the target's own
+    /// segment rather than hard-coding one and failing the other's CI job.
+    pub fn checkout_dir_name(self) -> &'static str {
+        match self {
+            Target::Node => "workspace",
+            Target::Rust => "repo",
+        }
+    }
+
     /// Whether the target program is actually runnable here. When it is not
     /// (e.g. the Node plugin is not installed on a plain CI runner), tests skip
     /// cleanly rather than fail — the dedicated Node-target CI job is where they
@@ -530,6 +542,80 @@ impl Engine {
         &self.http
     }
 
+    /// Deploy a plain (non-BPMN) resource — e.g. the text a `linkName: prompt`
+    /// linked resource carries — and return its `resourceKey`.
+    pub fn deploy_resource(&self, name: &str, content: &str) -> reqwest::Result<String> {
+        let part = reqwest::blocking::multipart::Part::text(content.to_string())
+            .file_name(name.to_string())
+            .mime_str("text/plain")
+            .expect("mime");
+        let form = reqwest::blocking::multipart::Form::new().part("resources", part);
+        let v: serde_json::Value = self
+            .http
+            .post(format!("{}/v2/deployments", self.url))
+            .multipart(form)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let key = v["deployments"]
+            .as_array()
+            .and_then(|d| d.first())
+            .and_then(|d| d["resource"]["resourceKey"].as_str().map(str::to_string))
+            .or_else(|| {
+                v["deployments"]
+                    .as_array()
+                    .and_then(|d| d.first())
+                    .and_then(|d| d["resource"]["resourceKey"].as_i64())
+                    .map(|k| k.to_string())
+            });
+        Ok(key.expect("deployment response carries a resource.resourceKey"))
+    }
+
+    /// The AgentInstance records for one process instance
+    /// (`POST /v2/agent-instances/search`). Empty when the worker under test
+    /// minted none (or the engine predates the AgentInstance surface).
+    pub fn agent_instances(&self, process_instance_key: &str) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = self
+            .http
+            .post(format!("{}/v2/agent-instances/search", self.url))
+            .json(&serde_json::json!({
+                "filter": { "processInstanceKey": process_instance_key },
+                "page": { "limit": 100 },
+            }))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .unwrap_or_else(|_| serde_json::json!({ "items": [] }));
+        v["items"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// The recorded AgentHistory turns for one AgentInstance
+    /// (`POST /v2/agent-instances/{key}/history/search`).
+    pub fn agent_instance_history(&self, agent_instance_key: &str) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = self
+            .http
+            .post(format!(
+                "{}/v2/agent-instances/{agent_instance_key}/history/search",
+                self.url
+            ))
+            .json(&serde_json::json!({ "page": { "limit": 1000 } }))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .unwrap_or_else(|_| serde_json::json!({ "items": [] }));
+        v["items"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// The job's activation deadline as the engine reports it
+    /// (`POST /v2/jobs/search`), epoch millis. A worker that refreshes its
+    /// lease pushes this out while the agent runs.
+    pub fn job_deadline(&self, job_type: &str) -> Option<i64> {
+        let job = self.job(job_type)?;
+        job["deadline"]
+            .as_i64()
+            .or_else(|| job["deadline"].as_str()?.parse().ok())
+    }
+
     /// Number of jobs of `job_type` the engine will hand out right now (capped
     /// at one). Tests use this as a black-box probe that an unrelated job is
     /// still *waiting* — i.e. was never activated by a worker under test.
@@ -837,6 +923,31 @@ impl JobOutcome {
     pub fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.output.stdout).to_string()
     }
+
+    /// The worker's stderr, parsed as `refreshes=N` counts (newest first). The
+    /// worker logs `refreshes=<n>` on every settle line; an empty vec means no
+    /// such line (a worker without the refresh instrumentation).
+    pub fn refresh_counts(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for line in self.stderr().lines() {
+            let mut rest = line;
+            while let Some(idx) = rest.find("refreshes=") {
+                let digits: String = rest[idx + "refreshes=".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<u64>() {
+                    out.push(n);
+                }
+                rest = &rest[idx + "refreshes=".len()..];
+            }
+        }
+        // The scan walks stderr oldest-to-newest; reverse so callers get the
+        // documented newest-first order (`counts.first()` is the LATEST settle
+        // line even when several were logged).
+        out.reverse();
+        out
+    }
 }
 
 /// Deploy a one-task process with a unique job type, start an instance carrying
@@ -868,6 +979,7 @@ pub fn run_worker_job(
         vars,
         worker_flags,
         extra_env,
+        &[],
     );
     // The outcome cloned the home's path (it borrows nothing from `home`), so
     // now that the `&home` borrow has ended, move the home into the outcome to
@@ -905,6 +1017,356 @@ pub fn run_worker_job_in(
         vars,
         worker_flags,
         extra_env,
+        &[],
+    )
+}
+
+/// [`run_worker_job_in`] against a caller-supplied [`TempHome`], additionally
+/// stamping `custom_headers` onto the job's BPMN task (e.g. a `linkedResources`
+/// declaration). The caller keeps `home` alive, exactly as [`run_worker_job_in`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_with(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    custom_headers: &[(&str, &str)],
+) -> JobOutcome {
+    run_worker_job_with_home(
+        engine,
+        target,
+        home,
+        None,
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+        custom_headers,
+    )
+}
+
+/// The worker half of a [`with_worker_running`] run: everything the scoped
+/// closure needs to observe or steer the live job.
+pub struct WorkerRun {
+    /// The unique job type of the deployed one-job process.
+    pub job_type: String,
+    /// The process instance key the job belongs to.
+    pub process_instance_key: String,
+    /// Where the fake agent flushes its record (`NS_FAKE_RECORD`). It appears
+    /// incrementally (the agent rewrites it per script step), so a test can
+    /// watch it to know the agent has started.
+    pub record_path: PathBuf,
+    child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+}
+
+impl WorkerRun {
+    /// Whether the worker process has already exited.
+    pub fn worker_exited(&self) -> bool {
+        self.child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .map(|s| s.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Kill the worker and its whole agent subtree (SIGKILL), mid-run. This is
+    /// the kill/resume contract: the job's activation is left to lapse so the
+    /// engine can redeliver it to a fresh worker.
+    pub fn kill_worker(&self) {
+        #[cfg(unix)]
+        kill_process_tree(self.child.lock().unwrap().id());
+        let _ = self.child.lock().unwrap().kill();
+    }
+
+    /// Whether the fake agent has started (its record file exists yet).
+    pub fn agent_started(&self) -> bool {
+        self.record_path.exists()
+    }
+}
+
+/// Deploy the test job and start the worker-under-test on a scoped thread, then
+/// run `during` WHILE the worker is live, and finally reap the worker and
+/// return its [`JobOutcome`].
+///
+/// This is the mid-run interleaving [`run_worker_job`] cannot express: `during`
+/// executes after the worker has started polling but before it is reaped, so a
+/// test can supersede the activation, kill the worker, or watch the engine
+/// mid-job. The worker runs on a thread (its pipes are pumped by the same
+/// reader threads as [`output_within`]); after `during` returns, the worker is
+/// given [`WORKER_TEST_TIMEOUT`] from launch to exit on its own (`--max-jobs
+/// 1`), else it is killed — exactly the blocking harness's watchdog.
+///
+/// Rust-target only in practice: the Node worker never self-exits, so a scoped
+/// run would have to kill it at the end regardless; the tests that need this
+/// interleaving (supersede, kill/resume) are Rust-pinned anyway.
+#[allow(clippy::too_many_arguments)]
+pub fn with_worker_running<R>(
+    engine: &Engine,
+    target: &Target,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    during: impl FnOnce(&WorkerRun) -> R + Send,
+) -> (JobOutcome, R) {
+    let home = TempHome::new();
+    let job_type = engine.unique_type(test);
+    let process_id = format!("p-{job_type}");
+    engine
+        .deploy_bpmn(&process_id, &bpmn::single_task(&process_id, &job_type))
+        .expect("deploy bpmn");
+    let instance = engine
+        .create_instance(&process_id, vars)
+        .expect("create instance");
+    let process_instance_key = instance["processInstanceKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            instance["processInstanceKey"]
+                .as_i64()
+                .map(|k| k.to_string())
+        })
+        .expect("create instance: no processInstanceKey");
+
+    let work = tempfile::Builder::new()
+        .prefix("ns-run-")
+        .tempdir()
+        .unwrap();
+    let record_path = work.path().join("record.json");
+    let script_json = serde_json::to_string(&serde_json::Value::Array(script.to_vec())).unwrap();
+
+    let profile = format!("ctfake{}", rand_suffix());
+    hire_profile(*target, &home, &profile);
+    let mut cmd = work_command(*target, &profile, &job_type, worker_flags);
+    home.apply(&mut cmd);
+    cmd.env("NS_FAKE_SCRIPT", &script_json)
+        .env("NS_FAKE_RECORD", &record_path)
+        .env("CAMUNDA_REST_ADDRESS", engine.url());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    // Spawn the worker on this thread, pump its pipes, and run `during` while
+    // it is live. The worker child is shared with the reaper below via an
+    // Option-in-Mutex: `during` may kill the process (supersede tests do not;
+    // the kill/resume test kills via its own handle), but the reap always waits.
+    let launch = Instant::now();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().expect("spawn worker");
+    let mut out = child.stdout.take().expect("worker stdout");
+    let mut err = child.stderr.take().expect("worker stderr");
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+
+    let run = WorkerRun {
+        job_type: job_type.clone(),
+        process_instance_key: process_instance_key.clone(),
+        record_path: record_path.clone(),
+        child: std::sync::Arc::clone(&child),
+    };
+    // `during` runs to completion while the worker is live; it can observe the
+    // engine, watch the agent record, supersede the activation, or kill the
+    // worker (`run.kill_worker()`). A PANIC in `during` must not leak the
+    // worker: unwinding would skip the reaper below, and dropping `Child` does
+    // not terminate it, leaving the worker and its fake-agent subtree alive to
+    // interfere with later tests. Catch the unwind, kill + reap the process
+    // tree, join the pipe threads (their reads end at EOF once the tree is
+    // dead), then resume the panic so the test still fails with its own
+    // message.
+    let during_result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| during(&run))) {
+            Ok(r) => r,
+            Err(payload) => {
+                #[cfg(unix)]
+                kill_process_tree(child.lock().unwrap().id());
+                let mut guard = child.lock().unwrap();
+                let _ = guard.kill();
+                let _ = guard.wait();
+                drop(guard);
+                let _ = out_h.join();
+                let _ = err_h.join();
+                std::panic::resume_unwind(payload);
+            }
+        };
+
+    // Reap: the worker should exit on its own after `--max-jobs 1`; give it the
+    // remainder of the watchdog window from launch, then kill. The deadline is
+    // anchored to the pre-spawn `launch` instant (not `Instant::now()` here) so
+    // a slow `during` callback — e.g. the lease test polling for ~20s — cannot
+    // extend the worker's subprocess lifetime past the WORKER_TEST_TIMEOUT cap.
+    let deadline = launch + WORKER_TEST_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.lock().unwrap().try_wait().expect("try_wait worker") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            kill_process_tree(child.lock().unwrap().id());
+            let _ = child.lock().unwrap().kill();
+            break child.lock().unwrap().wait().expect("wait killed worker");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
+    (
+        JobOutcome {
+            job_type,
+            process_instance_key,
+            engine: engine.clone(),
+            record_path,
+            output,
+            home_path: home.path().to_path_buf(),
+            _home: Some(home),
+            _work: work,
+        },
+        during_result,
+    )
+}
+
+/// [`with_worker_running`] against an ALREADY-deployed job type, so a test can
+/// run a second worker over the same job (the resume contract) instead of
+/// deploying a fresh unique type. `job_type`/`process_id`/`process_instance_key`
+/// come from the caller's own deploy + instance creation.
+#[allow(clippy::too_many_arguments)]
+pub fn with_worker_running_on<R>(
+    engine: &Engine,
+    target: &Target,
+    job_type: &str,
+    process_instance_key: &str,
+    script: &[serde_json::Value],
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    during: impl FnOnce(&WorkerRun) -> R + Send,
+) -> (JobOutcome, R) {
+    let home = TempHome::new();
+    let work = tempfile::Builder::new()
+        .prefix("ns-run-")
+        .tempdir()
+        .unwrap();
+    let record_path = work.path().join("record.json");
+    let script_json = serde_json::to_string(&serde_json::Value::Array(script.to_vec())).unwrap();
+
+    let profile = format!("ctfake{}", rand_suffix());
+    hire_profile(*target, &home, &profile);
+    let mut cmd = work_command(*target, &profile, job_type, worker_flags);
+    home.apply(&mut cmd);
+    cmd.env("NS_FAKE_SCRIPT", &script_json)
+        .env("NS_FAKE_RECORD", &record_path)
+        .env("CAMUNDA_REST_ADDRESS", engine.url());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    let launch = Instant::now();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().expect("spawn worker");
+    let mut out = child.stdout.take().expect("worker stdout");
+    let mut err = child.stderr.take().expect("worker stderr");
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+
+    let run = WorkerRun {
+        job_type: job_type.to_string(),
+        process_instance_key: process_instance_key.to_string(),
+        record_path: record_path.clone(),
+        child: std::sync::Arc::clone(&child),
+    };
+    let during_result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| during(&run))) {
+            Ok(r) => r,
+            Err(payload) => {
+                // Same panic-safety contract as `with_worker_running`: kill + reap
+                // the worker tree and join the pipe threads before resuming the
+                // panic, so a failed mid-run assertion cannot leak a live worker
+                // into later tests.
+                #[cfg(unix)]
+                kill_process_tree(child.lock().unwrap().id());
+                let mut guard = child.lock().unwrap();
+                let _ = guard.kill();
+                let _ = guard.wait();
+                drop(guard);
+                let _ = out_h.join();
+                let _ = err_h.join();
+                std::panic::resume_unwind(payload);
+            }
+        };
+
+    // Anchor the reap deadline to the pre-spawn `launch` instant (not
+    // `Instant::now()` here) so a slow `during` callback cannot push the
+    // worker's subprocess lifetime past the WORKER_TEST_TIMEOUT cap.
+    let deadline = launch + WORKER_TEST_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.lock().unwrap().try_wait().expect("try_wait worker") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            kill_process_tree(child.lock().unwrap().id());
+            let _ = child.lock().unwrap().kill();
+            break child.lock().unwrap().wait().expect("wait killed worker");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
+    (
+        JobOutcome {
+            job_type: job_type.to_string(),
+            process_instance_key: process_instance_key.to_string(),
+            engine: engine.clone(),
+            record_path,
+            output,
+            home_path: home.path().to_path_buf(),
+            _home: Some(home),
+            _work: work,
+        },
+        during_result,
     )
 }
 
@@ -923,11 +1385,15 @@ fn run_worker_job_with_home(
     vars: serde_json::Value,
     worker_flags: &[&str],
     extra_env: &[(&str, &str)],
+    custom_headers: &[(&str, &str)],
 ) -> JobOutcome {
     let job_type = engine.unique_type(test);
     let process_id = format!("p-{job_type}");
     engine
-        .deploy_bpmn(&process_id, &bpmn::single_task(&process_id, &job_type))
+        .deploy_bpmn(
+            &process_id,
+            &bpmn::single_task_with_headers(&process_id, &job_type, custom_headers),
+        )
         .expect("deploy bpmn");
     let instance = engine
         .create_instance(&process_id, vars)
@@ -1188,29 +1654,32 @@ fn run_node_worker(
         if settle_until.is_none() && record_path.exists() {
             settle_until = Some(Instant::now() + NODE_SETTLE_GRACE);
         }
-        // Once the worker has handled the job (its agent recorded a run, so a
-        // settle window is open), poll the engine and decide how to reap based on
-        // the settlement kind: a terminal state is no longer acquirable so we
-        // grant a brief logging grace, but a retry-left failure is immediately
-        // re-activatable (zero backoff) and the still-running worker would
-        // reacquire and fail it again — so reap at once to pin the retry count.
-        if settle_until.is_some() {
-            match settled() {
-                Settlement::RetriableFailure => {
-                    #[cfg(unix)]
-                    kill_process_tree(child.id());
-                    let _ = child.kill();
-                    break child.wait().expect("wait killed node worker");
-                }
-                Settlement::Terminal => {
-                    if let Some(until) = settle_until {
-                        if until > Instant::now() + NODE_POST_SETTLE {
-                            settle_until = Some(Instant::now() + NODE_POST_SETTLE);
-                        }
-                    }
-                }
-                Settlement::Pending => {}
+        // Poll the engine and decide how to reap from the settlement kind — EVEN
+        // BEFORE a record exists. A provisioning failure (e.g. an unresolvable
+        // secretRef) settles the job BEFORE the agent runs, so `record.json` is
+        // never written and the settle window above never opens; gating this on
+        // `settle_until.is_some()` would leave the still-running, zero-backoff Node
+        // worker free to reacquire and re-fail the job repeatedly until
+        // `NODE_NO_WORK_DEADLINE`, driving retries to exhaustion and corrupting the
+        // retry-count assertion (e.g. `missing_secret_ref_fails_the_job` expects
+        // `retries == 2`). A terminal state is no longer acquirable so we grant a
+        // brief logging grace; a retry-left failure is immediately re-activatable
+        // (zero backoff) so we reap at once to pin the retry count.
+        match settled() {
+            Settlement::RetriableFailure => {
+                #[cfg(unix)]
+                kill_process_tree(child.id());
+                let _ = child.kill();
+                break child.wait().expect("wait killed node worker");
             }
+            // Open (or shorten) a brief logging grace. This fires even with no
+            // record — a terminal provisioning failure also writes none — so we
+            // reap promptly instead of idling to `NODE_NO_WORK_DEADLINE`.
+            Settlement::Terminal => {
+                let grace = Instant::now() + NODE_POST_SETTLE;
+                settle_until = Some(settle_until.map_or(grace, |until| until.min(grace)));
+            }
+            Settlement::Pending => {}
         }
         let reap = match settle_until {
             Some(until) => Instant::now() >= until,
@@ -1613,5 +2082,50 @@ mod unit {
         assert!(!job_is_settled(
             &json!({ "state": "CREATED", "retries": 3 })
         ));
+    }
+
+    #[test]
+    fn refresh_counts_are_newest_first() {
+        // The parser scans stderr oldest-to-newest but promises newest-first:
+        // with several settle lines (and several `refreshes=` markers on one
+        // line), `first()` must be the LATEST count, not the oldest.
+        let outcome = JobOutcome {
+            job_type: "t".into(),
+            process_instance_key: "1".into(),
+            engine: Engine {
+                url: "http://localhost:8080".into(),
+                http: reqwest::blocking::Client::new(),
+            },
+            record_path: PathBuf::from("/nonexistent-record.json"),
+            output: Output {
+                status: {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        std::process::ExitStatus::from_raw(0)
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::ExitStatusExt;
+                        std::process::ExitStatus::from_raw(0)
+                    }
+                },
+                stdout: Vec::new(),
+                stderr: b"job 1 completed in 1.0s (refreshes=1)\nnoise refreshes=2 and refreshes=3\njob 2 completed in 2.0s (refreshes=7)\n".to_vec(),
+            },
+            home_path: PathBuf::from("/nonexistent-home"),
+            _home: None,
+            _work: tempfile::tempdir().expect("tempdir"),
+        };
+        assert_eq!(
+            outcome.refresh_counts(),
+            vec![7, 3, 2, 1],
+            "the whole scan is reversed: the last line's counts first, so \
+             `first()` is the latest settle line's count"
+        );
+        // A worker without the refresh instrumentation yields an empty vec.
+        let mut silent = outcome;
+        silent.output.stderr = b"no settle lines here\n".to_vec();
+        assert!(silent.refresh_counts().is_empty());
     }
 }

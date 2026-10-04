@@ -117,14 +117,26 @@ fn sleep_ms(ms: u64) {
 
 /// Run a shell command in the agent's current directory (the worker's per-job
 /// run dir), inheriting stdio to the agent's stderr. Test-only: it lets a test
-/// provision real filesystem/git state the worker will act on after the turn.
-fn run_shell_step(cmd: &str) {
+/// provision real filesystem/git state the worker will act on after the turn,
+/// or gate the rest of the script on a real precondition.
+///
+/// Returns `None` on success, or `Some(exit_code)` when the command fails to
+/// run or exits non-zero. A failing `shell` step MUST abort the turn (see the
+/// call site): otherwise a gate step like `test -d .git` would log its failure
+/// yet let a later `write_result` run anyway, silently completing a job whose
+/// precondition never held.
+fn run_shell_step(cmd: &str) -> Option<i32> {
     match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
-        Ok(status) if !status.success() => {
-            eprintln!("fake-agent: shell step exited {status}: {cmd}")
+        Ok(status) if status.success() => None,
+        Ok(status) => {
+            eprintln!("fake-agent: shell step exited {status}: {cmd}");
+            // A signal-killed process has no exit code; fail non-zero regardless.
+            Some(status.code().filter(|&c| c != 0).unwrap_or(1))
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("fake-agent: shell step failed to run ({e}): {cmd}"),
+        Err(e) => {
+            eprintln!("fake-agent: shell step failed to run ({e}): {cmd}");
+            Some(1)
+        }
     }
 }
 
@@ -196,8 +208,16 @@ fn run_steps(
             // Test-only escape hatch: run a shell command in the agent's cwd
             // (the worker's per-job run dir). Used to provision a real git repo
             // + commit + origin so the worker's finalize fallback-branch path is
-            // exercised end-to-end rather than short-circuiting on a non-repo.
-            run_shell_step(cmd);
+            // exercised end-to-end rather than short-circuiting on a non-repo,
+            // or to gate the rest of the script on a real precondition.
+            //
+            // A failing step aborts the turn with its exit code, so any later
+            // step (notably `write_result`) never runs — a gate that cannot be
+            // met must prevent completion, not merely log and fall through.
+            if let Some(code) = run_shell_step(cmd) {
+                record.flush();
+                return StepEnd::Exit(code);
+            }
         } else if let Some(v) = obj.get("result_marker") {
             // A `::nano:result::<compact-json>` marker the worker scrapes.
             // Delivered mode-appropriately: a stdout line in pipe mode, an ACP
