@@ -231,13 +231,17 @@ async fn remove_partial_checkout(workspace: &Path) {
 /// since `submodule init` copies each submodule URL into a `submodule.<name>.url`
 /// entry there that the `origin` scrub does not reach.
 ///
-/// Directory recursion uses `file_type()` (which does not follow symlinks), so a
-/// symlinked entry is never traversed into, and each `config` rewrite goes
-/// through an atomic no-follow open (`scrub_file_credentials_in_place`) so a
-/// symlink planted at the leaf between the `file_type()` check and the write
-/// cannot redirect the scrub outside the checkout. Errors are propagated so the
-/// caller can remove the whole checkout rather than return one that may still
-/// hold a token.
+/// On Linux the recursion is performed entirely through `openat2`-pinned
+/// no-follow directory handles ([`scrub_config_tree_pinned`]): `.git/modules` is
+/// resolved **once** with `RESOLVE_NO_SYMLINKS` into a handle pinned by inode,
+/// and every descendant is `fstatat`/`openat`'d relative to that handle, so a
+/// same-UID actor cannot swap an approved directory for a symlink in the window
+/// between the triage and the `read_dir`/open (the residual TOCTOU this closes).
+/// Where `openat2` is unavailable (non-Linux, or a pre-5.6 kernel) the walk
+/// falls back to the path-based [`scrub_config_tree_path_based`], whose per-entry
+/// `file_type()` check and atomic no-follow leaf open are symlink-safe but do not
+/// pin the approved directory. Errors are propagated so the caller can remove the
+/// whole checkout rather than return one that may still hold a token.
 fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     let modules = workspace.join(".git").join("modules");
     // Resolve the root with `symlink_metadata` (which does NOT follow symlinks):
@@ -246,8 +250,7 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     // checkout. A genuine `--recurse-submodules` clone always creates
     // `.git/modules` as a real directory, so treat anything else (a symlink, a
     // regular file, or an absent path) as "nothing to scrub" and never traverse
-    // it. Descendants are already guarded by the per-entry `file_type()` checks
-    // below, which are likewise symlink-safe.
+    // it. The pinned (and path-based) walks below re-check this symlink-safely.
     match std::fs::symlink_metadata(&modules) {
         Ok(meta) if meta.file_type().is_dir() => {}
         Ok(_) => return Ok(()),
@@ -261,6 +264,85 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     // left behind (defense in depth — the token is supplied out of band and is
     // never written here, symmetric with the origin and nested-module scrubs).
     scrub_file_credentials_in_place(&workspace.join(".git").join("config"))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use crate::saferoot::{DirHandle, PinError};
+        match DirHandle::open_root_nofollow(&modules) {
+            Ok(root) => return scrub_config_tree_pinned(root, &modules),
+            // Kernel too old for `openat2` (pre-5.6): fall through to the
+            // best-effort path-based walk below.
+            Err(PinError::Unsupported) => {}
+            // The modules root was swapped for a symlink (or an ancestor
+            // component became one) between the stat above and this pin: refuse
+            // to traverse it rather than follow it outside the checkout.
+            Err(PinError::Io(e)) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
+            Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(PinError::Io(e)) => {
+                return Err(e).with_context(|| format!("pinning {}", modules.display()));
+            }
+        }
+    }
+
+    scrub_config_tree_path_based(modules)
+}
+
+/// `openat2`-pinned recursion for [`scrub_submodule_config_credentials`]: every
+/// directory under the pinned `.git/modules` root is enumerated and re-opened
+/// through a no-follow handle, and each `config` leaf is opened `O_NOFOLLOW`
+/// *through its pinned parent*, so no component swapped to a symlink after it was
+/// triaged can redirect the scrub outside the checkout. `display` is the root's
+/// path, used only to build human-readable error context.
+#[cfg(target_os = "linux")]
+fn scrub_config_tree_pinned(root: crate::saferoot::DirHandle, display: &Path) -> Result<()> {
+    let mut stack = vec![(root, display.to_path_buf())];
+    while let Some((dir, dir_path)) = stack.pop() {
+        let names = dir
+            .entry_names()
+            .with_context(|| format!("reading {}", dir_path.display()))?;
+        for name in names {
+            let path = dir_path.join(&name);
+            let meta = match dir.symlink_metadata(&name) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+            };
+            // A symlinked entry is never traversed or opened: skip it so the
+            // scrub can never be redirected outside the pinned tree.
+            if meta.is_symlink {
+                continue;
+            }
+            if meta.is_dir {
+                match dir.open_child_dir(&name) {
+                    Ok(child) => stack.push((child, path)),
+                    // Swapped to a symlink after the stat: skip, never follow.
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+                }
+            } else if name == "config" {
+                match dir.open_child_file_rw_nofollow(&name) {
+                    Ok(file) => scrub_open_file(file, &path)?,
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Path-based recursion for [`scrub_submodule_config_credentials`]: the
+/// pre-`openat2` fallback (non-Linux, or a pre-5.6 kernel). Directory recursion
+/// uses `file_type()` (which does not follow symlinks), so a symlinked entry is
+/// never traversed into, and each `config` rewrite goes through an atomic
+/// no-follow open (`scrub_file_credentials_in_place`) so a symlink planted at the
+/// leaf between the `file_type()` check and the write cannot redirect the scrub.
+/// It does not pin the approved directory, so a directory swapped for a symlink
+/// between the `file_type()` triage and the `read_dir` is the residual TOCTOU the
+/// pinned walk closes on Linux.
+fn scrub_config_tree_path_based(modules: PathBuf) -> Result<()> {
     let mut stack = vec![modules];
     while let Some(dir) = stack.pop() {
         let entries =
@@ -309,10 +391,8 @@ fn scrub_fetch_head(workspace: &Path) -> Result<()> {
 /// rejected explicitly (best-effort; such targets are not supported daemon
 /// hosts). A missing or non-regular file is a no-op.
 fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
     #[cfg(unix)]
-    let mut file = {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).write(true);
@@ -331,7 +411,7 @@ fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
         }
     };
     #[cfg(not(unix))]
-    let mut file = {
+    let file = {
         // No atomic no-follow open here: reject a symlink explicitly so the
         // documented no-symlink guarantee still holds.
         match std::fs::symlink_metadata(path) {
@@ -349,9 +429,22 @@ fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
 
     // Only rewrite a real regular file; a FIFO/device/dir opened above is skipped
     // so the read below can never block or misbehave on a special file.
+    scrub_open_file(file, path)
+}
+
+/// Read-modify-write the scrub on an **already-opened** file handle, used by both
+/// the path-based [`scrub_file_credentials_in_place`] (which opens the leaf
+/// `O_NOFOLLOW`) and the `openat2`-pinned [`scrub_config_tree_pinned`] (which
+/// opens each `config` through its pinned parent). Holding the handle for the
+/// whole read-modify-write is what makes the rewrite race-free; `display` is used
+/// only for error context. A non-regular file (a FIFO/device/dir that slipped
+/// past the open) is a no-op.
+fn scrub_open_file(mut file: std::fs::File, display: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
     let meta = file
         .metadata()
-        .with_context(|| format!("stat {}", path.display()))?;
+        .with_context(|| format!("stat {}", display.display()))?;
     if !meta.file_type().is_file() {
         return Ok(());
     }
@@ -366,23 +459,24 @@ fn scrub_file_credentials_in_place(path: &Path) -> Result<()> {
     std::io::Read::by_ref(&mut file)
         .take(MAX_SCRUB_BYTES + 1)
         .read_to_end(&mut raw)
-        .with_context(|| format!("reading {}", path.display()))?;
+        .with_context(|| format!("reading {}", display.display()))?;
     if raw.len() as u64 > MAX_SCRUB_BYTES {
         bail!(
             "{} exceeds the {}-byte credential-scrub cap — refusing to load it",
-            path.display(),
+            display.display(),
             MAX_SCRUB_BYTES
         );
     }
-    let contents = String::from_utf8(raw).with_context(|| format!("reading {}", path.display()))?;
+    let contents =
+        String::from_utf8(raw).with_context(|| format!("reading {}", display.display()))?;
     let scrubbed = scrub_url_credentials(&contents);
     if scrubbed != contents {
         file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("seeking {}", path.display()))?;
+            .with_context(|| format!("seeking {}", display.display()))?;
         file.set_len(0)
-            .with_context(|| format!("truncating {}", path.display()))?;
+            .with_context(|| format!("truncating {}", display.display()))?;
         file.write_all(scrubbed.as_bytes())
-            .with_context(|| format!("rewriting {}", path.display()))?;
+            .with_context(|| format!("rewriting {}", display.display()))?;
     }
     Ok(())
 }
@@ -940,6 +1034,51 @@ mod tests {
         assert!(
             got.contains("s3cr3tPAT"),
             "scrub must not follow the symlinked root"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn submodule_scrub_skips_symlinked_subdirectory() {
+        // A symlink planted at an INTERIOR node of the `.git/modules` tree (a
+        // directory entry swapped for a symlink to a dir outside the checkout)
+        // must not be descended into: the no-follow walker (openat2-pinned on
+        // Linux, `file_type()`-guarded elsewhere) skips the link, so a `config`
+        // beneath the link target is never rewritten, while a real sibling
+        // `config` is still scrubbed.
+        let tmp = std::env::temp_dir().join(format!("nano-sub-innerlink-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("nano-sub-innerout-{}", std::process::id()));
+        let modules = tmp.join(".git").join("modules");
+        std::fs::create_dir_all(modules.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
+        let body =
+            |host: &str| format!("[remote \"origin\"]\n\turl = https://{token}@{host}/o/r.git\n");
+
+        // A genuine nested submodule config (must be scrubbed).
+        let real_cfg = modules.join("real").join("config");
+        std::fs::write(&real_cfg, body("h-real")).unwrap();
+
+        // An out-of-checkout config reachable only through a symlinked entry
+        // (must be left untouched).
+        let outside_cfg = outside.join("config");
+        std::fs::write(&outside_cfg, body("h-out")).unwrap();
+        std::os::unix::fs::symlink(&outside, modules.join("evil")).unwrap();
+
+        scrub_submodule_config_credentials(&tmp).expect("scrub skips the symlinked subdir");
+
+        let real = std::fs::read_to_string(&real_cfg).unwrap();
+        assert!(
+            !real.contains("s3cr3tPAT"),
+            "the real nested config must be scrubbed"
+        );
+        let out = std::fs::read_to_string(&outside_cfg).unwrap();
+        assert!(
+            out.contains("s3cr3tPAT"),
+            "the scrub must not follow a symlinked subdirectory out of the checkout"
         );
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&outside);

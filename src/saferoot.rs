@@ -294,6 +294,29 @@ impl DirHandle {
         Ok(DirHandle { fd })
     }
 
+    /// Open a direct child **regular file** relative to this handle for
+    /// read+write, never following a symlink and never escaping this directory
+    /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, plus `O_NOFOLLOW` on the final
+    /// component). `O_NONBLOCK` guards against an attacker-planted FIFO whose
+    /// open would otherwise block the worker thread; the caller rejects any
+    /// non-regular file after the open via `fstat`.
+    ///
+    /// Used by the submodule-config credential scrub so each `config` is opened
+    /// *through the pinned parent handle* — a component swapped to a symlink
+    /// after the entry was triaged (or the leaf itself swapped) cannot redirect
+    /// the rewrite outside the checkout: the open is refused (`ELOOP`) rather
+    /// than followed.
+    pub(crate) fn open_child_file_rw_nofollow(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        let c = cstr(name)?;
+        let fd = openat2_raw(
+            self.fd.as_raw_fd(),
+            &c,
+            (libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        )?;
+        Ok(std::fs::File::from(fd))
+    }
+
     /// Like [`open_child_dir`](Self::open_child_dir) but returns an `O_PATH`
     /// handle: usable only as a *dirfd* anchor for `*at` operations
     /// (`mkdirat` / `openat2` / `fstatat`), never for reading or `fchmod`.
