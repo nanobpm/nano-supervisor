@@ -357,7 +357,10 @@ mod tests {
         // neither opt-out nor the legacy flag supplied.
         let (no_lease, with_lease) = parse_daemon_flags(&["nano-supervisor", "daemon"]);
         assert!(!no_lease, "bare `daemon` must not set --no-lease");
-        assert!(!with_lease, "bare `daemon` must not set the legacy --with-lease");
+        assert!(
+            !with_lease,
+            "bare `daemon` must not set the legacy --with-lease"
+        );
         assert!(
             daemon_leases(no_lease),
             "bare `daemon` must lease by default"
