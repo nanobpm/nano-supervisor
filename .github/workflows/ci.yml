@@ -107,8 +107,8 @@ jobs:
         run: cargo test -p contract-tests --locked --no-fail-fast
 
   # Worker contract tests against the Rust `nano-supervisor work <hire>` (issue
-  # #4), end to end on the same engine as the Node job — one suite, both targets. Only the worker_* files: the CLI surface
-  # (`hire`, `workforce`, …) is Node-only until #3 lands for Rust.
+  # #4), end to end on the same engine as the Node job — one suite, both targets. The fleet CLI surface (#3: hire, assign,
+  # supervisor add/status, workforce list/add/status) runs as its own step via the cli/state/socket suites.
   contract-tests-rust:
     name: contract tests (Rust target, ${{ matrix.os }})
     strategy:
@@ -134,6 +134,11 @@ jobs:
             --test worker_prompt --test worker_env --test worker_result \
             --test worker_lease --test worker_finalize --test worker_selection \
             --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard -- --nocapture
+      - name: fleet CLI contract tests (Rust target)
+        # live_status_round_trip stays skipped (needs NS_ALLOW_LIVE_SUPERVISOR=1): CI must not start a real daemon (#40).
+        run: |
+          export NS_BIN="$PWD/target/debug/nano-supervisor"
+          cargo test -p contract-tests --locked --test cli --test state --test socket -- --nocapture
 
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:
