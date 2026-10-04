@@ -282,8 +282,14 @@ fn env_option_arity(t: &str) -> Option<usize> {
         // the value is not glued on with `=`; the rest (`--ignore-environment`,
         // `--null`, …) are nullary.
         return Some(match name {
-            "unset" | "chdir" | "split-string" | "argv0" | "default-signal" | "block-signal"
-            | "ignore-signal" | "list-signal-handling" => {
+            "unset"
+            | "chdir"
+            | "split-string"
+            | "argv0"
+            | "default-signal"
+            | "block-signal"
+            | "ignore-signal"
+            | "list-signal-handling" => {
                 if long.contains('=') {
                     1
                 } else {
@@ -1208,7 +1214,12 @@ mod tests {
 
         // A glued-on value (`-uFOO`) and a nullary bundle (`-i0`) are one token.
         let mut env_glued = hire(Protocol::Acp, "env", "none");
-        env_glued.args = vec!["-uFOO".into(), "sh".into(), "-c".into(), "nano-coder".into()];
+        env_glued.args = vec![
+            "-uFOO".into(),
+            "sh".into(),
+            "-c".into(),
+            "nano-coder".into(),
+        ];
         assert_eq!(
             acp_spawn_args(&env_glued),
             vec![
@@ -1222,7 +1233,12 @@ mod tests {
         // `env` options in front of a NON-shell program still just append — the
         // option skip must not mistake a non-shell for a shell wrapper.
         let mut env_agent = hire(Protocol::Acp, "env", "none");
-        env_agent.args = vec!["-i".into(), "nano-coder".into(), "-c".into(), "config".into()];
+        env_agent.args = vec![
+            "-i".into(),
+            "nano-coder".into(),
+            "-c".into(),
+            "config".into(),
+        ];
         assert_eq!(
             acp_spawn_args(&env_agent),
             vec![
@@ -1241,11 +1257,22 @@ mod tests {
         // pipe hire that hides an ACP selector behind `env -i …` fails open.
         assert!(command_has_acp_selector(
             "env",
-            &["-i".into(), "sh".into(), "-c".into(), "nano-coder --acp".into()]
+            &[
+                "-i".into(),
+                "sh".into(),
+                "-c".into(),
+                "nano-coder --acp".into()
+            ]
         ));
         assert!(command_has_acp_selector(
             "/usr/bin/env",
-            &["-u".into(), "FOO".into(), "sh".into(), "-c".into(), "nano-coder --acp".into()]
+            &[
+                "-u".into(),
+                "FOO".into(),
+                "sh".into(),
+                "-c".into(),
+                "nano-coder --acp".into()
+            ]
         ));
         assert!(command_has_acp_selector(
             "env",
@@ -1254,7 +1281,12 @@ mod tests {
         // A wrapped NON-ACP script behind env options is still accepted.
         assert!(!command_has_acp_selector(
             "env",
-            &["-i".into(), "sh".into(), "-c".into(), "nano-coder --pipe".into()]
+            &[
+                "-i".into(),
+                "sh".into(),
+                "-c".into(),
+                "nano-coder --pipe".into()
+            ]
         ));
         // An `env` option's own value is not a command: `env -u sh copilot` runs
         // `copilot` (the `-u` value `sh` is unset, not executed), so no `-acp`
@@ -1302,7 +1334,10 @@ mod tests {
         h.args = vec!["-c".into(), "env -i bash -c 'nano-coder'".into()];
         assert_eq!(
             acp_spawn_args(&h),
-            vec!["-c".to_string(), "env -i bash -c 'nano-coder --acp'".to_string()]
+            vec![
+                "-c".to_string(),
+                "env -i bash -c 'nano-coder --acp'".to_string()
+            ]
         );
     }
 

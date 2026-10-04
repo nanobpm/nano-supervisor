@@ -1607,7 +1607,11 @@ mod unit {
         // `job_is_settled` stays true for both settled kinds (its callers only
         // ask "has the worker finished with it?").
         assert!(job_is_settled(&json!({ "state": "CREATED", "retries": 2 })));
-        assert!(job_is_settled(&json!({ "state": "COMPLETED", "retries": 0 })));
-        assert!(!job_is_settled(&json!({ "state": "CREATED", "retries": 3 })));
+        assert!(job_is_settled(
+            &json!({ "state": "COMPLETED", "retries": 0 })
+        ));
+        assert!(!job_is_settled(
+            &json!({ "state": "CREATED", "retries": 3 })
+        ));
     }
 }

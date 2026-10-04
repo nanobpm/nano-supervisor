@@ -137,9 +137,10 @@ fn settlement_with_a_wrong_lease_token_is_rejected() {
     } else {
         skip!("engine issued no lease token for {job_type} (pre-0.0.24?)");
     };
-    let token = job[token_field].as_str().map(str::to_string).expect(
-        "token_field was selected because job[token_field] is a string",
-    );
+    let token = job[token_field]
+        .as_str()
+        .map(str::to_string)
+        .expect("token_field was selected because job[token_field] is a string");
     // The fence is only meaningful if the wrong token differs from the real one.
     assert_ne!(
         token, "not-the-lease",

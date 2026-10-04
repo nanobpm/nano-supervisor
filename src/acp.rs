@@ -1039,7 +1039,9 @@ mod tests {
         // accumulate the same lines or a tool-only run reads empty here while
         // Node reports it non-empty (and a status-only run is failed as empty).
         assert_eq!(
-            describe_update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })),
+            describe_update(
+                &json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })
+            ),
             Some("hi".to_string())
         );
         assert_eq!(
@@ -1047,21 +1049,29 @@ mod tests {
             Some("go".to_string())
         );
         assert_eq!(
-            describe_update(&json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hmm" } })),
+            describe_update(
+                &json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "hmm" } })
+            ),
             Some("\u{1F4AD} hmm".to_string())
         );
         // A tool call serializes a `⚙ [tool: …]` line (with its status when one
         // is present), so a tool-only run is non-empty.
         assert_eq!(
-            describe_update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read" })),
+            describe_update(
+                &json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read" })
+            ),
             Some("\u{2699} [tool: read]\n".to_string())
         );
         assert_eq!(
-            describe_update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read", "status": "completed" })),
+            describe_update(
+                &json!({ "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "read", "status": "completed" })
+            ),
             Some("\u{2699} [tool: read — completed]\n".to_string())
         );
         assert_eq!(
-            describe_update(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed" })),
+            describe_update(
+                &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed" })
+            ),
             Some("\u{2699} [tool: c1 — completed]\n".to_string())
         );
         // A plan and an unknown/status update contribute a marker line too.
@@ -1091,7 +1101,9 @@ mod tests {
         assert!(update_is_effective_turn(&resource));
         // A top-level `text` object and a bare string still produce output.
         assert_eq!(
-            describe_update(&json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })),
+            describe_update(
+                &json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } })
+            ),
             Some("hi".to_string())
         );
         assert_eq!(

@@ -2602,8 +2602,7 @@ mod tests {
         );
 
         // A clean completion passes the inner result straight through.
-        let clean: std::result::Result<Result<u8>, _> =
-            tokio::spawn(async { Ok(7u8) }).await;
+        let clean: std::result::Result<Result<u8>, _> = tokio::spawn(async { Ok(7u8) }).await;
         assert_eq!(reconcile_exec_join("job-ok", clean, true).unwrap(), 7);
     }
 
