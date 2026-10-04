@@ -5,10 +5,10 @@ per hire** as tokio tasks that share **one** engine connection, next to the Node
 supervisor on a single hire, to gather real-world evidence early.
 
 Each slot is a worker that services one hire's rank×capability job-type matrix,
-one job at a time. It reuses the spike's leased activation + lease-refresh
-fencing (`src/jobs.rs`, `src/worker.rs`) and adds the MVP job handling: prompt
-assembly, repo clone, ACP **and** pipe protocols, result-file / `::nano:result::`
-parsing, and the empty-result → fail guard.
+one job at a time. It reuses the leased activation + lease-refresh fencing
+(`src/jobs.rs`, `src/worker.rs`) proven by the spike and adds the MVP job
+handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
+`::nano:result::` parsing, and the empty-result → fail guard.
 
 ## What it does
 
@@ -18,8 +18,14 @@ parsing, and the empty-result → fail guard.
   `rank:cap1+cap2`).
 - **Connection** settings come from c8ctl profiles (`--profile`, else the active
   profile, else `CAMUNDA_*` env). Job commands always use the
-  `camunda-orchestration-sdk` transport (the same one the Node plugin uses); the
-  `--with-lease` story is the same as the spike.
+  `camunda-orchestration-sdk` transport (the same one the Node plugin uses).
+  **Lease compatibility:** the SDK speaks the Camunda 8.10 spec field names, so
+  `--with-lease` needs an engine that returns the lease as `jobLeaseToken`
+  (Nano engine ≥ 1.70.1 does; see `src/jobs.rs`). An engine that still returns
+  only the legacy `leaseToken` field gives the SDK no lease to carry, so
+  `--with-lease` activations arrive unleased and the daemon shuts down loudly
+  rather than run unfenced — such an engine is incompatible with `--with-lease`
+  here.
 - **Own worker names** — `‹host›-nanod-‹hire›-‹slot›` — so the daemon's jobs are
   told apart from the Node workers' (`‹host›-‹hire›-‹random›`).
 - **Host sandbox only**; a container-sandbox hire is skipped with a warning. A
