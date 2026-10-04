@@ -30,6 +30,11 @@ const VALID_RANKS: [&str; 4] = ["principal", "senior", "junior", "decider"];
 /// would silently run an ACP harness over pipe instead of failing.
 const VALID_PROTOCOLS: [&str; 2] = ["acp", "pipe"];
 
+/// The sandbox modes a hire may declare. Anything else is rejected at hire
+/// time: the daemon refuses every sandbox but `none` (host), so a typo like
+/// `dokcer` accepted here would persist a profile that can never run.
+const VALID_SANDBOXES: [&str; 3] = ["none", "docker", "podman"];
+
 /// One persisted hire in `config.json`. The field order is the golden order the
 /// `config_after_hire` snapshot pins; a `#[derive(Serialize)]` struct always
 /// emits its fields in declaration order (independent of serde_json's
@@ -263,6 +268,20 @@ pub fn hire(args: HireArgs) -> Result<()> {
         );
     }
 
+    let sandbox = args
+        .sandbox
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_sandbox);
+    if !VALID_SANDBOXES.contains(&sandbox.as_str()) {
+        bail!(
+            "Invalid sandbox \"{}\". Valid sandboxes: {}",
+            args.sandbox.as_deref().unwrap_or_default(),
+            VALID_SANDBOXES.join(", ")
+        );
+    }
+
     let hire = StoredHire {
         name: name.clone(),
         rank: rank.clone(),
@@ -270,12 +289,7 @@ pub fn hire(args: HireArgs) -> Result<()> {
         args: args.args.clone(),
         model: args.model.clone().unwrap_or_default().trim().to_string(),
         capabilities: capabilities.clone(),
-        sandbox: args
-            .sandbox
-            .clone()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(default_sandbox),
+        sandbox,
         image: args.image.clone().unwrap_or_default(),
         terminal: args
             .terminal
@@ -349,12 +363,13 @@ pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
         .hires
         .get_mut(profile)
         .with_context(|| format!("no hire named \"{profile}\""))?;
-    let mut merged = hire.capabilities.clone();
-    merged.extend(capabilities.split(',').map(|c| c.to_string()));
-    let merged = normalize_capabilities(merged);
-    hire.capabilities = merged.clone();
+    // `assign` SETS the capability list: starting from the old set would make a
+    // stale capability impossible to remove, and the profile would keep
+    // subscribing to its job types. Normalize the supplied list directly.
+    let caps = normalize_capabilities(capabilities.split(',').map(|c| c.to_string()).collect());
+    hire.capabilities = caps.clone();
     write_config(&cfg)?;
-    println!("Reassigned {profile} — capabilities: {}", merged.join(", "));
+    println!("Reassigned {profile} — capabilities: {}", caps.join(", "));
     Ok(())
 }
 
@@ -512,6 +527,11 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
         name: name.to_string(),
         workers: Vec::new(),
     });
+    // The write destination comes from the requested (validated) name, so bind
+    // the loaded manifest to it: a manifest file whose internal `name` disagrees
+    // with its filename would otherwise redirect the write to a *different*
+    // file, silently leaving the requested one unchanged.
+    manifest.name = name.to_string();
     match manifest.workers.iter_mut().find(|w| w.profile == profile) {
         Some(existing) => {
             existing.instances = instances;
@@ -709,5 +729,111 @@ mod tests {
         args.env = vec!["=orphan".to_string()];
         let err = hire(args).unwrap_err().to_string();
         assert!(err.contains("expected KEY=VALUE"), "{err}");
+    }
+
+    /// The daemon refuses every sandbox but `none` (host), so hire must reject
+    /// an unknown --sandbox at write time — a typo like `dokcer` must fail, not
+    /// persist a profile that can never run.
+    #[test]
+    fn hire_rejects_unknown_sandbox() {
+        let cfg = TempCfg::new();
+        let mut args = hire_args("coder");
+        args.sandbox = Some("dokcer".to_string());
+        let err = hire(args).unwrap_err().to_string();
+        assert!(err.contains("Invalid sandbox \"dokcer\""), "{err}");
+        assert!(err.contains("none, docker, podman"), "{err}");
+
+        for ok in ["none", "docker", "podman", " Docker "] {
+            let mut args = hire_args("coder");
+            args.sandbox = Some(ok.to_string());
+            hire(args).unwrap_or_else(|e| panic!("sandbox {ok:?}: {e}"));
+        }
+        drop(cfg);
+    }
+
+    /// `assign` SETS the capability list: a stale capability must be removable,
+    /// not merged back in from the old set.
+    #[test]
+    fn assign_replaces_capabilities() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        assign("coder", "feature,pr-review").unwrap();
+        assign("coder", "fix").unwrap();
+        let cfg = read_config().unwrap();
+        assert_eq!(
+            cfg.hires["coder"].capabilities,
+            vec!["fix".to_string()],
+            "assign must replace, not merge with, the old set"
+        );
+    }
+
+    /// The write destination comes from the requested name: a manifest whose
+    /// internal `name` disagrees with its filename must not redirect the write.
+    #[test]
+    fn workforce_add_binds_manifest_to_requested_name() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        let dir = home_dir().unwrap().join("workforce");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("default.json"),
+            "{\"version\":1,\"name\":\"other\",\"workers\":[]}",
+        )
+        .unwrap();
+        workforce_add("default", "coder", 1, "auto").unwrap();
+        let m = read_manifest("default").unwrap().unwrap();
+        assert_eq!(m.name, "default");
+        assert_eq!(m.workers.len(), 1);
+        assert!(
+            !dir.join("other.json").exists(),
+            "the internal name must not redirect the write to other.json"
+        );
+    }
+
+    /// A minimal `C8CTL_NANO_HOME` guard: points the state home at a fresh temp
+    /// dir for the duration of a state-mutating test. Tests mutate the process
+    /// environment, so they must not run concurrently — a process-wide mutex
+    /// held for the guard's lifetime serializes them.
+    struct TempCfg {
+        home: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    impl TempCfg {
+        fn new() -> Self {
+            let guard = env_lock().lock().unwrap();
+            let home = std::env::temp_dir().join(format!(
+                "fleet-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var_os("C8CTL_NANO_HOME");
+            std::env::set_var("C8CTL_NANO_HOME", &home);
+            Self {
+                home,
+                prev,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for TempCfg {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("C8CTL_NANO_HOME", v),
+                None => std::env::remove_var("C8CTL_NANO_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
     }
 }
