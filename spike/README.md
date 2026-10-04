@@ -35,10 +35,9 @@ c8ctl. An unknown or unrunnable hire exits 78 (`EX_CONFIG`), like Node.
   `jobType`, `prompt`, the normalised `task` envelope, `variables`,
   `customHeaders`, `profile`, …) and gets `AGENT_PROFILE`/`AGENT_RANK`/
   `AGENT_MODEL`/`AGENT_CAPABILITIES`/`AGENT_JOB_TYPE`/`AGENT_RESULT_FILE`.
-- **Leases.** Every activation asks for a lease (engine 0.0.24 issues
-  `jobLeaseToken`, which the SDK carries) and is refreshed every third of
-  `--recovery-window`. A 404/409 on refresh is a lost activation: the agent is
-  stopped and the job is not settled.
+- **Leases.** See [Leases](../README.md#leases) — `work` requests a lease on
+  every activation and runs unfenced when the engine issues none, like the Node
+  plugin.
 - **Result.** `AGENT_RESULT_FILE`, else the last `::nano:result::` line, else a
   fenced JSON block. With no result but some output, the agent is re-invoked
   once with the re-emit nudge.

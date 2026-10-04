@@ -121,13 +121,14 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     ));
 
     // `wait_for_signal` reports whether a slot flipped the watch for a FATAL
-    // misconfiguration (an unleased activation under `--with-lease`) versus an
-    // operator Ctrl-C/SIGTERM. We still drain either way, but a fatal shutdown
-    // must surface as a non-zero exit (issue: `--with-lease` is documented to
-    // fail LOUDLY — returning `Ok(())` made the daemon look like a clean drain).
+    // misconfiguration (an unleased activation while leasing is enabled — the
+    // default) versus an operator Ctrl-C/SIGTERM. We still drain either way, but
+    // a fatal shutdown must surface as a non-zero exit (issue: default leasing is
+    // documented to fail LOUDLY — returning `Ok(())` made the daemon look like a
+    // clean drain).
     let fatal = wait_for_signal(&shutdown_tx).await;
     if fatal {
-        log("fatal: a slot could not fence its work under --with-lease (engine not issuing leases); draining and exiting non-zero");
+        log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); draining and exiting non-zero");
     } else {
         log("shutdown signal received; draining slots…");
     }
@@ -150,8 +151,9 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     }
     if fatal {
         bail!(
-            "daemon shut down because a slot received an unleased activation under --with-lease — \
-             the engine is not issuing leases, so the requested fencing is impossible"
+            "daemon shut down because a slot received an unleased activation while leasing is \
+             enabled (the default; opt out with --no-lease) — the engine is not issuing leases, so \
+             the requested fencing is impossible"
         );
     }
     Ok(())
@@ -667,14 +669,14 @@ pub(crate) fn short_hostname() -> String {
 }
 
 /// Block until a shutdown trigger fires. Returns `true` when a slot flipped the
-/// `fatal` watch — an unrecoverable misconfiguration (e.g. an unleased activation
-/// under `--with-lease`) that must exit loudly — and `false` for an operator
-/// Ctrl-C/SIGTERM drain. The caller distinguishes the two so a fatal shutdown
-/// surfaces as a non-zero exit rather than a clean `Ok(())`.
+/// `fatal` watch — an unrecoverable misconfiguration (e.g. an unleased
+/// activation while leasing is enabled, the default) that must exit loudly — and
+/// `false` for an operator Ctrl-C/SIGTERM drain. The caller distinguishes the two
+/// so a fatal shutdown surfaces as a non-zero exit rather than a clean `Ok(())`.
 pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) -> bool {
     // Also wake if a slot flips the shutdown watch (a fatal misconfiguration,
-    // e.g. an unleased activation under --with-lease), so the daemon exits loudly
-    // rather than lingering with the offending slot stopped.
+    // e.g. an unleased activation while leasing is enabled), so the daemon exits
+    // loudly rather than lingering with the offending slot stopped.
     let mut fatal_rx = fatal.subscribe();
     // A second subscription used only to re-read the watch's *final* value after
     // the wait returns — `select!` reports whichever arm fired, not the channel's
@@ -1377,9 +1379,9 @@ mod tests {
         ));
     }
 
-    // A slot that flips the fatal watch (an unleased activation under
-    // `--with-lease`) must be reported as fatal so `run` exits non-zero rather
-    // than returning a clean drain `Ok(())`.
+    // A slot that flips the fatal watch (an unleased activation while leasing is
+    // enabled, the default) must be reported as fatal so `run` exits non-zero
+    // rather than returning a clean drain `Ok(())`.
     #[tokio::test]
     async fn wait_for_signal_reports_slot_requested_fatal() {
         let (tx, _rx) = watch::channel(false);

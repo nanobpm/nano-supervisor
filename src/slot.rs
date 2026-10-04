@@ -50,8 +50,9 @@ pub struct SlotConfig {
     /// Ask the engine for a lease on each activation.
     pub with_lease: bool,
     /// Refuse to run unfenced: an unleased activation shuts the process down
-    /// (the daemon's `--with-lease`). `work` requests leases but, like the Node
-    /// plugin, runs unfenced when the engine does not issue one.
+    /// (the daemon leases by default; opt out with `--no-lease`). `work`
+    /// requests leases but, like the Node plugin, runs unfenced when the engine
+    /// does not issue one.
     pub require_lease: bool,
     /// Stop after handling this many jobs (`work --max-jobs`); `None` = forever.
     pub max_jobs: Option<usize>,
@@ -140,17 +141,18 @@ pub async fn run(
         }
         for job in batch {
             if cfg.require_lease && job.lease.is_none() {
-                // The CLI's `--with-lease` contract is to fail LOUDLY when the
-                // engine does not issue leases (see the flag's help). Merely
-                // skipping would leave the activation to expire and be
-                // re-delivered forever — a silent spin that never fences. If the
-                // engine returns an unleased activation here it will do so for
-                // every job, so the requested fencing is impossible: shut the
+                // Leasing is on by default (opt out with `--no-lease`); its
+                // contract is to fail LOUDLY when the engine does not issue
+                // leases. Merely skipping would leave the activation to expire
+                // and be re-delivered forever — a silent spin that never fences.
+                // If the engine returns an unleased activation here it will do so
+                // for every job, so the requested fencing is impossible: shut the
                 // whole daemon down loudly instead of running on unfenced.
                 log(&format!(
-                    "slot {}: job {} activated without a lease token under --with-lease; the engine \
-                     is not issuing leases, so the requested fencing is impossible — shutting the \
-                     daemon down instead of running unfenced",
+                    "slot {}: job {} activated without a lease token while leasing is enabled (the \
+                     default; opt out with --no-lease); the engine is not issuing leases, so the \
+                     requested fencing is impossible — shutting the daemon down instead of running \
+                     unfenced",
                     cfg.worker_name,
                     job.job.job_key.value()
                 ));
