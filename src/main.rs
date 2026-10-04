@@ -95,6 +95,12 @@ enum Cmd {
         /// Exit after handling this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
+        /// Test-harness escape hatch: run attached inside an agent run instead of
+        /// refusing (see the `NANO_AGENT_RUN` guard). Bound to the invoking
+        /// process so the job's teardown still kills it. For the hermetic
+        /// contract tests only — never for a real fleet.
+        #[arg(long = "foreground-for-tests", hide = true)]
+        foreground_for_tests: bool,
     },
     /// Run the MVP daemon: N slots per hire (from config.json), one shared
     /// engine connection, host sandbox only.
@@ -138,6 +144,12 @@ enum Cmd {
         /// to opt out.
         #[arg(long, hide = true)]
         with_lease: bool,
+        /// Test-harness escape hatch: run attached inside an agent run instead of
+        /// refusing (see the `NANO_AGENT_RUN` guard). Bound to the invoking
+        /// process so the job's teardown still kills it. For the hermetic
+        /// contract tests only — never for a real fleet.
+        #[arg(long = "foreground-for-tests", hide = true)]
+        foreground_for_tests: bool,
     },
     /// Internal: the macOS parent-death watchdog (kills an agent's process group
     /// when the daemon dies). Not for direct use.
@@ -178,6 +190,68 @@ fn daemon_leases(no_lease: bool) -> bool {
     !no_lease
 }
 
+/// Env var the worker stamps on every agent process (`slot::build_agent_env`) to
+/// mark its process tree as belonging to an agent run. Its presence here means
+/// *this* `nano-supervisor` was launched by an agent.
+const AGENT_RUN_ENV: &str = "NANO_AGENT_RUN";
+/// Explicit opt-in letting a supervisor/worker run attached inside an agent run.
+const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
+
+/// Pure refusal decision for a nested supervisor/worker (#40), split out so it is
+/// testable without touching process-global env. Returns the explanatory error
+/// message when the command must be refused, or `None` when it may run.
+///
+/// * `run` — the value of `NANO_AGENT_RUN` (`None`/empty ⇒ not inside an agent
+///   run ⇒ never refused).
+/// * `foreground_for_tests` — the `--foreground-for-tests` flag.
+/// * `allow_nested` — the value of `NANO_ALLOW_NESTED_SUPERVISOR` (`"1"` opts in).
+fn nested_refusal(
+    command: &str,
+    run: Option<&str>,
+    foreground_for_tests: bool,
+    allow_nested: Option<&str>,
+) -> Option<String> {
+    let run = run.filter(|v| !v.is_empty())?;
+    if foreground_for_tests || allow_nested == Some("1") {
+        return None;
+    }
+    Some(format!(
+        "refusing to start `nano-supervisor {command}` inside an agent run \
+         ({AGENT_RUN_ENV}={run}). A supervisor or worker started by an agent \
+         escapes the job's teardown and becomes a phantom that can lease real \
+         jobs and misreport the fleet. Agents must never start a real supervisor \
+         or daemon outside the hermetic test harness. If this IS a contract test, \
+         opt in with `--foreground-for-tests` or `{ALLOW_NESTED_ENV}=1` to run \
+         attached (bound to the invoking process)."
+    ))
+}
+
+/// Refuse to start a long-lived supervisor/worker inside an agent run (#40).
+///
+/// The worker marks every agent's environment with `NANO_AGENT_RUN`. A
+/// supervisor an agent starts daemonises (`setsid`, new session) and so escapes
+/// the job's process-group teardown, becoming a phantom that can lease real jobs
+/// and misreport the fleet. So when `NANO_AGENT_RUN` is set we refuse, unless the
+/// caller explicitly opts in — `--foreground-for-tests` or
+/// `NANO_ALLOW_NESTED_SUPERVISOR=1` — which the hermetic contract tests use to
+/// run **attached**: no `setsid`, and bound to the invoking process so the job's
+/// teardown still takes it down.
+fn guard_nested_supervisor(command: &str, foreground_for_tests: bool) -> Result<()> {
+    let run = std::env::var(AGENT_RUN_ENV).ok();
+    let allow = std::env::var(ALLOW_NESTED_ENV).ok();
+    if let Some(msg) =
+        nested_refusal(command, run.as_deref(), foreground_for_tests, allow.as_deref())
+    {
+        anyhow::bail!(msg);
+    }
+    if run.as_deref().is_some_and(|r| !r.is_empty()) {
+        // Opted in: run attached. Bind to the invoking agent's death so the job's
+        // process-group kill (or the agent exiting) takes this process down too.
+        pdeath::bind_self_to_parent_death();
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -197,7 +271,9 @@ async fn main() -> Result<()> {
             runs_dir,
             config,
             max_jobs,
+            foreground_for_tests,
         } => {
+            guard_nested_supervisor("work", foreground_for_tests)?;
             work::run(work::WorkOptions {
                 hire,
                 job_types: job_type,
@@ -232,7 +308,9 @@ async fn main() -> Result<()> {
             config,
             no_lease,
             with_lease: _,
+            foreground_for_tests,
         } => {
+            guard_nested_supervisor("daemon", foreground_for_tests)?;
             let opts = daemon::DaemonOptions {
                 profile,
                 with_lease: daemon_leases(no_lease),
@@ -471,12 +549,41 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_recovery_window, daemon_leases, normalize_runs_dir, normalize_runs_dir_impl, Cli,
-        Cmd, MIN_RECOVERY_WINDOW,
+        clamp_recovery_window, daemon_leases, nested_refusal, normalize_runs_dir,
+        normalize_runs_dir_impl, Cli, Cmd, MIN_RECOVERY_WINDOW,
     };
     use clap::Parser;
     use std::path::{Component, Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn nested_refusal_blocks_an_agent_run_without_opt_in() {
+        // Inside an agent run (NANO_AGENT_RUN set), no opt-in: refused, and the
+        // message explains itself.
+        let msg = nested_refusal("daemon", Some("214829"), false, None)
+            .expect("must refuse inside an agent run");
+        assert!(msg.contains("NANO_AGENT_RUN"), "message: {msg}");
+        assert!(msg.contains("214829"), "message names the run: {msg}");
+        assert!(msg.contains("daemon"), "message names the command: {msg}");
+    }
+
+    #[test]
+    fn nested_refusal_allows_outside_an_agent_run() {
+        // Not inside an agent run: never refused, regardless of opt-in.
+        assert!(nested_refusal("daemon", None, false, None).is_none());
+        assert!(nested_refusal("work", Some(""), false, None).is_none());
+    }
+
+    #[test]
+    fn nested_refusal_opt_in_flag_and_env_bypass() {
+        // The flag opts in.
+        assert!(nested_refusal("daemon", Some("214829"), true, None).is_none());
+        // `NANO_ALLOW_NESTED_SUPERVISOR=1` opts in.
+        assert!(nested_refusal("daemon", Some("214829"), false, Some("1")).is_none());
+        // Any other value does NOT opt in.
+        assert!(nested_refusal("daemon", Some("214829"), false, Some("0")).is_some());
+        assert!(nested_refusal("daemon", Some("214829"), false, Some("")).is_some());
+    }
 
     #[test]
     fn clamp_recovery_window_floors_degenerate_values() {

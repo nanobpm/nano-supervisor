@@ -53,6 +53,31 @@ pub fn arm(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn arm(_cmd: &mut Command) {}
 
+/// Bind the CURRENT process to die when its parent does. Used when a supervisor
+/// is allowed to run *attached* inside an agent run (#40): arming
+/// `PR_SET_PDEATHSIG` on ourselves means that if the invoking agent dies — or the
+/// job's process-group kill reaps it — this supervisor is SIGKILLed too, instead
+/// of lingering as a phantom. On non-Linux targets it is a no-op: those callers
+/// stay in the invoking process group (no `setsid`), so the group kill already
+/// takes them down.
+#[cfg(target_os = "linux")]
+pub fn bind_self_to_parent_death() {
+    // SAFETY: a single async-signal-safe libc call that only arms a signal
+    // disposition for this process; it touches no Rust allocator state.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn bind_self_to_parent_death() {}
+
 /// `SIGKILL` a process group by its leader pid (the pid is also the pgid, since
 /// agents are spawned with `process_group(0)`). Used by the ACP/pipe cancellation
 /// guards so that dropping an in-flight agent — e.g. when a slot aborts its
