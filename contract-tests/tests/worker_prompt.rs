@@ -192,6 +192,13 @@ fn resolvable_secret_ref_lets_the_job_run() {
         "prompt-secret-ok",
         &[
             json!({ "emit": "ran with the secret" }),
+            // Gate completion on the agent process actually SEEING the resolved
+            // secret: the host resolver must forward CT_PRESENT_SECRET's value
+            // into the agent's environment under its ref name. A resolver that
+            // validates presence but drops the value fails this `test` (which
+            // aborts the turn), so `write_result` never runs and the job cannot
+            // COMPLETE — proving forwarding, not merely non-blocking resolution.
+            json!({ "shell": "test \"$CT_PRESENT_SECRET\" = 's3cr3t-value'" }),
             json!({ "write_result": { "ok": true } }),
         ],
         json!({

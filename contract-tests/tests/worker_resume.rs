@@ -154,6 +154,16 @@ fn killed_worker_job_resumes_not_restarts() {
         "COMPLETED",
         "a killed worker must not complete the job: {job:#}"
     );
+    // ...and with its FULL retry budget intact: a killed worker must not
+    // settle the job from beyond the grave (a settle-fail would decrement
+    // retries 3 → 2). Asserting the budget — not just non-completion —
+    // distinguishes a true resume from a worker that wrongly failed the job
+    // and let phase 2 complete it on a depleted budget.
+    assert_eq!(
+        job["retries"].as_i64().unwrap_or(-1),
+        3,
+        "a killed worker must preserve the full retry budget: {job:#}"
+    );
 
     // Phase 2: a fresh worker (a new process, new activation) picks the SAME
     // job up once the lapsed deadline lets the engine redeliver it, and runs it
