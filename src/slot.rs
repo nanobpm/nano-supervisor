@@ -2222,8 +2222,8 @@ mod tests {
             "ZEEBE_CLIENT_SECRET",
             "CAMUNDA_BASIC_AUTH_PASSWORD",
             // The SDK also accepts the `ZEEBE_*` aliases as an ambient
-            // connection source (see `profile::env_has_oauth`), so basic-auth
-            // credentials supplied that way must be stripped too.
+            // connection source, so basic-auth credentials supplied that way
+            // must be stripped too.
             "ZEEBE_BASIC_AUTH_USERNAME",
             "ZEEBE_BASIC_AUTH_PASSWORD",
             // A `*_REST_ADDRESS` connection URL can embed HTTP(S) userinfo

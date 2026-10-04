@@ -95,10 +95,6 @@ enum Cmd {
         /// Exit after handling this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
-        /// Job command transport: `sdk` (default via `auto`) or `nano` (raw HTTP,
-        /// legacy `leaseToken` dialect for engines older than 0.0.24).
-        #[arg(long, default_value = "auto")]
-        job_api: String,
     },
     /// Run the MVP daemon: N slots per hire (from config.json), one shared
     /// engine connection, host sandbox only.
@@ -134,10 +130,6 @@ enum Cmd {
         /// Ask the engine for job leases (fails loudly if the engine doesn't issue them).
         #[arg(long)]
         with_lease: bool,
-        /// Job command transport: `sdk` (default via `auto`) or `nano` (raw HTTP,
-        /// legacy `leaseToken` dialect for engines older than 0.0.24).
-        #[arg(long, default_value = "auto")]
-        job_api: String,
     },
     /// Internal: the macOS parent-death watchdog (kills an agent's process group
     /// when the daemon dies). Not for direct use.
@@ -187,13 +179,11 @@ async fn main() -> Result<()> {
             runs_dir,
             config,
             max_jobs,
-            job_api,
         } => {
             work::run(work::WorkOptions {
                 hire,
                 job_types: job_type,
                 profile,
-                job_api: engine::JobApi::parse(&job_api)?,
                 name,
                 recovery_window: clamp_recovery_window(recovery_window),
                 idle_timeout: Duration::from_millis(idle_timeout),
@@ -220,11 +210,9 @@ async fn main() -> Result<()> {
             runs_dir,
             config,
             with_lease,
-            job_api,
         } => {
             let opts = daemon::DaemonOptions {
                 profile,
-                job_api: engine::JobApi::parse(&job_api)?,
                 with_lease,
                 slots: slots.max(1),
                 only: hire,

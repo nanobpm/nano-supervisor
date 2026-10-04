@@ -16,7 +16,7 @@ use anyhow::Result;
 use tokio::sync::watch;
 
 use crate::daemon::{short_hostname, validate, wait_for_signal};
-use crate::engine::{self, JobApi};
+use crate::engine;
 use crate::runtime::log;
 use crate::slot::{self, SlotConfig};
 use crate::state;
@@ -32,7 +32,6 @@ pub struct WorkOptions {
     pub hire: String,
     pub job_types: Vec<String>,
     pub profile: Option<String>,
-    pub job_api: JobApi,
     pub name: Option<String>,
     pub recovery_window: Duration,
     pub idle_timeout: Duration,
@@ -208,7 +207,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         })
     };
 
-    let (_profile, jobs) = engine::connect(opts.profile.as_deref(), opts.job_api)?;
+    let (_profile, jobs) = engine::connect(opts.profile.as_deref())?;
     let worker_name = opts.name.clone().unwrap_or_else(|| {
         // Node parity: the default worker name must be unique per `work`
         // PROCESS, not per (host, hire) — otherwise two concurrent workers on
