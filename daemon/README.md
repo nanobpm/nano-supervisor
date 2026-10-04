@@ -6,7 +6,7 @@ supervisor on a single hire, to gather real-world evidence early.
 
 Each slot is a worker that services one hire's rank×capability job-type matrix,
 one job at a time. It reuses the leased activation + lease-refresh fencing
-(`src/jobs.rs`, `src/worker.rs`) proven by the spike and adds the MVP job
+(`src/jobs.rs`, `src/slot.rs`) proven by the spike and adds the MVP job
 handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
 `::nano:result::` parsing, and the empty-result → fail guard.
 
