@@ -1642,29 +1642,32 @@ fn run_node_worker(
         if settle_until.is_none() && record_path.exists() {
             settle_until = Some(Instant::now() + NODE_SETTLE_GRACE);
         }
-        // Once the worker has handled the job (its agent recorded a run, so a
-        // settle window is open), poll the engine and decide how to reap based on
-        // the settlement kind: a terminal state is no longer acquirable so we
-        // grant a brief logging grace, but a retry-left failure is immediately
-        // re-activatable (zero backoff) and the still-running worker would
-        // reacquire and fail it again — so reap at once to pin the retry count.
-        if settle_until.is_some() {
-            match settled() {
-                Settlement::RetriableFailure => {
-                    #[cfg(unix)]
-                    kill_process_tree(child.id());
-                    let _ = child.kill();
-                    break child.wait().expect("wait killed node worker");
-                }
-                Settlement::Terminal => {
-                    if let Some(until) = settle_until {
-                        if until > Instant::now() + NODE_POST_SETTLE {
-                            settle_until = Some(Instant::now() + NODE_POST_SETTLE);
-                        }
-                    }
-                }
-                Settlement::Pending => {}
+        // Poll the engine and decide how to reap from the settlement kind — EVEN
+        // BEFORE a record exists. A provisioning failure (e.g. an unresolvable
+        // secretRef) settles the job BEFORE the agent runs, so `record.json` is
+        // never written and the settle window above never opens; gating this on
+        // `settle_until.is_some()` would leave the still-running, zero-backoff Node
+        // worker free to reacquire and re-fail the job repeatedly until
+        // `NODE_NO_WORK_DEADLINE`, driving retries to exhaustion and corrupting the
+        // retry-count assertion (e.g. `missing_secret_ref_fails_the_job` expects
+        // `retries == 2`). A terminal state is no longer acquirable so we grant a
+        // brief logging grace; a retry-left failure is immediately re-activatable
+        // (zero backoff) so we reap at once to pin the retry count.
+        match settled() {
+            Settlement::RetriableFailure => {
+                #[cfg(unix)]
+                kill_process_tree(child.id());
+                let _ = child.kill();
+                break child.wait().expect("wait killed node worker");
             }
+            // Open (or shorten) a brief logging grace. This fires even with no
+            // record — a terminal provisioning failure also writes none — so we
+            // reap promptly instead of idling to `NODE_NO_WORK_DEADLINE`.
+            Settlement::Terminal => {
+                let grace = Instant::now() + NODE_POST_SETTLE;
+                settle_until = Some(settle_until.map_or(grace, |until| until.min(grace)));
+            }
+            Settlement::Pending => {}
         }
         let reap = match settle_until {
             Some(until) => Instant::now() >= until,
