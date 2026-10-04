@@ -1159,15 +1159,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    /// Env var that re-enters this test binary as the low-fd-limit *child*: its
+    /// value is the prepared wide-tree root to scrub. Keeping the work in a
+    /// fresh process lets us pin `RLIMIT_NOFILE` just above the ancestry-chain
+    /// depth without disturbing the parent harness's own descriptors.
+    #[cfg(all(unix, target_os = "linux"))]
+    const FD_LIMIT_CHILD_ENV: &str = "NANO_SCRUB_FD_LIMIT_CHILD";
+
     #[test]
     #[cfg(all(unix, target_os = "linux"))]
     fn submodule_scrub_wide_tree_does_not_exhaust_fds() {
-        // Many sibling submodules (wide .git/modules): the depth-bounded walk
-        // must scrub every config without holding one fd per sibling.
+        // Child role: a parent invocation (below) re-exec'd this test binary
+        // with the wide-tree root in FD_LIMIT_CHILD_ENV. Pin the soft fd limit
+        // just above current usage + the walk's bounded depth, then scrub. A
+        // breadth-first walk that retains one open handle per sibling would hit
+        // EMFILE here and exit non-zero; the depth-bounded walk, which holds
+        // only the current ancestry chain, stays under the limit and exits 0.
+        if let Ok(root) = std::env::var(FD_LIMIT_CHILD_ENV) {
+            // Count currently-open descriptors so the cap tracks the harness's
+            // real baseline rather than a guessed absolute number.
+            let base = std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(32);
+            // Headroom covers the deepest ancestry chain of pinned dir handles
+            // plus their readdir streams and the single open config file — a
+            // small constant, and far below the sibling count the parent builds.
+            let want = base as u64 + 24;
+            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: plain libc rlimit get/set on a zeroed struct.
+            unsafe {
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+                    std::process::exit(3);
+                }
+                rl.rlim_cur = want.min(rl.rlim_max);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                    std::process::exit(3);
+                }
+            }
+            let code = match scrub_submodule_config_credentials(std::path::Path::new(&root)) {
+                Ok(()) => 0,
+                Err(_) => 2, // EMFILE (or any failure) under the low cap
+            };
+            std::process::exit(code);
+        }
+
+        // Parent role: build a *wide* tree — many sibling submodule configs under
+        // one `.git/modules` — then run the scrub in a child pinned to a low fd
+        // limit (above). `n` must exceed the child's fd headroom so a per-sibling
+        // handle leak is forced to fail there.
         let tmp = std::env::temp_dir().join(format!("nano-sub-wide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
         let modules = tmp.join(".git").join("modules");
         let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
-        let n = 200; // comfortably above a low RLIMIT_NOFILE per-sibling failure
+        let n = 200; // comfortably above the child's (baseline + depth) fd cap
         let mut cfgs = Vec::new();
         for i in 0..n {
             let d = modules.join(format!("sub{i}"));
@@ -1176,7 +1218,26 @@ mod tests {
             std::fs::write(&c, format!("[remote \"origin\"]\n\turl = https://{token}@h/o/r{i}.git\n")).unwrap();
             cfgs.push(c);
         }
-        scrub_submodule_config_credentials(&tmp).expect("wide tree scrubs without EMFILE");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "provision::tests::submodule_scrub_wide_tree_does_not_exhaust_fds",
+            ])
+            .env(FD_LIMIT_CHILD_ENV, &tmp)
+            .status()
+            .expect("spawn low-fd-limit scrub child");
+        assert!(
+            status.success(),
+            "wide-tree scrub exhausted the fd limit (exit {:?}): the walk must bound \
+             open directory handles by depth, not by sibling count",
+            status.code()
+        );
+
+        // Belt-and-braces: the child really scrubbed this tree (guards against a
+        // filter that silently matched zero tests — then these still hold the PAT).
         for c in &cfgs {
             let got = std::fs::read_to_string(c).unwrap();
             assert!(!got.contains("s3cr3tPAT"), "every wide-tree config scrubbed: {c:?}");
