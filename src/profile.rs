@@ -217,7 +217,8 @@ fn read_pem(inline: &Option<String>, path: &Option<String>, what: &str) -> Resul
         return Ok(Some(pem.clone().into_bytes()));
     }
     if let Some(p) = path {
-        let bytes = std::fs::read(p).with_context(|| format!("failed to read {what} from {p:?}"))?;
+        let bytes =
+            std::fs::read(p).with_context(|| format!("failed to read {what} from {p:?}"))?;
         return Ok(Some(bytes));
     }
     Ok(None)
@@ -382,15 +383,16 @@ UN1CCiHPvqDsiGUoCf+ajydjBPrOo+S8rBIR1HlMUnLMojMp7kExWF0rXdkjvyic\n\
         };
         let err = apply_tls(reqwest::Client::builder(), &t).unwrap_err();
         assert!(
-            err.to_string().contains("requires both a client certificate"),
+            err.to_string()
+                .contains("requires both a client certificate"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
     fn apply_tls_rejects_encrypted_key() {
-        let err = build_identity(TEST_CERT.as_bytes(), TEST_KEY.as_bytes(), Some("pw"))
-            .unwrap_err();
+        let err =
+            build_identity(TEST_CERT.as_bytes(), TEST_KEY.as_bytes(), Some("pw")).unwrap_err();
         assert!(
             err.to_string().contains("PASSPHRASE"),
             "unexpected error: {err}"

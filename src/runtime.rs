@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -60,6 +60,50 @@ fn rand_fraction() -> f64 {
     })
 }
 
+/// The sleep before the next lease-refresh attempt, capped by the lease time
+/// *remaining* — never by the full window.
+///
+/// `failures` is the consecutive-failure streak (0 = the healthy steady state,
+/// which waits the `every` cadence). On a failure the loop backs off
+/// exponentially from `every` (full jitter) so a DOWN engine is not re-probed at
+/// the refresh cadence. But the delay is then capped to what is actually left on
+/// the lease (`deadline - now`), less a margin to issue the request: an extend
+/// that fails after a long (e.g. 30s) timeout has already burned lease time, so
+/// a delay sized from the FULL window could push the retry past the activation's
+/// expiry and lose in-flight work. Capping to the remaining budget keeps the
+/// retry inside the lease; the caller fences (via the `failures >= 2` give-up)
+/// once the budget is exhausted rather than letting the activation lapse
+/// silently. The deadline is reset by the caller after each successful extend.
+///
+/// Returns `None` when the lease has already effectively expired (the caller
+/// should make one last immediate attempt, whose 404/409 then fences the job).
+/// Pure and testable.
+fn refresh_budget(
+    now: Instant,
+    deadline: Instant,
+    every: Duration,
+    window: Duration,
+    failures: u32,
+) -> Option<Duration> {
+    let wait = if failures == 0 {
+        every
+    } else {
+        let exp = every.saturating_mul(1u32 << failures.min(20));
+        let capped = exp.min(window.max(every));
+        Duration::from_millis((capped.as_millis() as u64 as f64 * rand_fraction()) as u64)
+    };
+    // The lease time left after `now`, less a margin to issue the request. A
+    // failed extend can take up to ~30s to time out; leave room for the attempt
+    // that follows this sleep to actually reach the engine before the deadline.
+    const REQUEST_MARGIN: Duration = Duration::from_millis(500);
+    let remaining = deadline
+        .checked_duration_since(now)?
+        .checked_sub(REQUEST_MARGIN);
+    // `None` (no budget left) means the lease is effectively up — the caller
+    // makes a final immediate attempt rather than sleeping past the deadline.
+    remaining.map(|budget| wait.min(budget))
+}
+
 pub(crate) async fn refresh_loop(
     jobs: Jobs,
     key: String,
@@ -75,6 +119,12 @@ pub(crate) async fn refresh_loop(
     // minimum so the loop always yields between extends.
     let every = (window / 3).max(Duration::from_millis(1));
     let mut failures = 0u32;
+    // The absolute instant the current lease expires. The activation was granted
+    // for `window` when this loop was spawned, so start there; each successful
+    // extend pushes it out by another `window`. Capping the retry sleep against
+    // THIS deadline (not the full window) is what keeps a retry from landing
+    // after the activation has already expired (see `refresh_budget`).
+    let mut deadline = Instant::now() + window;
     loop {
         // After a transient failure, wait longer than the steady-state cadence
         // before retrying: an engine that is DOWN (connection refused — the
@@ -82,16 +132,16 @@ pub(crate) async fn refresh_loop(
         // refresh cadence, or a fleet of long-running jobs would churn TCP
         // connections into `TIME_WAIT` exactly like an activation storm
         // (nanobpm/nano-supervisor#23). Back off exponentially from the cadence
-        // (with full jitter), bounded by the window itself so the second attempt
-        // still lands inside the activation's remaining lifetime — the
-        // `failures >= 2` give-up below then fences the job rather than letting
-        // it expire silently.
-        let wait = if failures == 0 {
-            every
-        } else {
-            let exp = every.saturating_mul(1u32 << failures.min(20));
-            let capped = exp.min(window.max(every));
-            Duration::from_millis((capped.as_millis() as u64 as f64 * rand_fraction()) as u64)
+        // (with full jitter) — but cap the sleep to the lease time REMAINING,
+        // not the full window: an extend that fails after a long timeout has
+        // already burned lease time, so a window-sized delay could push the
+        // retry past expiry and lose in-flight work. `refresh_budget` returns
+        // `None` once the lease is effectively up; we then make one last
+        // immediate attempt whose 404/409 fences the job (the `failures >= 2`
+        // give-up below) rather than letting it expire silently.
+        let wait = match refresh_budget(Instant::now(), deadline, every, window, failures) {
+            Some(w) => w,
+            None => Duration::ZERO,
         };
         tokio::select! {
             // A stop request during the idle interval ends the loop at once:
@@ -115,6 +165,10 @@ pub(crate) async fn refresh_loop(
             Ok(()) => {
                 failures = 0;
                 count.fetch_add(1, Ordering::Relaxed);
+                // The extend succeeded, so the lease now runs another full
+                // `window` from now: reset the absolute deadline so a transient
+                // timeout earlier in the streak cannot lose in-flight work.
+                deadline = Instant::now() + window;
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -153,7 +207,8 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use crate::jobs::status_of;
-    use crate::runtime::{activation_backoff, ACTIVATION_BACKOFF_MAX};
+    use crate::runtime::{activation_backoff, refresh_budget, ACTIVATION_BACKOFF_MAX};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn activation_backoff_is_bounded_and_jittered() {
@@ -182,6 +237,45 @@ mod tests {
         assert!(
             capped.len() > 1,
             "capped backoff must be jittered, not a fixed delay"
+        );
+    }
+
+    #[test]
+    fn refresh_budget_is_capped_by_remaining_lease_not_full_window() {
+        let every = Duration::from_secs(100); // window / 3 for a 300s lease
+        let window = Duration::from_secs(300);
+
+        // Steady state (no failures): the cadence, uncapped, while the lease is fresh.
+        let now = Instant::now();
+        let deadline = now + window;
+        assert_eq!(
+            refresh_budget(now, deadline, every, window, 0),
+            Some(every),
+            "a healthy loop waits the steady-state cadence"
+        );
+
+        // The regression: late in the lease, a jittered window-sized delay would
+        // land AFTER expiry. The budget must clamp the sleep to what remains
+        // (less the request margin), never the full window.
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5); // only 5s left on the lease
+        for failures in [1, 2, 5, 20] {
+            let w = refresh_budget(now, deadline, every, window, failures)
+                .expect("budget while the lease is still live");
+            assert!(
+                now + w <= deadline,
+                "retry sleep {w:?} (failures={failures}) overruns the lease deadline"
+            );
+        }
+
+        // A lease that has already expired yields no budget: the caller makes a
+        // final immediate attempt instead of sleeping past the deadline.
+        let now = Instant::now();
+        let deadline = now - Duration::from_secs(1);
+        assert_eq!(
+            refresh_budget(now, deadline, every, window, 1),
+            None,
+            "an expired lease leaves no refresh budget"
         );
     }
 
