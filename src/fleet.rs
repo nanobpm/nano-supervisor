@@ -24,6 +24,12 @@ use crate::state::{job_type_matrix, normalize_capabilities, state_home};
 /// rejection message.
 const VALID_RANKS: [&str; 4] = ["principal", "senior", "junior", "decider"];
 
+/// The transport protocols a hire may declare. Anything else is rejected at
+/// hire time: `state::Protocol::parse` deliberately maps an unknown stored
+/// value to `pipe` (tolerant read of legacy configs), so a typo accepted here
+/// would silently run an ACP harness over pipe instead of failing.
+const VALID_PROTOCOLS: [&str; 2] = ["acp", "pipe"];
+
 /// One persisted hire in `config.json`. The field order is the golden order the
 /// `config_after_hire` snapshot pins; a `#[derive(Serialize)]` struct always
 /// emits its fields in declaration order (independent of serde_json's
@@ -232,8 +238,14 @@ pub fn hire(args: HireArgs) -> Result<()> {
     let capabilities = split_caps(args.capabilities.as_deref());
     let mut env = BTreeMap::new();
     for pair in &args.env {
-        if let Some((k, v)) = pair.split_once('=') {
-            env.insert(k.to_string(), v.to_string());
+        match pair.split_once('=') {
+            Some(("", _)) => {
+                bail!("invalid --env entry \"{pair}\": expected KEY=VALUE with a non-empty key")
+            }
+            Some((k, v)) => {
+                env.insert(k.to_string(), v.to_string());
+            }
+            None => bail!("invalid --env entry \"{pair}\": expected KEY=VALUE"),
         }
     }
 
@@ -243,6 +255,13 @@ pub fn hire(args: HireArgs) -> Result<()> {
         .map(|p| p.trim().to_ascii_lowercase())
         .filter(|p| !p.is_empty())
         .unwrap_or_else(default_protocol);
+    if !VALID_PROTOCOLS.contains(&protocol.as_str()) {
+        bail!(
+            "Invalid protocol \"{}\". Valid protocols: {}",
+            args.protocol.as_deref().unwrap_or_default(),
+            VALID_PROTOCOLS.join(", ")
+        );
+    }
 
     let hire = StoredHire {
         name: name.clone(),
@@ -415,7 +434,32 @@ struct Manifest {
 }
 
 fn manifest_path(name: &str) -> Result<PathBuf> {
-    Ok(home_dir()?.join("workforce").join(format!("{name}.json")))
+    // The manifest name becomes a filename under the home's `workforce/`
+    // directory, so it must be exactly one plain path component. `Path::join`
+    // silently DISCARDS the base when the argument is absolute, and a `..`
+    // (or separator) component climbs out of `workforce/` — either way a
+    // crafted name would read/write state files outside the home. Fail closed:
+    // reject anything that is not a single normal component.
+    let bad = || {
+        anyhow::anyhow!(
+            "invalid workforce name \"{name}\": expected a plain name (no path separators or `..`)"
+        )
+    };
+    let trimmed = name.trim();
+    // Reject both platforms' separators explicitly: on Unix a backslash is a
+    // valid filename character, so the component check below passes `a\b`,
+    // but the same manifest read on Windows would traverse into `b`.
+    if trimmed.is_empty() || trimmed.contains(['/', '\\']) {
+        return Err(bad());
+    }
+    let as_path = std::path::Path::new(trimmed);
+    match as_path.components().collect::<Vec<_>>().as_slice() {
+        [std::path::Component::Normal(_)] => {}
+        _ => return Err(bad()),
+    }
+    Ok(home_dir()?
+        .join("workforce")
+        .join(format!("{trimmed}.json")))
 }
 
 fn read_manifest(name: &str) -> Result<Option<Manifest>> {
@@ -454,6 +498,15 @@ pub fn workforce_list(name: &str) -> Result<()> {
 }
 
 pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> Result<()> {
+    // Like `assign` and `supervisor add`, refuse to persist state for a profile
+    // that can never run.
+    let cfg = read_config()?;
+    if !cfg.hires.contains_key(profile) {
+        bail!("no hire named \"{profile}\"");
+    }
+    // A desired-zero worker entry is meaningless (the Node CLI floors instances
+    // at 1); clamp rather than persist an empty workers list.
+    let instances = instances.max(1);
     let mut manifest = read_manifest(name)?.unwrap_or(Manifest {
         version: 1,
         name: name.to_string(),
@@ -567,4 +620,94 @@ pub fn workforce_status(name: &str, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hire_args(name: &str) -> HireArgs {
+        HireArgs {
+            list: false,
+            json: false,
+            name: Some(name.to_string()),
+            rank: Some("senior".to_string()),
+            command: Some("nano-coder".to_string()),
+            capabilities: None,
+            model: None,
+            protocol: None,
+            permission: None,
+            sandbox: None,
+            image: None,
+            terminal: None,
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    /// The manifest name becomes a filename, so anything that is not a single
+    /// plain path component must be rejected: an absolute name would make
+    /// `Path::join` discard the home, and a `..`/separator component would
+    /// climb out of `workforce/`. Fail closed on every variant.
+    #[test]
+    fn manifest_path_rejects_escaping_names() {
+        for bad in [
+            "",
+            "   ",
+            "/tmp/x",
+            "/",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".",
+            "./x",
+            "x/",
+            "x//y",
+        ] {
+            assert!(
+                manifest_path(bad).is_err(),
+                "name {bad:?} must be rejected, not turned into a path"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_path_accepts_plain_names() {
+        for good in ["default", "my-fleet", "fleet_2", "x.y"] {
+            let p = manifest_path(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+            assert_eq!(
+                p.file_name().unwrap().to_string_lossy(),
+                format!("{good}.json").as_str()
+            );
+            assert_eq!(p.parent().unwrap().file_name().unwrap(), "workforce");
+        }
+    }
+
+    /// `state::Protocol::parse` maps an unknown stored value to `pipe`
+    /// (tolerant read), so hire must reject an unknown --protocol at write
+    /// time — a typo like `--protocol acpp` must fail, not silently degrade.
+    #[test]
+    fn hire_rejects_unknown_protocol() {
+        let mut args = hire_args("coder");
+        args.protocol = Some("bogus".to_string());
+        let err = hire(args).unwrap_err().to_string();
+        assert!(err.contains("Invalid protocol \"bogus\""), "{err}");
+        assert!(err.contains("acp, pipe"), "{err}");
+    }
+
+    /// A malformed repeatable --env entry must error like every other malformed
+    /// hire input, not be silently dropped.
+    #[test]
+    fn hire_rejects_malformed_env_entries() {
+        let mut args = hire_args("coder");
+        args.env = vec!["NOVAL".to_string()];
+        let err = hire(args).unwrap_err().to_string();
+        assert!(err.contains("expected KEY=VALUE"), "{err}");
+
+        let mut args = hire_args("coder");
+        args.env = vec!["=orphan".to_string()];
+        let err = hire(args).unwrap_err().to_string();
+        assert!(err.contains("expected KEY=VALUE"), "{err}");
+    }
 }
