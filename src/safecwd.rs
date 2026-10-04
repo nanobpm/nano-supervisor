@@ -90,13 +90,6 @@ pub(crate) fn normalize_run_path(path: &Path) -> io::Result<PathBuf> {
     Ok(out)
 }
 
-/// Serializes the last-resort `fchdir`-based `CwdHandle::path()` recovery
-/// (Unix hosts without procfs or `F_GETPATH`), which mutates the process-global
-/// cwd. Real daemon hosts (Linux/macOS) never reach it — they recover the path
-/// without changing the cwd at all.
-#[cfg(unix)]
-static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// A directory resolved no-follow and pinned by its fd, used to launch a child
 /// with its cwd set to the validated inode (via `fchdir` in `pre_exec`) rather
 /// than by re-resolving a path at spawn time.
@@ -132,6 +125,16 @@ impl Clone for CwdHandle {
 }
 
 impl CwdHandle {
+    /// Wrap an already-pinned, no-follow directory fd — e.g. the child handle a
+    /// run-dir preparation pinned via `openat2` — as a `CwdHandle`, without
+    /// re-resolving any path. Lets preparation hand its exact validated inode
+    /// straight to the launch rather than reopening the run dir by name, which a
+    /// same-UID actor could have swapped for an ordinary tree in between (#35).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_fd(fd: std::os::unix::io::OwnedFd) -> CwdHandle {
+        CwdHandle { fd }
+    }
+
     /// Resolve `path` as a directory without following a symlink at any
     /// component and pin the result. A symlinked component anywhere in `path`
     /// is refused (so the caller's launch fails closed instead of escaping the
@@ -264,15 +267,18 @@ impl CwdHandle {
     /// pathname. On non-Unix hosts this is the (leaf-validated) path the handle
     /// was opened from.
     ///
-    /// Recovery MUST NOT mutate the process-global cwd on a real daemon host:
-    /// the supervisor runs a multi-threaded Tokio runtime (`main`), so a
-    /// transient `fchdir` into the pinned dir would make any *other* thread's
-    /// concurrent relative-path operation resolve against the pinned run dir
-    /// instead of the real cwd. Linux reads the fd's current name straight from
-    /// `/proc/self/fd/<fd>` and macOS via `fcntl(F_GETPATH)` — neither touches
-    /// the cwd. The `fchdir`/`getcwd` dance survives only as a last-resort
-    /// fallback for other Unix hosts, and there it is serialized by a
-    /// process-wide lock so at least concurrent `path()` calls cannot interleave.
+    /// Recovery MUST NOT mutate the process-global cwd: the supervisor runs a
+    /// multi-threaded Tokio runtime (`main`), so a transient `fchdir` into the
+    /// pinned dir would make any *other* thread's concurrent relative-path
+    /// operation resolve against the pinned run dir instead of the real cwd.
+    /// Linux reads the fd's current name straight from `/proc/self/fd/<fd>` and
+    /// macOS via `fcntl(F_GETPATH)` — neither touches the cwd. When neither
+    /// non-mutating recovery is available (a Unix host without procfs or
+    /// `F_GETPATH`, or a Linux pinned directory that has since been deleted),
+    /// this **fails closed** with an error rather than falling back to an
+    /// `fchdir` that would mutate the supervisor's process-global cwd: the
+    /// caller surfaces the error (the launch / ACP handoff fails) instead of
+    /// racing unrelated threads' path resolution.
     #[cfg(unix)]
     pub(crate) fn path(&self) -> io::Result<PathBuf> {
         #[cfg(target_os = "linux")]
@@ -287,13 +293,17 @@ impl CwdHandle {
                 return Ok(p);
             }
         }
-        self.path_via_fchdir()
+        Err(io::Error::other(
+            "cannot recover the pinned directory path without mutating the \
+             process-global cwd (procfs/F_GETPATH unavailable, or the directory \
+             was deleted)",
+        ))
     }
 
     /// Linux: recover the pinned fd's current name from procfs — no cwd change.
-    /// Returns `None` (so the caller falls back to the locked `fchdir` path) if
-    /// procfs is unavailable or the link is not a plain absolute path, e.g. a
-    /// deleted directory whose link carries a trailing `" (deleted)"`.
+    /// Returns `None` (so the caller fails closed) if procfs is unavailable or
+    /// the link is not a plain absolute path, e.g. a deleted directory whose
+    /// link carries a trailing `" (deleted)"`.
     #[cfg(all(unix, target_os = "linux"))]
     fn path_via_proc(&self) -> Option<PathBuf> {
         use std::os::unix::ffi::OsStrExt;
@@ -328,53 +338,6 @@ impl CwdHandle {
         }
         let len = buf.iter().position(|&b| b == 0)?;
         Some(PathBuf::from(
-            std::ffi::OsStr::from_bytes(&buf[..len]).to_os_string(),
-        ))
-    }
-
-    /// Last-resort recovery for Unix hosts without procfs/`F_GETPATH`: save the
-    /// process cwd, `fchdir` into the pinned fd, read `getcwd`, then restore.
-    /// This mutates the PROCESS-GLOBAL cwd, so it is serialized by a process-
-    /// wide lock — that only prevents two `path()` calls from interleaving, not
-    /// an unrelated thread's relative-path op, which is exactly why the
-    /// no-cwd-change paths above are preferred on every real daemon host.
-    #[cfg(unix)]
-    fn path_via_fchdir(&self) -> io::Result<PathBuf> {
-        use std::os::unix::io::AsRawFd;
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut buf = vec![0u8; libc::PATH_MAX as usize];
-        // SAFETY: `saved`/`self.fd` are valid fds; `buf` is writable for its
-        // length and NUL-terminated by `getcwd` on success.
-        unsafe {
-            let saved = libc::open(
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            );
-            if saved < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let body = (|| {
-                if libc::fchdir(self.fd.as_raw_fd()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getcwd(buf.as_mut_ptr().cast(), buf.len()).is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            })();
-            // ALWAYS restore the process cwd before propagating any error: a
-            // failed `getcwd` with the process left inside the pinned dir
-            // would silently redirect every later relative resolution.
-            let restore = libc::fchdir(saved);
-            libc::close(saved);
-            if restore != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            body?;
-        }
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        use std::os::unix::ffi::OsStrExt;
-        Ok(PathBuf::from(
             std::ffi::OsStr::from_bytes(&buf[..len]).to_os_string(),
         ))
     }

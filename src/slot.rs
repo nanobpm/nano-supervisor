@@ -579,15 +579,6 @@ impl PreparedRun {
     pub(crate) fn agent_cwd(&self) -> &crate::safecwd::CwdHandle {
         &self.cwd
     }
-
-    /// Pin the freshly cloned `<run>/repo` checkout *relative to the pinned
-    /// run dir*, so the agent and the HEAD probes bind the same inode the
-    /// clone wrote even if a path component is swapped afterwards.
-    pub(crate) fn checkout_cwd(&self) -> Result<crate::safecwd::CwdHandle> {
-        self.cwd
-            .open_child(std::ffi::OsStr::new("repo"))
-            .context("pinning the provisioned checkout")
-    }
 }
 
 /// Prepare a per-job run directory under `runs_dir` with the full symlink and
@@ -599,11 +590,14 @@ impl PreparedRun {
 /// the clone, prompt-derived files, and `result.json` are not readable by other
 /// local users regardless of umask — this still matters when `runs_dir` falls
 /// back to a shared system temp location.
-pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+pub(crate) fn prepare_run_dir(
+    runs_dir: &Path,
+    run_dir: &Path,
+) -> Result<crate::safecwd::CwdHandle> {
     #[cfg(target_os = "linux")]
     {
         match prepare_run_dir_pinned(runs_dir, run_dir) {
-            Ok(()) => return Ok(()),
+            Ok(handle) => return Ok(handle),
             // Kernel too old for `openat2` (pre-5.6): fall through to the
             // best-effort path-based checks below.
             Err(crate::saferoot::PinError::Unsupported) => {}
@@ -625,7 +619,10 @@ pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
 /// refresher (especially on a single-core host) and lose the very lease this job
 /// is running under. Use this from async contexts; `prepare_run_dir` remains for
 /// synchronous callers and tests.
-pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf) -> Result<()> {
+pub(crate) async fn prepare_run_dir_blocking(
+    runs_dir: PathBuf,
+    run_dir: PathBuf,
+) -> Result<crate::safecwd::CwdHandle> {
     // The wipe/create is synchronous; a panic in the blocking task surfaces as a
     // `JoinError`, which we treat as the prepare failing (the run dir state is
     // then unknown, so failing the job is the safe outcome).
@@ -646,7 +643,7 @@ pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf
 fn prepare_run_dir_pinned(
     runs_dir: &Path,
     run_dir: &Path,
-) -> std::result::Result<(), crate::saferoot::PinError> {
+) -> std::result::Result<crate::safecwd::CwdHandle, crate::saferoot::PinError> {
     use crate::saferoot::{DirHandle, PinError};
     let name = run_dir.file_name().ok_or_else(|| {
         PinError::Io(std::io::Error::new(
@@ -668,15 +665,21 @@ fn prepare_run_dir_pinned(
     }
     std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
     let root = DirHandle::open_root_nofollow(runs_dir)?;
-    root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
-    Ok(())
+    let child = root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
+    // Carry the EXACT pinned child inode preparation just created and secured
+    // into the launch — never reopen `run_dir` by path, which a same-UID actor
+    // could have swapped for an ordinary (unwiped, unsecured) tree in between.
+    Ok(crate::safecwd::CwdHandle::from_fd(child.into_fd()))
 }
 
 /// Path-based `prepare_run_dir`: the pre-`openat2` fallback (non-Linux, or a
 /// Linux kernel older than 5.6). Rejects a symlinked leaf / ancestor before
 /// *and* after the non-atomic remove+create — a best-effort approximation of
 /// the pinned-handle guarantee that cannot fully close the TOCTOU window.
-fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+fn prepare_run_dir_path_based(
+    runs_dir: &Path,
+    run_dir: &Path,
+) -> Result<crate::safecwd::CwdHandle> {
     reject_symlink(runs_dir)?;
     reject_symlink(run_dir)?;
     reject_symlinked_ancestors(run_dir)?;
@@ -690,7 +693,12 @@ fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
     reject_symlinked_ancestors(run_dir)?;
     restrict_dir_mode(runs_dir)?;
     restrict_dir_mode(run_dir)?;
-    Ok(())
+    // Pin the prepared dir no-follow and hand the handle back, so the caller
+    // carries the validated inode into the launch rather than reopening the
+    // path (this backend cannot pin atomically, but a leaf re-open right after
+    // the final no-follow checks above is the closest this fallback gets).
+    crate::safecwd::CwdHandle::open(run_dir)
+        .with_context(|| format!("pinning prepared run dir {}", run_dir.display()))
 }
 
 /// Reap a completed run directory under `runs_dir` with the same pinned
@@ -1612,16 +1620,15 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     if !cfg.keep_runs {
         sweep_stale_runs_blocking(cfg.runs_dir.clone(), FAILED_RUN_RETENTION, false).await;
     }
-    prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?;
-    // Pin the prepared run dir ONCE and carry the capability through
-    // provisioning, the agent launches, and the HEAD probes: re-resolving the
-    // path at each launch would accept a same-UID actor's post-prepare
-    // replacement of the job dir (or an ancestor) with an ordinary directory
-    // tree — no-follow resolution sees no symlink in that case, but the launch
-    // would bind a different inode from the one preparation validated (#35).
+    // Prepare the run dir and carry the EXACT pinned capability it returns
+    // through provisioning, the agent launches, and the HEAD probes. Preparation
+    // pins the inode it wiped and secured (0700) and hands that fd back, so we
+    // never reopen the job dir by path afterwards — a same-UID actor replacing
+    // the job dir (or an ancestor) with an ordinary directory tree between
+    // preparation and a reopen would pass no-follow resolution yet bind a
+    // different, unsecured inode from the one preparation validated (#35).
     let prepared = PreparedRun {
-        cwd: crate::safecwd::CwdHandle::open(&run_dir)
-            .with_context(|| format!("pinning run dir {}", run_dir.display()))?,
+        cwd: prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?,
     };
     let agent_cwd = match &env.repository {
         Some(repo) => {
@@ -1630,10 +1637,13 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
                 redact_url(&repo.url),
                 repo.provider
             ));
+            // `provision` returns the pinned checkout handle it used for every
+            // git step; carry THAT exact inode into the agent/HEAD launches
+            // rather than reopening `repo` by name (which a same-UID actor could
+            // swap between the opens) (#35).
             crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
                 .await
-                .context("provisioning repository")?;
-            prepared.checkout_cwd()?
+                .context("provisioning repository")?
         }
         None => prepared.agent_cwd().clone(),
     };

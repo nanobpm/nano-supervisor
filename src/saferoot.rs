@@ -287,7 +287,14 @@ impl DirHandle {
     /// and lock both it and this root directory to `mode` — all relative to the
     /// pinned handle. `mkdirat` is umask-subject, so an explicit `fchmod` on the
     /// freshly pinned child makes the final mode exact regardless of umask.
-    pub(crate) fn prepare_child_dir(&self, name: &OsStr, mode: u32) -> io::Result<()> {
+    ///
+    /// Returns the pinned child handle so the caller carries the *exact* inode
+    /// preparation validated into the launch, instead of reopening `name` by
+    /// path afterwards — a same-UID actor could replace the freshly prepared
+    /// directory (or an ancestor) with an ordinary tree between this return and
+    /// a later no-follow reopen, which would then bind a directory preparation
+    /// never wiped or secured (#35).
+    pub(crate) fn prepare_child_dir(&self, name: &OsStr, mode: u32) -> io::Result<DirHandle> {
         match self.symlink_metadata(name) {
             Ok(_) => self.remove_tree(name)?,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -302,7 +309,14 @@ impl DirHandle {
         let child = self.open_child_dir(name)?;
         child.restrict_mode(mode)?;
         self.restrict_mode(mode)?;
-        Ok(())
+        Ok(child)
+    }
+
+    /// Consume this handle, yielding the owned, no-follow-pinned directory fd —
+    /// used to hand a freshly prepared child (e.g. a run dir) to a `CwdHandle`
+    /// without reopening it by path.
+    pub(crate) fn into_fd(self) -> OwnedFd {
+        self.fd
     }
 }
 
