@@ -17,8 +17,9 @@ parsing, and the empty-result → fail guard.
   `capabilities` expand to the job-type matrix (`rank`, `rank:cap`,
   `rank:cap1+cap2`).
 - **Connection** settings come from c8ctl profiles (`--profile`, else the active
-  profile, else `CAMUNDA_*` env). The same `--job-api auto|sdk|nano` /
-  `--with-lease` story as the spike.
+  profile, else `CAMUNDA_*` env). Job commands always use the
+  `camunda-orchestration-sdk` transport (the same one the Node plugin uses); the
+  `--with-lease` story is the same as the spike.
 - **Own worker names** — `‹host›-nanod-‹hire›-‹slot›` — so the daemon's jobs are
   told apart from the Node workers' (`‹host›-‹hire›-‹random›`).
 - **Host sandbox only**; a container-sandbox hire is skipped with a warning. A

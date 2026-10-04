@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use tokio::sync::watch;
 
-use crate::engine::{self, JobApi};
+use crate::engine;
 use crate::runtime::log;
 use crate::slot::{self, SlotConfig};
 use crate::state::{self, Hire, Protocol};
@@ -31,7 +31,6 @@ const DRAIN_GRACE: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     pub profile: Option<String>,
-    pub job_api: JobApi,
     pub with_lease: bool,
     /// Capacity-1 slots to run per hire.
     pub slots: usize,
@@ -70,7 +69,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         bail!("no hires matched --hire {:?}", opts.only);
     }
 
-    let (_profile, jobs) = engine::connect(opts.profile.as_deref(), opts.job_api)?;
+    let (_profile, jobs) = engine::connect(opts.profile.as_deref())?;
     let host = short_hostname();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
