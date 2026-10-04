@@ -1,6 +1,6 @@
 //! The four job commands the worker needs, over the `camunda-orchestration-sdk`.
 //!
-//! The SDK speaks the Camunda 8.10 spec field names. Nano engine ≥ 1.70.1
+//! The SDK speaks the Camunda 8.10 spec field names. Nano engine ≥ v0.0.24
 //! normalised the lease-token name to the spec's `jobLeaseToken`, so the SDK
 //! round-trips the lease and settles leased jobs end to end (verified in
 //! nanobpm/nano-bpm#1284). The earlier raw-HTTP `--job-api nano` transport —

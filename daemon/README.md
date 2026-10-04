@@ -21,7 +21,7 @@ handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
   `camunda-orchestration-sdk` transport (the same one the Node plugin uses).
   **Lease compatibility:** the SDK speaks the Camunda 8.10 spec field names, so
   `--with-lease` needs an engine that returns the lease as `jobLeaseToken`
-  (Nano engine ≥ 1.70.1 does; see `src/jobs.rs`). An engine that still returns
+  (Nano engine ≥ v0.0.24 does; see `src/jobs.rs`). An engine that still returns
   only the legacy `leaseToken` field gives the SDK no lease to carry, so
   `--with-lease` activations arrive unleased and the daemon shuts down loudly
   rather than run unfenced — such an engine is incompatible with `--with-lease`
