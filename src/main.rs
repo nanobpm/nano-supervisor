@@ -25,10 +25,10 @@ mod slot;
 mod state;
 mod work;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -207,7 +207,10 @@ async fn main() -> Result<()> {
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 clone_timeout: Duration::from_millis(clone_timeout),
-                runs_dir,
+                runs_dir: match runs_dir {
+                    Some(d) => Some(normalize_runs_dir(&d)?),
+                    None => None,
+                },
                 config_path: config,
                 max_jobs,
                 keep_runs,
@@ -239,7 +242,10 @@ async fn main() -> Result<()> {
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 clone_timeout: Duration::from_millis(clone_timeout),
-                runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
+                runs_dir: match runs_dir {
+                    Some(d) => normalize_runs_dir(&d)?,
+                    None => normalize_runs_dir(&default_runs_dir())?,
+                },
                 config_path: config,
             };
             daemon::run(opts).await
@@ -275,6 +281,149 @@ fn default_runs_dir() -> PathBuf {
         return PathBuf::from(home).join(".local/state/nano-supervisor/runs");
     }
     std::env::temp_dir().join(format!("nano-supervisor-runs-{}", current_user_id()))
+}
+
+/// Normalize an operator-supplied `--runs-dir` (or an environment-derived
+/// default root) into a `..`-free path the Linux pinned-handle walk
+/// (`saferoot::DirHandle::create_root_nofollow`, which refuses any `..`) will
+/// accept — WITHOUT ever changing which directory the path denotes.
+///
+/// Only two rewrites are safe to perform lexically, because neither can cross a
+/// symlink:
+/// * `.` components are dropped (they never change the target).
+/// * A *leading* `..` on a relative path (no normal component precedes it) is
+///   resolved against the current directory. `std::env::current_dir()` returns
+///   the kernel's fully resolved, symlink-free working directory, so folding
+///   `..` against *its* components can never silently retarget across a link.
+///   This preserves the pre-hardening `--runs-dir ../runs` behaviour the
+///   non-Linux `create_dir_all` fallback still has.
+///
+/// Every OTHER `..` is REJECTED rather than folded. Collapsing `a/../b`
+/// lexically is only correct when `a` is a real directory; if `a` is a symlink,
+/// `a/..` resolves to the link *target's* parent, so folding would hand the
+/// no-follow walk a path pointing at a different root than the filesystem does —
+/// and the walk, seeing no `..`, could create and later wipe a job tree under
+/// the wrong root (e.g. `/tmp/link/../runs` with `link -> /outside/sub` folds to
+/// `/tmp/runs` but resolves to `/outside/runs`). This layer must not touch the
+/// filesystem to tell a directory from a symlink, so it fails closed: any `..`
+/// that would pop an operator-supplied component, and any `..` that climbs past
+/// the filesystem root (`/..`), is rejected — the operator passes an
+/// already-resolved path instead.
+///
+/// Two invariants keep the downstream no-follow layer consistent:
+/// * The result never contains `..`, so the pinned-handle walk accepts it.
+/// * The result is never empty. A cwd-equivalent input (`.`, `./`) normalizes
+///   to `.`, because an empty path would diverge between `create_root_nofollow`
+///   (which opens the anchor, i.e. the cwd) and `open_root_nofollow` (which
+///   `openat2`s the literal path and fails an empty one with `ENOENT`) —
+///   breaking the sweep / completion-cleanup while preparation still worked.
+pub(crate) fn normalize_runs_dir(path: &Path) -> Result<PathBuf> {
+    normalize_runs_dir_impl(path, || {
+        std::env::current_dir()
+            .context("resolving current directory for a parent-relative --runs-dir")
+    })
+}
+
+/// Core of [`normalize_runs_dir`], parameterized over the current-directory
+/// lookup so tests can resolve a leading `..` against a fixed base WITHOUT
+/// mutating the process-wide working directory (which would race parallel
+/// tests). `cwd` is invoked at most once, only when a leading `..` must be
+/// anchored.
+fn normalize_runs_dir_impl(path: &Path, cwd: impl FnOnce() -> Result<PathBuf>) -> Result<PathBuf> {
+    // Retained components. `trusted` marks one that came from the symlink-free
+    // cwd (safe to pop); operator-supplied components are untrusted, so a `..`
+    // that would pop one is rejected rather than folded across a possible link.
+    let mut stack: Vec<(std::ffi::OsString, bool)> = Vec::new();
+    let mut prefix: Option<std::ffi::OsString> = None;
+    let mut absolute = path.is_absolute();
+    let mut cwd = Some(cwd);
+
+    for comp in path.components() {
+        match comp {
+            // Preserve a Windows drive/UNC prefix verbatim; it is never popped
+            // and anchors the rebuilt path (a no-op on Unix, where there is no
+            // prefix). `RootDir` only marks the path absolute.
+            Component::Prefix(p) => prefix = Some(p.as_os_str().to_os_string()),
+            Component::RootDir => absolute = true,
+            Component::CurDir => {}
+            Component::Normal(name) => stack.push((name.to_os_string(), false)),
+            Component::ParentDir => match stack.last() {
+                // A cwd component is symlink-free, so popping it is safe.
+                Some((_, true)) => {
+                    stack.pop();
+                }
+                // Popping an operator-supplied component could cross a symlink
+                // and silently retarget the path — fail closed.
+                Some((_, false)) => {
+                    return Err(anyhow::anyhow!(
+                        "runs directory {} contains a `..` after a path component, which could \
+                         change its target across a symlink; pass an already-resolved path",
+                        path.display()
+                    ));
+                }
+                None => {
+                    if absolute {
+                        // `/..` climbs past the filesystem root.
+                        return Err(anyhow::anyhow!(
+                            "runs directory {} climbs above its base with `..`",
+                            path.display()
+                        ));
+                    }
+                    // Leading `..` on a relative path: anchor at the
+                    // symlink-free current directory (once) and pop one of its
+                    // components for this `..`.
+                    let base = match cwd.take() {
+                        Some(f) => f()?,
+                        // `current_dir()` returns an absolute path, so after the
+                        // first anchor `absolute` is set and this arm is never
+                        // reached again; guard defensively rather than panic.
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "runs directory {} could not be resolved against a non-absolute \
+                                 current directory",
+                                path.display()
+                            ))
+                        }
+                    };
+                    for c in base.components() {
+                        match c {
+                            Component::Prefix(p) => prefix = Some(p.as_os_str().to_os_string()),
+                            Component::RootDir => absolute = true,
+                            Component::Normal(n) => stack.push((n.to_os_string(), true)),
+                            _ => {}
+                        }
+                    }
+                    if stack.pop().is_none() {
+                        // The cwd is the filesystem root, so this `..` climbs
+                        // past it.
+                        return Err(anyhow::anyhow!(
+                            "runs directory {} climbs above the filesystem root",
+                            path.display()
+                        ));
+                    }
+                }
+            },
+        }
+    }
+
+    let mut out = PathBuf::new();
+    if let Some(p) = &prefix {
+        out.push(p);
+    }
+    if absolute {
+        out.push(Component::RootDir.as_os_str());
+    }
+    for (name, _) in &stack {
+        out.push(name);
+    }
+    // Never hand back an empty path (see the invariant above): a relative
+    // cwd-equivalent input folds to nothing, which `.` expresses without the
+    // empty-path divergence. An absolute root (`/`) keeps its RootDir, so `out`
+    // is only empty for a relative cwd-equivalent.
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    Ok(out)
 }
 
 /// Per-user discriminator for the fallback temp runs root. `libc` is a Unix-only
@@ -321,8 +470,12 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_recovery_window, daemon_leases, Cli, Cmd, MIN_RECOVERY_WINDOW};
+    use super::{
+        clamp_recovery_window, daemon_leases, normalize_runs_dir, normalize_runs_dir_impl, Cli,
+        Cmd, MIN_RECOVERY_WINDOW,
+    };
     use clap::Parser;
+    use std::path::{Component, Path, PathBuf};
     use std::time::Duration;
 
     #[test]
@@ -337,6 +490,108 @@ mod tests {
             clamp_recovery_window(300_000),
             Duration::from_millis(300_000)
         );
+    }
+
+    // Interior `..` is REJECTED, not folded: collapsing `a/../b` lexically is
+    // only correct when `a` is a real directory, but `a` could be a symlink
+    // whose `..` resolves elsewhere. Since this boundary must not touch the
+    // filesystem to tell them apart, it fails closed so the no-follow walk can
+    // never be handed a path that silently points at a different root.
+    #[test]
+    fn normalize_runs_dir_rejects_interior_parent_traversal() {
+        assert!(normalize_runs_dir(Path::new("/a/b/../runs")).is_err());
+        assert!(normalize_runs_dir(Path::new("sub/../runs")).is_err());
+        assert!(normalize_runs_dir(Path::new("/a/b/c/../../runs")).is_err());
+        assert!(normalize_runs_dir(Path::new("sub/..")).is_err());
+        // The reviewer's symlink-hiding case: `link` could be a symlink, so
+        // `link/..` must not be folded away before the no-follow walk sees it.
+        assert!(normalize_runs_dir(Path::new("/tmp/link/../runs")).is_err());
+    }
+
+    // `.` components are always safe to drop — they never change the target.
+    #[test]
+    fn normalize_runs_dir_folds_current_dir_components() {
+        assert_eq!(
+            normalize_runs_dir(Path::new("/a/./b/./runs")).unwrap(),
+            PathBuf::from("/a/b/runs")
+        );
+    }
+
+    // A path with no `.`/`..` is returned unchanged (the common case).
+    #[test]
+    fn normalize_runs_dir_passes_plain_paths_through() {
+        assert_eq!(
+            normalize_runs_dir(Path::new("/var/lib/runs")).unwrap(),
+            PathBuf::from("/var/lib/runs")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("runs")).unwrap(),
+            PathBuf::from("runs")
+        );
+    }
+
+    // A cwd-equivalent `--runs-dir` (`.`, `./`) folds to nothing, which must
+    // surface as `.` — never an empty path. An empty path would diverge
+    // downstream: `create_root_nofollow("")` opens the cwd anchor (so
+    // preparation works) while `open_root_nofollow("")` fails `ENOENT` (so the
+    // sweep / completion cleanup break). `.` keeps every consumer consistent.
+    #[test]
+    fn normalize_runs_dir_never_returns_empty() {
+        assert_eq!(
+            normalize_runs_dir(Path::new(".")).unwrap(),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("./")).unwrap(),
+            PathBuf::from(".")
+        );
+        // An absolute root keeps its RootDir component, so it is not empty.
+        assert_eq!(
+            normalize_runs_dir(Path::new("/")).unwrap(),
+            PathBuf::from("/")
+        );
+    }
+
+    // A leading `..` on a relative path is resolved against the current
+    // directory — the same target the non-Linux `create_dir_all` fallback
+    // always resolved it to, so `--runs-dir ../runs` keeps working on Linux
+    // (the pinned-handle walk refuses a literal `..`). The cwd is INJECTED
+    // here so the test never mutates the process-wide working directory (which
+    // would race parallel tests); the kernel's real cwd is symlink-free, so
+    // folding `..` against it is safe.
+    #[test]
+    fn normalize_runs_dir_resolves_leading_parent_against_cwd() {
+        let out = normalize_runs_dir_impl(Path::new("../runs"), || {
+            Ok(PathBuf::from("/home/user/project"))
+        })
+        .unwrap();
+        assert_eq!(out, PathBuf::from("/home/user/runs"));
+        // Multiple leading `..` climb multiple cwd components.
+        let out = normalize_runs_dir_impl(Path::new("../../runs"), || {
+            Ok(PathBuf::from("/home/user/project"))
+        })
+        .unwrap();
+        assert_eq!(out, PathBuf::from("/home/runs"));
+        // The result is absolute and `..`-free, so the no-follow walk accepts it.
+        assert!(out.is_absolute());
+        assert!(!out.components().any(|c| matches!(c, Component::ParentDir)));
+    }
+
+    // Unsafe parent traversals are rejected, never silently clamped: an
+    // absolute `..` that climbs past `/`, a leading `..` from the filesystem
+    // root (nothing to climb to), and an interior `..` after a component on a
+    // relative path (the component could be a symlink) all fail closed.
+    #[test]
+    fn normalize_runs_dir_rejects_unsafe_parent_traversal() {
+        assert!(normalize_runs_dir(Path::new("/../x")).is_err());
+        assert!(normalize_runs_dir(Path::new("/a/../../../x")).is_err());
+        // Interior `..` after a relative component: rejected, not folded.
+        assert!(normalize_runs_dir_impl(Path::new("a/../../x"), || {
+            Ok(PathBuf::from("/home/user/project"))
+        })
+        .is_err());
+        // A leading `..` when the cwd is the filesystem root has nothing above.
+        assert!(normalize_runs_dir_impl(Path::new("../runs"), || Ok(PathBuf::from("/"))).is_err());
     }
 
     /// Parse a `daemon` invocation and return its `(no_lease, with_lease)` flags.
