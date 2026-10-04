@@ -294,6 +294,29 @@ impl DirHandle {
         Ok(DirHandle { fd })
     }
 
+    /// Open a direct child **regular file** relative to this handle for
+    /// read+write, never following a symlink and never escaping this directory
+    /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, plus `O_NOFOLLOW` on the final
+    /// component). `O_NONBLOCK` guards against an attacker-planted FIFO whose
+    /// open would otherwise block the worker thread; the caller rejects any
+    /// non-regular file after the open via `fstat`.
+    ///
+    /// Used by the submodule-config credential scrub so each `config` is opened
+    /// *through the pinned parent handle* — a component swapped to a symlink
+    /// after the entry was triaged (or the leaf itself swapped) cannot redirect
+    /// the rewrite outside the checkout: the open is refused (`ELOOP`) rather
+    /// than followed.
+    pub(crate) fn open_child_file_rw_nofollow(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        let c = cstr(name)?;
+        let fd = openat2_raw(
+            self.fd.as_raw_fd(),
+            &c,
+            (libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        )?;
+        Ok(std::fs::File::from(fd))
+    }
+
     /// Like [`open_child_dir`](Self::open_child_dir) but returns an `O_PATH`
     /// handle: usable only as a *dirfd* anchor for `*at` operations
     /// (`mkdirat` / `openat2` / `fstatat`), never for reading or `fchmod`.
@@ -351,7 +374,30 @@ impl DirHandle {
     /// Enumerate this directory's entry names (excluding `.` and `..`),
     /// relative to the pinned handle. `fdopendir` consumes the fd it is given,
     /// so a duplicate is used and the original pinned fd is left intact.
+    ///
+    /// Best-effort: a mid-stream `readdir` error ends enumeration and the
+    /// partial listing is returned as `Ok`. That is right for the sweep / slot
+    /// reaping (a truncated list merely defers reaping to the next pass), but
+    /// NOT for a security decision — callers that must not act on a partial
+    /// listing (e.g. the credential scrub) use [`entry_names_strict`].
     pub(crate) fn entry_names(&self) -> io::Result<Vec<OsString>> {
+        self.collect_entry_names(false)
+    }
+
+    /// Like [`entry_names`](Self::entry_names) but **strict**: a mid-stream
+    /// `readdir` error is surfaced as `Err` rather than silently treated as
+    /// end-of-directory. Use this wherever a partial listing would be a
+    /// security hole — e.g. the submodule-config credential scrub, which must
+    /// fail (and so refuse to hand out the checkout) rather than report success
+    /// while an unenumerated `config` keeps its credentials.
+    pub(crate) fn entry_names_strict(&self) -> io::Result<Vec<OsString>> {
+        self.collect_entry_names(true)
+    }
+
+    /// Shared enumeration core. When `strict` is false a NULL `readdir` return
+    /// is always end-of-directory; when true, `errno` is zeroed before each call
+    /// and a NULL return with a non-zero `errno` is an I/O error, not EOF.
+    fn collect_entry_names(&self, strict: bool) -> io::Result<Vec<OsString>> {
         // SAFETY: dup of a valid fd; ownership of `dupfd` is handed to
         // `fdopendir` (closed by `closedir`), or closed directly on the error
         // path below.
@@ -375,13 +421,24 @@ impl DirHandle {
         // sweep's post-reap emptiness check).
         unsafe { libc::rewinddir(dirp) };
         let mut names = Vec::new();
-        loop {
-            // The classic `while ((e = readdir(d)))` idiom: a NULL return is
-            // end-of-directory. (Best-effort: a rare mid-stream error also ends
-            // enumeration, which for the sweep merely defers reaping.)
+        let result = loop {
+            // Distinguish EOF from a mid-stream error: `readdir` returns NULL
+            // for both, setting `errno` only on error. Zero it first so a NULL
+            // return with a clear `errno` is a genuine EOF.
+            if strict {
+                unsafe { *libc::__errno_location() = 0 };
+            }
             let ent = unsafe { libc::readdir(dirp) };
             if ent.is_null() {
-                break;
+                if strict {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(0) {
+                        break Err(e);
+                    }
+                }
+                // Best-effort (non-strict) mode keeps the historical behaviour:
+                // a NULL ends enumeration whether it was EOF or a rare error.
+                break Ok(());
             }
             // SAFETY: `d_name` is a NUL-terminated C string within the entry.
             let cs = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
@@ -390,9 +447,9 @@ impl DirHandle {
                 continue;
             }
             names.push(OsStr::from_bytes(bytes).to_os_string());
-        }
+        };
         unsafe { libc::closedir(dirp) };
-        Ok(names)
+        result.map(|()| names)
     }
 
     /// Recursively remove a direct child (`name`) relative to this handle,
@@ -532,6 +589,148 @@ mod tests {
         assert!(handle.entry_names().unwrap().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // The strict variant enumerates the same full, current contents as the
+    // best-effort one on a healthy directory — it differs ONLY in that a
+    // mid-stream `readdir` error is surfaced as `Err` rather than silently
+    // treated as EOF. (A real mid-stream I/O error is not deterministically
+    // reproducible in a unit test; the credential scrub relies on this path
+    // failing closed rather than reporting a partial listing as success.)
+    #[test]
+    fn entry_names_strict_matches_best_effort_on_healthy_dir() {
+        let root = scratch_root("entrynames-strict");
+        for name in ["aaa", "bbb", "ccc"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let handle = DirHandle::open_root_nofollow(&root).expect("pin root");
+
+        let mut strict = handle.entry_names_strict().expect("strict list");
+        strict.sort();
+        let mut best_effort = handle.entry_names().expect("best-effort list");
+        best_effort.sort();
+        assert_eq!(
+            strict,
+            vec![
+                OsString::from("aaa"),
+                OsString::from("bbb"),
+                OsString::from("ccc")
+            ]
+        );
+        assert_eq!(
+            strict, best_effort,
+            "strict and best-effort agree on a healthy dir"
+        );
+
+        // Idempotent on a reused handle, exactly like the best-effort variant.
+        let mut again = handle.entry_names_strict().expect("second strict list");
+        again.sort();
+        assert_eq!(strict, again);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // The post-triage symlink-swap race this PR's hardening exists to close: a
+    // `config` leaf that stats as a regular file but is swapped for a symlink
+    // (to a credential-bearing file OUTSIDE the checkout) before its relative
+    // open must be REFUSED with `ELOOP` (`RESOLVE_NO_SYMLINKS | O_NOFOLLOW`),
+    // leaving the outside target byte-for-byte untouched. A walker that
+    // re-checks `file_type()` and then opens by path would follow the link and
+    // rewrite the target; the pinned no-follow open must not.
+    #[test]
+    fn open_child_file_rw_nofollow_refuses_post_triage_symlink_swap() {
+        let base = scratch_root("swap-leaf");
+        let dir = base.join("mod");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("config");
+        std::fs::write(
+            &target,
+            "url = https://x-access-token:s3cr3tPAT@h/o/r.git\n",
+        )
+        .unwrap();
+
+        let handle = DirHandle::open_root_nofollow(&dir).expect("pin parent");
+
+        // Triage: a real `config` regular file is present.
+        let leaf = dir.join("config");
+        std::fs::write(&leaf, "url = https://h/o/r.git\n").unwrap();
+        let meta = handle
+            .symlink_metadata(OsStr::new("config"))
+            .expect("stat config");
+        assert!(
+            !meta.is_symlink && !meta.is_dir,
+            "config stats as a regular file"
+        );
+
+        // Swap it for a symlink to the outside target before the open.
+        std::fs::remove_file(&leaf).unwrap();
+        std::os::unix::fs::symlink(&target, &leaf).unwrap();
+
+        // The pinned no-follow open must refuse (ELOOP), not follow the link.
+        let err = handle
+            .open_child_file_rw_nofollow(OsStr::new("config"))
+            .expect_err("a post-triage symlink swap must be refused");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "the swapped-in symlink must fail the open with ELOOP, got {err:?}"
+        );
+        // The outside target was never rewritten.
+        let got = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            got.contains("s3cr3tPAT"),
+            "the scrub must not follow the swapped symlink out of the checkout"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The directory-descent half of the same race: an entry that stats as a
+    // directory but is swapped for a symlink (to a dir outside the checkout)
+    // before its relative open must be REFUSED with `ELOOP`
+    // (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | O_NOFOLLOW`), never descended
+    // into.
+    #[test]
+    fn open_child_dir_refuses_post_triage_symlink_swap() {
+        let base = scratch_root("swap-dir");
+        let dir = base.join("mod");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let handle = DirHandle::open_root_nofollow(&dir).expect("pin parent");
+
+        // Triage: a real `sub` directory is present.
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let meta = handle
+            .symlink_metadata(OsStr::new("sub"))
+            .expect("stat sub");
+        assert!(
+            meta.is_dir && !meta.is_symlink,
+            "sub stats as a real directory"
+        );
+
+        // Swap it for a symlink to the outside dir before the open.
+        std::fs::remove_dir(&sub).unwrap();
+        std::os::unix::fs::symlink(&outside, &sub).unwrap();
+
+        let err = handle
+            .open_child_dir(OsStr::new("sub"))
+            .err()
+            .expect("a post-triage dir swap must be refused");
+        // The open is refused either way: `RESOLVE_NO_SYMLINKS` fails it with
+        // `ELOOP`, and `O_DIRECTORY` fails a symlink (whose target type is not
+        // yet resolved) with `ENOTDIR`. Which one the kernel returns is
+        // version-dependent; both are a secure refusal to descend into the link.
+        assert!(
+            matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+            "the swapped-in symlinked dir must be refused (ELOOP or ENOTDIR), got {err:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     // `create_root_nofollow` must materialise a deep path through no-follow
