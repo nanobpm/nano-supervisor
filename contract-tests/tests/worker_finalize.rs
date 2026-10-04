@@ -170,7 +170,7 @@ fn provisioned_repo_finalize_pushes_a_fallback_branch() {
         outcome.stderr()
     );
     // The worker's finalize detected the agent's commit and pushed a fallback
-    // branch: the completion variables report the branch, the commit count and
+    // branch: the completion variables report the branch, the commit list and
     // the push — none of which an unprovisioned run (the test above) produces.
     let vars = outcome.variables();
     let branch = vars["branch"].as_str().unwrap_or("");
@@ -178,9 +178,13 @@ fn provisioned_repo_finalize_pushes_a_fallback_branch() {
         branch.starts_with("nano/agent-work/"),
         "the fallback branch is nano/agent-work/…; vars: {vars:#?}"
     );
+    // The Node worker reports `commits` as an ARRAY of the new commit SHAs
+    // (`gitResult.commits = git log … .split('\n')` in c8ctl-plugin.js), not a
+    // numeric count — assert the array is non-empty. A numeric parse
+    // (`as_i64`) reads an array as `None` and fails even when finalize worked.
     assert!(
-        vars["commits"].as_i64().unwrap_or(0) >= 1,
-        "the agent's commit is counted: {vars:#?}"
+        vars["commits"].as_array().is_some_and(|c| !c.is_empty()),
+        "the agent's commit is reported as a non-empty commits array: {vars:#?}"
     );
     assert_eq!(
         vars["pushed"].as_bool(),

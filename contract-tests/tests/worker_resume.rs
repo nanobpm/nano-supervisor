@@ -68,6 +68,24 @@ fn job_writes_an_agent_instance_record() {
         "the AgentInstance {key} must have at least one recorded history turn; \
          the engine has none"
     );
+    // The opening CONFIGURATION item alone satisfies `!history.is_empty()`, so
+    // also pin the UPDATE path: the agent's emitted "turn one" must be recorded
+    // as an ASSISTANT history turn whose text content carries it. History items
+    // are `{role, content:[{contentType:"TEXT", text:…}, …]}`.
+    let has_assistant_turn = history.iter().any(|turn| {
+        turn["role"].as_str() == Some("ASSISTANT")
+            && turn["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|b| {
+                    b["contentType"].as_str() == Some("TEXT")
+                        && b["text"].as_str().is_some_and(|t| t.contains("turn one"))
+                })
+            })
+    });
+    assert!(
+        has_assistant_turn,
+        "the AgentInstance {key} history must record the emitted assistant turn \
+         \"turn one\" (role ASSISTANT, TEXT content); history: {history:#?}"
+    );
 }
 
 /// A job whose first worker is KILLED mid-run is picked up by a fresh worker
