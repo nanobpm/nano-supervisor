@@ -156,6 +156,18 @@ impl Target {
         }
     }
 
+    /// The final path segment of the provisioned repository checkout under the
+    /// per-job run dir. The two workers name it differently — the Node worker
+    /// checks out into `<run dir>/workspace`, the Rust worker into
+    /// `<run dir>/repo` — so a cross-target test must assert the target's own
+    /// segment rather than hard-coding one and failing the other's CI job.
+    pub fn checkout_dir_name(self) -> &'static str {
+        match self {
+            Target::Node => "workspace",
+            Target::Rust => "repo",
+        }
+    }
+
     /// Whether the target program is actually runnable here. When it is not
     /// (e.g. the Node plugin is not installed on a plain CI runner), tests skip
     /// cleanly rather than fail — the dedicated Node-target CI job is where they

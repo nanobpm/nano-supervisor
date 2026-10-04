@@ -98,7 +98,9 @@ fn worker_gives_agent_result_file_and_nano_env() {
 
 /// End-to-end **repository provisioning**: a job whose envelope carries a
 /// `repository` is cloned before the agent runs, and the agent's working
-/// directory IS the checkout (`<run dir>/repo`, with a `.git`). The repo is a
+/// directory IS the checkout (`<run dir>/<checkout>`, with a `.git`, where the
+/// segment is target-specific — `workspace` for Node, `repo` for Rust). The
+/// repo is a
 /// local bare git repository seeded by the test — no network, no credentials.
 #[test]
 fn worker_provisions_the_repository_into_the_run_dir() {
@@ -227,12 +229,14 @@ fn worker_provisions_the_repository_into_the_run_dir() {
     // The agent ran INSIDE the provisioned checkout: its cwd is the clone and
     // the checkout carries a `.git`. The run dir is reaped on a successful
     // settle, so assert on the RECORDED cwd's shape (it must end in the
-    // worker's `repo` checkout segment), not on the post-reap filesystem.
+    // worker's target-specific checkout segment), not on the post-reap
+    // filesystem.
     let cwd = std::path::Path::new(&record.cwd);
+    let checkout = target.checkout_dir_name();
     assert_eq!(
         cwd.file_name().and_then(|n| n.to_str()),
-        Some("repo"),
-        "the agent must run in the provisioned checkout (<run dir>/repo); cwd was {}",
+        Some(checkout),
+        "the agent must run in the provisioned checkout (<run dir>/{checkout}); cwd was {}",
         record.cwd
     );
     assert!(
