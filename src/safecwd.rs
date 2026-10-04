@@ -103,10 +103,11 @@ impl CwdHandle {
         Ok(())
     }
 
-    /// `apply`, for a synchronous [`std::process::Command`]. Only the tests
-    /// need to drive a child synchronously; the production launch sites all use
-    /// the async [`apply`](Self::apply).
-    #[cfg(all(unix, test))]
+    /// `apply`, for a synchronous [`std::process::Command`]. The bounded
+    /// `git rev-parse HEAD` probe (`slot::git_head_timeout`) drives its child
+    /// synchronously, and the tests drive one too; both bind the pinned fd the
+    /// same way the async [`apply`](Self::apply) does.
+    #[cfg(unix)]
     pub(crate) fn apply_std(&self, cmd: &mut std::process::Command) -> io::Result<()> {
         // SAFETY: as `apply` — async-signal-safe `fchdir` in the pre-exec child.
         unsafe {
@@ -115,7 +116,7 @@ impl CwdHandle {
         Ok(())
     }
 
-    #[cfg(all(not(unix), test))]
+    #[cfg(not(unix))]
     pub(crate) fn apply_std(&self, cmd: &mut std::process::Command) -> io::Result<()> {
         cmd.current_dir(&self.path);
         Ok(())

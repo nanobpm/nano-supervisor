@@ -1452,9 +1452,8 @@ const GIT_HEAD_POLL: Duration = Duration::from_millis(10);
 fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(dir)
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--verify", "HEAD"])
         // An agent-controlled checkout could carry a prompt/sidebar config; keep
         // the invocation minimal and non-interactive.
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1465,7 +1464,19 @@ fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
         // instead of blocking unboundedly inside `Child::wait_with_output`.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // Enter the checkout through a pinned, no-follow directory handle (`fchdir`
+    // in the child's `pre_exec`) rather than re-resolving `dir` as a path at
+    // spawn time: the run dir can sit under a world-writable ancestor, so a
+    // same-UID actor could swap a component for a symlink between provisioning
+    // and this probe and redirect `git rev-parse` to an attacker repo, spoofing
+    // the pre/post HEAD that is the empty-job detector's only "did the agent
+    // commit" signal (#35, as for the git()/agent launches). A refused
+    // (symlinked) component fails the probe closed, which reads as the safe
+    // `None` ("no commits") default like any other probe failure.
+    let handle = crate::safecwd::CwdHandle::open(dir).ok()?;
+    handle.apply_std(&mut cmd).ok()?;
+    let mut child = cmd
         .spawn()
         .ok()?;
     // Bounded wait: poll `try_wait` so a git wedged on agent-planted blocking
@@ -3278,6 +3289,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nano-git-head-ok-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         std::fs::create_dir_all(&base).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (e.g. macOS
+        // `/var`→`/private/var`): the probe now binds the run dir through the
+        // no-follow handle, which legitimately refuses a symlinked component —
+        // real daemon run dirs are provisioned through that same handle.
+        let base = std::fs::canonicalize(&base).unwrap();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -3320,6 +3336,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn git_head_refuses_a_symlinked_ancestor() {
+        // The #35 class, for the HEAD probe: an agent-controlled run dir can sit
+        // under a world-writable ancestor, so a same-UID actor could swap an
+        // ancestor for a symlink to an attacker repo between provisioning and
+        // this probe. Resolving the cwd through the pinned no-follow handle must
+        // refuse that path (fail closed → `None` "no commits"), never follow the
+        // symlink and report the attacker's HEAD. Before the fix the probe used
+        // `current_dir(dir)`, re-resolved the symlink at spawn, and returned the
+        // attacker's sha.
+        let base = std::env::temp_dir().join(format!(
+            "nano-git-head-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        // An attacker-controlled real git repo with a commit.
+        let evil = base.join("evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&evil, &["init", "-q"]);
+        git(
+            &evil,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        // `<base>/link` is a symlink to the attacker repo; the probe target
+        // `<base>/link` therefore reaches the attacker repo only through it.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&evil, &link).unwrap();
+        assert_eq!(
+            git_head(&link),
+            None,
+            "a run dir reached through a symlinked ancestor must be refused, not followed"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn git_head_is_bounded_when_git_hangs() {
         // The class Copilot flagged: an agent-controlled checkout can make
         // `git rev-parse` block indefinitely (here `.git/HEAD` is a FIFO, so
@@ -3329,6 +3404,11 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
         let git_dir = base.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor so the probe reaches
+        // `git` (which then wedges on the FIFO) instead of being refused by the
+        // no-follow cwd bind before it ever spawns — this test must exercise the
+        // deadline, not the symlink refusal.
+        let base = std::fs::canonicalize(&base).unwrap();
         // A FIFO never yields data, so git blocks reading HEAD.
         let mk = std::process::Command::new("mkfifo")
             .arg(git_dir.join("HEAD"))
@@ -3361,6 +3441,11 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
         let git_dir = base.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor so the probe reaches
+        // (and wedges on) git rather than being refused early by the no-follow
+        // cwd bind — this test must exercise the blocking-pool dispatch, not the
+        // symlink refusal.
+        let base = std::fs::canonicalize(&base).unwrap();
         // A FIFO never yields data, so git blocks reading HEAD until the
         // probe's deadline kills it — the probe takes the full timeout.
         let mk = std::process::Command::new("mkfifo")
