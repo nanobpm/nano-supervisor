@@ -1171,7 +1171,6 @@ dependencies = [
  "camunda-orchestration-sdk",
  "clap",
  "libc",
- "reqwest",
  "ryu",
  "serde",
  "serde_json",

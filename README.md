@@ -7,6 +7,24 @@ Standalone Rust supervisor and job workers for Nano BPM coding agents (replaces 
 - `nano-supervisor work <hire>` — one worker for a hired profile, the Rust
   `c8 nano work <profile>`. See [`spike/README.md`](spike/README.md).
 
+## Leases
+
+Both workers run the same leased activation + lease-refresh fencing
+(`src/jobs.rs`, `src/slot.rs`). Every activation asks for a lease (engine ≥
+0.0.24 issues `jobLeaseToken`, which the SDK carries) and is refreshed every
+third of `--recovery-window`. A 404/409 on refresh is a lost activation: the
+agent is stopped and the job is **not** settled, so a *leased* activation is
+never settled after losing its lease. (This says nothing about unleased runs:
+`work`, and `daemon --no-lease`, settle activations the engine never leased —
+see below.)
+
+The two workers differ only in what they do when the engine issues **no** token:
+
+- `daemon` **leases by default** and refuses to run unfenced — an unleased
+  activation shuts the slot down loudly. Pass `--no-lease` to run unfenced.
+- `work` requests a lease too but, like the Node plugin, runs unfenced when the
+  engine does not issue one.
+
 ## Contract tests
 
 `contract-tests/` is a black-box suite (issues #3/#4/#5) that pins the fleet

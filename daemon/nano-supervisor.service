@@ -28,10 +28,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Edit the path / flags to taste: an absolute path if the binary isn't on PATH,
-# and e.g. `--profile omarchy --with-lease --slots 1`. The `--hire <hire-name>`
+# and e.g. `--profile omarchy --slots 1` (leasing is on by default; add
+# `--no-lease` to run unfenced). The `--hire <hire-name>`
 # below is mandatory — replace `<hire-name>` with a real hire from config.json so
 # this daemon only runs the hire you intend (see the note above).
-ExecStart=%h/.local/bin/nano-supervisor daemon --with-lease --hire <hire-name>
+ExecStart=%h/.local/bin/nano-supervisor daemon --hire <hire-name>
 # The daemon drains on SIGTERM (stops leasing, finishes in-flight work) within
 # its own grace window; give systemd room before it escalates to SIGKILL.
 TimeoutStopSec=30

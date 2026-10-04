@@ -95,10 +95,6 @@ enum Cmd {
         /// Exit after handling this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
-        /// Job command transport: `sdk` (default via `auto`) or `nano` (raw HTTP,
-        /// legacy `leaseToken` dialect for engines older than 0.0.24).
-        #[arg(long, default_value = "auto")]
-        job_api: String,
     },
     /// Run the MVP daemon: N slots per hire (from config.json), one shared
     /// engine connection, host sandbox only.
@@ -131,13 +127,17 @@ enum Cmd {
         /// Override the config.json path (default: the c8ctl-nano state home).
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Ask the engine for job leases (fails loudly if the engine doesn't issue them).
+        /// Run unfenced: do NOT ask the engine for job leases. By default the
+        /// daemon leases every activation and a worker that gets no lease token
+        /// refuses the job (leasing is the default; it fails loudly if the
+        /// engine doesn't issue a token).
         #[arg(long)]
+        no_lease: bool,
+        /// Deprecated no-op: leasing is now on by default, so `--with-lease` is
+        /// implied. Kept so existing invocations keep working; use `--no-lease`
+        /// to opt out.
+        #[arg(long, hide = true)]
         with_lease: bool,
-        /// Job command transport: `sdk` (default via `auto`) or `nano` (raw HTTP,
-        /// legacy `leaseToken` dialect for engines older than 0.0.24).
-        #[arg(long, default_value = "auto")]
-        job_api: String,
     },
     /// Internal: the macOS parent-death watchdog (kills an agent's process group
     /// when the daemon dies). Not for direct use.
@@ -168,6 +168,16 @@ fn clamp_recovery_window(ms: u64) -> Duration {
     Duration::from_millis(ms).max(MIN_RECOVERY_WINDOW)
 }
 
+/// Resolve whether the `daemon` should lease each activation, from the parsed
+/// CLI flags. Leasing is the default; `--no-lease` is the only opt-out, so the
+/// decision derives solely from `!no_lease`. The legacy `--with-lease` is a
+/// hidden, deprecated no-op (leasing is already implied) kept so existing
+/// invocations keep working — it is intentionally not consulted here, which also
+/// makes `--no-lease` win when both are passed.
+fn daemon_leases(no_lease: bool) -> bool {
+    !no_lease
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -187,13 +197,11 @@ async fn main() -> Result<()> {
             runs_dir,
             config,
             max_jobs,
-            job_api,
         } => {
             work::run(work::WorkOptions {
                 hire,
                 job_types: job_type,
                 profile,
-                job_api: engine::JobApi::parse(&job_api)?,
                 name,
                 recovery_window: clamp_recovery_window(recovery_window),
                 idle_timeout: Duration::from_millis(idle_timeout),
@@ -222,13 +230,12 @@ async fn main() -> Result<()> {
             clone_timeout,
             runs_dir,
             config,
-            with_lease,
-            job_api,
+            no_lease,
+            with_lease: _,
         } => {
             let opts = daemon::DaemonOptions {
                 profile,
-                job_api: engine::JobApi::parse(&job_api)?,
-                with_lease,
+                with_lease: daemon_leases(no_lease),
                 slots: slots.max(1),
                 only: hire,
                 recovery_window: clamp_recovery_window(recovery_window),
@@ -322,10 +329,7 @@ pub(crate) fn normalize_runs_dir(path: &Path) -> Result<PathBuf> {
 /// mutating the process-wide working directory (which would race parallel
 /// tests). `cwd` is invoked at most once, only when a leading `..` must be
 /// anchored.
-fn normalize_runs_dir_impl(
-    path: &Path,
-    cwd: impl FnOnce() -> Result<PathBuf>,
-) -> Result<PathBuf> {
+fn normalize_runs_dir_impl(path: &Path, cwd: impl FnOnce() -> Result<PathBuf>) -> Result<PathBuf> {
     // Retained components. `trusted` marks one that came from the symlink-free
     // cwd (safe to pop); operator-supplied components are untrusted, so a `..`
     // that would pop one is rejected rather than folded across a possible link.
@@ -466,7 +470,11 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_recovery_window, normalize_runs_dir, normalize_runs_dir_impl, MIN_RECOVERY_WINDOW};
+    use super::{
+        clamp_recovery_window, daemon_leases, normalize_runs_dir, normalize_runs_dir_impl, Cli,
+        Cmd, MIN_RECOVERY_WINDOW,
+    };
+    use clap::Parser;
     use std::path::{Component, Path, PathBuf};
     use std::time::Duration;
 
@@ -566,9 +574,7 @@ mod tests {
         assert_eq!(out, PathBuf::from("/home/runs"));
         // The result is absolute and `..`-free, so the no-follow walk accepts it.
         assert!(out.is_absolute());
-        assert!(!out
-            .components()
-            .any(|c| matches!(c, Component::ParentDir)));
+        assert!(!out.components().any(|c| matches!(c, Component::ParentDir)));
     }
 
     // Unsafe parent traversals are rejected, never silently clamped: an
@@ -585,8 +591,72 @@ mod tests {
         })
         .is_err());
         // A leading `..` when the cwd is the filesystem root has nothing above.
+        assert!(normalize_runs_dir_impl(Path::new("../runs"), || Ok(PathBuf::from("/"))).is_err());
+    }
+
+    /// Parse a `daemon` invocation and return its `(no_lease, with_lease)` flags.
+    fn parse_daemon_flags(args: &[&str]) -> (bool, bool) {
+        match Cli::parse_from(args).cmd {
+            Cmd::Daemon {
+                no_lease,
+                with_lease,
+                ..
+            } => (no_lease, with_lease),
+            _ => panic!("expected the `daemon` subcommand for args {args:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_leases_by_default() {
+        // The central default inversion: a bare `daemon` must fence (lease) with
+        // neither opt-out nor the legacy flag supplied.
+        let (no_lease, with_lease) = parse_daemon_flags(&["nano-supervisor", "daemon"]);
+        assert!(!no_lease, "bare `daemon` must not set --no-lease");
         assert!(
-            normalize_runs_dir_impl(Path::new("../runs"), || Ok(PathBuf::from("/"))).is_err()
+            !with_lease,
+            "bare `daemon` must not set the legacy --with-lease"
+        );
+        assert!(
+            daemon_leases(no_lease),
+            "bare `daemon` must lease by default"
+        );
+    }
+
+    #[test]
+    fn daemon_no_lease_opts_out() {
+        let (no_lease, _) = parse_daemon_flags(&["nano-supervisor", "daemon", "--no-lease"]);
+        assert!(no_lease, "--no-lease must parse as set");
+        assert!(
+            !daemon_leases(no_lease),
+            "--no-lease must run the daemon unfenced"
+        );
+    }
+
+    #[test]
+    fn daemon_legacy_with_lease_still_accepted() {
+        // Backward compatibility: the hidden, deprecated `--with-lease` must
+        // still parse and is a no-op — leasing is already the default.
+        let (no_lease, with_lease) =
+            parse_daemon_flags(&["nano-supervisor", "daemon", "--with-lease"]);
+        assert!(with_lease, "legacy --with-lease must still be accepted");
+        assert!(!no_lease);
+        assert!(
+            daemon_leases(no_lease),
+            "legacy --with-lease must keep leasing on"
+        );
+    }
+
+    #[test]
+    fn daemon_no_lease_wins_over_legacy_with_lease() {
+        // Leasing derives solely from `!no_lease`, so if both flags are passed
+        // the opt-out wins and the daemon runs unfenced.
+        let (no_lease, with_lease) =
+            parse_daemon_flags(&["nano-supervisor", "daemon", "--with-lease", "--no-lease"]);
+        assert!(no_lease);
+        assert!(with_lease);
+        assert!(
+            !daemon_leases(no_lease),
+            "--no-lease must win when combined with the legacy --with-lease"
         );
     }
 }
