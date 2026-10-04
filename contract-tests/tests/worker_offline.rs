@@ -238,8 +238,46 @@ fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
             })
             .expect("create instance: no processInstanceKey");
 
-        // One worker, pointed at the LIVE engine, kept alive across the outage. It
-        // runs the scripted fake agent when it picks the job up.
+        // Resolve the engine PID while it is still responsive, then freeze the
+        // engine BEFORE the worker starts polling. Spawning the worker first
+        // (against a LIVE engine) raced: it could activate and COMPLETE the
+        // waiting job in the window before the freeze, so the later assertions
+        // would pass on pre-outage work without ever exercising reconnection.
+        let engine_pid = engine_process_pid(&engine);
+
+        // The job must be genuinely WAITING before the outage: then the only way
+        // it can reach COMPLETED is the post-resume reconnect this test asserts.
+        // The job search is eventually consistent, so poll for it to appear
+        // (bounded) rather than assuming it is indexed the instant the instance
+        // is created.
+        let pre = {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(job) = engine.job(&job_type) {
+                    break job;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the waiting job never became visible before the outage"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        };
+        assert!(
+            !contract_tests::job_is_settled(&pre),
+            "the job must still be pending before the outage; got {pre}"
+        );
+
+        // Phase 1 — engine DOWN. Freeze the engine and immediately arm an RAII
+        // guard that resumes it on ANY unwind: a panicking assertion below must
+        // never leave the shared test engine stopped (later contract tests would
+        // then skip, time out, or hang).
+        signal_process(engine_pid, libc::SIGSTOP);
+        let mut resume_guard = EngineResumeGuard::arm(engine_pid);
+
+        // Only now start the worker. Its very first poll hits the frozen engine
+        // and stalls, so it cannot pick up — let alone complete — the job until
+        // we resume. It must stay alive (not crash, not give up) for the freeze.
         let home = TempHome::new();
         let work = tempfile::Builder::new()
             .prefix("ns-run-")
@@ -264,11 +302,6 @@ fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
         );
         let stderr_rx = spawn_stderr_reader(&mut child);
 
-        // Phase 1 — engine DOWN: freeze the engine so the worker's polls/activations
-        // stall against an unresponsive gateway. The worker must stay alive (not
-        // crash, not give up) for the whole freeze.
-        let engine_pid = engine_process_pid(&engine);
-        signal_process(engine_pid, libc::SIGSTOP);
         let freeze = Duration::from_secs(6);
         std::thread::sleep(freeze);
         let alive_down = child.try_wait().map(|s| s.is_none()).unwrap_or(false);
@@ -277,9 +310,10 @@ fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
             "the worker must stay up through an engine outage (it exits only when killed)"
         );
 
-        // Phase 2 — engine UP: resume the SAME engine. The SAME worker must
-        // reconnect, activate the waiting job, run the agent, and settle it.
-        signal_process(engine_pid, libc::SIGCONT);
+        // Phase 2 — engine UP: resume the SAME engine (disarming the guard; the
+        // explicit resume is the normal path). The SAME worker must reconnect,
+        // activate the waiting job, run the agent, and settle it.
+        resume_guard.resume();
         let outcome = wait_for_settled(&engine, &job_type, Duration::from_secs(60));
 
         // Reap the worker before asserting on its capture.
@@ -294,12 +328,52 @@ fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
             outcome["state"].as_str().unwrap_or(""),
             "COMPLETED",
             "after the outage the SAME worker must reconnect and complete the waiting job; \
-         engine job: {outcome}; worker stderr:\n{stderr_text}"
+             engine job: {outcome}; worker stderr:\n{stderr_text}"
         );
         assert!(
-        stderr_has_activity(&stderr_text),
-        "the SAME worker must show it reconnected and ran the job after the freeze; stderr:\n{stderr_text}"
-    );
+            stderr_has_activity(&stderr_text),
+            "the SAME worker must show it reconnected and ran the job after the freeze; stderr:\n{stderr_text}"
+        );
+    }
+}
+
+/// RAII guard that resumes a frozen engine on drop unless explicitly disarmed.
+///
+/// The recovery test freezes the shared engine with `SIGSTOP`; if an assertion
+/// between the freeze and the explicit `SIGCONT` panics, the unwinding stack
+/// would otherwise leave the engine stopped for every later contract test. This
+/// guard sends `SIGCONT` on any drop (including a panic unwind) so the engine is
+/// always restored; `resume()` performs the normal explicit resume and disarms
+/// it so the drop becomes a no-op.
+#[cfg(unix)]
+struct EngineResumeGuard {
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl EngineResumeGuard {
+    fn arm(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    /// Normal-path resume: `SIGCONT` the engine and disarm so drop is a no-op.
+    fn resume(&mut self) {
+        if self.armed {
+            signal_process(self.pid, libc::SIGCONT);
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EngineResumeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // A panic unwound before the explicit resume — restore the engine so
+            // later tests are not stranded against a frozen gateway.
+            signal_process(self.pid, libc::SIGCONT);
+        }
     }
 }
 
