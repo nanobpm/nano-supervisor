@@ -145,12 +145,19 @@ impl DirHandle {
     /// walk: `/` for an absolute path, `.` (the current directory) for a
     /// relative one. Resolved with `RESOLVE_NO_SYMLINKS` and NOT
     /// `RESOLVE_BENEATH` (the anchor is the walk's base, not a descent).
+    ///
+    /// Opened `O_PATH`: the anchor and the intermediate ancestors it seeds are
+    /// only ever used as a *dirfd* for `mkdirat` / `openat2` / `fstatat`, which
+    /// an `O_PATH` handle supports with only search (`x`) permission — never a
+    /// read of the directory. This matches how the kernel traversed ancestors in
+    /// the old whole-path resolution (search, not read), so a legitimately
+    /// non-readable ancestor (e.g. mode `0o300`) no longer fails the walk.
     fn open_anchor(absolute: bool) -> Result<DirHandle, PinError> {
         let anchor: &CStr = if absolute { c"/" } else { c"." };
         match openat2_raw(
             libc::AT_FDCWD,
             anchor,
-            (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             RESOLVE_NO_SYMLINKS,
         ) {
             Ok(fd) => Ok(DirHandle { fd }),
@@ -177,20 +184,24 @@ impl DirHandle {
     ///
     /// New components are created `0o777` (umask applies), matching
     /// `create_dir_all`; the caller locks the leaf it owns to its final mode.
+    ///
+    /// Intermediate ancestors are opened `O_PATH` (search-only, via
+    /// [`open_child_dir_opath`](Self::open_child_dir_opath)) so a legitimately
+    /// non-readable ancestor does not fail the walk; only the **final** runs
+    /// root is opened readable, since the caller stats / enumerates / `fchmod`s
+    /// it (which `O_PATH` cannot do). This preserves the old behaviour where
+    /// only the runs root itself needed read permission.
     pub(crate) fn create_root_nofollow(path: &Path) -> Result<DirHandle, PinError> {
         use std::path::Component;
-        let mut handle = DirHandle::open_anchor(path.is_absolute())?;
+        // Collect the directory components to create/open, rejecting `..` and
+        // Windows prefixes (no business in a runs-root path) *before* creating
+        // anything — fail closed earlier rather than part-way through the walk.
+        let mut names: Vec<&OsStr> = Vec::new();
         for comp in path.components() {
             match comp {
                 // The anchor already accounts for the root / cwd base.
                 Component::RootDir | Component::CurDir => continue,
-                Component::Normal(name) => {
-                    handle.mkdirat_ignore_existing(name, 0o777)?;
-                    // Re-open through a handle (no-follow, beneath the parent):
-                    // a component swapped to a symlink after the `mkdirat` is
-                    // refused here rather than silently traversed.
-                    handle = handle.open_child_dir(name).map_err(PinError::Io)?;
-                }
+                Component::Normal(name) => names.push(name),
                 // `..` and Windows prefixes have no business in a runs-root
                 // path; refuse rather than risk escaping the anchor.
                 Component::ParentDir | Component::Prefix(_) => {
@@ -200,6 +211,24 @@ impl DirHandle {
                     )));
                 }
             }
+        }
+        let mut handle = DirHandle::open_anchor(path.is_absolute())?;
+        let last = names.len().saturating_sub(1);
+        for (i, name) in names.into_iter().enumerate() {
+            handle.mkdirat_ignore_existing(name, 0o777)?;
+            // Re-open through a handle (no-follow, beneath the parent): a
+            // component swapped to a symlink after the `mkdirat` is refused here
+            // rather than silently traversed.
+            handle = if i == last {
+                // The final runs root is what the caller operates on (stat /
+                // enumerate / fchmod), so it must be a readable, non-`O_PATH`
+                // handle.
+                handle.open_child_dir(name).map_err(PinError::Io)?
+            } else {
+                // Intermediate ancestors are only traversed; `O_PATH` needs no
+                // read permission, so a valid non-readable ancestor is fine.
+                handle.open_child_dir_opath(name).map_err(PinError::Io)?
+            };
         }
         Ok(handle)
     }
@@ -228,6 +257,24 @@ impl DirHandle {
             self.fd.as_raw_fd(),
             &c,
             dir_open_flags(),
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        )?;
+        Ok(DirHandle { fd })
+    }
+
+    /// Like [`open_child_dir`](Self::open_child_dir) but returns an `O_PATH`
+    /// handle: usable only as a *dirfd* anchor for `*at` operations
+    /// (`mkdirat` / `openat2` / `fstatat`), never for reading or `fchmod`.
+    /// Opening a directory this way requires only search (`x`) permission, not
+    /// read — so a legitimately non-readable intermediate ancestor (e.g. mode
+    /// `0o300`) does not fail the walk — while `RESOLVE_NO_SYMLINKS |
+    /// RESOLVE_BENEATH` still refuses a swapped-in or escaping component.
+    fn open_child_dir_opath(&self, name: &OsStr) -> io::Result<DirHandle> {
+        let c = cstr(name)?;
+        let fd = openat2_raw(
+            self.fd.as_raw_fd(),
+            &c,
+            (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
             RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
         )?;
         Ok(DirHandle { fd })
@@ -543,6 +590,38 @@ mod tests {
             .err()
             .expect("a `..` component must be rejected");
         assert!(matches!(err, PinError::Io(_)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // A non-readable (but searchable) INTERMEDIATE ancestor must not fail root
+    // creation: intermediate ancestors are opened `O_PATH` (search-only), so a
+    // valid `0o300` ancestor — traversable and writable but not readable — no
+    // longer breaks job preparation with `EACCES`, matching the old whole-path
+    // resolution where only the final runs root needed read permission.
+    #[test]
+    fn create_root_nofollow_tolerates_non_readable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch_root("create-nonreadable");
+        let mid = base.join("mid");
+        std::fs::create_dir_all(&mid).unwrap();
+        // write + execute, NO read: `mkdirat`/traversal are allowed but an
+        // `O_RDONLY` open of `mid` would fail `EACCES`.
+        std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let target = mid.join("runs");
+
+        let handle = DirHandle::create_root_nofollow(&target)
+            .expect("a non-readable (0o300) ancestor must not fail root creation");
+        assert!(
+            target.is_dir(),
+            "the runs root must be created under a non-readable ancestor"
+        );
+        // The leaf itself is readable, so the caller can still operate on it.
+        handle
+            .mkdirat_ignore_existing(OsStr::new("job"), 0o700)
+            .expect("mkdir through the pinned readable leaf");
+
+        // Restore perms so the scratch tree can be removed.
+        std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&base).ok();
     }
 }

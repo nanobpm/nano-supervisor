@@ -153,16 +153,15 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         Ok(tail) => canon_anchor.join(tail),
         Err(_) => runs_dir,
     };
-    slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
-    std::fs::create_dir_all(&runs_dir)?;
-    // Re-validate NO-FOLLOW now that the tail exists on disk: a same-UID process
-    // could swap the freshly created leaf (or any tail ancestor) for a symlink
-    // between the create above and first use. Do NOT `canonicalize` here —
-    // `canonicalize` FOLLOWS such a swap to the attacker-chosen target and the
-    // checks would then pass against it. `reject_symlinked_ancestors_below`
-    // inspects every component below the (already canonical) anchor with
-    // `symlink_metadata` (no-follow) and REJECTS a swapped-in link.
-    slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+    // Establish the runs root through pinned no-follow handles on Linux 5.6+
+    // (path-based reject+create+recheck fallback elsewhere). An inline
+    // `reject_symlinked_ancestors_below` → `create_dir_all` → recheck here was a
+    // check-then-create TOCTOU: a same-UID actor could swap a tail ancestor for
+    // a symlink during the create and restore it before the recheck, redirecting
+    // the created tree — and the recursive stale-run sweep below — outside the
+    // workspace. `create_runs_root` builds every component relative to a pinned
+    // parent, so a swapped/planted symlink is refused by the open, not followed.
+    slot::create_runs_root(&runs_dir, &canon_anchor)?;
     // Sweep at the SHARED parent of this worker's namespace, not the namespace
     // itself: a crashed worker leaves `rust-worker-<old-pid>` as a sibling of
     // the next launch's root, so sweeping only `runs_dir` could never discover

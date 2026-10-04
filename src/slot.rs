@@ -604,6 +604,54 @@ pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf
         .map_err(|e| anyhow::Error::new(e).context("prepare_run_dir blocking task panicked"))?
 }
 
+/// Establish the worker's `runs_dir` as a safe run **root** at startup, closing
+/// the same bootstrap TOCTOU that [`prepare_run_dir`] closes for per-job dirs.
+///
+/// `work <hire>` must create `runs_dir` (and then sweep its shared parent)
+/// before any job runs. Doing that with a path-based
+/// [`reject_symlinked_ancestors_below`] → `create_dir_all` → re-check is a
+/// check-then-create race: a same-UID actor can swap a tail ancestor for a
+/// symlink during the `create_dir_all` and restore it before the re-check, so
+/// the tree (and the recursive stale-run sweep that follows) is materialised
+/// inside the link target even though both checks pass. On Linux 5.6+ this
+/// instead builds every component through pinned no-follow handles
+/// ([`DirHandle::create_root_nofollow`]), which refuses a swapped/planted
+/// symlink component rather than following it. `anchor` is the trusted,
+/// already-canonicalized base; it is used only by the path-based fallback
+/// (non-Linux, or a pre-5.6 kernel without `openat2`), whose weaker check
+/// spares legitimate platform symlinks at/above the anchor.
+pub(crate) fn create_runs_root(runs_dir: &Path, anchor: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::saferoot::{DirHandle, PinError};
+        match DirHandle::create_root_nofollow(runs_dir) {
+            // The pinned runs-root handle is dropped; the directories it created
+            // through no-follow handles persist on disk.
+            Ok(_root) => return Ok(()),
+            // Kernel too old for `openat2` (pre-5.6): fall through to the
+            // best-effort path-based bootstrap below.
+            Err(PinError::Unsupported) => {}
+            // A refused symlinked component (ELOOP) or any other error is a
+            // real, security-relevant outcome — surface it, never retry the
+            // weaker path-based create that would follow the very link we
+            // refused.
+            Err(PinError::Io(e)) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("creating runs root {}", runs_dir.display())));
+            }
+        }
+    }
+    // Path-based fallback (non-Linux, or a pre-5.6 kernel): reject a symlinked
+    // tail component, create, then re-validate. This cannot fully close the
+    // TOCTOU window — hence the pinned-handle path above — but is the best
+    // available guarantee where `openat2` is unavailable.
+    reject_symlinked_ancestors_below(runs_dir, anchor)?;
+    std::fs::create_dir_all(runs_dir)
+        .with_context(|| format!("creating runs root {}", runs_dir.display()))?;
+    reject_symlinked_ancestors_below(runs_dir, anchor)?;
+    Ok(())
+}
+
 /// `prepare_run_dir` via `openat2(RESOLVE_NO_SYMLINKS)` handles pinned to the
 /// runs root: the root itself is first *established as a private root* through
 /// no-follow directory handles ([`DirHandle::create_root_nofollow`] mkdir+opens
