@@ -127,8 +127,16 @@ enum Cmd {
         /// Override the config.json path (default: the c8ctl-nano state home).
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Ask the engine for job leases (fails loudly if the engine doesn't issue them).
+        /// Run unfenced: do NOT ask the engine for job leases. By default the
+        /// daemon leases every activation and a worker that gets no lease token
+        /// refuses the job (leasing is the default; it fails loudly if the
+        /// engine doesn't issue a token).
         #[arg(long)]
+        no_lease: bool,
+        /// Deprecated no-op: leasing is now on by default, so `--with-lease` is
+        /// implied. Kept so existing invocations keep working; use `--no-lease`
+        /// to opt out.
+        #[arg(long, hide = true)]
         with_lease: bool,
     },
     /// Internal: the macOS parent-death watchdog (kills an agent's process group
@@ -209,11 +217,12 @@ async fn main() -> Result<()> {
             clone_timeout,
             runs_dir,
             config,
-            with_lease,
+            no_lease,
+            with_lease: _,
         } => {
             let opts = daemon::DaemonOptions {
                 profile,
-                with_lease,
+                with_lease: !no_lease,
                 slots: slots.max(1),
                 only: hire,
                 recovery_window: clamp_recovery_window(recovery_window),

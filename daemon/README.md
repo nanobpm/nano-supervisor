@@ -19,13 +19,13 @@ handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
 - **Connection** settings come from c8ctl profiles (`--profile`, else the active
   profile, else `CAMUNDA_*` env). Job commands always use the
   `camunda-orchestration-sdk` transport (the same one the Node plugin uses).
-  **Lease compatibility:** the SDK speaks the Camunda 8.10 spec field names, so
-  `--with-lease` needs an engine that returns the lease as `jobLeaseToken`
-  (Nano engine ≥ v0.0.24 does; see `src/jobs.rs`). An engine that still returns
-  only the legacy `leaseToken` field gives the SDK no lease to carry, so
-  `--with-lease` activations arrive unleased and the daemon shuts down loudly
-  rather than run unfenced — such an engine is incompatible with `--with-lease`
-  here.
+  **Lease compatibility:** the daemon **leases by default** — the SDK speaks the
+  Camunda 8.10 spec field names, so leasing needs an engine that returns the
+  lease as `jobLeaseToken` (Nano engine ≥ v0.0.24 does; see `src/jobs.rs`). An
+  engine that still returns only the legacy `leaseToken` field gives the SDK no
+  lease to carry, so activations arrive unleased and the daemon shuts down
+  loudly rather than run unfenced — such an engine is incompatible with the
+  default leasing (pass `--no-lease` to run unfenced on one).
 - **Own worker names** — `‹host›-nanod-‹hire›-‹slot›` — so the daemon's jobs are
   told apart from the Node workers' (`‹host›-‹hire›-‹random›`).
 - **Host sandbox only**; a container-sandbox hire is skipped with a warning. A
@@ -50,11 +50,12 @@ c8 nano start                                   # local cluster on :8080
 c8 nano hire --name coder --rank senior --command copilot --capabilities pr-review
 
 cargo build --release
-target/release/nano-supervisor daemon --profile local --with-lease --slots 1
+target/release/nano-supervisor daemon --profile local --slots 1
 ```
 
 Useful flags (all optional): `--hire <name>` (repeatable) to run a subset,
-`--slots N`, `--recovery-window`/`--idle-timeout`/`--poll-timeout`/`--clone-timeout`
+`--slots N`, `--no-lease` (run unfenced; leasing is on by default),
+`--recovery-window`/`--idle-timeout`/`--poll-timeout`/`--clone-timeout`
 (ms), `--runs-dir <dir>`, `--config <path>`.
 
 ## Run as a systemd user service (omarchy)
