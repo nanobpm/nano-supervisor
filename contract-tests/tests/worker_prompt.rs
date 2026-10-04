@@ -152,7 +152,12 @@ fn missing_secret_ref_fails_the_job() {
             "prompt": "needs a secret",
             "io.nanobpm.agentTask.setup.secretRefs": ["CT_DEFINITELY_MISSING_SECRET"],
         }),
-        &[],
+        // Select the SAME host resolver the positive case uses so this exercises
+        // the intended "host resolver cannot supply the requested key" path, and
+        // not the separate "no resolver configured at all" failure. The resolver
+        // is active but `CT_DEFINITELY_MISSING_SECRET` is absent from the env
+        // below (`&[]`), so resolution must fail and the job must not run.
+        &["--secret-resolver", "host"],
         &[],
     );
     // The job must NOT complete: the worker fails it as a provisioning error,

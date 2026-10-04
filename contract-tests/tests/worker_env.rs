@@ -139,6 +139,28 @@ fn worker_provisions_the_repository_into_the_run_dir() {
             "seed",
         ],
     );
+    // Create a DISTINCT non-default branch at a distinct commit. Requesting this
+    // branch (below) proves `repository.ref` is honoured: a worker that ignores
+    // the field and performs a default clone lands on `main`'s HEAD, which is a
+    // different commit than this branch's HEAD, so the seeded-commit gate fails
+    // and the job cannot complete. HEAD is left back on `main` before the bare
+    // clone so the origin's default branch stays `main` (not the requested ref).
+    git(&seed, &["checkout", "-q", "-b", "ct-ref-target"]);
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=tester",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "ref-target",
+        ],
+    );
+    git(&seed, &["checkout", "-q", "main"]);
     git(
         &seed,
         &[
@@ -150,13 +172,14 @@ fn worker_provisions_the_repository_into_the_run_dir() {
             origin.to_str().expect("origin path"),
         ],
     );
-    // Pin the seeded commit: the agent's script below writes a successful
-    // result ONLY when its cwd is a real clone of this origin at exactly this
-    // commit, so a worker that merely creates a `repo/` directory (or clones
-    // the wrong ref) can no longer pass the test.
+    // Pin the seeded commit on the NON-DEFAULT branch: the agent's script below
+    // writes a successful result ONLY when its cwd is a real clone of this origin
+    // at exactly this commit, so a worker that merely creates a `repo/` directory
+    // (or clones the default `main` instead of the requested ref) can no longer
+    // pass the test.
     let seed_head = {
         let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
+            .args(["rev-parse", "ct-ref-target"])
             .current_dir(&seed)
             .output()
             .expect("spawn git rev-parse");
@@ -187,7 +210,9 @@ fn worker_provisions_the_repository_into_the_run_dir() {
             // The reserved envelope namespace: the worker assembles the
             // repository block from the `io.nanobpm.agentTask.*` variables.
             "io.nanobpm.agentTask.repository.url": repo_url,
-            "io.nanobpm.agentTask.repository.ref": "main",
+            // Request the NON-DEFAULT branch so honouring `ref` is what lands the
+            // seeded commit — a default clone would check out `main` and fail.
+            "io.nanobpm.agentTask.repository.ref": "ct-ref-target",
         }),
         &[],
         &[],
@@ -215,8 +240,9 @@ fn worker_provisions_the_repository_into_the_run_dir() {
         "the checkout lives under the worker's agent-runs root; cwd was {}",
         record.cwd
     );
-    // The clone honoured the envelope's ref: the seeded default branch is
-    // `main`, and the payload the agent received carries the repository block.
+    // The clone honoured the envelope's ref: the requested branch is the
+    // non-default `ct-ref-target`, and the payload the agent received carries
+    // the repository block.
     let payload = outcome.payload();
     assert_eq!(
         payload["task"]["repository"]["url"].as_str().unwrap_or(""),
