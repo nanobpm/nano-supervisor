@@ -205,8 +205,17 @@ impl DirHandle {
     pub(crate) fn create_root_nofollow(path: &Path) -> Result<DirHandle, PinError> {
         use std::path::Component;
         // Collect the directory components to create/open, rejecting `..` and
-        // Windows prefixes (no business in a runs-root path) *before* creating
-        // anything — fail closed earlier rather than part-way through the walk.
+        // Windows prefixes *before* creating anything — fail closed earlier
+        // rather than part-way through the walk. A `..` can never be honoured
+        // here: the walk pins an anchor (`/` or the cwd) and descends with
+        // `RESOLVE_BENEATH`, so a parent traversal would either climb out of
+        // that anchor (forbidden) or require re-resolution against the live
+        // path. Callers that accept an operator `--runs-dir` resolve any `..`
+        // lexically at the CLI boundary (`main::normalize_runs_dir`) BEFORE
+        // the path reaches this security layer, preserving the pre-hardening
+        // `../runs` behaviour the non-Linux `create_dir_all` fallback still
+        // has; this walk stays fail-closed so a `..` that slips past the
+        // boundary is refused, never silently followed.
         let mut names: Vec<&OsStr> = Vec::new();
         for comp in path.components() {
             match comp {
@@ -214,7 +223,8 @@ impl DirHandle {
                 Component::RootDir | Component::CurDir => continue,
                 Component::Normal(name) => names.push(name),
                 // `..` and Windows prefixes have no business in a runs-root
-                // path; refuse rather than risk escaping the anchor.
+                // path that has reached the security layer; refuse rather than
+                // risk escaping the anchor (see the boundary normalization).
                 Component::ParentDir | Component::Prefix(_) => {
                     return Err(PinError::Io(io::Error::new(
                         ErrorKind::InvalidInput,
@@ -602,7 +612,12 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    // `..` in a runs-root path is refused rather than allowed to climb out.
+    // A `..` that reaches the security layer is still refused (fail-closed):
+    // the walk can never honour a parent traversal without escaping its pinned
+    // anchor. The pre-hardening `--runs-dir ../runs` behaviour is preserved at
+    // the CLI boundary (`main::normalize_runs_dir`), which folds `..`
+    // lexically before the path gets here — so this rejection only fires for a
+    // `..` that slipped past the boundary, never for a legitimate runs dir.
     #[test]
     fn create_root_nofollow_rejects_parent_component() {
         let base = scratch_root("create-parent");
@@ -611,6 +626,36 @@ mod tests {
             .err()
             .expect("a `..` component must be rejected");
         assert!(matches!(err, PinError::Io(_)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The OTHER half of the parent-traversal contract: once the CLI boundary
+    // (`main::normalize_runs_dir`) has folded `..` lexically, the resulting
+    // `..`-free path — e.g. `--runs-dir ../runs` → `<parent>/runs` — must
+    // establish cleanly through the pinned walk. This is the regression test
+    // for "Linux rejects parent-traversal runs directories": the normalized
+    // form of a parent-traversal runs dir is accepted on Linux exactly as the
+    // non-Linux `create_dir_all` fallback accepts the raw form.
+    #[test]
+    fn create_root_nofollow_accepts_normalized_parent_traversal_target() {
+        let base = scratch_root("create-parent-ok");
+        // `--runs-dir <base>/sub/../runs` normalizes lexically to
+        // `<base>/runs` (the `sub` component is cancelled by `..` before the
+        // path reaches this layer). Establish THAT.
+        let normalized = base.join("runs");
+        let handle = DirHandle::create_root_nofollow(&normalized)
+            .expect("a normalized parent-traversal target must establish");
+        assert!(normalized.is_dir(), "the runs root must be created");
+        // The pinned handle operates on the real leaf.
+        handle
+            .mkdirat_ignore_existing(OsStr::new("job"), 0o700)
+            .expect("mkdir through the pinned leaf");
+        assert!(normalized.join("job").is_dir());
+        // And crucially the cancelled `sub` was never created.
+        assert!(
+            !base.join("sub").exists(),
+            "the cancelled `..` component must not be materialised"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 

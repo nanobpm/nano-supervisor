@@ -25,7 +25,7 @@ mod slot;
 mod state;
 mod work;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -199,7 +199,10 @@ async fn main() -> Result<()> {
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 clone_timeout: Duration::from_millis(clone_timeout),
-                runs_dir,
+                runs_dir: match runs_dir {
+                    Some(d) => Some(normalize_runs_dir(&d)?),
+                    None => None,
+                },
                 config_path: config,
                 max_jobs,
                 keep_runs,
@@ -232,7 +235,10 @@ async fn main() -> Result<()> {
                 idle_timeout: Duration::from_millis(idle_timeout),
                 poll_timeout: Duration::from_millis(poll_timeout),
                 clone_timeout: Duration::from_millis(clone_timeout),
-                runs_dir: runs_dir.unwrap_or_else(default_runs_dir),
+                runs_dir: match runs_dir {
+                    Some(d) => normalize_runs_dir(&d)?,
+                    None => default_runs_dir(),
+                },
                 config_path: config,
             };
             daemon::run(opts).await
@@ -268,6 +274,43 @@ fn default_runs_dir() -> PathBuf {
         return PathBuf::from(home).join(".local/state/nano-supervisor/runs");
     }
     std::env::temp_dir().join(format!("nano-supervisor-runs-{}", current_user_id()))
+}
+
+/// Lexically normalize `.` and `..` in an operator-supplied `--runs-dir`,
+/// WITHOUT touching the filesystem (no symlink is followed — that resolution
+/// stays with the no-follow walk / path checks downstream). This preserves the
+/// pre-hardening behaviour the non-Linux `create_dir_all` fallback still has —
+/// `--runs-dir ../runs` resolves against the operator's cwd — which the Linux
+/// pinned-handle walk (`saferoot::DirHandle::create_root_nofollow`) otherwise
+/// rejects outright, since it refuses any `..` component to guarantee the walk
+/// can never climb out of its pinned anchor. Resolving the parent traversal
+/// lexically here hands the walk an equivalent path with no `..`, so the daemon
+/// and `work` accept the same runs-dir on every platform instead of failing
+/// only on Linux.
+///
+/// A relative path stays relative (`.`/`..` still resolve against the cwd at
+/// use time, exactly as the fallback treated them); only the infix `.`/`..`
+/// are folded. A `..` that would climb above the base (a leading `..` on a
+/// relative path, or past `/` on an absolute one) is rejected rather than
+/// silently clamped, so an operator mistake surfaces as a clear error instead
+/// of a surprising location.
+fn normalize_runs_dir(path: &Path) -> Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(anyhow::anyhow!(
+                        "--runs-dir {} climbs above its base with `..`",
+                        path.display()
+                    ));
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Ok(out)
 }
 
 /// Per-user discriminator for the fallback temp runs root. `libc` is a Unix-only
@@ -314,7 +357,8 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_recovery_window, MIN_RECOVERY_WINDOW};
+    use super::{clamp_recovery_window, normalize_runs_dir, MIN_RECOVERY_WINDOW};
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     #[test]
@@ -329,5 +373,53 @@ mod tests {
             clamp_recovery_window(300_000),
             Duration::from_millis(300_000)
         );
+    }
+
+    // `--runs-dir ../runs` must keep working on Linux: the parent traversal is
+    // folded lexically at the CLI boundary so the pinned-handle walk (which
+    // refuses `..`) receives an equivalent path with no `..`. This mirrors the
+    // non-Linux `create_dir_all` fallback, which always honoured it.
+    #[test]
+    fn normalize_runs_dir_folds_parent_traversal() {
+        assert_eq!(
+            normalize_runs_dir(Path::new("/a/b/../runs")).unwrap(),
+            PathBuf::from("/a/runs")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("sub/../runs")).unwrap(),
+            PathBuf::from("runs")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("/a/./b/./runs")).unwrap(),
+            PathBuf::from("/a/b/runs")
+        );
+        // Nested parents: `/a/b/c/../../runs` → `/a/runs`.
+        assert_eq!(
+            normalize_runs_dir(Path::new("/a/b/c/../../runs")).unwrap(),
+            PathBuf::from("/a/runs")
+        );
+    }
+
+    // A path with no `.`/`..` is returned unchanged (the common case).
+    #[test]
+    fn normalize_runs_dir_passes_plain_paths_through() {
+        assert_eq!(
+            normalize_runs_dir(Path::new("/var/lib/runs")).unwrap(),
+            PathBuf::from("/var/lib/runs")
+        );
+        assert_eq!(
+            normalize_runs_dir(Path::new("runs")).unwrap(),
+            PathBuf::from("runs")
+        );
+    }
+
+    // A `..` that climbs above the base is rejected, not silently clamped:
+    // `/../x` would escape `/`, and a leading `../x` would climb above the cwd
+    // — both surface as a clear operator error rather than a surprise location.
+    #[test]
+    fn normalize_runs_dir_rejects_climbing_above_base() {
+        assert!(normalize_runs_dir(Path::new("/../x")).is_err());
+        assert!(normalize_runs_dir(Path::new("../x")).is_err());
+        assert!(normalize_runs_dir(Path::new("a/../../x")).is_err());
     }
 }
