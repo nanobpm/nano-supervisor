@@ -293,40 +293,67 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
 /// *through its pinned parent*, so no component swapped to a symlink after it was
 /// triaged can redirect the scrub outside the checkout. `display` is the root's
 /// path, used only to build human-readable error context.
+///
+/// Two hardening properties shape the walk:
+///
+/// * **Strict enumeration.** Each directory is listed with
+///   [`DirHandle::entry_names_strict`], which surfaces a mid-stream `readdir`
+///   error as `Err` instead of silently treating it as end-of-directory. A
+///   partial listing would otherwise be returned as `Ok`, letting the scrub
+///   report success while an unenumerated `config` keeps its credentials — so
+///   here a read error fails the whole scrub (and the caller then refuses to
+///   hand out the checkout) rather than risk a missed credential.
+///
+/// * **Depth-bounded descriptors.** The walk is depth-first and holds open only
+///   the current ancestry chain: a subdirectory's handle is opened, its subtree
+///   fully processed, and the handle dropped *before* the next sibling is
+///   opened. Sibling entries are carried by name, not by handle, so the number
+///   of open directory descriptors is bounded by the tree's depth rather than
+///   its width — a wide `.git/modules` (many sibling submodules) cannot exhaust
+///   `RLIMIT_NOFILE`/`EMFILE`.
 #[cfg(target_os = "linux")]
 fn scrub_config_tree_pinned(root: crate::saferoot::DirHandle, display: &Path) -> Result<()> {
-    let mut stack = vec![(root, display.to_path_buf())];
-    while let Some((dir, dir_path)) = stack.pop() {
-        let names = dir
-            .entry_names()
-            .with_context(|| format!("reading {}", dir_path.display()))?;
-        for name in names {
-            let path = dir_path.join(&name);
-            let meta = match dir.symlink_metadata(&name) {
-                Ok(m) => m,
+    scrub_config_dir_pinned(&root, display)
+}
+
+/// Depth-first worker for [`scrub_config_tree_pinned`]: scrubs `dir`'s own
+/// `config` leaf, then recurses into each subdirectory in turn. `dir`'s handle
+/// stays open for the whole call and is dropped when it returns, so at any
+/// moment only the handles along the current ancestor chain are open.
+#[cfg(target_os = "linux")]
+fn scrub_config_dir_pinned(dir: &crate::saferoot::DirHandle, dir_path: &Path) -> Result<()> {
+    let names = dir
+        .entry_names_strict()
+        .with_context(|| format!("reading {}", dir_path.display()))?;
+    for name in names {
+        let path = dir_path.join(&name);
+        let meta = match dir.symlink_metadata(&name) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+        };
+        // A symlinked entry is never traversed or opened: skip it so the
+        // scrub can never be redirected outside the pinned tree.
+        if meta.is_symlink {
+            continue;
+        }
+        if meta.is_dir {
+            match dir.open_child_dir(&name) {
+                // Descend with the child's handle held; it is dropped (closing
+                // the fd) when this recursion returns, before the next sibling
+                // is opened — so open fds track depth, not breadth.
+                Ok(child) => scrub_config_dir_pinned(&child, &path)?,
+                // Swapped to a symlink after the stat: skip, never follow.
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
-            };
-            // A symlinked entry is never traversed or opened: skip it so the
-            // scrub can never be redirected outside the pinned tree.
-            if meta.is_symlink {
-                continue;
+                Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
             }
-            if meta.is_dir {
-                match dir.open_child_dir(&name) {
-                    Ok(child) => stack.push((child, path)),
-                    // Swapped to a symlink after the stat: skip, never follow.
-                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-                }
-            } else if name == "config" {
-                match dir.open_child_file_rw_nofollow(&name) {
-                    Ok(file) => scrub_open_file(file, &path)?,
-                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-                }
+        } else if name == "config" {
+            match dir.open_child_file_rw_nofollow(&name) {
+                Ok(file) => scrub_open_file(file, &path)?,
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
             }
         }
     }
@@ -1082,6 +1109,79 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(all(unix, target_os = "linux"))]
+    fn submodule_scrub_refuses_config_swapped_to_symlink_after_triage() {
+        // The post-triage symlink-swap race the pinned walk closes: a `config`
+        // leaf that is a regular file when the walker stats it but is swapped
+        // for a symlink (to a credential-bearing file OUTSIDE the checkout)
+        // before its relative open must be REFUSED (`ELOOP`) — the scrub leaves
+        // the outside target byte-for-byte untouched. The pre-hardening
+        // `file_type()`-then-open-by-path walker would follow the link and
+        // rewrite the target; the pinned no-follow open must not.
+        let tmp = std::env::temp_dir().join(format!("nano-sub-swap-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("nano-sub-swapout-{}", std::process::id()));
+        let modules = tmp.join(".git").join("modules");
+        let sub = modules.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
+
+        // The out-of-checkout config the swapped symlink points at (must be
+        // left untouched).
+        let outside_cfg = outside.join("config");
+        std::fs::write(
+            &outside_cfg,
+            format!("[remote \"origin\"]\n\turl = https://{token}@h-out/o/r.git\n"),
+        )
+        .unwrap();
+
+        // Triage sees a real, credential-free `config` regular file...
+        let leaf = sub.join("config");
+        std::fs::write(&leaf, "[remote \"origin\"]\n\turl = https://h/o/r.git\n").unwrap();
+        // ...which the attacker swaps for a symlink to the outside config
+        // before the walker's relative open.
+        std::fs::remove_file(&leaf).unwrap();
+        std::os::unix::fs::symlink(&outside_cfg, &leaf).unwrap();
+
+        // The scrub must not follow the swapped symlink: it either skips the
+        // entry (ELOOP) or fails outright, but never rewrites the target.
+        let _ = scrub_submodule_config_credentials(&tmp);
+
+        let out = std::fs::read_to_string(&outside_cfg).unwrap();
+        assert!(
+            out.contains("s3cr3tPAT"),
+            "the scrub must not follow a post-triage symlink swap out of the checkout"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(all(unix, target_os = "linux"))]
+    fn submodule_scrub_wide_tree_does_not_exhaust_fds() {
+        // Many sibling submodules (wide .git/modules): the depth-bounded walk
+        // must scrub every config without holding one fd per sibling.
+        let tmp = std::env::temp_dir().join(format!("nano-sub-wide-{}", std::process::id()));
+        let modules = tmp.join(".git").join("modules");
+        let token = format!("{}:{}", "x-access-token", "s3cr3tPAT");
+        let n = 200; // comfortably above a low RLIMIT_NOFILE per-sibling failure
+        let mut cfgs = Vec::new();
+        for i in 0..n {
+            let d = modules.join(format!("sub{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            let c = d.join("config");
+            std::fs::write(&c, format!("[remote \"origin\"]\n\turl = https://{token}@h/o/r{i}.git\n")).unwrap();
+            cfgs.push(c);
+        }
+        scrub_submodule_config_credentials(&tmp).expect("wide tree scrubs without EMFILE");
+        for c in &cfgs {
+            let got = std::fs::read_to_string(c).unwrap();
+            assert!(!got.contains("s3cr3tPAT"), "every wide-tree config scrubbed: {c:?}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
