@@ -1619,14 +1619,47 @@ fn detect_commits(before: Option<&str>, after: Option<&str>, provisioned: bool) 
     }
 }
 
+/// Fallback "the run dir holds agent work" decision when finalize reported no
+/// enumerated `commits`. `retain` (finalize's incomplete/failed-scan signal) and
+/// `work_found` (stranded work the enumeration deliberately cleared) EACH mean
+/// the job-keyed run dir may hold the ONLY copy of agent work even though the
+/// checkout HEAD never moved (`head_has_commits` false). Either one must make the
+/// run count as having commits, so a retained/stranded result is never misread as
+/// empty and failed — a failure retries the job and the retry wipes the run dir,
+/// destroying the very work `retain`/`work_found` was protecting (e.g. finalize
+/// returns `retain=true, commits=[], work_found=false` after an inconclusive
+/// branch/reflog scan).
+fn retained_result_counts_as_commits(
+    retain: bool,
+    work_found: bool,
+    head_has_commits: bool,
+) -> bool {
+    retain || work_found || head_has_commits
+}
+
 /// Whether a successfully-completed run's directory may be reaped. A provisioned
-/// checkout that advanced HEAD (`has_commits`) holds commits that — absent a
-/// finalize/push stage — live ONLY in the run dir, so reaping would destroy the
-/// single copy of work the job just reported successful. Retain those (they are
-/// aged out later by `sweep_stale_runs`); reap everything else (non-repository
-/// runs and provisioned runs that made no commit).
-fn may_reap_completed_run(provisioned: bool, has_commits: bool) -> bool {
-    !(provisioned && has_commits)
+/// checkout that advanced HEAD (`has_commits`) whose commits were NOT pushed
+/// (`!pushed`) holds work that lives ONLY in the run dir, so reaping would
+/// destroy the single copy of work the job just reported successful. Retain
+/// those (they are aged out later by `sweep_stale_runs`); reap everything else —
+/// non-repository runs, provisioned runs that made no commit, and provisioned
+/// runs whose commits finalize PUSHED to the origin (durable off-box).
+///
+/// `retained` is finalize's explicit stranded-work/incomplete-scan signal
+/// ([`crate::provision::GitResult::retain`]). It forces retention INDEPENDENTLY
+/// of the HEAD compare: a side-branch/detached commit that is then abandoned
+/// leaves the final HEAD unchanged (so `has_commits` reads false) while the only
+/// copy of that work sits in the run dir — the HEAD compare alone would reap it.
+fn may_reap_completed_run(
+    provisioned: bool,
+    has_commits: bool,
+    pushed: bool,
+    retained: bool,
+) -> bool {
+    if retained {
+        return false;
+    }
+    !(provisioned && has_commits && !pushed)
 }
 
 async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
@@ -1692,7 +1725,22 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let prepared = PreparedRun {
         cwd: prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?,
     };
-    let agent_cwd = match &env.repository {
+    // The `branch` envelope's base/create/push selection, parsed once so the
+    // pre-agent work-branch cut and the post-agent finalize agree on it.
+    let branch_cfg = env.normalized.get("branch").and_then(|v| v.as_object());
+    let branch_base = branch_cfg
+        .and_then(|b| b.get("base"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let branch_create = branch_cfg
+        .and_then(|b| b.get("create"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let branch_push = branch_cfg
+        .and_then(|b| b.get("push"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let (agent_cwd, git_prep) = match &env.repository {
         Some(repo) => {
             log(&format!(
                 "job {key}: cloning {} ({})",
@@ -1703,19 +1751,49 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // git step; carry THAT exact inode into the agent/HEAD launches
             // rather than reopening `repo` by name (which a same-UID actor could
             // swap between the opens) (#35).
-            crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
+            let cwd = crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
                 .await
-                .context("provisioning repository")?
+                .context("provisioning repository")?;
+            // Cut the work branch the agent commits onto BEFORE it runs, so
+            // finalize has a pushable branch (never the shared base).
+            //
+            // The fallback-branch suffix must be unique PER ACTIVATION, not per
+            // job: the job `key` is stable across redelivery, so if this push
+            // lands but the lease is lost before completion, the retry
+            // wipes/reclones, regenerates the SAME fallback name from the base,
+            // and its later push is rejected non-fast-forward against the first
+            // attempt's branch. A fresh per-activation id makes each attempt's
+            // fallback distinct. `key` stays the job/run-directory identity.
+            let activation = format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let prep = crate::provision::prepare_work_branch(
+                &cwd,
+                repo,
+                branch_base.as_deref(),
+                branch_create.as_deref(),
+                branch_push,
+                &activation,
+                cfg.clone_timeout,
+            )
+            .await;
+            (cwd, Some(prep))
         }
         None => {
             // No repository: the agent and HEAD probes run in the run dir
             // itself. Dup the pinned handle fallibly — a dup failure (e.g.
             // descriptor exhaustion, EMFILE) must surface as a normal job
             // error here, not a worker-crashing panic from `Clone`.
-            prepared
+            let cwd = prepared
                 .agent_cwd()
                 .try_clone()
-                .context("dup the pinned run-dir handle")?
+                .context("dup the pinned run-dir handle")?;
+            (cwd, None)
         }
     };
     // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
@@ -1835,20 +1913,42 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let name = &cfg.hire.name;
     let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
 
+    // Git finalize: enumerate the agent's commits on the work branch and push
+    // it to the fallback `nano/agent-work/...` branch (the agent opened no PR of
+    // its own). Only on a clean agent run — a failed run is retried, so its
+    // partial work must not be published. `None` for an unprovisioned run (no
+    // `gitResult`, so no branch/commits/pushed completion variables).
+    let git_result = match (env.repository.as_ref(), git_prep.as_ref()) {
+        (Some(repo), Some(prep)) if run.ok => {
+            Some(crate::provision::finalize_git(&agent_cwd, prep, repo, cfg.clone_timeout).await)
+        }
+        _ => None,
+    };
+
     // Node's `gitResult.commits.length > 0` / `pushed === true` empty-detection
     // signals. A repository agent that advanced the checkout HEAD committed
     // real work, so it is NOT empty even with no stdout/result; failing it
-    // would burn a retry. No `finalizeGit` push stage exists yet, so
-    // `pushed` is always false here. A newly PROVISIONED repository starts
-    // with no baseline HEAD (`start_head` is `None`), so the agent's FIRST
-    // commit yields `(None, Some(after))` — treat that appearance of HEAD as
-    // a commit too (Node's non-empty `gitResult.commits`), or a quiet pipe
-    // agent that made its first commit would be misread as empty and
-    // retried. A NON-repository run dir (no checkout) reads `None`/`None`
-    // and stays "no commits". Computed once here: it both drives empty-detection
-    // AND gates reaping (a provisioned checkout that advanced HEAD holds commits
-    // that, absent a push stage, exist ONLY in the run dir).
+    // would burn a retry. When finalize ran, its commit enumeration is
+    // authoritative ONLY when it found commits: a rev-list failure (or a
+    // >1 MiB stdout-tail truncation inside `git()`) also reads as an empty
+    // list, so an empty enumeration falls back to the pre/post HEAD compare
+    // rather than condemning a quiet committing agent as an empty run. A
+    // NON-repository run dir reads "no commits".
     let provisioned = env.repository.is_some();
+    let pushed = git_result.as_ref().is_some_and(|g| g.pushed);
+    // Finalize's explicit stranded-work / incomplete-scan signal. When set, the
+    // run dir may hold the only copy of agent work (a side-branch/detached
+    // commit, or a scan that failed open), so it must be retained regardless of
+    // what the pre/post HEAD compare concludes about `has_commits`.
+    let retain = git_result.as_ref().is_some_and(|g| g.retain);
+    // Finalize's "real work exists" signal, DISTINCT from `retain` (incomplete
+    // scan) and from `commits` (which the stranded-work paths deliberately
+    // clear). A quiet commit-only run that strands work on a side branch or a
+    // detached HEAD leaves the final HEAD unchanged AND `commits` empty, so
+    // neither the enumeration nor the pre/post HEAD compare would see it — and
+    // the empty-job detector would fail the run as "empty", its retry wiping the
+    // job-keyed dir that holds the only copy. Treat `work_found` as commits.
+    let work_found = git_result.as_ref().is_some_and(|g| g.work_found);
     // The post-run HEAD probe is best-effort too: dup the pinned handle
     // fallibly so a dup failure (EMFILE) reads as `None` ("HEAD unreadable"),
     // not a `Clone` panic — mirroring `start_head` above.
@@ -1856,7 +1956,25 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Ok(cwd) => git_head_blocking(cwd).await,
         Err(_) => None,
     };
-    let has_commits = detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned);
+    let has_commits = match &git_result {
+        Some(g) if !g.commits.is_empty() => true,
+        _ => {
+            // `retain` (an incomplete/failed scan) and `work_found` (stranded
+            // work the enumeration deliberately cleared) each mean the run dir
+            // may hold the ONLY copy of agent work, even with `commits` empty and
+            // the checkout HEAD unchanged. Treat BOTH as "has commits" so a
+            // retained result cannot fall through to the empty-result path below:
+            // failing it there would retry the job, and the retry wipes the
+            // job-keyed run dir — destroying the very work `retain` was protecting
+            // (e.g. finalize returns `retain=true, commits=[], work_found=false`
+            // after a branch/reflog scan failed inconclusively).
+            retained_result_counts_as_commits(
+                retain,
+                work_found,
+                detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned),
+            )
+        }
+    };
 
     let settle = if !run.ok {
         let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {
@@ -1872,7 +1990,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         &run.stdout,
         run.has_turns,
         has_commits,
-        false,
+        pushed,
         run.acp_outcome.is_some(),
     ) {
         Settle::Fail {
@@ -1895,6 +2013,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         vars.insert("exitCode".into(), json!(0));
         vars.insert("agent".into(), json!(name));
         vars.insert("truncated".into(), json!(run.truncated));
+        // Surface the finalize outcome (`gitResult`) as completion variables,
+        // mirroring the Node plugin's `branch`/`commits`/`pushed`/`pullRequest`.
+        if let Some(g) = &git_result {
+            vars.insert("branch".into(), json!(g.branch));
+            vars.insert("commits".into(), json!(g.commits));
+            vars.insert("pushed".into(), json!(g.pushed));
+            vars.insert("pullRequest".into(), g.pr.clone().unwrap_or(Value::Null));
+        }
         Settle::Complete(vars)
     };
 
@@ -1904,19 +2030,20 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // dispatched to the blocking pool so a large checkout removal cannot stall
     // the executor and starve the lease refresher before `complete_job` lands.
     //
-    // DO NOT reap a provisioned checkout that advanced HEAD: with no
-    // finalize/push stage those commits are not durable — they live ONLY in this
-    // run dir, so deleting it would destroy the single copy of work the job just
-    // reported successful. Retain such a run (like a failed one) for recovery;
-    // `sweep_stale_runs` ages it out later on the normal cadence.
+    // DO NOT reap a provisioned checkout whose commits were not pushed: those
+    // commits are not durable — they live ONLY in this run dir, so deleting it
+    // would destroy the single copy of work the job just reported successful.
+    // `retain` (finalize's stranded-work/incomplete-scan signal) also forces
+    // retention independently of the HEAD compare. Retain such a run (like a
+    // failed one) for recovery; `sweep_stale_runs` ages it out on the cadence.
     if matches!(settle, Settle::Complete(_)) && !cfg.keep_runs {
-        if may_reap_completed_run(provisioned, has_commits) {
+        if may_reap_completed_run(provisioned, has_commits, pushed, retain) {
             reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
         } else {
             log(&format!(
-                "job {key}: retaining run dir {} — provisioned checkout advanced HEAD but the \
-                 worker has no finalize/push stage, so its commits are not durable; reaping would \
-                 delete their only copy (aged out later by sweep_stale_runs)",
+                "job {key}: retaining run dir {} — provisioned checkout holds commits that were \
+                 not pushed (or finalize flagged stranded/incomplete work), so they are not \
+                 durable; reaping would delete their only copy (aged out later by sweep_stale_runs)",
                 run_dir.display()
             ));
         }
@@ -3900,16 +4027,49 @@ mod tests {
     }
 
     #[test]
+    fn retained_or_stranded_result_counts_as_commits() {
+        // The HEAD compare says "no commit" (checkout unchanged) and finalize
+        // enumerated no pushable commits — but an inconclusive/incomplete scan
+        // (`retain`) or stranded work the enumeration cleared (`work_found`) each
+        // mean the run dir may hold the ONLY copy of agent work. Either flag alone
+        // MUST make the run count as having commits so it is never failed as empty
+        // and retried (the retry wipes the job-keyed run dir).
+        assert!(retained_result_counts_as_commits(true, false, false));
+        assert!(retained_result_counts_as_commits(false, true, false));
+        // A genuinely empty run — no retain, no stranded work, HEAD unmoved — is
+        // still correctly "no commits" so the empty detector can fail it.
+        assert!(!retained_result_counts_as_commits(false, false, false));
+        // A moved HEAD counts regardless of the finalize flags.
+        assert!(retained_result_counts_as_commits(false, false, true));
+    }
+
+    #[test]
     fn provisioned_commits_are_retained_not_reaped() {
-        // A provisioned checkout that advanced HEAD holds commits that — with no
-        // finalize/push stage — live ONLY in the run dir, so a successful run
-        // must NOT reap it (that would destroy the sole copy).
-        assert!(!may_reap_completed_run(true, true));
+        // A provisioned checkout that advanced HEAD whose commits were NOT pushed
+        // lives ONLY in the run dir, so a successful run must NOT reap it (that
+        // would destroy the sole copy).
+        assert!(!may_reap_completed_run(true, true, false, false));
+        // Once finalize PUSHED those commits they are durable off-box, so the run
+        // dir reaps normally.
+        assert!(may_reap_completed_run(true, true, true, false));
         // A provisioned run that made no commit has nothing durable to lose.
-        assert!(may_reap_completed_run(true, false));
+        assert!(may_reap_completed_run(true, false, false, false));
         // A non-repository run never holds commits, so it is always reapable.
-        assert!(may_reap_completed_run(false, false));
-        assert!(may_reap_completed_run(false, true));
+        assert!(may_reap_completed_run(false, false, false, false));
+        assert!(may_reap_completed_run(false, true, false, false));
+    }
+
+    #[test]
+    fn finalize_retain_flag_forces_retention() {
+        // `retain` is finalize's stranded-work / incomplete-scan signal. It must
+        // force retention INDEPENDENTLY of the HEAD compare: a side-branch or
+        // detached commit that is then abandoned leaves the final HEAD unchanged
+        // (so `has_commits` reads false) while the only copy of that work sits in
+        // the run dir — the HEAD compare alone would reap it.
+        assert!(!may_reap_completed_run(true, false, false, true));
+        assert!(!may_reap_completed_run(true, true, false, true));
+        // Even a pushed run is retained when finalize flagged an incomplete scan.
+        assert!(!may_reap_completed_run(true, true, true, true));
     }
 
     #[cfg(unix)]

@@ -306,9 +306,10 @@ fn stdout_stripped_of_empty_result(stdout: &str) -> String {
 /// `has_commits` / `has_pushed` are the plugin's `gitResult.commits.length > 0`
 /// and `gitResult.pushed === true` signals: a repository agent that commits or
 /// pushes real work but emits no stdout/result is NOT empty and must complete,
-/// not be failed into a retry. The Rust worker has no `finalizeGit` push stage
-/// yet, so the caller derives `has_commits` from a pre/post `rev-parse` of the
-/// checkout HEAD (any advance = a commit) and passes `has_pushed: false`.
+/// not be failed into a retry. The caller feeds the finalize stage's commit
+/// enumeration and pushed flag, falling back to a pre/post `rev-parse` of the
+/// checkout HEAD (any advance = a commit) when finalize did not run or
+/// enumerated nothing.
 ///
 /// `has_outcome` is the plugin's ACP-outcome signal: an agent that emitted an
 /// explicit prompt outcome (e.g. `blocked`) did work and reported it, so the run
