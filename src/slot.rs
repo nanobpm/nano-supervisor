@@ -64,6 +64,14 @@ pub struct SlotConfig {
     pub propagate_job_panic: bool,
     /// Keep per-job run directories instead of reaping them (`--keep-runs`).
     pub keep_runs: bool,
+    /// The connection this worker is pinned to (issue #41), used to seed every
+    /// agent's isolated c8ctl config dir: the agent's own `c8` commands see
+    /// exactly the job's engine and nothing else, and its `c8 use profile`
+    /// writes stay inside the run directory.
+    pub connection: crate::pin::ConnectionPin,
+    /// The pinned connection fully resolved, when it names a c8ctl profile —
+    /// the seed content for the agent's isolated `profiles.json`.
+    pub connection_profile: Option<crate::profile::Profile>,
 }
 
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
@@ -2144,6 +2152,10 @@ fn build_agent_env(
     env.push(("NANO_AGENT_NAME".into(), cfg.worker_name.clone()));
     // MVP: the agentic visibility channel is off (host sandbox only).
     env.push(("NANO_AGENTIC".into(), "off".into()));
+    // Issue #40's marker: this process tree is an agent run, so a supervisor an
+    // agent tries to start can refuse to daemonise (and a sweep can tell an
+    // agent-owned subtree from the operator's fleet).
+    env.push(("NANO_AGENT_RUN".into(), key.to_string()));
     env.push((
         "AGENT_RESULT_FILE".into(),
         result_file.to_string_lossy().into_owned(),
@@ -2153,7 +2165,85 @@ fn build_agent_env(
     env.push(("AGENT_MODEL".into(), cfg.hire.model.clone()));
     env.push(("AGENT_CAPABILITIES".into(), cfg.hire.capabilities.join(",")));
     env.push(("AGENT_JOB_TYPE".into(), job.r#type.clone()));
+    // Issue #41, proposal 3: quarantine the agent's c8ctl session. Agents run
+    // as the same OS user as the operator, so an agent's `c8 use profile`
+    // otherwise rewrites the operator's global `~/.config/c8ctl/session.json`
+    // and the next supervisor/worker start follows it onto a different engine.
+    // Point the agent at an isolated per-run config dir, seeded with exactly
+    // the pinned connection, so its profile changes stay inside the run and
+    // its own `c8` commands see only the job's engine.
+    if let Some(dir) = seed_agent_c8ctl_dir(cfg, result_file) {
+        env.push((
+            "C8CTL_CONFIG_DIR".into(),
+            dir.to_string_lossy().into_owned(),
+        ));
+    }
     env
+}
+
+/// Seed the per-run isolated c8ctl config dir (`<run dir>/c8ctl`) from the
+/// worker's pinned connection: a `session.json` whose `activeProfile` is the
+/// pinned profile and a `profiles.json` carrying only that profile, both
+/// written `0600`. Returns the dir to export as `C8CTL_CONFIG_DIR`, or `None`
+/// when the pin carries no c8ctl profile (a `CAMUNDA_*`-env connection has no
+/// profile files to seed — the agent's c8ctl then starts empty and its writes
+/// still stay inside the run dir).
+///
+/// The dir is derived from `result_file` (`<run dir>/result.json` → its parent
+/// is the run dir) so the env builder stays pure for its unit tests — the seed
+/// is best-effort: a seeding failure logs and skips the override rather than
+/// failing the job, because the run dir was just prepared owner-only and a
+/// failure here means something is already very wrong with it.
+fn seed_agent_c8ctl_dir(cfg: &SlotConfig, result_file: &std::path::Path) -> Option<PathBuf> {
+    // Prefer the fully resolved profile; when the pin names one that no longer
+    // resolves (e.g. it was deleted after pinning), still seed the NAME with
+    // the pin's recorded baseUrl fingerprint, so the agent's `c8` sees the
+    // same engine identity the banner reported instead of nothing at all.
+    let profile = cfg.connection_profile.clone().or_else(|| {
+        cfg.connection.profile.clone().map(|name| crate::profile::Profile {
+            name,
+            base_url: cfg.connection.base_url.clone(),
+            ..Default::default()
+        })
+    })?;
+    let run_dir = result_file.parent()?.to_path_buf();
+    let dir = run_dir.join("c8ctl");
+    if let Err(e) = seed_c8ctl_dir(&dir, &profile) {
+        log(&format!(
+            "warning: could not seed the agent's isolated c8ctl config dir {}: {e:#} \
+             — the agent inherits the ambient c8ctl session for this job",
+            dir.display()
+        ));
+        return None;
+    }
+    Some(dir)
+}
+
+/// Write the isolated c8ctl config dir's two seed files. Split from
+/// [`seed_agent_c8ctl_dir`] so the contract test can drive it directly.
+pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating the agent's c8ctl config dir {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", dir.display()))?;
+    }
+    let session = serde_json::json!({ "activeProfile": profile.name });
+    let profiles = serde_json::json!({ "profiles": [profile] });
+    for (name, value) in [("session.json", session), ("profiles.json", profiles)] {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&value)?))
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2197,6 +2287,15 @@ mod tests {
             max_jobs: None,
             propagate_job_panic: false,
             keep_runs: false,
+            connection: crate::pin::ConnectionPin {
+                profile: Some("merlin".into()),
+                base_url: Some("http://merlin:8080".into()),
+            },
+            connection_profile: Some(crate::profile::Profile {
+                name: "merlin".into(),
+                base_url: Some("http://merlin:8080".into()),
+                ..Default::default()
+            }),
         }
     }
 

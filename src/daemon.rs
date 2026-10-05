@@ -16,6 +16,7 @@ use anyhow::{bail, Result};
 use tokio::sync::watch;
 
 use crate::engine;
+use crate::pin;
 use crate::runtime::log;
 use crate::slot::{self, SlotConfig};
 use crate::state::{self, Hire, Protocol};
@@ -69,7 +70,36 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         bail!("no hires matched --hire {:?}", opts.only);
     }
 
-    let (_profile, jobs) = engine::connect(opts.profile.as_deref())?;
+    // Issue #41: pin the connection. Resolve the profile ONCE (explicit
+    // `--profile`, else the pin this state home recorded, else the current
+    // active profile) and persist the choice in `supervisor.json`, so a later
+    // `c8 use profile` — by an agent or an operator — can never silently
+    // retarget this daemon's fleet on its next start.
+    let state_home = state::state_home().ok_or_else(|| {
+        anyhow::anyhow!("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
+    })?;
+    let decision = pin::resolve_or_pin(&state_home, opts.profile.as_deref())?;
+    let engine_desc = decision.pin.describe();
+    if decision.created {
+        log(&format!(
+            "pinned the connection in {}: engine: {engine_desc}",
+            pin::state_file(&state_home).display()
+        ));
+    }
+    pin::warn_if_drifted(&decision);
+    // The console header names the engine loudly: the incident's only clue was
+    // buried in per-worker logs, so the daemon's own startup output now leads
+    // with the engine it is about to serve.
+    log(&format!("engine: {engine_desc}"));
+
+    // Every slot of this daemon connects through the PINNED profile — never
+    // the ambient session — so a moved active profile cannot split the fleet.
+    let pinned_name = decision.pin.profile.clone();
+    let all_types: Vec<String> = selected
+        .iter()
+        .flat_map(|h| state::job_type_matrix(&h.rank, &h.capabilities))
+        .collect();
+    let (_profile, jobs) = engine::connect(pinned_name.as_deref(), &engine_desc, &all_types)?;
     let host = short_hostname();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -101,6 +131,8 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 max_jobs: None,
                 propagate_job_panic: false,
                 keep_runs: false,
+                connection: decision.pin.clone(),
+                connection_profile: decision.profile.clone(),
             });
             handles.push(tokio::spawn(slot::run(
                 jobs.clone(),

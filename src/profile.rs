@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use camunda_orchestration_sdk::{CamundaClient, CamundaOptions};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
     pub name: String,
@@ -40,6 +40,16 @@ struct SessionFile {
 }
 
 pub fn c8ctl_config_dir() -> Option<PathBuf> {
+    // Issue #41: an explicit override wins first. The worker seeds every agent
+    // with an isolated per-run `C8CTL_CONFIG_DIR` so an agent's
+    // `c8 use profile` / `c8 profile add` lands inside its own run directory
+    // and can never rewrite the operator's global c8ctl session — which every
+    // supervisor/worker on the host would otherwise follow on its next start.
+    if let Some(dir) = std::env::var_os("C8CTL_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME")?;
         return Some(PathBuf::from(home).join("Library/Application Support/c8ctl"));
@@ -49,6 +59,18 @@ pub fn c8ctl_config_dir() -> Option<PathBuf> {
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
     Some(base.join("c8ctl"))
+}
+
+/// The name of c8ctl's currently active profile, if a session names one.
+/// Compared against the pinned connection to detect drift (issue #41): an
+/// agent's `c8 use profile` rewrites exactly this, so a mismatch after the
+/// fact is the observable signal that the ambient session moved.
+pub fn active_profile_name() -> Option<String> {
+    let dir = c8ctl_config_dir()?;
+    std::fs::read(dir.join("session.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
+        .and_then(|s| s.active_profile)
 }
 
 /// Pick the profile named `wanted`, else the session's active profile.
@@ -134,6 +156,32 @@ pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
         }
     }
     CamundaClient::new(opts).map_err(|e| anyhow::anyhow!("creating engine client: {e}"))
+}
+
+/// The engine base URL a connection resolved to, normalized the same way
+/// [`sdk_settings`] normalizes it for the SDK (trailing `/` and `/v2` stripped).
+/// Used as the connection *fingerprint* in the pinned state (issue #41): the
+/// supervisor records it next to the profile name so a later start can tell
+/// "same profile name, different engine" apart from "same engine". With no
+/// profile this is the ambient `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`.
+pub fn resolved_base_url(profile: Option<&Profile>) -> Option<String> {
+    if let Some(p) = profile {
+        if let Some(url) = &p.base_url {
+            let url = url.trim_end_matches('/');
+            let url = url.strip_suffix("/v2").unwrap_or(url);
+            return Some(url.to_string());
+        }
+    }
+    for key in ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"] {
+        if let Some(v) = std::env::var_os(key) {
+            let v = v.to_string_lossy().trim().trim_end_matches('/').to_string();
+            if !v.is_empty() {
+                let v = v.strip_suffix("/v2").unwrap_or(&v).to_string();
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

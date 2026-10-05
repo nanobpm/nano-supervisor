@@ -25,6 +25,27 @@ The two workers differ only in what they do when the engine issues **no** token:
 - `work` requests a lease too but, like the Node plugin, runs unfenced when the
   engine does not issue one.
 
+## The pinned connection (issue #41)
+
+The supervisor never follows c8ctl's **mutable active profile** more than once.
+On its first start, `daemon`/`work` resolves the connection — an explicit
+`--profile`, else the active profile, else the `CAMUNDA_*` env — and records it
+in `<state home>/supervisor.json` as `connection: {profile, baseUrl}` (the
+baseUrl is the fingerprint). Every later start of the same state home reuses
+the **pinned** profile, so an agent's (or anyone's) `c8 use profile` cannot
+retarget the fleet on its next restart; an explicit `--profile` re-pins. Both
+processes lead their startup output with `engine: <profile> (<baseUrl>)` and
+warn loudly when the session's active profile has drifted from the pin, or when
+the pinned profile's baseUrl no longer matches the fingerprint. A worker whose
+job types are all test-looking (`probe-*`/`ct-*`) logs a prominent warning
+naming the engine on its first live activation.
+
+Agents are quarantined from the operator's c8ctl session: every agent runs with
+`C8CTL_CONFIG_DIR` pointed at an isolated per-run dir (`<run dir>/c8ctl`),
+seeded with exactly the pinned connection, so an agent's `c8 use profile` /
+`c8 profile add` writes stay inside its run and the operator's
+`~/.config/c8ctl/session.json` is never touched.
+
 ## Contract tests
 
 `contract-tests/` is a black-box suite (issues #3/#4/#5) that pins the fleet

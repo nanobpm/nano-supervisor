@@ -17,8 +17,13 @@ handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
   `capabilities` expand to the job-type matrix (`rank`, `rank:cap`,
   `rank:cap1+cap2`).
 - **Connection** settings come from c8ctl profiles (`--profile`, else the active
-  profile, else `CAMUNDA_*` env). Job commands always use the
-  `camunda-orchestration-sdk` transport (the same one the Node plugin uses).
+  profile, else `CAMUNDA_*` env) — resolved **once** and **pinned** in
+  `<state home>/supervisor.json` (`connection: {profile, baseUrl}`, issue #41).
+  Every later start reuses the pin, so a moved `activeProfile` (e.g. an agent's
+  `c8 use profile`) can never silently retarget the fleet; drift between the
+  pin and the session is warned about loudly at startup, and the startup banner
+  names the engine (`engine: <profile> (<baseUrl>)`). Job commands always use
+  the `camunda-orchestration-sdk` transport (the same one the Node plugin uses).
   **Lease compatibility:** the daemon **leases by default** — the SDK speaks the
   Camunda 8.10 spec field names, so leasing needs an engine that returns the
   lease as `jobLeaseToken` (Nano engine ≥ v0.0.24 does; see `src/jobs.rs`). An

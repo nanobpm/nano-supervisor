@@ -10,7 +10,16 @@ use crate::profile::{self, Profile};
 /// Resolve a profile, log which connection it picked, and build the shared job
 /// client (the `camunda-orchestration-sdk` transport — the same one the Node
 /// plugin uses).
-pub fn connect(profile_name: Option<&str>) -> Result<(Option<Profile>, Jobs)> {
+///
+/// `engine_desc` is the pinned connection's `engine: <profile> (<baseUrl>)`
+/// banner identity (issue #41); `job_types` is the worker's served matrix, used
+/// by the sanity guard that warns when a worker only serves test-looking
+/// (`probe-*`/`ct-*`) types on a live engine.
+pub fn connect(
+    profile_name: Option<&str>,
+    engine_desc: &str,
+    job_types: &[String],
+) -> Result<(Option<Profile>, Jobs)> {
     let resolved = profile::resolve(profile_name)?;
     match &resolved {
         Some(p) => crate::runtime::log(&format!(
@@ -20,7 +29,8 @@ pub fn connect(profile_name: Option<&str>) -> Result<(Option<Profile>, Jobs)> {
         )),
         None => crate::runtime::log("no c8ctl profile; using CAMUNDA_* environment"),
     }
-    let jobs = build(resolved.as_ref())?;
+    let jobs =
+        build(resolved.as_ref())?.with_identity(engine_desc.to_string(), job_types.to_vec());
     Ok((resolved, jobs))
 }
 

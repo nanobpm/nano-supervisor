@@ -43,6 +43,16 @@ pub(crate) fn validate_job_key(key: &str) -> Result<()> {
 #[derive(Clone)]
 pub struct Jobs {
     client: Box<CamundaClient>,
+    /// The pinned engine identity (`engine: <profile> (<baseUrl>)`), carried so
+    /// the sanity guard can name the engine in its warning.
+    engine_desc: Option<String>,
+    /// The job-type prefixes that mark a throwaway contract-test engine
+    /// (issue #41): a worker whose whole matrix matches only these is almost
+    /// certainly pointed at a test cluster, so the first activation logs a
+    /// prominent warning naming the engine.
+    test_type_prefixes: Vec<String>,
+    /// Fires the sanity-guard warning at most once per worker process.
+    sanity_warned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Preserve an SDK error as a STRUCTURED [`anyhow`] link rather than flattening
@@ -97,7 +107,34 @@ impl Jobs {
     pub fn new(client: CamundaClient) -> Self {
         Jobs {
             client: Box::new(client),
+            engine_desc: None,
+            test_type_prefixes: Vec::new(),
+            sanity_warned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Attach the pinned engine identity and the worker's test-looking job-type
+    /// prefixes for the issue-#41 sanity guard (see [`Jobs::activate`]).
+    pub fn with_identity(self, engine_desc: String, test_type_prefixes: Vec<String>) -> Self {
+        Jobs {
+            engine_desc: Some(engine_desc),
+            test_type_prefixes,
+            ..self
+        }
+    }
+
+    /// True when every served job type looks like a throwaway test type — the
+    /// exact shape of the issue-#41 incident, where a retargeted fleet served a
+    /// stray engine's `probe-*`/`ct-*` jobs. A production hire's matrix
+    /// (`senior`, `senior:feature`, …) never matches, so this only fires for
+    /// workers whose whole purpose is test types (an explicit `--job-type`
+    /// selection, or a hire configured for them).
+    fn looks_like_test_engine(&self) -> bool {
+        !self.test_type_prefixes.is_empty()
+            && self
+                .test_type_prefixes
+                .iter()
+                .all(|t| t.starts_with("probe-") || t.starts_with("ct-"))
     }
 
     pub async fn activate(
@@ -116,6 +153,26 @@ impl Jobs {
             req.with_lease = Some(Some(true));
         }
         let r = self.client.activate_jobs(req).await.map_err(sdk_error)?;
+        // Sanity guard (issue #41, proposal 4): a worker that only serves
+        // test-looking job types and got a LIVE answer from its engine is very
+        // likely the retargeted-fleet incident — the only clue then was the
+        // worker log. Warn once, prominently, naming the engine URL, so the
+        // next retarget is diagnosable from the log instead of from burned
+        // tokens. The worker keeps running: a contract-test fleet is a
+        // legitimate configuration, so this must inform, never block.
+        if !r.jobs.is_empty()
+            && self.looks_like_test_engine()
+            && !self.sanity_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            crate::runtime::log(&format!(
+                "WARNING: worker {worker} is connected to {} but every job type it serves is \
+                 test-looking ({:?}); if this is not a throwaway test engine, the worker was \
+                 likely re-pointed by a changed c8ctl active profile — check the pinned \
+                 connection in supervisor.json (issue #41)",
+                self.engine_desc.as_deref().unwrap_or("the engine"),
+                self.test_type_prefixes
+            ));
+        }
         Ok(r.jobs
             .into_iter()
             .map(|j| {

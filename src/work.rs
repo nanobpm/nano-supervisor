@@ -17,6 +17,7 @@ use tokio::sync::watch;
 
 use crate::daemon::{short_hostname, validate, wait_for_signal};
 use crate::engine;
+use crate::pin;
 use crate::runtime::log;
 use crate::slot::{self, SlotConfig};
 use crate::state;
@@ -215,7 +216,35 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         })
     };
 
-    let (_profile, jobs) = engine::connect(opts.profile.as_deref())?;
+    // Issue #41: pin the connection exactly like the daemon does. A worker
+    // that re-resolved c8ctl's *mutable* active profile on every start is the
+    // incident's vector: one agent's `c8 use profile` moved the session, and
+    // the next-started workers silently followed it onto a stray test engine.
+    // The pin in `supervisor.json` makes the connection a recorded decision —
+    // an explicit `--profile` (re)pins; otherwise the existing pin wins over
+    // the ambient session; a first start pins what it resolved.
+    let state_home = state::state_home()
+        .unwrap_or_else(|| config_exit("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)"));
+    let decision = match pin::resolve_or_pin(&state_home, opts.profile.as_deref()) {
+        Ok(d) => d,
+        Err(e) => config_exit(&format!("cannot resolve the pinned connection: {e:#}")),
+    };
+    let engine_desc = decision.pin.describe();
+    if decision.created {
+        log(&format!(
+            "pinned the connection in {}: engine: {engine_desc}",
+            pin::state_file(&state_home).display()
+        ));
+    }
+    pin::warn_if_drifted(&decision);
+    // The worker's startup banner names the engine it is about to serve — the
+    // issue-#41 incident's only clue was a job-type line deep in the log.
+    log(&format!("engine: {engine_desc}"));
+    let pinned_name = decision.pin.profile.clone();
+    let (_profile, jobs) = match engine::connect(pinned_name.as_deref(), &engine_desc, &job_types) {
+        Ok(v) => v,
+        Err(e) => config_exit(&format!("cannot connect to the pinned engine: {e:#}")),
+    };
     let worker_name = opts.name.clone().unwrap_or_else(|| {
         // Node parity: the default worker name must be unique per `work`
         // PROCESS, not per (host, hire) — otherwise two concurrent workers on
@@ -247,6 +276,8 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         max_jobs: opts.max_jobs,
         propagate_job_panic: true,
         keep_runs: opts.keep_runs,
+        connection: decision.pin.clone(),
+        connection_profile: decision.profile.clone(),
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));
