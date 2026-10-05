@@ -390,8 +390,10 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
             anyhow::bail!(
                 "the pinned connection in supervisor.json has no recorded engine \
                  baseUrl fingerprint, so it cannot be enforced and would fall back \
-                 to the ambient connection — silently retargetable. Re-pin with \
-                 --profile or set an explicit engine address (issue #41)."
+                 to the ambient connection — silently retargetable. Setting an \
+                 engine address alone will NOT repair this pin (this check runs \
+                 before the environment is consulted): delete/reset the pin in \
+                 supervisor.json first, or re-pin with --profile (issue #41)."
             );
         }
     }
@@ -485,7 +487,9 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
     //    follows it because there is nothing stored to restore or compare. That
     //    is a pinned home that is still retargetable without an explicit re-pin.
     //    Require a resolvable engine URL so the pin can record a fingerprint.
-    if created && base_url.is_none() {
+    //    `resolved_base_url` never yields an empty string, but guard against one
+    //    defensively so a self-invalid `Some("")` pin is never written.
+    if created && base_url.as_deref().is_none_or(|u| u.trim().is_empty()) {
         anyhow::bail!(
             "cannot pin the supervisor connection: no engine base URL could be \
              resolved from a c8ctl profile or CAMUNDA_REST_ADDRESS/\
@@ -952,7 +956,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Issue #41: an existing pin with NO recorded baseUrl fingerprint (a
+    /// "Previously missed" (review round 9): a profile/env URL that normalizes
+    /// to the empty string (e.g. `/` or `/v2`) must NOT persist a self-invalid
+    /// `Some("")` pin. The first start would write an unenforceable fingerprint
+    /// that the next start's non-empty-fingerprint guard then rejects. Fail
+    /// closed on creation instead.
+    #[test]
+    fn empty_normalized_base_url_fails_closed_instead_of_persisting() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _addr = EnvGuard::unset("CAMUNDA_REST_ADDRESS");
+        let _zaddr = EnvGuard::unset("ZEEBE_REST_ADDRESS");
+        for empty_url in ["/", "/v2", "/v2/", "   "] {
+            let home = temp_home("emptybaseurl");
+            let c8ctl = home.join("c8ctl-config");
+            std::fs::create_dir_all(&c8ctl).unwrap();
+            let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+            std::fs::write(
+                c8ctl.join("profiles.json"),
+                format!(
+                    r#"{{"profiles":[{{"name":"merlin","baseUrl":"{empty_url}"}}]}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+            let err = resolve_or_pin(&home, Some("merlin")).err().unwrap_or_else(|| {
+                panic!("baseUrl {empty_url:?} normalizes to empty and must fail closed")
+            });
+            assert!(
+                format!("{err:#}").contains("no engine base URL"),
+                "baseUrl {empty_url:?}: unexpected error: {err:#}"
+            );
+            // Nothing self-invalid may have been persisted.
+            assert!(
+                read(&home).unwrap().is_none(),
+                "baseUrl {empty_url:?} must not persist a pin"
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
     /// structurally valid but empty `{"connection":{"profile":null}}`, or a
     /// profile pin whose URL was dropped) must FAIL CLOSED rather than fall back
     /// to the ambient env/session — otherwise it silently restores the

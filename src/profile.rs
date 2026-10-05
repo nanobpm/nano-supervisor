@@ -241,19 +241,33 @@ pub fn client_with_base_override(
 /// "same profile name, different engine" apart from "same engine". With no
 /// profile this is the ambient `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`.
 pub fn resolved_base_url(profile: Option<&Profile>) -> Option<String> {
+    // A URL that normalizes to the empty string (e.g. a profile/env value of
+    // `/`, `/v2`, or whitespace) is NOT a usable fingerprint: returning
+    // `Some("")` here would let the pin persist a self-invalid connection the
+    // next start rejects. Collapse every empty-normalized result to `None` so a
+    // profile source falls through to the env and an empty env falls through to
+    // the next key (and ultimately `None`).
     if let Some(p) = profile {
         if let Some(url) = &p.base_url {
-            let url = url.trim_end_matches('/');
-            let url = url.strip_suffix("/v2").unwrap_or(url);
-            return Some(url.to_string());
+            let url = url.trim().trim_end_matches('/');
+            let url = url.strip_suffix("/v2").unwrap_or(url).trim_end_matches('/');
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
         }
     }
     for key in ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"] {
         if let Some(v) = std::env::var_os(key) {
             let v = v.to_string_lossy().trim().trim_end_matches('/').to_string();
             if !v.is_empty() {
-                let v = v.strip_suffix("/v2").unwrap_or(&v).to_string();
-                return Some(v);
+                let v = v
+                    .strip_suffix("/v2")
+                    .unwrap_or(&v)
+                    .trim_end_matches('/')
+                    .to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
             }
         }
     }
