@@ -179,11 +179,13 @@ impl Clone for CwdHandle {
     /// A second handle to the SAME pinned inode (a close-on-exec dup of the
     /// fd), so the capability can be carried by several consumers (the agent
     /// launch, the HEAD probes) without re-resolving the path.
+    ///
+    /// `Clone` cannot fail, so a dup failure (e.g. descriptor exhaustion,
+    /// `EMFILE`) is panicked on here — prefer [`CwdHandle::try_clone`] at
+    /// callers that can propagate, so an exhausted fd table surfaces as a
+    /// normal job error rather than a worker-crashing panic.
     fn clone(&self) -> Self {
-        // `dup_fd` only fails on a genuine fd-table/OS error; treat that like
-        // any other fd-ownership failure here (there is no `TryClone`).
-        let fd = self.dup_fd().expect("dup the pinned directory fd");
-        CwdHandle { fd }
+        self.try_clone().expect("dup the pinned directory fd")
     }
 }
 
@@ -197,12 +199,22 @@ impl Clone for CwdHandle {
 }
 
 impl CwdHandle {
+    /// Fallible [`Clone`]: a second handle to the SAME pinned inode (a
+    /// close-on-exec dup of the fd), propagating a dup failure (e.g.
+    /// descriptor exhaustion, `EMFILE`) instead of panicking. Prefer this at
+    /// callers that can return an error, so an exhausted fd table becomes a
+    /// normal job error rather than a worker crash.
+    #[cfg(unix)]
+    pub(crate) fn try_clone(&self) -> io::Result<CwdHandle> {
+        Ok(CwdHandle { fd: self.dup_fd()? })
+    }
+
     /// Wrap an already-pinned, no-follow directory fd — e.g. the child handle a
-    /// run-dir preparation pinned via `openat2` — as a `CwdHandle`, without
-    /// re-resolving any path. Lets preparation hand its exact validated inode
-    /// straight to the launch rather than reopening the run dir by name, which a
-    /// same-UID actor could have swapped for an ordinary tree in between (#35).
-    #[cfg(target_os = "linux")]
+    /// run-dir preparation pinned — as a `CwdHandle`, without re-resolving any
+    /// path. Lets preparation hand its exact validated inode straight to the
+    /// launch rather than reopening the run dir by name, which a same-UID actor
+    /// could have swapped for an ordinary tree in between (#35).
+    #[cfg(unix)]
     pub(crate) fn from_fd(fd: std::os::unix::io::OwnedFd) -> CwdHandle {
         CwdHandle { fd }
     }
@@ -212,28 +224,32 @@ impl CwdHandle {
     /// is refused (so the caller's launch fails closed instead of escaping the
     /// validated tree); a missing directory or a non-directory target is an
     /// error.
+    ///
+    /// On Unix, production preparation carries the pinned fd it created
+    /// (`from_fd`) rather than reopening by path, so this path-resolution open
+    /// is reached only by the tests (and the non-Unix fallback below).
+    #[cfg(unix)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open(path: &Path) -> io::Result<CwdHandle> {
-        #[cfg(unix)]
-        {
-            let fd = open_nofollow(path)?;
-            Ok(CwdHandle { fd })
+        let fd = open_nofollow(path)?;
+        Ok(CwdHandle { fd })
+    }
+
+    /// Non-Unix `open`: no `fchdir`/`pre_exec`, so fall back to validating the
+    /// leaf is not a symlink and then using the path. Best-effort — these are
+    /// not supported daemon hosts.
+    #[cfg(not(unix))]
+    pub(crate) fn open(path: &Path) -> io::Result<CwdHandle> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing symlinked working directory",
+            ));
         }
-        #[cfg(not(unix))]
-        {
-            // No `fchdir`/`pre_exec`: fall back to validating the leaf is not a
-            // symlink and then using the path. Best-effort — these are not
-            // supported daemon hosts.
-            let meta = std::fs::symlink_metadata(path)?;
-            if meta.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "refusing symlinked working directory",
-                ));
-            }
-            Ok(CwdHandle {
-                path: path.to_path_buf(),
-            })
-        }
+        Ok(CwdHandle {
+            path: path.to_path_buf(),
+        })
     }
 
     /// Arm `cmd` to enter this pinned directory in the forked child before
@@ -848,6 +864,42 @@ mod tests {
             std::fs::canonicalize(child_cwd(&handle)).unwrap(),
             std::fs::canonicalize(&dir).unwrap(),
             "child cwd must be the pinned directory"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `try_clone` returns a second handle to the SAME pinned inode (not a
+    /// re-resolution of the path), so a caller that can propagate uses it
+    /// instead of the panicking `Clone`. Both handles must launch into the same
+    /// directory, and the clone must survive an ancestor swap just like the
+    /// original.
+    #[test]
+    fn try_clone_shares_the_pinned_inode() {
+        let dir = scratch("try-clone");
+        std::fs::write(dir.join("marker"), b"real").unwrap();
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        let cloned = handle.try_clone().expect("try_clone the pinned fd");
+        assert_eq!(
+            std::fs::canonicalize(child_cwd(&cloned)).unwrap(),
+            std::fs::canonicalize(&dir).unwrap(),
+            "the try_cloned handle must launch in the same pinned inode"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Clone` and `try_clone` must agree: both dup the same pinned fd, so a
+    /// `clone()` (used where infallible) lands in the same inode `try_clone`
+    /// (used where fallible) does.
+    #[test]
+    fn clone_and_try_clone_agree() {
+        let dir = scratch("clone-agree");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        let a = handle.clone();
+        let b = handle.try_clone().expect("try_clone");
+        assert_eq!(
+            std::fs::canonicalize(child_cwd(&a)).unwrap(),
+            std::fs::canonicalize(child_cwd(&b)).unwrap(),
+            "clone and try_clone must bind the same pinned inode"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

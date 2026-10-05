@@ -419,17 +419,11 @@ async fn stop_refresher(stop_tx: watch::Sender<bool>, refresher: tokio::task::Jo
 
 /// Restrict a directory to owner-only access (mode 0700) on Unix, so job data
 /// placed under the shared temp directory is not readable/traversable by other
-/// local users. A no-op on non-Unix platforms and when the path is absent.
+/// local users. A no-op when the path is absent. Used only by the non-Unix
+/// path-based prepare fallback (Unix preparation chmods through the pinned fd
+/// instead); kept non-Unix-only so a Unix build has no dead code.
+#[cfg(not(unix))]
 fn restrict_dir_mode(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if dir.exists() {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("restricting permissions on {}", dir.display()))?;
-        }
-    }
-    #[cfg(not(unix))]
     let _ = dir;
     Ok(())
 }
@@ -440,6 +434,11 @@ fn restrict_dir_mode(dir: &Path) -> Result<()> {
 /// the agent cwd and `restrict_dir_mode` would otherwise target a path outside
 /// `runs_dir`. `symlink_metadata` inspects the link itself rather than
 /// following it, so a dangling or replaced link is still caught.
+///
+/// On Unix the pinned prepare/sweep paths refuse a symlink atomically at the
+/// no-follow open instead, so this path-based check is only reached by the
+/// non-Unix fallback (and the tests exercising the rejection).
+#[cfg(any(not(unix), test))]
 pub(crate) fn reject_symlink(dir: &Path) -> Result<()> {
     if std::fs::symlink_metadata(dir)
         .map(|m| m.file_type().is_symlink())
@@ -594,23 +593,17 @@ pub(crate) fn prepare_run_dir(
     runs_dir: &Path,
     run_dir: &Path,
 ) -> Result<crate::safecwd::CwdHandle> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        match prepare_run_dir_pinned(runs_dir, run_dir) {
-            Ok(handle) => return Ok(handle),
-            // Kernel too old for `openat2` (pre-5.6): fall through to the
-            // best-effort path-based checks below.
-            Err(crate::saferoot::PinError::Unsupported) => {}
-            // A refused symlinked component (ELOOP) or any other error is a
-            // real, security-relevant outcome — surface it, never retry the
-            // weaker path-based version.
-            Err(crate::saferoot::PinError::Io(e)) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("preparing run dir {}", run_dir.display())));
-            }
-        }
+        prepare_run_dir_pinned(runs_dir, run_dir).map_err(|e| match e {
+            crate::saferoot::PinError::Io(e) => anyhow::Error::new(e)
+                .context(format!("preparing run dir {}", run_dir.display())),
+        })
     }
-    prepare_run_dir_path_based(runs_dir, run_dir)
+    #[cfg(not(unix))]
+    {
+        prepare_run_dir_path_based(runs_dir, run_dir)
+    }
 }
 
 /// `prepare_run_dir` dispatched to the blocking pool. Preparing a run dir wipes
@@ -631,15 +624,18 @@ pub(crate) async fn prepare_run_dir_blocking(
         .map_err(|e| anyhow::Error::new(e).context("prepare_run_dir blocking task panicked"))?
 }
 
-/// `prepare_run_dir` via an `openat2(RESOLVE_NO_SYMLINKS)` handle pinned to the
-/// runs root: the stale-wipe, create, and 0700 chmod of both the root and the
-/// job dir all happen *relative to that pinned handle*, so a same-UID actor
-/// cannot swap `runs_dir` (or an ancestor) for a symlink between a check and the
-/// operation and redirect the remove/create outside the workspace. This is the
-/// atomic fix the path-based `reject_symlink` re-checks can only approximate.
+/// `prepare_run_dir` via a no-follow handle pinned to the runs root: the
+/// stale-wipe, create, and 0700 chmod of both the root and the job dir all
+/// happen *relative to that pinned handle*, so a same-UID actor cannot swap
+/// `runs_dir` (or an ancestor) for a symlink between a check and the operation
+/// and redirect the remove/create outside the workspace — and the job-dir
+/// handle preparation returns is the *exact* inode it wiped and secured, so the
+/// launch never reopens `run_dir` by path (which a same-UID actor could have
+/// replaced with an ordinary, unprepared tree in between). This is the atomic
+/// fix the path-based `reject_symlink` re-checks can only approximate.
 /// `run_dir` is always `<runs_dir>/<key>` (a single, engine-validated numeric
 /// component), so its `file_name()` is the child directory to prepare.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn prepare_run_dir_pinned(
     runs_dir: &Path,
     run_dir: &Path,
@@ -652,14 +648,14 @@ fn prepare_run_dir_pinned(
         ))
     })?;
     // Bootstrap: the runs root must exist before it can be opened no-follow. A
-    // symlinked component is still caught the instant we open it (openat2
-    // refuses it), so this only ever materialises real directories under an
-    // honest root; a planted symlink ancestor fails the open rather than being
-    // silently followed. But `create_dir_all` itself *follows* symlinks, so an
-    // attacker-planted symlinked ancestor could make the bootstrap materialise
-    // the root through it (in an attacker-chosen target) *before* the no-follow
-    // open ever runs. Reject a symlinked existing ancestor first so the create
-    // cannot be redirected out of the workspace.
+    // symlinked component is still caught the instant we open it (the no-follow
+    // open refuses it), so this only ever materialises real directories under
+    // an honest root; a planted symlink ancestor fails the open rather than
+    // being silently followed. But `create_dir_all` itself *follows* symlinks,
+    // so an attacker-planted symlinked ancestor could make the bootstrap
+    // materialise the root through it (in an attacker-chosen target) *before*
+    // the no-follow open ever runs. Reject a symlinked existing ancestor first
+    // so the create cannot be redirected out of the workspace.
     if let Err(e) = reject_symlinked_ancestors(runs_dir) {
         return Err(PinError::Io(std::io::Error::other(e.to_string())));
     }
@@ -672,10 +668,13 @@ fn prepare_run_dir_pinned(
     Ok(crate::safecwd::CwdHandle::from_fd(child.into_fd()))
 }
 
-/// Path-based `prepare_run_dir`: the pre-`openat2` fallback (non-Linux, or a
-/// Linux kernel older than 5.6). Rejects a symlinked leaf / ancestor before
-/// *and* after the non-atomic remove+create — a best-effort approximation of
-/// the pinned-handle guarantee that cannot fully close the TOCTOU window.
+/// Path-based `prepare_run_dir`: the non-Unix fallback (no `openat`/`fchmod`
+/// pinned-handle support — not a supported daemon host). Rejects a symlinked
+/// leaf / ancestor before *and* after the non-atomic remove+create — a
+/// best-effort approximation of the pinned-handle guarantee that cannot fully
+/// close the TOCTOU window. Every Unix host uses the pinned
+/// [`prepare_run_dir_pinned`] instead.
+#[cfg(not(unix))]
 fn prepare_run_dir_path_based(
     runs_dir: &Path,
     run_dir: &Path,
@@ -703,24 +702,20 @@ fn prepare_run_dir_path_based(
 
 /// Reap a completed run directory under `runs_dir` with the same pinned
 /// no-follow guarantee as [`prepare_run_dir`]: the removal happens *relative to*
-/// an `openat2(RESOLVE_NO_SYMLINKS)` handle on the runs root, so a same-UID
-/// actor cannot swap `run_dir` (or an ancestor) for a symlink between the
-/// job's completion and this cleanup and redirect a path-based
-/// `remove_dir_all` into deleting an unrelated tree outside the workspace.
-/// Falls back to a plain `remove_dir_all` only where the pinned path is
-/// unavailable (non-Linux, or a pre-5.6 kernel without `openat2`). `run_dir` is
-/// always `<runs_dir>/<key>` (a single engine-validated component), so its
+/// a no-follow pinned handle on the runs root, so a same-UID actor cannot swap
+/// `run_dir` (or an ancestor) for a symlink between the job's completion and
+/// this cleanup and redirect a path-based `remove_dir_all` into deleting an
+/// unrelated tree outside the workspace. Falls back to a plain `remove_dir_all`
+/// only on a non-Unix host (no pinned-handle support). `run_dir` is always
+/// `<runs_dir>/<key>` (a single engine-validated component), so its
 /// `file_name()` is the child to remove. A missing dir is treated as success.
 pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use crate::saferoot::{DirHandle, PinError};
         if let Some(name) = run_dir.file_name() {
             match DirHandle::open_root_nofollow(runs_dir) {
                 Ok(root) => return root.remove_tree(name),
-                // Kernel too old for `openat2` (pre-5.6): fall through to the
-                // best-effort path-based remove below.
-                Err(PinError::Unsupported) => {}
                 // A refused symlinked root (ELOOP) or any other error is a real,
                 // security-relevant outcome — surface it, never retry the weaker
                 // path-based remove that would follow the very link we refused.
@@ -728,7 +723,7 @@ pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<(
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     let _ = runs_dir;
     match std::fs::remove_dir_all(run_dir) {
         Ok(()) => Ok(()),
@@ -1006,26 +1001,24 @@ fn remove_if_inactive(path: &Path, remove: impl FnOnce()) -> bool {
 ///     reap its aged, inactive child runs — then removes that namespace only if
 ///     it is left empty.
 pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration, recurse_namespaces: bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        match sweep_stale_runs_pinned(runs_dir, max_age, recurse_namespaces) {
-            Ok(()) => return,
-            // Kernel too old for `openat2` (pre-5.6): fall through to the
-            // best-effort path-based sweep below.
-            Err(crate::saferoot::PinError::Unsupported) => {}
+        // The pinned sweep handles every outcome on Unix (reaping, or skipping
+        // with a log on a refused/errored root), so there is nothing further.
+        if let Err(crate::saferoot::PinError::Io(e)) =
+            sweep_stale_runs_pinned(runs_dir, max_age, recurse_namespaces)
+        {
             // A refused symlinked root (ELOOP) or any other error: skip the
             // sweep entirely rather than risk traversing a redirected root —
             // exactly the behaviour the path-based version's up-front reject
             // provided, now enforced atomically at open time.
-            Err(crate::saferoot::PinError::Io(e)) => {
-                log(&format!(
-                    "skipping stale-run sweep of {}: {e} (possible local symlink attack)",
-                    runs_dir.display()
-                ));
-                return;
-            }
+            log(&format!(
+                "skipping stale-run sweep of {}: {e} (possible local symlink attack)",
+                runs_dir.display()
+            ));
         }
     }
+    #[cfg(not(unix))]
     sweep_stale_runs_path_based(runs_dir, max_age, recurse_namespaces);
 }
 
@@ -1089,7 +1082,7 @@ fn process_is_alive(_pid: i32) -> bool {
 /// sweep's deletions outside the workspace — the race path-based re-checks
 /// cannot atomically close. Descent into an aged run dir is likewise no-follow,
 /// so a symlink *inside* a swept dir deletes the link, never its target.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn sweep_stale_runs_pinned(
     runs_dir: &Path,
     max_age: Duration,
@@ -1193,7 +1186,7 @@ fn sweep_stale_runs_pinned(
 
 /// Reap a single aged run dir `name` (relative to pinned `dir`), logging the
 /// outcome. Shared by the top-level and one-level-descent sweep paths.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn reap_pinned(
     dir: &crate::saferoot::DirHandle,
     name: &std::ffi::OsStr,
@@ -1222,10 +1215,12 @@ fn is_aged_out(modified: Option<SystemTime>, now: SystemTime, max_age: Duration)
         .is_some_and(|age| age >= max_age)
 }
 
-/// Path-based `sweep_stale_runs`: the pre-`openat2` fallback (non-Linux, or a
-/// Linux kernel older than 5.6). Rejects a symlinked root/ancestor up front,
-/// then reads and removes by path — a best-effort approximation that cannot
-/// fully close the check/traverse TOCTOU the pinned version does.
+/// Path-based `sweep_stale_runs`: the non-Unix fallback (no pinned-handle
+/// support — not a supported daemon host). Rejects a symlinked root/ancestor up
+/// front, then reads and removes by path — a best-effort approximation that
+/// cannot fully close the check/traverse TOCTOU the pinned version does. Every
+/// Unix host uses the pinned [`sweep_stale_runs_pinned`] instead.
+#[cfg(not(unix))]
 fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_namespaces: bool) {
     // Refuse to traverse a symlinked root, or one reached through a symlinked
     // ancestor, before touching it: `read_dir` (and the `remove_dir_all` below)
@@ -1329,8 +1324,9 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
     }
 }
 
-/// Reap a single aged run dir at `path` by path (fallback sweep), logging the
-/// outcome.
+/// Reap a single aged run dir at `path` by path (the non-Unix fallback sweep),
+/// logging the outcome. Unix sweeps reap through the pinned handle instead.
+#[cfg(not(unix))]
 fn reap_path(path: &Path, max_age: Duration) {
     match std::fs::remove_dir_all(path) {
         Ok(()) => log(&format!(
@@ -1656,7 +1652,16 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
                 .await
                 .context("provisioning repository")?
         }
-        None => prepared.agent_cwd().clone(),
+        None => {
+            // No repository: the agent and HEAD probes run in the run dir
+            // itself. Dup the pinned handle fallibly — a dup failure (e.g.
+            // descriptor exhaustion, EMFILE) must surface as a normal job
+            // error here, not a worker-crashing panic from `Clone`.
+            prepared
+                .agent_cwd()
+                .try_clone()
+                .context("dup the pinned run-dir handle")?
+        }
     };
     // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
     // the empty-job detector can tell whether the agent committed anything.
@@ -3311,7 +3316,7 @@ mod tests {
     }
 
     /// A unique scratch dir under the system temp root (no tempfile dep here).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn unique_tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "nano-{tag}-{}-{}",
@@ -3325,7 +3330,7 @@ mod tests {
         p
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn prepare_run_dir_pinned_creates_owner_only_and_wipes_stale() {
         use std::os::unix::fs::PermissionsExt;
@@ -3354,7 +3359,7 @@ mod tests {
         std::fs::remove_dir_all(&runs).ok();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn prepare_run_dir_pinned_refuses_symlinked_root() {
         // A symlinked runs root must be refused by the pinned open (ELOOP),
@@ -3377,7 +3382,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn sweep_pinned_does_not_follow_symlinked_entry_inside_aged_dir() {
         // An aged run dir containing a symlink to an outside directory must be
