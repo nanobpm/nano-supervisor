@@ -77,6 +77,57 @@ fn refuses_to_start_inside_an_agent_run() {
     // worker job.
 }
 
+/// The guard is wired into the `work` entrypoint exactly as it is into `daemon`
+/// (`src/main.rs` calls `guard_nested_supervisor` for both), but the test above
+/// only ever invokes `daemon`. A regression that dropped the `work` call would
+/// otherwise stay green and reopen nested workers. This is the black-box
+/// counterpart for `work <hire>`: with `NANO_AGENT_RUN` set and no opt-in, the
+/// command must refuse with the guard-specific diagnostic *before* it touches
+/// config/engine startup — so it exits non-zero naming `NANO_AGENT_RUN` even
+/// though no hire, config, or engine exists in the isolated home.
+#[test]
+fn work_refuses_to_start_inside_an_agent_run() {
+    let target = Target::from_env();
+    require_target!(target);
+    if target == Target::Node {
+        // The Node plugin's guard is tracked on the parent issue; the Rust port
+        // owns the guard in this repository.
+        eprintln!(
+            "SKIP nested_supervisor::work_refuses_to_start_inside_an_agent_run: \
+             the Node plugin guard is tracked separately"
+        );
+        return;
+    }
+    let home = TempHome::with_target(target);
+    // `work <hire>` requires a positional hire; any value does, because the
+    // guard fires before the hire is resolved against config.json.
+    let out = home
+        .cmd(&["work", "coder"])
+        .env("NANO_AGENT_RUN", "214829")
+        .env("NANO_AGENT_RUN_DIR", home.path().join("agent-runs/run-x"))
+        .output()
+        .expect("spawn nested worker");
+
+    assert!(
+        !out.status.success(),
+        "a worker started inside an agent run must exit non-zero; got {:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("NANO_AGENT_RUN"),
+        "the work refusal must be the #40 guard's specifically (mention NANO_AGENT_RUN), \
+         not an unrelated config/engine error; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("work"),
+        "the refusal must name the `work` command so the entrypoint is identifiable; \
+         stderr was: {stderr}"
+    );
+}
+
 /// End-to-end form of the issue #40 acceptance: a *real agent subprocess* — the
 /// scripted fake agent, running under a worker job — attempts to start the
 /// nested supervisor. The worker must have propagated `NANO_AGENT_RUN` into the
