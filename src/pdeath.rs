@@ -58,6 +58,11 @@ pub fn arm(_cmd: &mut Command) {}
 /// guards so that dropping an in-flight agent — e.g. when a slot aborts its
 /// `execute` future on lease loss — tears down the whole tree, not just the
 /// leader that `kill_on_drop` reaps. Harmless if the group is already gone.
+///
+/// Callers must gate this on [`PgidGuard::still_ours`] (or an equivalent
+/// identity check): a bare numeric pgid proves only that *some* group currently
+/// holds it, not that it is the agent's group (issue #27 — the recycled-PGID
+/// race).
 #[cfg(unix)]
 pub(crate) fn sigkill_group(pid: u32) {
     // SAFETY: a plain libc kill of a process group; no Rust state is touched and
@@ -106,6 +111,144 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
     false
 }
 
+/// The identity of a process group, captured at spawn so a later cleanup can
+/// tell *the agent's* group apart from an unrelated group that recycled the
+/// numeric pgid (issue #27).
+///
+/// A process group has no kernel handle of its own, so its identity is pinned
+/// through its **leader**: the leader's start time (the same per-incarnation
+/// token [`parent_start_time`] uses for daemon PID-reuse detection) plus its
+/// real uid. While any member of the group is alive the pgid stays reserved and
+/// the leader's `/proc` entry keeps its original start time (a reaped leader
+/// survives as a zombie held by the group), so re-reading it and comparing
+/// proves the group currently holding the pgid is the one that was spawned —
+/// not a recycled one. The uid disambiguates a cross-user recycle that lands on
+/// the same clock tick (start times are only unique per tick).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GroupIdentity {
+    /// Leader start time: Linux `/proc/<pid>/stat` field 22 (clock ticks since
+    /// boot), macOS `sysctl(KERN_PROC)` `kp_proc.p_starttime` in microseconds.
+    start: u64,
+    /// The leader's real uid at capture.
+    uid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).ok()?;
+    // `comm` (field 2) may itself contain spaces and parentheses, so parse from
+    // just past the final ')'. After it, field 3 (state) is the first token, so
+    // starttime (field 22) is the 20th token — 0-based index 19.
+    let after = &stat[stat.rfind(')')? + 1..];
+    let start: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{pgid}/status")).ok()?;
+    let uid = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(GroupIdentity { start, uid })
+}
+
+#[cfg(target_os = "macos")]
+fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
+    // `kern.proc.pid` returns the `kinfo_proc` for a live (or zombie) process.
+    // `kp_proc.p_starttime` is the process's start `{sec, usec}`; fold to
+    // microseconds for a single comparable token. `kp_eproc.e_ucred.cr_uid` is
+    // the real uid.
+    unsafe {
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pgid as libc::c_int,
+        ];
+        let mut info: libc::kinfo_proc = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::kinfo_proc>();
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        let tv = info.kp_proc.p_starttime;
+        let start = (tv.tv_sec as u64).checked_mul(1_000_000)? + tv.tv_usec as u64;
+        Some(GroupIdentity {
+            start,
+            uid: info.kp_eproc.e_ucred.cr_uid,
+        })
+    }
+}
+
+/// No identity source on other unix targets: callers fall back to the numeric
+/// liveness probe alone (the pre-#27 behaviour) rather than failing closed.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn leader_identity(_pgid: u32) -> Option<GroupIdentity> {
+    None
+}
+
+/// A preserved process-group id **plus the identity of the group it named at
+/// spawn**. Every cleanup SIGKILL is gated on [`PgidGuard::still_ours`], which
+/// re-verifies the identity immediately before signalling, so a pgid that was
+/// freed and recycled by an unrelated process group is never signalled (issue
+/// #27). Construct via [`PgidGuard::capture`] right after spawn.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PgidGuard {
+    pgid: u32,
+    identity: Option<GroupIdentity>,
+}
+
+#[cfg(unix)]
+impl PgidGuard {
+    /// Capture the pgid and its leader's identity. `pgid` is the leader's pid
+    /// (agents are spawned with `process_group(0)`, so pid == pgid). When the
+    /// identity cannot be read (a non-Linux/macOS unix, or a leader that exited
+    /// in the spawn→capture window) it is `None` and [`PgidGuard::still_ours`]
+    /// degrades to the numeric liveness probe — the pre-#27 behaviour — rather
+    /// than disabling cleanup.
+    pub(crate) fn capture(pgid: u32) -> Self {
+        Self {
+            pgid,
+            identity: leader_identity(pgid),
+        }
+    }
+
+    /// The numeric pgid, for passing to the watchdog / legacy call sites.
+    pub(crate) fn pgid(&self) -> u32 {
+        self.pgid
+    }
+
+    /// True only while the group holding this pgid is **still the group that
+    /// was captured** — i.e. it is alive *and* its leader's identity matches.
+    /// This is the check every cleanup SIGKILL must pass: a bare
+    /// `kill(-pgid, 0)` (`group_alive`) proves only that *some* group holds the
+    /// number, so on its own it can green-light signalling an unrelated group
+    /// that recycled the pgid after the agent exited.
+    pub(crate) fn still_ours(&self) -> bool {
+        if !group_alive(self.pgid) {
+            return false;
+        }
+        match self.identity {
+            // Identity captured: require it to still match. A mismatch (or a
+            // now-unreadable leader) means the original group is gone and the
+            // pgid was recycled — do not signal.
+            Some(id) => leader_identity(self.pgid) == Some(id),
+            // No identity source on this platform: fall back to the numeric
+            // probe alone (the pre-#27 behaviour).
+            None => true,
+        }
+    }
+}
+
 /// Gracefully tear down an agent's whole process group and reap the leader:
 /// `SIGTERM` the group, poll up to `grace` for it to exit (reaping the leader as
 /// soon as it does), then `SIGKILL` the group to catch any `TERM`-resistant
@@ -121,47 +264,53 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// that would silently skip it and leak descendants. A reaped leader's pid stays
 /// reserved as a pgid while any descendant remains in the group, so probing it
 /// still identifies the right group.
+///
+/// Every group signal is gated on [`PgidGuard::still_ours`]: the guard
+/// re-verifies the group's identity immediately before each SIGTERM/SIGKILL, so
+/// a pgid that was freed and recycled by an unrelated group in the window since
+/// the last check is never signalled (issue #27).
 #[cfg(unix)]
 pub(crate) async fn terminate_group_and_reap(
     child: &mut tokio::process::Child,
     pgid: Option<u32>,
     grace: std::time::Duration,
 ) {
-    if let Some(pid) = pgid {
-        // Only signal the pgid while the group genuinely still has a member. If
-        // the leader was already reaped and no descendant remains, the pid is no
-        // longer reserved and could have been recycled — signalling it would risk
-        // hitting an unrelated group.
-        if group_alive(pid) {
+    if let Some(pgid) = pgid {
+        let guard = PgidGuard::capture(pgid);
+        // Only signal the pgid while it still names *our* group. If the leader
+        // was already reaped and no descendant remains, the pid is no longer
+        // reserved and could have been recycled — signalling it would risk
+        // hitting an unrelated group, so the identity check must pass first.
+        if guard.still_ours() {
             // Negative pid = the whole process group (agent + tools it started).
             // Signal via a direct libc `kill(-pgid, SIGTERM)` rather than
             // spawning `kill(1)`: a spawned child would inherit the daemon's
             // scrubbed-from-the-agent `CAMUNDA_*`/`ZEEBE_*` credentials and expose
             // them via `/proc/<pid>/environ` to a same-user host agent for the
             // duration of that child.
-            sigterm_group(pid);
+            sigterm_group(pgid);
             let deadline = std::time::Instant::now() + grace;
             loop {
                 // Reap the leader the instant it exits. Otherwise its unreaped
-                // zombie keeps `group_alive` true for the entire grace window,
+                // zombie keeps `still_ours` true for the entire grace window,
                 // forcing a fixed multi-second wait on every clean shutdown. A
                 // live descendant keeps the pgid reserved, so reaping the leader
                 // here does not free the pid still needed for the group SIGKILL.
                 let _ = child.try_wait();
-                if !group_alive(pid) {
-                    // Leader reaped and no descendant left: the group is gone.
-                    // Don't re-signal (the freed pid could now be recycled).
+                if !guard.still_ours() {
+                    // Leader reaped and no descendant left: the group is gone (or
+                    // its pgid was recycled). Don't re-signal.
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
                     // A `TERM`-resistant descendant survived; the pgid is still
-                    // valid (that descendant holds it). Re-probe immediately
-                    // before the SIGKILL: the last survivor can exit in the
-                    // window since the loop's top-of-iteration `group_alive`
-                    // check, freeing the pgid to be recycled by an unrelated
-                    // group — only signal when the group is still present.
-                    if group_alive(pid) {
-                        sigkill_group(pid);
+                    // ours (that descendant holds it). Re-verify the identity
+                    // immediately before the SIGKILL: the last survivor can exit
+                    // in the window since the loop's top-of-iteration check,
+                    // freeing the pgid to be recycled by an unrelated group —
+                    // only signal when the group is still verifiably ours.
+                    if guard.still_ours() {
+                        sigkill_group(pgid);
                     }
                     break;
                 }
@@ -188,11 +337,24 @@ pub(crate) async fn terminate_group_and_reap(
 /// unless disarmed. Ensures a dropped (aborted) in-flight agent tears down the
 /// whole tree — not just the leader `kill_on_drop` reaps — while the normal path
 /// disarms it once the group has been reaped (so a recycled pid is never hit).
-pub(crate) struct GroupGuard(Option<u32>);
+///
+/// The guard captures the group's identity at construction ([`PgidGuard`]) and
+/// re-verifies it immediately before the drop-time SIGKILL, so a pgid that was
+/// freed and recycled by an unrelated group in the drop window is never
+/// signalled (issue #27).
+pub(crate) struct GroupGuard(Option<PgidGuard>);
 
 impl GroupGuard {
     pub(crate) fn new(pid: Option<u32>) -> Self {
-        Self(pid)
+        #[cfg(unix)]
+        {
+            Self(pid.map(PgidGuard::capture))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Self(None)
+        }
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -202,17 +364,18 @@ impl GroupGuard {
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            // Only signal while the group genuinely still has a member. A
+        #[cfg(unix)]
+        if let Some(guard) = self.0 {
+            // Only signal while the group is still verifiably ours. A
             // cancellation can drop the guard in the window after the leader was
             // reaped (by `kill_on_drop`, or a prior `child.wait()` on the pipe
             // EOF / ACP request path) but before `disarm` runs; once the group is
             // empty the pid is no longer reserved as a pgid and may have been
             // recycled for an unrelated group, so an unconditional kill could hit
-            // it. Gating on `group_alive` mirrors `terminate_group_and_reap` and
-            // keeps a live descendant reserving the pgid the target of the kill.
-            if group_alive(pid) {
-                sigkill_group(pid);
+            // it. `still_ours` re-checks the leader's identity, so a recycled
+            // pgid is never signalled even when a live process group holds it.
+            if guard.still_ours() {
+                sigkill_group(guard.pgid());
             }
         }
     }
@@ -243,6 +406,13 @@ pub fn watch(agent_pid: u32) {
     let parent_start = parent_start_time(parent);
     #[cfg(not(target_os = "linux"))]
     let parent_start: Option<u64> = None;
+    // Capture the agent group's identity here too, while the agent is
+    // guaranteed alive, and hand it to the watchdog. The watchdog's final
+    // SIGKILL is then gated on the identity (issue #27), so a pgid recycled by
+    // an unrelated group between the agent's exit and the daemon's death is
+    // never signalled. Without this the watchdog only has the numeric pgid,
+    // which proves liveness of *some* group, not the agent's.
+    let group_identity = leader_identity(agent_pid);
     // Detached so it survives independently and can reap us; it exits on its own
     // once the target process group is gone.
     let mut cmd = std::process::Command::new(exe);
@@ -253,6 +423,12 @@ pub fn watch(agent_pid: u32) {
         .arg(agent_pid.to_string());
     if let Some(start) = parent_start {
         cmd.arg("--parent-start").arg(start.to_string());
+    }
+    if let Some(id) = group_identity {
+        cmd.arg("--pgid-start")
+            .arg(id.start.to_string())
+            .arg("--pgid-uid")
+            .arg(id.uid.to_string());
     }
     // Scrub the environment before spawning. The watchdog is a sibling of the
     // agent's process group and needs nothing but its own executable and the CLI
@@ -290,18 +466,30 @@ pub fn watch(_agent_pid: u32) {}
 /// agent's process group has exited on its own (a completed job), so the
 /// watchdog does not linger as a polling child for the daemon's whole lifetime.
 #[cfg(target_os = "macos")]
-pub fn reap_watchdog(parent_pid: u32, pgid: u32, _parent_start: Option<u64>) {
+pub fn reap_watchdog(
+    parent_pid: u32,
+    pgid: u32,
+    _parent_start: Option<u64>,
+    pgid_start: Option<u64>,
+    pgid_uid: Option<u32>,
+) {
+    // Rebuild the identity token the daemon captured at spawn (issue #27). Both
+    // halves are required; if either is missing the watchdog has no identity and
+    // falls back to the numeric liveness probe alone (the pre-#27 behaviour).
+    let expected = pgid_start
+        .zip(pgid_uid)
+        .map(|(start, uid)| GroupIdentity { start, uid });
+    let still_ours = || group_identity_matches(pgid, expected);
     // SAFETY: standard kqueue usage; the fd is closed before return.
     unsafe {
         let kq = libc::kqueue();
         if kq < 0 {
             // No kqueue: fall back to polling both conditions.
-            // Re-probe the group immediately before signalling: the parent may
-            // have exited while the agent's group already went away, freeing the
-            // pid to be recycled by an unrelated group — `group_alive` (a
-            // `kill(-pgid, 0)` liveness check) ensures we only SIGKILL a group
-            // that still genuinely holds this pgid.
-            if wait_parent_or_group_gone(parent_pid, pgid, None) && group_alive(pgid) {
+            // Re-verify the group's identity immediately before signalling: the
+            // parent may have exited while the agent's group already went away,
+            // freeing the pid to be recycled by an unrelated group — only SIGKILL
+            // a group that is still verifiably the agent's.
+            if wait_parent_or_group_gone(parent_pid, pgid, None) && still_ours() {
                 sigkill_group(pgid);
             }
             return;
@@ -339,11 +527,11 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32, _parent_start: Option<u64>) {
             }
         };
         libc::close(kq);
-        // Re-probe the group immediately before signalling: after the parent
-        // exited the agent's group may already have vanished, freeing the pid to
-        // be recycled by an unrelated group. `group_alive` gates the kill so a
-        // stale numeric pgid can never target a recycled group.
-        if parent_died && group_alive(pgid) {
+        // Re-verify the group's identity immediately before signalling: after the
+        // parent exited the agent's group may already have vanished, freeing the
+        // pid to be recycled by an unrelated group. The identity check gates the
+        // kill so a recycled pgid is never signalled (issue #27).
+        if parent_died && still_ours() {
             sigkill_group(pgid);
         }
     }
@@ -356,7 +544,13 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32, _parent_start: Option<u64>) {
 /// own (a completed job), so the watchdog does not linger for the daemon's whole
 /// lifetime.
 #[cfg(target_os = "linux")]
-pub fn reap_watchdog(parent_pid: u32, pgid: u32, parent_start: Option<u64>) {
+pub fn reap_watchdog(
+    parent_pid: u32,
+    pgid: u32,
+    parent_start: Option<u64>,
+    pgid_start: Option<u64>,
+    pgid_uid: Option<u32>,
+) {
     // Prefer the start time the daemon captured for us while it was still alive
     // (passed via `--parent-start`); only fall back to reading `/proc` ourselves
     // if it was not supplied. Reading it here is racy: the daemon may already be
@@ -364,15 +558,38 @@ pub fn reap_watchdog(parent_pid: u32, pgid: u32, parent_start: Option<u64>) {
     // daemon-supplied value keeps `expected_start` populated so a recycled parent
     // pid can never masquerade as the original and strand the agent group.
     let expected_start = parent_start.or_else(|| parent_start_time(parent_pid));
+    // Rebuild the agent group's identity token the daemon captured at spawn
+    // (issue #27). Both halves are required; if either is missing the watchdog
+    // has no identity and falls back to the numeric liveness probe alone.
+    let expected_group = pgid_start
+        .zip(pgid_uid)
+        .map(|(start, uid)| GroupIdentity { start, uid });
     // SAFETY: plain libc calls; no shared Rust state is touched.
     unsafe {
-        // Re-probe the group immediately before signalling: the parent may have
-        // exited while the agent's group already went away, freeing the pid to
-        // be recycled by an unrelated group. `group_alive` gates the kill so a
-        // stale numeric pgid can never target a recycled group.
-        if wait_parent_or_group_gone(parent_pid, pgid, expected_start) && group_alive(pgid) {
+        // Re-verify the group's identity immediately before signalling: the
+        // parent may have exited while the agent's group already went away,
+        // freeing the pid to be recycled by an unrelated group. The identity
+        // check gates the kill so a recycled pgid is never signalled (issue #27).
+        if wait_parent_or_group_gone(parent_pid, pgid, expected_start)
+            && group_identity_matches(pgid, expected_group)
+        {
             sigkill_group(pgid);
         }
+    }
+}
+
+/// True while the group holding `pgid` is alive **and** still has the captured
+/// identity. With no captured identity (`expected == None`, e.g. a platform
+/// without an identity source) this degrades to the numeric liveness probe —
+/// the pre-#27 behaviour — rather than disabling the watchdog's cleanup.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn group_identity_matches(pgid: u32, expected: Option<GroupIdentity>) -> bool {
+    if !group_alive(pgid) {
+        return false;
+    }
+    match expected {
+        Some(id) => leader_identity(pgid) == Some(id),
+        None => true,
     }
 }
 
@@ -455,7 +672,14 @@ unsafe fn wait_parent_or_group_gone(
 
 /// Stub on platforms without a watchdog process (they rely on [`arm`]).
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn reap_watchdog(_parent_pid: u32, _pgid: u32, _parent_start: Option<u64>) {}
+pub fn reap_watchdog(
+    _parent_pid: u32,
+    _pgid: u32,
+    _parent_start: Option<u64>,
+    _pgid_start: Option<u64>,
+    _pgid_uid: Option<u32>,
+) {
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -482,5 +706,110 @@ mod tests {
         // A pid that cannot exist yields a false (unreadable /proc) — the
         // caller's `kill(_, 0)` probe is the authority for a truly-gone pid.
         assert!(!parent_is_dead_or_zombie(u32::MAX));
+    }
+
+    #[test]
+    fn leader_identity_reads_own_incarnation() {
+        // Our own process is alive, so its identity (start time + uid) must be
+        // readable and stable across reads — this is the token `PgidGuard`
+        // captures at spawn and re-verifies before a cleanup SIGKILL.
+        let me = std::process::id();
+        let a = leader_identity(me).expect("own identity readable");
+        let b = leader_identity(me).expect("own identity readable");
+        assert_eq!(a, b);
+        assert!(a.start > 0);
+        assert_eq!(a.uid, unsafe { libc::getuid() });
+    }
+
+    #[test]
+    fn leader_identity_none_for_nonexistent_pid() {
+        assert!(leader_identity(u32::MAX).is_none());
+    }
+
+    /// Spawn a child in its own process group that sleeps, return (child, pgid).
+    fn spawn_group_leader() -> (std::process::Child, u32) {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // Own process group: pid == pgid, mirroring the agent launch.
+        cmd.process_group(0);
+        let child = cmd.spawn().expect("spawn sleep");
+        let pgid = child.id();
+        (child, pgid)
+    }
+
+    #[test]
+    fn pgid_guard_matches_live_group() {
+        let (mut child, pgid) = spawn_group_leader();
+        let guard = PgidGuard::capture(pgid);
+        assert!(
+            guard.identity.is_some(),
+            "identity must be captured for a live leader"
+        );
+        assert!(guard.still_ours(), "a live group must verify as ours");
+        // Cleanup.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pgid_guard_refuses_after_group_exit() {
+        let (mut child, pgid) = spawn_group_leader();
+        let guard = PgidGuard::capture(pgid);
+        assert!(guard.still_ours());
+        // Kill the whole group and reap the leader so the pgid is freed.
+        let _ = child.kill();
+        let _ = child.wait();
+        // Once the group is gone the numeric probe fails, so still_ours is false.
+        // (If the pgid were recycled by an unrelated group the identity check —
+        // not just liveness — is what would refuse; that path is pinned by
+        // `pgid_guard_refuses_a_recycled_identity` below.)
+        assert!(!guard.still_ours(), "a gone group must not verify as ours");
+    }
+
+    #[test]
+    fn pgid_guard_refuses_a_recycled_identity() {
+        // Simulate the recycled-PGID race without needing to actually recycle a
+        // pid: capture a guard for a live group, then forge a *different*
+        // identity (wrong start time) and confirm `group_identity_matches`
+        // refuses it even though the group is alive. This is the exact check
+        // that stops a cleanup SIGKILL from hitting an unrelated group that
+        // recycled the pgid.
+        let (mut child, pgid) = spawn_group_leader();
+        let real = leader_identity(pgid).expect("live leader identity");
+        // A recycled leader has a different start time (and possibly uid).
+        let recycled = GroupIdentity {
+            start: real.start.wrapping_add(1),
+            uid: real.uid,
+        };
+        assert!(
+            !group_identity_matches(pgid, Some(recycled)),
+            "a mismatched start time must refuse the kill even while the group is alive"
+        );
+        // A wrong uid must also refuse.
+        let wrong_uid = GroupIdentity {
+            start: real.start,
+            uid: real.uid.wrapping_add(1),
+        };
+        assert!(
+            !group_identity_matches(pgid, Some(wrong_uid)),
+            "a mismatched uid must refuse the kill even while the group is alive"
+        );
+        // And the correct identity still passes.
+        assert!(group_identity_matches(pgid, Some(real)));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn group_identity_matches_degrades_to_liveness_without_identity() {
+        // With no captured identity (None) the check falls back to the numeric
+        // liveness probe — the pre-#27 behaviour — so cleanup still works on
+        // platforms without an identity source.
+        let (mut child, pgid) = spawn_group_leader();
+        assert!(group_identity_matches(pgid, None));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!group_identity_matches(pgid, None));
     }
 }
