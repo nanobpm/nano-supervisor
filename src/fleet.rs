@@ -42,28 +42,65 @@ const VALID_SANDBOXES: [&str; 3] = ["none", "docker", "podman"];
 /// can interpret and the Node-compatible CLI would reject.
 const VALID_TERMINALS: [&str; 2] = ["pty", "pipe"];
 
-/// The permission policies a hire may declare. The CLI contract currently
-/// implements only `yolo` — the Rust ACP client unconditionally applies the
-/// yolo allow policy (`src/acp.rs`), and `escalate`/`filter` are reserved and
-/// not yet enforced — so any other value (including the historical `ask`
-/// default) is rejected rather than persisted as a policy that is silently not
-/// honoured.
-const VALID_PERMISSIONS: [&str; 1] = ["yolo"];
+/// The permission policies a hire may declare. The Node 1.69.2 surface accepts
+/// and persists all three; only `yolo` is *enforced* today (the Rust ACP client
+/// unconditionally applies the yolo allow policy, `src/acp.rs`), while
+/// `escalate`/`filter` are RESERVED (pending nano-workforce#559) and behave like
+/// `yolo`. They are still accepted and persisted verbatim for forward- and
+/// drop-in-compatibility — rejecting them would make existing valid Node hire
+/// commands fail — so the caller warns that a reserved mode is not yet enforced.
+const VALID_PERMISSIONS: [&str; 3] = ["yolo", "escalate", "filter"];
 
-/// The largest supported `--instances` value for a workforce worker. `instances`
-/// is a `u32`, so an unbounded value (e.g. `--instances 4294967295`) makes
-/// `workforce status` eagerly construct billions of `StatusWorker` values and
-/// exhaust memory. This bound is enforced both when a manifest is written
-/// (`workforce add`) and when one is read for status expansion, so a hand-edited
-/// or legacy manifest cannot trigger the blow-up either. 1024 is far above any
-/// real fleet and matches the snapshot fixtures (which use 1–2).
-const MAX_WORKER_INSTANCES: u32 = 1024;
+/// The largest supported `--instances` value for a workforce worker, matching
+/// the Node `MAX_ADD_INSTANCES` per-entry cap. `instances` is a `u32`, so an
+/// unbounded value (e.g. `--instances 4294967295`) makes `workforce status`
+/// eagerly construct billions of `StatusWorker` values and exhaust memory. This
+/// bound is enforced both when a manifest is written (`workforce add`) and when
+/// one is read for status expansion, so a hand-edited or legacy manifest cannot
+/// trigger the blow-up either. 64 matches the Node target exactly, so a manifest
+/// written here is one the Node target accepts (and vice versa).
+const MAX_WORKER_INSTANCES: u32 = 64;
+
+/// The established character set for a profile (hire) name and a workforce
+/// manifest name: `[A-Za-z0-9][A-Za-z0-9._-]*` (Node's `isValidProfileName` /
+/// `isValidManifestName`). The name rides in worker IDs and the manifest
+/// filename, so a space, separator, or control character would either fail later
+/// or (for a manifest) climb out of `workforce/`. Matched case-insensitively.
+fn is_valid_name_charset(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The established character set for an environment variable name:
+/// `[A-Za-z_][A-Za-z0-9_]*` (Node's `ENV_NAME_RE`). Persisting an invalid name
+/// would make Rust state differ from Node and fail only later when the agent is
+/// spawned.
+fn is_valid_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 /// One persisted hire in `config.json`. The field order is the golden order the
 /// `config_after_hire` snapshot pins; a `#[derive(Serialize)]` struct always
 /// emits its fields in declaration order (independent of serde_json's
 /// `preserve_order` feature), so writing through this type keeps the on-disk
 /// key order stable.
+///
+/// The trailing `other` map captures every field this struct does NOT model
+/// (e.g. the `updatedAt` an `assign` stamps, or a field a future plugin version
+/// adds). Without it, deserializing a hire into this closed struct and rewriting
+/// the config would silently drop those fields from *every* hire on any
+/// unrelated `hire`/`assign` — violating in-place compatibility with Node. The
+/// map is empty for a freshly created hire, so the golden `config_after_hire`
+/// shape (exactly the modelled fields) is unchanged.
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredHire {
     name: String,
@@ -89,6 +126,9 @@ struct StoredHire {
     env: BTreeMap<String, String>,
     #[serde(rename = "createdAt", default)]
     created_at: serde_json::Value,
+    /// Unmodelled per-profile fields, preserved verbatim across a rewrite.
+    #[serde(flatten)]
+    other: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_sandbox() -> String {
@@ -167,8 +207,29 @@ fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<(
     let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
 
     let write_result = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp_path)
+        // Create the temp owner-only (0600): a state file can carry credentials
+        // (profiles persist arbitrary `--env` values), and `File::create` honours
+        // the process umask — so a previously owner-only `config.json` would
+        // otherwise become 0644 after a rewrite, exposing it to other local
+        // users. OpenOptions' `mode` applies only when the file is *created*, so
+        // also reset the mode when reusing a crash-left temp (which may predate
+        // this hardening or have been created with a permissive umask).
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp_path)
             .with_context(|| format!("creating {}", tmp_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting permissions on {}", tmp_path.display()))?;
+        }
         f.write_all(json.as_bytes())
             .with_context(|| format!("writing {}", tmp_path.display()))?;
         // Flush user-space buffers and fsync so the bytes are durable before
@@ -382,6 +443,13 @@ pub fn hire(args: HireArgs) -> Result<()> {
         .filter(|s| !s.is_empty())
         .context("hire requires --name")?
         .to_string();
+    // The profile name participates in worker IDs (`wf-<manifest>-<name>-<i>`),
+    // so it must match the established character set, not merely be non-empty.
+    if !is_valid_name_charset(&name) {
+        bail!(
+            "Invalid profile name \"{name}\". Use letters, digits, dot, dash or underscore."
+        );
+    }
     let rank_raw = args
         .rank
         .as_deref()
@@ -408,13 +476,22 @@ pub fn hire(args: HireArgs) -> Result<()> {
     let mut env = BTreeMap::new();
     for pair in &args.env {
         match pair.split_once('=') {
+            // Never echo the VALUE in a diagnostic — a user may pass a secret
+            // via `--env` (e.g. `--env =SECRET`), and printing it would leak it
+            // to stderr / CI logs. Report only that the name is empty, matching
+            // the reference parser's deliberate value-hiding.
             Some(("", _)) => {
-                bail!("invalid --env entry \"{pair}\": expected KEY=VALUE with a non-empty key")
+                bail!("invalid --env entry: expected KEY=VALUE with a non-empty key (value hidden)")
             }
             Some((k, v)) => {
+                if !is_valid_env_name(k) {
+                    bail!(
+                        "invalid --env name \"{k}\": must match [A-Za-z_][A-Za-z0-9_]* (value hidden)"
+                    );
+                }
                 env.insert(k.to_string(), v.to_string());
             }
-            None => bail!("invalid --env entry \"{pair}\": expected KEY=VALUE"),
+            None => bail!("invalid --env entry: expected KEY=VALUE (value hidden)"),
         }
     }
 
@@ -446,6 +523,14 @@ pub fn hire(args: HireArgs) -> Result<()> {
         );
     }
 
+    let image = args.image.clone().unwrap_or_default().trim().to_string();
+    // A container sandbox is unlaunchable without an image; the reference CLI
+    // rejects `docker`/`podman` unless `--image` is non-empty, rather than
+    // persisting a profile that can never run.
+    if matches!(sandbox.as_str(), "docker" | "podman") && image.is_empty() {
+        bail!("--sandbox {sandbox} requires --image <ref> (the container image the agent runs in).");
+    }
+
     let terminal = args
         .terminal
         .as_deref()
@@ -473,6 +558,14 @@ pub fn hire(args: HireArgs) -> Result<()> {
             VALID_PERMISSIONS.join(", ")
         );
     }
+    // escalate/filter are accepted and persisted for forward-compatibility, but
+    // not yet enforced (pending nano-workforce#559) — warn so a hire is never
+    // misread as gating destructive ops today. The value is kept as given.
+    if permission == "escalate" || permission == "filter" {
+        eprintln!(
+            "warning: permission policy \"{permission}\" is RESERVED and not yet enforced in this build (pending nano-workforce#559); it effectively behaves like yolo (auto-allow all) and is persisted as-is."
+        );
+    }
 
     let hire = StoredHire {
         name: name.clone(),
@@ -482,12 +575,14 @@ pub fn hire(args: HireArgs) -> Result<()> {
         model: args.model.clone().unwrap_or_default().trim().to_string(),
         capabilities: capabilities.clone(),
         sandbox,
-        image: args.image.clone().unwrap_or_default(),
+        image,
         terminal,
         protocol: protocol.clone(),
         permission,
         env,
         created_at: serde_json::Value::String(now_iso8601()),
+        // A freshly created hire has no unmodelled fields to preserve.
+        other: BTreeMap::new(),
     };
 
     // Serialize the read-modify-write against concurrent fleet commands and
@@ -513,15 +608,58 @@ pub fn hire(args: HireArgs) -> Result<()> {
     Ok(())
 }
 
+/// POSIX single-quote a token so it survives `sh -c` as one literal argv token,
+/// matching the Node `shQuote` (`'` → `'\''`, empty → `''`).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Build the harness command line exactly like the Node `buildAgentCommandLine`:
+/// with no structured args the command is used verbatim (preserving hires that
+/// baked switches into the command); otherwise the command followed by each
+/// arg shell-quoted.
+fn build_agent_command_line(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return command.to_string();
+    }
+    let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+    format!("{} {}", command, quoted.join(" "))
+}
+
+/// One `hire --list` line, reproducing the Node 1.69.2 surface exactly (scripts
+/// parse it): the command line includes any persisted `--arg`s; empty model and
+/// capabilities print as `-`; and the optional `terminal`/`protocol`/`permission`
+/// fields are appended only when they hold a non-default value (`pty`, `acp`, or
+/// a recognized non-`yolo` permission respectively).
 fn hire_line(h: &StoredHire) -> String {
+    let model = if h.model.is_empty() { "-" } else { &h.model };
     let caps = if h.capabilities.is_empty() {
-        "(none)".to_string()
+        "-".to_string()
     } else {
         h.capabilities.join(", ")
     };
+    let mut optional = String::new();
+    if h.terminal.trim().eq_ignore_ascii_case("pty") {
+        optional.push_str("; terminal: pty");
+    }
+    if h.protocol.trim().eq_ignore_ascii_case("acp") {
+        optional.push_str("; protocol: acp");
+    }
+    // Only surface recognized non-default permission modes; unknown/legacy
+    // values are coerced back to yolo at runtime, so showing them here would
+    // make --list disagree with actual behavior.
+    let perm = h.permission.trim().to_ascii_lowercase();
+    if perm != "yolo" && VALID_PERMISSIONS.contains(&perm.as_str()) {
+        optional.push_str(&format!("; permission: {perm}"));
+    }
     format!(
-        "  {}  [{}]  {}  (model: {}; caps: {}; protocol: {})",
-        h.name, h.rank, h.command, h.model, caps, h.protocol
+        "  {}  [{}]  {}  (model: {}; caps: {}{})",
+        h.name,
+        h.rank,
+        build_agent_command_line(&h.command, &h.args),
+        model,
+        caps,
+        optional
     )
 }
 
@@ -620,16 +758,105 @@ pub fn supervisor(op: SupervisorOp) -> Result<()> {
 
 // --- workforce manifests ----------------------------------------------------
 
+/// A workforce entry's role routing. In the Node manifest format `roles` is
+/// either the string `"auto"` (serve every deployed agent job type) or a
+/// non-empty array of normalized role names (`["pr-review","fix"]`). Modelling
+/// it as an enum lets Rust both *read* a Node-created manifest that carries an
+/// explicit role list and *write* the compatible shape — `--roles a,b` must
+/// persist `["a","b"]`, not the incompatible string `"a,b"`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+enum Roles {
+    Auto(AutoRoles),
+    List(Vec<String>),
+}
+
+/// The `roles: "auto"` marker. A newtype over a unit-validated string so an
+/// untagged enum round-trips the literal `"auto"` (and only it) distinctly from
+/// a role list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutoRoles;
+
+impl serde::Serialize for AutoRoles {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("auto")
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AutoRoles {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s == "auto" {
+            Ok(AutoRoles)
+        } else {
+            Err(serde::de::Error::custom(
+                "roles must be \"auto\" or an array of role names",
+            ))
+        }
+    }
+}
+
+impl Default for Roles {
+    fn default() -> Self {
+        Roles::Auto(AutoRoles)
+    }
+}
+
+impl Roles {
+    /// Human-readable form for `workforce list`/`status`, matching Node's
+    /// `describeEntryRoles`: a list joins with `, `; `auto` prints as `auto`.
+    fn describe(&self) -> String {
+        match self {
+            Roles::Auto(_) => "auto".to_string(),
+            Roles::List(rs) => rs.join(", "),
+        }
+    }
+}
+
+/// A workforce role name (a capability token): starts with a letter/digit, then
+/// letters/digits/`. _ + -` (Node's `WORKFORCE_ROLE_RE`). No `:` — that delimits
+/// rank↔role in the mapped job type. Matched case-insensitively.
+fn is_valid_role(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// Parse a `--roles a,b,c` value into a deduped, validated, lowercased,
+/// sorted list of role names, mirroring Node's `parseRolesList`. Every element
+/// may itself be comma-separated. Returns an error string on an invalid role.
+fn parse_roles_list(raw: &str) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut errors = Vec::new();
+    for item in raw.split(',') {
+        let r = item.trim().to_ascii_lowercase();
+        if r.is_empty() {
+            continue;
+        }
+        if !is_valid_role(&r) {
+            errors.push(format!(
+                "invalid role \"{}\" (use letters, digits, and . _ + -)",
+                item.trim()
+            ));
+            continue;
+        }
+        seen.insert(r);
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(seen.into_iter().collect())
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct ManifestWorker {
     profile: String,
     instances: u32,
-    #[serde(default = "default_roles")]
-    roles: String,
-}
-
-fn default_roles() -> String {
-    "auto".into()
+    #[serde(default)]
+    roles: Roles,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -642,39 +869,29 @@ struct Manifest {
 
 fn manifest_path(name: &str) -> Result<PathBuf> {
     // The manifest name becomes a filename under the home's `workforce/`
-    // directory, so it must be exactly one plain path component. `Path::join`
-    // silently DISCARDS the base when the argument is absolute, and a `..`
-    // (or separator) component climbs out of `workforce/` — either way a
-    // crafted name would read/write state files outside the home. Fail closed:
-    // reject anything that is not a single normal component.
+    // directory AND rides in the deterministic `wf-<name>-` worker-id prefix, so
+    // it must satisfy the established manifest-name contract — the same
+    // character set as a profile name, `[A-Za-z0-9][A-Za-z0-9._-]*`. That is
+    // stricter than "a single normal path component": it also rejects spaces,
+    // separators, control characters and a leading `.`/`_`/`-`, any of which
+    // would either climb out of `workforce/` or produce an invalid worker id.
     let bad = || {
         anyhow::anyhow!(
-            "invalid workforce name \"{name}\": expected a plain name (no path separators or `..`)"
+            "invalid workforce name \"{name}\": use letters, digits, dot, dash or underscore (leading character must be a letter or digit)"
         )
     };
-    let trimmed = name.trim();
     // Reject surrounding whitespace rather than silently trimming: the path is
-    // derived from the trimmed name, but the manifest's stored `name`, status
-    // object, worker IDs, and output all use the original string — so
-    // `--name " default "` would alias `default.json` while persisting and
-    // reporting a *different* name. Rejecting it prevents the ambiguous alias.
-    if trimmed != name {
+    // derived from the name, and the manifest's stored `name`, status object,
+    // worker IDs, and output all use the original string — so `--name
+    // " default "` would alias `default.json` while reporting a *different*
+    // name. (A name with surrounding whitespace also fails the charset below;
+    // this branch only exists to keep the rejection precise.)
+    if !is_valid_name_charset(name) {
         return Err(bad());
-    }
-    // Reject both platforms' separators explicitly: on Unix a backslash is a
-    // valid filename character, so the component check below passes `a\b`,
-    // but the same manifest read on Windows would traverse into `b`.
-    if trimmed.is_empty() || trimmed.contains(['/', '\\']) {
-        return Err(bad());
-    }
-    let as_path = std::path::Path::new(trimmed);
-    match as_path.components().collect::<Vec<_>>().as_slice() {
-        [std::path::Component::Normal(_)] => {}
-        _ => return Err(bad()),
     }
     Ok(home_dir()?
         .join("workforce")
-        .join(format!("{trimmed}.json")))
+        .join(format!("{name}.json")))
 }
 
 fn read_manifest(name: &str) -> Result<Option<Manifest>> {
@@ -702,7 +919,7 @@ pub fn workforce_list(name: &str) -> Result<()> {
         Some(m) => {
             println!("Workforce \"{name}\":");
             for w in &m.workers {
-                println!("  {} × {} (roles: {})", w.profile, w.instances, w.roles);
+                println!("  {} × {} (roles: {})", w.profile, w.instances, w.roles.describe());
             }
         }
     }
@@ -716,14 +933,34 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
     if !cfg.hires.contains_key(profile) {
         bail!("no hire named \"{profile}\"");
     }
-    // A desired-zero worker entry is meaningless (the Node CLI floors instances
-    // at 1); clamp rather than persist an empty workers list. An unbounded
-    // `u32`, on the other hand, lets `workforce status` allocate billions of
-    // worker slots, so reject anything above the supported ceiling outright.
+    // Match the pinned Node behavior (`parseInstancesCount`, MAX_ADD_INSTANCES
+    // = 64) in both directions: `--instances 0` is REJECTED (not silently
+    // floored to 1 — a command must not report success with a different count
+    // than requested), and the per-entry maximum is 64, so a manifest written
+    // here is one the Node target accepts during a rollback.
+    if instances == 0 {
+        bail!("invalid --instances 0: use a whole number between 1 and {MAX_WORKER_INSTANCES}");
+    }
     if instances > MAX_WORKER_INSTANCES {
         bail!("invalid --instances {instances}: supported maximum is {MAX_WORKER_INSTANCES}");
     }
-    let instances = instances.max(1);
+    // Parse `--roles` into the Node manifest shape: the literal `auto` stays the
+    // string `"auto"`; any other value is a comma-separated role list persisted
+    // as a normalized array (`["a","b"]`), never the incompatible string `"a,b"`.
+    // The CLI defaults `--roles` to `auto` when the flag is absent, matching
+    // Node's "neither --auto nor --roles → auto". The marker check is
+    // case-SENSITIVE (`auto` exactly): Node's `parseRolesList` lowercases a
+    // `--roles AUTO` into the *role* `auto` and persists the list `["auto"]`, so
+    // only the exact literal `auto` selects the auto marker here.
+    let roles_value = if roles.trim() == "auto" {
+        Roles::default()
+    } else {
+        match parse_roles_list(roles) {
+            Ok(rs) if !rs.is_empty() => Roles::List(rs),
+            Ok(_) => bail!("--roles must name at least one role (or use \"auto\")"),
+            Err(e) => bail!("{e}"),
+        }
+    };
     // The read-modify-write below is the same lost-update class as `config.json`:
     // two concurrent `workforce add <name> <a>` / `<b>` on the *same* manifest
     // each read the pre-image and the second atomic rename silently drops the
@@ -745,12 +982,12 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
     match manifest.workers.iter_mut().find(|w| w.profile == profile) {
         Some(existing) => {
             existing.instances = instances;
-            existing.roles = roles.to_string();
+            existing.roles = roles_value.clone();
         }
         None => manifest.workers.push(ManifestWorker {
             profile: profile.to_string(),
             instances,
-            roles: roles.to_string(),
+            roles: roles_value,
         }),
     }
     // Test-only: widen the read→write window so the concurrency test reliably
@@ -779,7 +1016,10 @@ struct StatusWorker {
 #[derive(Serialize)]
 struct StatusEntry {
     profile: String,
-    roles: String,
+    /// The entry's `roles` in its persisted shape — the string `"auto"` or an
+    /// array of role names — matching Node's `buildWorkforceStatus`, which
+    /// passes `e.roles` through verbatim (it does NOT join a list into a string).
+    roles: Roles,
     #[serde(rename = "autoScope")]
     auto_scope: Option<String>,
     desired: u32,
@@ -862,7 +1102,10 @@ pub fn workforce_status(name: &str, json: bool) -> Result<()> {
         for e in &status.entries {
             println!(
                 "  {} desired {} running {} (roles: {})",
-                e.profile, e.desired, e.running, e.roles
+                e.profile,
+                e.desired,
+                e.running,
+                e.roles.describe()
             );
         }
     }
@@ -960,7 +1203,9 @@ mod tests {
 
     /// The daemon refuses every sandbox but `none` (host), so hire must reject
     /// an unknown --sandbox at write time — a typo like `dokcer` must fail, not
-    /// persist a profile that can never run.
+    /// persist a profile that can never run. A *container* sandbox additionally
+    /// requires a non-empty `--image` (the reference CLI rejects `docker`/
+    /// `podman` with no usable image rather than persist an unlaunchable profile).
     #[test]
     fn hire_rejects_unknown_sandbox() {
         let cfg = TempCfg::new();
@@ -970,12 +1215,51 @@ mod tests {
         assert!(err.contains("Invalid sandbox \"dokcer\""), "{err}");
         assert!(err.contains("none, docker, podman"), "{err}");
 
-        for ok in ["none", "docker", "podman", " Docker "] {
+        // `none` (host) needs no image.
+        for ok in ["none", " None "] {
             let mut args = hire_args("coder");
             args.sandbox = Some(ok.to_string());
             hire(args).unwrap_or_else(|e| panic!("sandbox {ok:?}: {e}"));
         }
+        // A container sandbox WITH an image is accepted.
+        for ok in ["docker", "podman"] {
+            let mut args = hire_args("coder");
+            args.sandbox = Some(ok.to_string());
+            args.image = Some("registry.example/agent:1".to_string());
+            hire(args).unwrap_or_else(|e| panic!("sandbox {ok:?} + image: {e}"));
+        }
         drop(cfg);
+    }
+
+    /// A container sandbox (`docker`/`podman`) with no usable `--image` persists
+    /// a profile that can never launch; the reference CLI rejects it up front.
+    #[test]
+    fn hire_rejects_container_sandbox_without_image() {
+        let _cfg = TempCfg::new();
+        for sandbox in ["docker", "podman"] {
+            // Missing image entirely.
+            let mut args = hire_args("coder");
+            args.sandbox = Some(sandbox.to_string());
+            let err = hire(args).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("--sandbox {sandbox} requires --image")),
+                "{sandbox} (no image): {err}"
+            );
+            // Blank/whitespace image is still no image.
+            let mut args = hire_args("coder");
+            args.sandbox = Some(sandbox.to_string());
+            args.image = Some("   ".to_string());
+            let err = hire(args).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("--sandbox {sandbox} requires --image")),
+                "{sandbox} (blank image): {err}"
+            );
+            // Nothing was persisted for the rejected hires.
+            assert!(
+                read_config().unwrap().hires.is_empty(),
+                "a rejected container hire must not persist a profile"
+            );
+        }
     }
 
     /// `--terminal` is persisted verbatim and no runtime can interpret an
@@ -998,14 +1282,16 @@ mod tests {
         drop(cfg);
     }
 
-    /// Only `yolo` is implemented (the ACP client unconditionally auto-allows);
-    /// a reserved-but-unenforced value like `ask`/`escalate` must be rejected,
-    /// not persisted as a policy that is silently not honoured. The default
-    /// (no `--permission`) must also resolve to `yolo`, never `ask`.
+    /// The Node surface accepts and persists all three permission policies
+    /// (`yolo`, `escalate`, `filter`); only `yolo` is enforced today, with
+    /// `escalate`/`filter` RESERVED-but-persisted for forward compatibility. So
+    /// hire must reject only a genuinely unknown value (or the historical `ask`
+    /// default), while accepting the reserved modes verbatim. The default (no
+    /// `--permission`) resolves to `yolo`, never `ask`.
     #[test]
-    fn hire_rejects_unsupported_permission() {
+    fn hire_permission_accepts_reserved_modes() {
         let cfg = TempCfg::new();
-        for bad in ["ask", "escalate", "filter", "typo"] {
+        for bad in ["ask", "typo"] {
             let mut args = hire_args("coder");
             args.permission = Some(bad.to_string());
             let err = hire(args).unwrap_err().to_string();
@@ -1013,13 +1299,16 @@ mod tests {
             assert!(err.contains("yolo"), "{bad}: {err}");
         }
 
-        for ok in ["yolo", " YOLO "] {
+        // Reserved modes are accepted and persisted verbatim (never downgraded).
+        for ok in ["yolo", " YOLO ", "escalate", "filter", " ESCALATE "] {
             let mut args = hire_args("coder");
             args.permission = Some(ok.to_string());
             hire(args).unwrap_or_else(|e| panic!("permission {ok:?}: {e}"));
         }
+        let stored = read_config().unwrap();
+        assert_eq!(stored.hires["coder"].permission, "escalate");
 
-        // Omitting --permission defaults to the only implemented policy, yolo.
+        // Omitting --permission defaults to the only enforced policy, yolo.
         hire(hire_args("defaulted")).unwrap();
         let stored = read_config().unwrap();
         assert_eq!(stored.hires["defaulted"].permission, "yolo");
@@ -1067,7 +1356,10 @@ mod tests {
 
     /// A workforce name with surrounding whitespace must be rejected, not
     /// trimmed for the path while persisted/reported untrimmed — otherwise
-    /// `--name " default "` aliases `default.json` under a different name.
+    /// `--name " default "` aliases `default.json` under a different name. And
+    /// because the name rides in the `wf-<name>-` worker-id prefix, interior
+    /// whitespace and other off-charset characters are rejected too (the Node
+    /// manifest-name contract is `[A-Za-z0-9][A-Za-z0-9._-]*`).
     #[test]
     fn manifest_path_rejects_surrounding_whitespace() {
         for bad in [
@@ -1082,13 +1374,42 @@ mod tests {
                 "name {bad:?} must be rejected, not aliased to a trimmed path"
             );
         }
-        // Interior whitespace is a single normal component and stays allowed.
-        assert!(manifest_path("my fleet").is_ok());
     }
 
-    /// `workforce add` must reject an `instances` value above the supported
-    /// ceiling rather than persist a manifest whose status expansion would
-    /// exhaust memory.
+    /// The manifest name follows the same character set as a profile name
+    /// (`[A-Za-z0-9][A-Za-z0-9._-]*`): spaces, separators, control characters
+    /// and a leading `.`/`_`/`-` are all rejected, since the name flows into the
+    /// deterministic `wf-<name>-` worker ids and the on-disk filename.
+    #[test]
+    fn manifest_path_enforces_name_charset() {
+        for bad in [
+            "my fleet",   // interior space
+            "my\tfleet",  // control char
+            "-lead",      // leading dash
+            "_lead",      // leading underscore
+            ".hidden",    // leading dot
+            "fleet name", // space
+            "café",       // non-ASCII
+        ] {
+            assert!(
+                manifest_path(bad).is_err(),
+                "name {bad:?} must be rejected by the character-set contract"
+            );
+        }
+        // The full accepted charset round-trips.
+        for good in ["default", "A", "a1", "my-fleet", "fleet_2", "x.y", "Z9.-_"] {
+            assert!(
+                manifest_path(good).is_ok(),
+                "name {good:?} must be accepted by the character-set contract"
+            );
+        }
+    }
+
+    /// `workforce add` must match the pinned Node `parseInstancesCount` in both
+    /// directions: `--instances 0` is REJECTED (not silently floored to 1 — a
+    /// command must not report success with a count different from what was
+    /// requested), and the per-entry maximum is 64 (not higher), so a manifest
+    /// written here is one the Node target accepts during a rollback.
     #[test]
     fn workforce_add_rejects_unbounded_instances() {
         let _cfg = TempCfg::new();
@@ -1101,10 +1422,70 @@ mod tests {
             read_manifest("default").unwrap().is_none(),
             "an over-large instances value must not persist a manifest"
         );
+        // One above the Node per-entry cap (64) is also rejected.
+        let err = workforce_add("default", "coder", MAX_WORKER_INSTANCES + 1, "auto")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supported maximum"), "{err}");
         // The ceiling itself is accepted.
         workforce_add("default", "coder", MAX_WORKER_INSTANCES, "auto").unwrap();
         let m = read_manifest("default").unwrap().unwrap();
         assert_eq!(m.workers[0].instances, MAX_WORKER_INSTANCES);
+    }
+
+    /// `--instances 0` must be rejected outright, not silently changed to 1:
+    /// reporting success with a different count than requested breaks drop-in
+    /// compatibility with the Node CLI.
+    #[test]
+    fn workforce_add_rejects_zero_instances() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        let err = workforce_add("default", "coder", 0, "auto")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("between 1 and"), "{err}");
+        assert!(
+            read_manifest("default").unwrap().is_none(),
+            "a zero instances value must not persist a manifest"
+        );
+    }
+
+    /// `workforce status --json` must emit `roles` in its persisted shape — the
+    /// string `"auto"` or an array of role names — matching Node's
+    /// `buildWorkforceStatus`, which passes `e.roles` through verbatim rather
+    /// than joining a list into a string.
+    #[test]
+    fn workforce_status_json_preserves_roles_shape() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        workforce_add("default", "coder", 1, "pr-review,fix").unwrap();
+        let m = read_manifest("default").unwrap().unwrap();
+        let entry = &m.workers[0];
+        // Build the status entry exactly as workforce_status does and check the
+        // serialized roles field is the array, not a joined string.
+        let se = StatusEntry {
+            profile: entry.profile.clone(),
+            roles: entry.roles.clone(),
+            auto_scope: None,
+            desired: entry.instances,
+            running: 0,
+            workers: Vec::new(),
+        };
+        let v = serde_json::to_value(&se).unwrap();
+        assert_eq!(v["roles"], serde_json::json!(["fix", "pr-review"]));
+        // And the auto form stays the string "auto".
+        workforce_add("default", "coder", 1, "auto").unwrap();
+        let m = read_manifest("default").unwrap().unwrap();
+        let se = StatusEntry {
+            profile: m.workers[0].profile.clone(),
+            roles: m.workers[0].roles.clone(),
+            auto_scope: None,
+            desired: m.workers[0].instances,
+            running: 0,
+            workers: Vec::new(),
+        };
+        let v = serde_json::to_value(&se).unwrap();
+        assert_eq!(v["roles"], serde_json::json!("auto"));
     }
 
     /// A manifest that already holds an out-of-range `instances` (hand-edited or
@@ -1215,6 +1596,210 @@ mod tests {
         );
     }
 
+    /// A hire may carry fields this struct does not model (`updatedAt`, or a
+    /// field a future plugin adds). Deserializing into the closed struct and
+    /// rewriting the config must PRESERVE those fields, not drop them — Node's
+    /// `assign` spreads the existing profile, so an unrelated `hire`/`assign`
+    /// must not strip them.
+    #[test]
+    fn config_rewrite_preserves_unknown_hire_fields() {
+        let _cfg = TempCfg::new();
+        // Seed a config with an unmodelled field on an existing hire.
+        let dir = home_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"hires":{"coder":{"name":"coder","rank":"senior","command":"nano-coder","updatedAt":"2026-01-01T00:00:00.000Z","customField":{"nested":1}}}}"#,
+        )
+        .unwrap();
+        // An unrelated hire rewrites the whole config.
+        hire(hire_args("other")).unwrap();
+        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            value["hires"]["coder"]["updatedAt"],
+            serde_json::json!("2026-01-01T00:00:00.000Z"),
+            "an unrelated hire must not drop the coder's unmodelled updatedAt"
+        );
+        assert_eq!(
+            value["hires"]["coder"]["customField"],
+            serde_json::json!({"nested": 1}),
+            "arbitrary unmodelled fields must survive a rewrite"
+        );
+        // And `assign` (which mutates the coder in place) preserves them too.
+        assign("coder", "fix").unwrap();
+        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            value["hires"]["coder"]["updatedAt"],
+            serde_json::json!("2026-01-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            value["hires"]["coder"]["capabilities"],
+            serde_json::json!(["fix"])
+        );
+    }
+
+    /// A freshly created hire writes exactly the modelled fields (no stray
+    /// `other` keys), so the golden `config_after_hire` shape is unchanged.
+    #[test]
+    fn fresh_hire_writes_only_modelled_fields() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        let raw = std::fs::read_to_string(home_dir().unwrap().join("config.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let keys: Vec<&str> = value["hires"]["coder"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        for k in &keys {
+            assert!(
+                matches!(
+                    *k,
+                    "name" | "rank" | "command" | "args" | "model" | "capabilities" | "sandbox"
+                        | "image" | "terminal" | "protocol" | "permission" | "env" | "createdAt"
+                ),
+                "fresh hire must not write unmodelled field {k:?}"
+            );
+        }
+    }
+
+    /// The profile name participates in worker IDs, so it must match the
+    /// established character set `[A-Za-z0-9][A-Za-z0-9._-]*` — spaces,
+    /// separators and control characters are rejected before any state write.
+    #[test]
+    fn hire_rejects_invalid_profile_name() {
+        let _cfg = TempCfg::new();
+        for bad in ["my agent", "a/b", "-lead", ".hidden", "café", "a b"] {
+            let mut args = hire_args("coder");
+            args.name = Some(bad.to_string());
+            let err = hire(args).unwrap_err().to_string();
+            assert!(
+                err.contains("Invalid profile name"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(
+            read_config().unwrap().hires.is_empty(),
+            "an invalid profile name must not persist a hire"
+        );
+        // The accepted charset round-trips.
+        for good in ["coder", "A", "a1", "my-agent", "agent_2", "x.y"] {
+            let mut args = hire_args("coder");
+            args.name = Some(good.to_string());
+            hire(args).unwrap_or_else(|e| panic!("name {good:?}: {e}"));
+        }
+    }
+
+    /// `--env` keys must match `[A-Za-z_][A-Za-z0-9_]*`; an invalid name is
+    /// rejected before insertion, and a malformed entry's VALUE is never echoed
+    /// in the diagnostic (it may be a secret).
+    #[test]
+    fn hire_validates_env_names_and_hides_values() {
+        let _cfg = TempCfg::new();
+        for bad in ["1TOKEN", "A-B", "A B"] {
+            let mut args = hire_args("coder");
+            args.env = vec![format!("{bad}=x")];
+            let err = hire(args).unwrap_err().to_string();
+            assert!(err.contains("invalid --env name"), "{bad}: {err}");
+        }
+        // The empty-name error must not leak the value.
+        let mut args = hire_args("coder");
+        args.env = vec!["=SECRET".to_string()];
+        let err = hire(args).unwrap_err().to_string();
+        assert!(err.contains("non-empty key"), "{err}");
+        assert!(!err.contains("SECRET"), "value must be hidden: {err}");
+        // A no-`=` entry must not leak either.
+        let mut args = hire_args("coder");
+        args.env = vec!["SECRET".to_string()];
+        let err = hire(args).unwrap_err().to_string();
+        assert!(!err.contains("SECRET"), "value must be hidden: {err}");
+        // Valid names are accepted.
+        let mut args = hire_args("coder");
+        args.env = vec!["_OK=1".to_string(), "A1_B=2".to_string()];
+        hire(args).unwrap_or_else(|e| panic!("valid env: {e}"));
+    }
+
+    /// `roles` is `"auto"` or a non-empty array of normalized role names. The
+    /// manifest must round-trip both: read a Node-written explicit list, and
+    /// write `--roles a,b` as `["a","b"]` (never the string `"a,b"`).
+    #[test]
+    fn workforce_roles_roundtrip_auto_and_list() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        // Default (auto) persists the string "auto".
+        workforce_add("default", "coder", 1, "auto").unwrap();
+        let raw = std::fs::read_to_string(home_dir().unwrap().join("workforce/default.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["workers"][0]["roles"], serde_json::json!("auto"));
+
+        // An explicit `--roles a,b` persists a normalized array, not a string.
+        workforce_add("default", "coder", 1, "Pr-Review, Fix ,pr-review").unwrap();
+        let raw = std::fs::read_to_string(home_dir().unwrap().join("workforce/default.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            value["workers"][0]["roles"],
+            serde_json::json!(["fix", "pr-review"]),
+            "--roles a,b must persist a normalized array"
+        );
+
+        // A Node-written manifest with an explicit list deserializes.
+        std::fs::write(
+            home_dir().unwrap().join("workforce/node.json"),
+            r#"{"version":1,"name":"node","workers":[{"profile":"coder","instances":1,"roles":["pr-review","fix"]}]}"#,
+        )
+        .unwrap();
+        let m = read_manifest("node").unwrap().unwrap();
+        assert_eq!(
+            m.workers[0].roles,
+            Roles::List(vec!["pr-review".to_string(), "fix".to_string()])
+        );
+        // An invalid role is rejected.
+        let err = workforce_add("default", "coder", 1, "bad:role")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid role"), "{err}");
+    }
+
+    /// `hire --list` must reproduce the Node surface: persisted `--arg`s are
+    /// shell-quoted into the command line, empty model/caps print as `-`, and
+    /// the `protocol`/`terminal`/`permission` fields appear only when non-default.
+    #[test]
+    fn hire_list_matches_node_format() {
+        let _cfg = TempCfg::new();
+        // Default pipe hire with an --arg: protocol/terminal omitted (defaults).
+        let mut args = hire_args("coder");
+        args.args = vec!["--allow-all".to_string()];
+        hire(args).unwrap();
+        let cfg = read_config().unwrap();
+        let line = hire_line(&cfg.hires["coder"]);
+        assert_eq!(
+            line,
+            "  coder  [senior]  nano-coder '--allow-all'  (model: -; caps: -)",
+            "default pipe hire with --arg: {line}"
+        );
+
+        // Non-default protocol/terminal/permission are appended in order.
+        let mut args = hire_args("reviewer");
+        args.protocol = Some("acp".to_string());
+        args.terminal = Some("pty".to_string());
+        args.permission = Some("escalate".to_string());
+        args.model = Some("gpt5".to_string());
+        args.capabilities = Some("fix,pr-review".to_string());
+        hire(args).unwrap();
+        let cfg = read_config().unwrap();
+        let line = hire_line(&cfg.hires["reviewer"]);
+        assert_eq!(
+            line,
+            "  reviewer  [senior]  nano-coder  (model: gpt5; caps: fix, pr-review; terminal: pty; protocol: acp; permission: escalate)",
+            "non-default modes appended: {line}"
+        );
+    }
+
+
+
     /// A minimal `C8CTL_NANO_HOME` guard: points the state home at a fresh temp
     /// dir for the duration of a state-mutating test. Tests mutate the process
     /// environment, so they must not run concurrently — a process-wide mutex
@@ -1232,7 +1817,12 @@ mod tests {
 
     impl TempCfg {
         fn new() -> Self {
-            let guard = env_lock().lock().unwrap();
+            // `unwrap_or_else(|e| e.into_inner())` recovers from a poisoned
+            // mutex: a test that panics while holding the lock (e.g. a failed
+            // assertion) must not cascade PoisonError failures into every later
+            // state-mutating test — the guard still serializes access, which is
+            // its only job.
+            let guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
             let home = std::env::temp_dir().join(format!(
                 "fleet-test-{}-{}",
                 std::process::id(),

@@ -196,8 +196,11 @@ enum Cmd {
         /// Terminal relay mode.
         #[arg(long)]
         terminal: Option<String>,
-        /// Extra argument appended to the agent command (repeatable).
-        #[arg(long = "arg")]
+        /// Extra argument appended to the agent command (repeatable). Agent
+        /// arguments are commonly flags themselves (e.g. `--arg --allow-all`),
+        /// so allow hyphen-prefixed values — otherwise clap treats a leading
+        /// `-` token as another option and a valid invocation fails to parse.
+        #[arg(long = "arg", allow_hyphen_values = true)]
         args: Vec<String>,
         /// Extra `KEY=VALUE` environment entry (repeatable).
         #[arg(long = "env")]
