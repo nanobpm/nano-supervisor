@@ -228,14 +228,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         // on rather than failing closed on it.
         #[cfg(unix)]
         {
-            if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
-                log(&format!(
-                    "warning: could not fsync state directory {} ({e}); \
-                     the pin is written but its on-disk rename may be less \
-                     durable across a power loss",
-                    dir.display()
-                ));
-            }
+            sync_dir_best_effort(dir);
         }
         Ok(())
     })();
@@ -255,6 +248,54 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("restricting {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Best-effort fsync of the containing directory `dir` after the atomic rename.
+///
+/// Extracted from `write_atomic` so the swallowed-error path is testable: the
+/// real directory fsync can fail on some platforms/filesystems (e.g. macOS can
+/// reject `fsync` on a directory descriptor with `EINVAL`/`ENOTSUP`), and that
+/// failure must NOT fail the pin write — the file is already written and
+/// atomically renamed into place. Tests override this via [`SYNC_DIR_HOOK`] to
+/// force an error and assert the write still succeeds.
+#[cfg(unix)]
+fn sync_dir_best_effort(dir: &Path) {
+    let result = {
+        #[cfg(test)]
+        if let Some(hook) = SYNC_DIR_HOOK.with(|h| *h.borrow()) {
+            hook(dir)
+        } else {
+            real_sync_dir(dir)
+        }
+        #[cfg(not(test))]
+        real_sync_dir(dir)
+    };
+    if let Err(e) = result {
+        log(&format!(
+            "warning: could not fsync state directory {} ({e}); \
+             the pin is written but its on-disk rename may be less \
+             durable across a power loss",
+            dir.display()
+        ));
+    }
+}
+
+/// The production directory fsync, kept separate so tests can bypass it.
+#[cfg(unix)]
+fn real_sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir).and_then(|d| d.sync_all())
+}
+
+// Test-only hook to force the directory fsync to fail (or otherwise observe
+// it) so the swallowed-error path in `write_atomic` can be exercised without
+// relying on a filesystem that actually rejects directory fsync.
+#[cfg(all(unix, test))]
+type SyncDirHook = fn(&Path) -> std::io::Result<()>;
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static SYNC_DIR_HOOK: std::cell::RefCell<Option<SyncDirHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// An interprocess (advisory `flock`) lock serializing the pin's
@@ -794,6 +835,10 @@ mod tests {
         // pin write and break startup, since the file is already written and
         // atomically renamed into place. Writing — and re-writing — a pin must
         // succeed on the host running this test, macOS included.
+        //
+        // This covers the happy path; the swallowed-error path is covered by
+        // `write_atomic_survives_a_failing_directory_fsync` below, which forces
+        // the directory fsync to fail via the SYNC_DIR_HOOK seam.
         let home = temp_home("write-atomic-durable");
         let path = state_file(&home);
         write_atomic(&path, b"{\"first\":true}\n").expect("first write must succeed");
@@ -802,6 +847,44 @@ mod tests {
         // durability path a second time).
         write_atomic(&path, b"{\"second\":true}\n").expect("re-write must succeed");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"second\":true}\n");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Red-first regression for PR #46: when the parent-directory fsync FAILS
+    /// (as macOS can on some filesystems), `write_atomic` must still succeed —
+    /// the pin is already written and atomically renamed, so a failed directory
+    /// fsync is only a durability nicety, not a fatal error. This forces the
+    /// error through the SYNC_DIR_HOOK seam so it is genuinely red-before /
+    /// green-after (unlike the happy-path test above, which passes on any host
+    /// whose directory fsync succeeds).
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_survives_a_failing_directory_fsync() {
+        fn fail_sync(_dir: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "EINVAL: fsync not supported on directory (simulated macOS)",
+            ))
+        }
+        SYNC_DIR_HOOK.with(|h| *h.borrow_mut() = Some(fail_sync));
+        // Ensure the hook is cleared even if the test panics.
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                SYNC_DIR_HOOK.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        let _guard = HookGuard;
+
+        let home = temp_home("write-atomic-dirfsync-fails");
+        let path = state_file(&home);
+        // The write must SUCCEED despite the directory fsync failing.
+        write_atomic(&path, b"{\"pinned\":true}\n")
+            .expect("write must succeed even when the directory fsync fails");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"pinned\":true}\n"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
