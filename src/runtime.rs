@@ -271,14 +271,15 @@ pub(crate) async fn refresh_loop(
     key: String,
     lease: Option<String>,
     window: Duration,
-    // The instant the activation response was received by the caller (captured
-    // in `handle` BEFORE validation/logging/spawn). The lease runs `window` from
-    // when the engine dispatched the job, i.e. essentially when that response was
-    // produced — NOT from the later instant this task starts executing. Basing
-    // the initial deadline on `Instant::now()` here would grant a full fresh
-    // window measured from an instant already past dispatch, over-granting by the
-    // post-response scheduling gap and letting the refresher run past the
-    // server-side lease. Take the caller's earlier timestamp instead.
+    // The instant the activation response was decoded by the caller (captured in
+    // `Jobs::activate` and threaded here via `Job::dispatched_at`). The lease
+    // runs `window` from when the engine dispatched the job — before that
+    // response was produced — NOT from the later instant this task starts
+    // executing. Basing the initial deadline on `Instant::now()` here would grant
+    // a full fresh window measured from an instant already past dispatch,
+    // over-granting by the response-transit + scheduling gap and letting the
+    // refresher run past the server-side lease. Take the caller's earlier
+    // (conservative) timestamp instead.
     activated_at: Instant,
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,

@@ -321,9 +321,22 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
+async fn handle(
+    jobs: Jobs,
+    cfg: Arc<SlotConfig>,
+    Job {
+        job,
+        lease,
+        dispatched_at,
+    }: Job,
+) {
     let key = job.job_key.value().to_string();
-    let started = Instant::now();
+    // The lease was started by the engine at dispatch; `dispatched_at` (captured
+    // in `Jobs::activate` when the response was decoded) is the conservative
+    // lower bound we thread into the refresher. A separate `Instant::now()` here
+    // would be LATER than dispatch by the response-transit + spawn gap, so it
+    // would over-grant the first window — the exact overrun the reviewer flagged.
+    let started = dispatched_at;
     // Validate the engine-supplied key BEFORE it is used to build any request
     // path. The refresher below (`extend`) and the `complete`/`fail` settle all
     // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
@@ -352,11 +365,12 @@ async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
         key.clone(),
         lease.clone(),
         cfg.recovery_window,
-        // Base the refresher's initial lease deadline on `started` (captured at
-        // the top of `handle`, right after the activation response) rather than
-        // an `Instant::now()` taken inside the loop: the lease began at dispatch,
+        // Base the refresher's initial lease deadline on `started` (=
+        // `dispatched_at`, captured in `Jobs::activate` when the response was
+        // decoded — before validation/logging/spawn) rather than an
+        // `Instant::now()` taken inside the loop: the lease began at dispatch,
         // so the earlier timestamp avoids over-granting the first window by the
-        // validation/logging/spawn gap.
+        // response-transit + validation/logging/spawn gap.
         started,
         refreshes.clone(),
         lost_tx,

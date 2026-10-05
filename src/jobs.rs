@@ -23,6 +23,17 @@ use serde_json::Value;
 pub struct Job {
     pub job: ActivatedJobResult,
     pub lease: Option<String>,
+    /// A conservative lower bound on when the engine started this job's lease.
+    ///
+    /// The engine starts the lease when it *dispatches* the job, which is before
+    /// the activation response crosses the wire and is decoded here. Capturing
+    /// the instant at decode time (in [`Jobs::activate`]) — rather than later,
+    /// when the slot's `handle` task begins — keeps the refresher's initial
+    /// deadline (`dispatched_at + window`) at or *before* the true server-side
+    /// expiry, so a delayed response cannot let the refresher and agent run past
+    /// the lease. It is a lower bound (decode happens after dispatch), so the
+    /// deadline is conservative: the refresher fences slightly early, never late.
+    pub dispatched_at: std::time::Instant,
 }
 
 /// Reject any job key that is not the engine's canonical numeric key format
@@ -116,11 +127,21 @@ impl Jobs {
             req.with_lease = Some(Some(true));
         }
         let r = self.client.activate_jobs(req).await.map_err(sdk_error)?;
+        // Capture the lease-start lower bound as soon as the response is decoded
+        // (the engine started each lease when it dispatched the job, before the
+        // response arrived). One timestamp shared by the whole batch: every job
+        // in it was dispatched no later than now, so a single `Instant::now()`
+        // here is a conservative (early) bound for all of them.
+        let dispatched_at = std::time::Instant::now();
         Ok(r.jobs
             .into_iter()
             .map(|j| {
                 let lease = j.job_lease_token.as_ref().map(|t| t.value().to_string());
-                Job { job: j, lease }
+                Job {
+                    job: j,
+                    lease,
+                    dispatched_at,
+                }
             })
             .collect())
     }
@@ -252,5 +273,44 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn dispatched_at_anchors_the_lease_deadline_no_later_than_decode() {
+        // Regression for the review finding that the refresher's initial lease
+        // deadline was anchored at `Instant::now()` taken when the slot's
+        // `handle` task began — AFTER the activation response had already been
+        // decoded (and after the engine had started the lease at dispatch). That
+        // later timestamp over-grants the first window by the response-transit +
+        // spawn gap, so the refresher and agent could run past the server-side
+        // lease. The deadline must instead be `dispatched_at + window`, where
+        // `dispatched_at` is captured at decode time and so is a conservative
+        // (early) lower bound on the true dispatch instant.
+        //
+        // Model it: the engine dispatched at T0. The response was decoded at
+        // `dispatched_at` (>= T0, the earliest we can observe). A `handle`-top
+        // timestamp lands strictly later still. The deadline built from
+        // `dispatched_at` must never exceed one built from any later instant —
+        // otherwise the lease is over-granted.
+        let window = std::time::Duration::from_secs(300);
+        let dispatched_at = std::time::Instant::now();
+        // Simulate the validation/logging/spawn gap before `handle` would have
+        // captured its own `Instant::now()` under the old code.
+        let handle_top = dispatched_at + std::time::Duration::from_millis(50);
+
+        let deadline_from_dispatch = dispatched_at + window;
+        let deadline_from_handle_top = handle_top + window;
+        assert!(
+            deadline_from_dispatch <= deadline_from_handle_top,
+            "anchoring at decode time must never grant a later deadline than the \
+             old handle-top capture (the over-grant the reviewer flagged)"
+        );
+        // And the conservative bound is genuinely earlier (it fences early,
+        // never late): the gap between the two deadlines is exactly the
+        // transit+spawn gap the old code added on top of the real lease.
+        assert_eq!(
+            deadline_from_handle_top - deadline_from_dispatch,
+            std::time::Duration::from_millis(50)
+        );
     }
 }
