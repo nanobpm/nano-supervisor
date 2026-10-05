@@ -2399,14 +2399,38 @@ fn seed_c8ctl_files(
 pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> Result<()> {
     for (name, body) in seed_c8ctl_files(profile)? {
         let path = dir.join(name);
-        // Fail closed on a planted symlink even on the path-based fallback.
-        reject_symlink(&path)?;
-        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+        // Create each seed EXCLUSIVELY (`create_new`): a plain `fs::write`
+        // truncates whatever already sits at `path`, and `reject_symlink`
+        // alone does not catch a HARD link, so a same-UID sibling that plants
+        // `session.json` as a hard link to the operator's real session would
+        // have that file overwritten by this seed. `O_CREAT | O_EXCL` fails
+        // closed on any pre-existing symlink, hard link, or regular file —
+        // matching the Linux pinned path's `write_new_child_file`. The dir was
+        // just wiped-and-recreated by the caller, so the exclusive create
+        // succeeds on the fresh, empty directory.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting {}", path.display()))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            f.write_all(body.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            f.write_all(body.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
         }
     }
     Ok(())
@@ -2732,6 +2756,34 @@ mod tests {
         );
         assert!(dir.is_dir(), "the c8ctl dir must be recreated");
         let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, hard-link defence: `seed_c8ctl_dir` creates each seed file
+    /// EXCLUSIVELY (`O_CREAT | O_EXCL`), so a same-UID sibling who plants a
+    /// hard link (or any regular file) at the seed path — a case `reject_symlink`
+    /// does NOT catch — cannot have the operator's real file silently
+    /// overwritten. The seed must FAIL CLOSED, leaving the planted content
+    /// untouched.
+    #[test]
+    fn seed_c8ctl_dir_fails_closed_on_a_preexisting_seed_file() {
+        let dir = std::env::temp_dir().join(format!("nano-slot-test-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A planted file (stand-in for a hard link to the operator's session).
+        std::fs::write(dir.join("session.json"), "PLANTED").unwrap();
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+        seed_c8ctl_dir(&dir, &profile)
+            .expect_err("an exclusive create must fail closed on a pre-existing seed file");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("session.json")).unwrap(),
+            "PLANTED",
+            "the planted file must never be overwritten by the seed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The profiled counterpart: a pinned profile seeds the isolated dir with

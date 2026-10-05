@@ -20,14 +20,28 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
     pub name: String,
+    // c8ctl's `isValidProfile` accepts an optional field only when it is ABSENT
+    // or a string — a JSON `null` (which `Serialize` emits for `None` by
+    // default) is rejected, so the seeded `profiles.json` would be thrown out
+    // and the agent would never see the pinned profile. Omit every `None`
+    // field so the seed matches c8ctl's own on-disk shape (issue #41).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub o_auth_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_tenant_id: Option<String>,
 }
 
@@ -335,5 +349,38 @@ mod tests {
         );
         let json = serde_json::to_string(&id).unwrap();
         assert!(!json.contains("secret"), "URL userinfo leaked: {json}");
+    }
+
+    /// Issue #41: c8ctl's `isValidProfile` accepts an optional field only when
+    /// it is ABSENT or a string — a JSON `null` is rejected and the whole
+    /// seeded `profiles.json` is thrown out, so the agent never sees the pinned
+    /// profile. The serialized identity must therefore OMIT every `None` field,
+    /// never emit `"clientId":null`.
+    #[test]
+    fn connection_identity_omits_null_fields() {
+        let p = profile(r#"{"name":"merlin","baseUrl":"http://engine:8080"}"#);
+        let json = serde_json::to_string(&p.connection_identity()).unwrap();
+        assert!(
+            !json.contains("null"),
+            "c8ctl rejects JSON null for optional fields; they must be omitted: {json}"
+        );
+        for field in [
+            "clientId",
+            "clientSecret",
+            "audience",
+            "oAuthUrl",
+            "scope",
+            "username",
+            "password",
+            "defaultTenantId",
+        ] {
+            assert!(
+                !json.contains(field),
+                "absent field {field} must be omitted, not serialized: {json}"
+            );
+        }
+        // The fields that ARE present round-trip as strings.
+        assert!(json.contains(r#""name":"merlin""#), "{json}");
+        assert!(json.contains(r#""baseUrl":"http://engine:8080""#), "{json}");
     }
 }

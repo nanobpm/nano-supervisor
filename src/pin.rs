@@ -373,6 +373,28 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         (None, Some(pin)) => (pin.profile.clone(), false),
         (None, None) => (active_profile.clone(), true),
     };
+    // Fail CLOSED on an existing pin that carries NO baseUrl fingerprint. A
+    // structurally valid but empty state such as `{"connection":{"profile":null}}`
+    // (or a profile pin whose `baseUrl` was dropped) would otherwise be followed
+    // as a real pin: the env-only branch falls back to the ambient env/session
+    // and a profile pin follows the profile's CURRENT url with no drift
+    // comparison — either silently restores the exact retargeting the pin exists
+    // to prevent (issue #41). An explicit `--profile` sets `created` (it repairs
+    // the pin), so this never blocks the operator's deliberate re-pin.
+    if !created {
+        let has_fingerprint = existing
+            .as_ref()
+            .and_then(|p| p.base_url.as_deref())
+            .is_some_and(|u| !u.trim().is_empty());
+        if !has_fingerprint {
+            anyhow::bail!(
+                "the pinned connection in supervisor.json has no recorded engine \
+                 baseUrl fingerprint, so it cannot be enforced and would fall back \
+                 to the ambient connection — silently retargetable. Re-pin with \
+                 --profile or set an explicit engine address (issue #41)."
+            );
+        }
+    }
     // An existing ENV-ONLY pin (`profile: None`) must stay env-only: `name` is
     // `None` here, and if `CAMUNDA_REST_ADDRESS` was later removed,
     // `profile::resolve(None)` would fall through to the session's active
@@ -907,6 +929,48 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("no longer resolves a baseUrl")),
             "a removed profile baseUrl must warn about drift, not be silently skipped: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41: an existing pin with NO recorded baseUrl fingerprint (a
+    /// structurally valid but empty `{"connection":{"profile":null}}`, or a
+    /// profile pin whose URL was dropped) must FAIL CLOSED rather than fall back
+    /// to the ambient env/session — otherwise it silently restores the
+    /// retargeting the pin exists to prevent. An explicit `--profile` still
+    /// repairs it.
+    #[test]
+    fn fingerprintless_pin_fails_closed_but_explicit_profile_repairs() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("nofingerprint");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+        )
+        .unwrap();
+        // A fingerprint-less existing pin, plus an ambient address it must NOT
+        // silently adopt.
+        std::fs::write(state_file(&home), r#"{"connection":{"profile":null}}"#).unwrap();
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://ambient:8080");
+
+        let err = resolve_or_pin(&home, None)
+            .err()
+            .expect("a fingerprint-less pin must fail closed, never adopt the ambient env");
+        assert!(
+            format!("{err:#}").contains("no recorded engine"),
+            "unexpected error: {err:#}"
+        );
+
+        // The operator's explicit --profile repairs the pin and records a
+        // fingerprint.
+        let repaired = resolve_or_pin(&home, Some("merlin")).expect("explicit --profile repairs");
+        assert!(repaired.created);
+        assert_eq!(
+            repaired.pin.base_url.as_deref(),
+            Some("http://engine-a:8080")
         );
         let _ = std::fs::remove_dir_all(&home);
     }

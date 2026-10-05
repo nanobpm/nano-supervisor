@@ -78,6 +78,15 @@ fn apply_hermetic_env(c: &mut Command, home: &Path) {
         }
     }
     c.env("C8CTL_NANO_HOME", home)
+        // Also isolate the c8ctl *data* dir (profiles.json / session.json).
+        // Without this a Rust worker under test reads the developer's real
+        // ~/.config/c8ctl, and the issue-#41 first-start precedence (the ambient
+        // active profile is resolved before `CAMUNDA_REST_ADDRESS`) could pin
+        // the operator's global profile and poll a REAL engine instead of the
+        // guarded local test one. Point it at an empty per-home dir; a test that
+        // needs seeded profiles overrides this key with a later
+        // `.env("C8CTL_DATA_DIR", …)` (a later set on the same key wins).
+        .env("C8CTL_DATA_DIR", home.join("c8ctl"))
         .env("C8CTL_NANO_NO_LAUNCHD", "1")
         .env("NANO_NO_UPDATE_NOTIFIER", "1");
 }
