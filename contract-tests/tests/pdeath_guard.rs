@@ -85,9 +85,14 @@ fn eventually<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
 
 /// Run `__reap-watchdog` against a live agent group with a **forged** identity
 /// (a wrong start time — exactly what a recycled pgid's new leader presents).
-/// The watchdog must decline to signal the mismatched group: the innocent group
-/// stays **alive**, and the watchdog keeps waiting on its (live) parent rather
-/// than firing.
+/// The watchdog is given a short-lived parent that we then **kill**, so it
+/// actually leaves `wait_parent_or_group_gone` and reaches the identity-gated
+/// SIGKILL decision — with a forged identity it must decline to signal the
+/// mismatched group. The innocent group stays **alive**, and the watchdog exits
+/// without firing. (Using the live test process as the parent, as a previous
+/// version did, made this test vacuous: the watchdog blocked on the live parent
+/// forever and never evaluated the identity, so the assertion passed regardless
+/// of the guard.)
 #[cfg(target_os = "linux")]
 #[test]
 fn watchdog_does_not_sigkill_a_recycled_pgid() {
@@ -104,8 +109,19 @@ fn watchdog_does_not_sigkill_a_recycled_pgid() {
     // match the real leader — what an unrelated group reusing the pgid presents.
     let forged_start = start.wrapping_add(1);
     let real_uid = unsafe { libc::getuid() };
-    // The watchdog waits on this (the test process, alive for the whole test).
-    let parent = std::process::id();
+
+    // A short-lived stand-in for the daemon: the watchdog waits on this pid and
+    // only reaches its identity-gated SIGKILL decision once it exits. Killing it
+    // below is what drives the watchdog to the decision point (a live parent
+    // would leave the watchdog blocked, never exercising the identity check).
+    let mut fake_parent = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fake parent");
+    let parent = fake_parent.id();
 
     let mut watchdog = Command::new(bin())
         .args([
@@ -114,6 +130,10 @@ fn watchdog_does_not_sigkill_a_recycled_pgid() {
             &parent.to_string(),
             "--pgid",
             &pgid.to_string(),
+            "--parent-start",
+            &proc_identity(parent)
+                .map(|(s, _)| s.to_string())
+                .unwrap_or_default(),
             "--pgid-start",
             &forged_start.to_string(),
             "--pgid-uid",
@@ -125,22 +145,38 @@ fn watchdog_does_not_sigkill_a_recycled_pgid() {
         .spawn()
         .expect("spawn watchdog");
 
-    // Give the watchdog a moment to register and evaluate. It must NOT kill the
-    // group (identity mismatch) and must keep waiting on the (live) parent.
-    std::thread::sleep(Duration::from_millis(600));
+    // Kill the fake daemon: the watchdog now wakes, re-verifies the group's
+    // identity, finds the forged start time does not match, and must decline to
+    // fire. Wait for it to exit so the decision has actually been taken before
+    // we assert (a still-running watchdog would prove nothing).
+    let _ = fake_parent.kill();
+    let _ = fake_parent.wait();
+    let exited = eventually(Duration::from_secs(5), || {
+        matches!(watchdog.try_wait(), Ok(Some(_)))
+    });
     assert!(
-        group_alive(pgid),
+        exited,
+        "the watchdog must exit once its parent dies, even when the identity \
+         does not match (it must not hang on a recycled pgid)"
+    );
+
+    // The group must still be alive. Poll briefly and reap the leader on every
+    // iteration: had the watchdog wrongly SIGKILLed it, the leader would be this
+    // process's unreaped zombie, and a zombie still holds its pgid — so a single
+    // `kill(-pgid, 0)` would keep answering "alive" and mask the wrongful kill
+    // (the same trap the positive control's reap loop documents). Reaping lets a
+    // real kill surface as "group gone".
+    let wrongly_killed = eventually(Duration::from_millis(500), || {
+        let _ = leader.try_wait();
+        !group_alive(pgid)
+    });
+    assert!(
+        !wrongly_killed,
         "the watchdog must not SIGKILL a group whose identity does not match \
          (a recycled pgid); the innocent group was killed"
     );
-    assert!(
-        watchdog.try_wait().expect("watchdog wait").is_none(),
-        "the watchdog must keep waiting on the live parent, not exit after a mismatch"
-    );
 
-    // Cleanup: kill the watchdog and the group.
-    let _ = watchdog.kill();
-    let _ = watchdog.wait();
+    // Cleanup: kill the group.
     let _ = leader.kill();
     let _ = leader.wait();
 }
