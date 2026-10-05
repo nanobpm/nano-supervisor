@@ -331,8 +331,8 @@ async fn handle(
     }: Job,
 ) {
     let key = job.job_key.value().to_string();
-    // The lease was started by the engine at dispatch; `dispatched_at` (captured
-    // in `Jobs::activate` when the response was decoded) is the conservative
+    // The lease was started by the engine at dispatch; `dispatched_at` (derived
+    // in `Jobs::activate` from the engine's `deadline`) is the conservative
     // lower bound we thread into the refresher. A separate `Instant::now()` here
     // would be LATER than dispatch by the response-transit + spawn gap, so it
     // would over-grant the first window — the exact overrun the reviewer flagged.
@@ -366,8 +366,8 @@ async fn handle(
         lease.clone(),
         cfg.recovery_window,
         // Base the refresher's initial lease deadline on `started` (=
-        // `dispatched_at`, captured in `Jobs::activate` when the response was
-        // decoded — before validation/logging/spawn) rather than an
+        // `dispatched_at`, derived in `Jobs::activate` from the engine's
+        // `deadline` — before validation/logging/spawn) rather than an
         // `Instant::now()` taken inside the loop: the lease began at dispatch,
         // so the earlier timestamp avoids over-granting the first window by the
         // response-transit + validation/logging/spawn gap.
