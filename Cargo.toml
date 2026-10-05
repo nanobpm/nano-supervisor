@@ -43,9 +43,12 @@ sha1 = "0.10"
 # pulled in.
 ryu = "1"
 # (Cross-process serialization of `config.json` / workforce-manifest
-# read-modify-write cycles is done with an atomic `create_new` lock marker in
-# `fleet::StateLock` — no external locking crate, so the flock unlink race is
-# avoided by construction and no lock file persists under the home.)
+# read-modify-write cycles uses an advisory `flock` on a temp-dir lock file in
+# `fleet::StateLock`. An OS-released lock — the kernel drops it the instant a
+# holder dies, so there is no abandoned marker to reclaim by guessing (an
+# age-based reclaim could steal the lock from a merely-slow owner and break
+# mutual exclusion) and the lock file never persists under the state home.)
+fs2 = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).

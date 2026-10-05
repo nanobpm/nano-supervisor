@@ -36,6 +36,20 @@ const VALID_PROTOCOLS: [&str; 2] = ["acp", "pipe"];
 /// `dokcer` accepted here would persist a profile that can never run.
 const VALID_SANDBOXES: [&str; 3] = ["none", "docker", "podman"];
 
+/// The terminal transports a hire may declare. Anything else is rejected at
+/// hire time, exactly as `--protocol`/`--sandbox` are: the value is persisted
+/// verbatim, so a typo such as `--terminal typo` would create state no runtime
+/// can interpret and the Node-compatible CLI would reject.
+const VALID_TERMINALS: [&str; 2] = ["pty", "pipe"];
+
+/// The permission policies a hire may declare. The CLI contract currently
+/// implements only `yolo` — the Rust ACP client unconditionally applies the
+/// yolo allow policy (`src/acp.rs`), and `escalate`/`filter` are reserved and
+/// not yet enforced — so any other value (including the historical `ask`
+/// default) is rejected rather than persisted as a policy that is silently not
+/// honoured.
+const VALID_PERMISSIONS: [&str; 1] = ["yolo"];
+
 /// The largest supported `--instances` value for a workforce worker. `instances`
 /// is a `u32`, so an unbounded value (e.g. `--instances 4294967295`) makes
 /// `workforce status` eagerly construct billions of `StatusWorker` values and
@@ -87,7 +101,7 @@ fn default_protocol() -> String {
     "pipe".into()
 }
 fn default_permission() -> String {
-    "ask".into()
+    "yolo".into()
 }
 
 /// `config.json` — the hires map plus any other top-level keys we don't model,
@@ -120,14 +134,21 @@ fn read_config() -> Result<ConfigFile> {
 }
 
 /// Serialize `value` to pretty JSON and commit it to `path` atomically: write a
-/// uniquely-named sibling temp file, `fsync` it, then `rename` over `path`.
+/// deterministic sibling temp file, `fsync` it, then `rename` over `path`.
 /// A same-directory rename is atomic on every supported OS, so a concurrent
 /// `work`/daemon read observes either the old file or the new one — never a
 /// truncated or partial `config.json` — and a crash mid-write leaves the
-/// previous copy intact (the orphaned temp file is harmless and overwritten on
-/// the next write). The temp file is renamed away, never left behind: the
-/// contract test `state_writes_stay_under_home` asserts the exact set of files
-/// under the home, so nothing extra may persist.
+/// previous copy intact.
+///
+/// The temp name is **deterministic** (`.<file>.tmp`), not unique per
+/// (pid, nanos): every writer of a given state file first takes that file's
+/// `StateLock` (see `update_config`/`workforce_add`), so two writers never race
+/// on this path, and a crash between `create` and `rename` leaves *at most this
+/// one* temp — which the next write to the same file reuses (truncates) and
+/// renames away — instead of a unique orphan per crash that would accumulate
+/// forever under the state home. On the success path the temp is renamed away,
+/// never left behind: the contract test `state_writes_stay_under_home` asserts
+/// the exact set of files under the home, so nothing extra may persist.
 fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -140,16 +161,10 @@ fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<(
         .file_name()
         .and_then(|n| n.to_str())
         .context("state path has no valid file name")?;
-    // Unique per (pid, nanos) so two processes never collide on the temp name.
-    let tmp_name = format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let tmp_path = path.with_file_name(tmp_name);
+    // Deterministic, lock-protected temp sibling: callers hold this file's
+    // `StateLock`, so there is no cross-writer collision, and a crashed temp is
+    // overwritten (not accumulated) by the next write rather than orphaned.
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
 
     let write_result = (|| -> Result<()> {
         let mut f = std::fs::File::create(&tmp_path)
@@ -177,89 +192,68 @@ fn write_config(cfg: &ConfigFile) -> Result<()> {
     write_json_atomic(&path, cfg)
 }
 
-/// A mutual-exclusion guard for a state file's read-modify-write cycle.
+/// A cross-process mutual-exclusion guard for a state file's read-modify-write
+/// cycle, built on an advisory `flock` (via `fs2`).
 ///
-/// The guard is an atomically-created `<file>.lock` marker: acquisition uses
-/// `OpenOptions::create_new` (`O_CREAT|O_EXCL`), which creates the file only if
-/// it does not already exist, so exactly one contender wins the path — there is
-/// no flock-style "unlink a locked inode, a third process locks a fresh inode
-/// and enters concurrently" race, because the lock *is* the path's existence,
-/// not an inode. The holder removes the file on release, so the home keeps
-/// exactly the documented file set (the contract test asserts it exhaustively).
+/// `acquire` opens a dedicated lock file and takes an exclusive `flock` on it
+/// for the guard's lifetime; dropping the guard closes the file descriptor,
+/// which the kernel treats as releasing the lock. This is an **OS-released**
+/// lock, and that property is the whole point: if the holder crashes or is
+/// killed, the kernel drops its `flock` immediately, so a contender never has
+/// to decide whether an abandoned on-disk marker's owner is still alive. The
+/// previous design reclaimed a marker purely by age, which could steal the lock
+/// from a merely-slow owner (paused, or blocked on a slow `fsync`) and admit a
+/// third writer into the same critical section — a mutual-exclusion break. With
+/// `flock`, a live-but-slow holder simply makes contenders *block* until it
+/// finishes (correct serialization), and a dead holder's lock is already gone.
 ///
-/// A process that crashes or is killed while holding the guard leaves the
-/// marker behind; the next contender's acquisition then spins forever on a lock
-/// no one holds. To fail closed rather than hang, a marker older than
-/// `LOCK_STALE_MS` is treated as abandoned and reclaimed (removed, then
-/// retried): a holder that takes that long is either dead or pathological, and
-/// a falsely-reclaimed lock degrades to the previous unsynchronized behaviour
-/// rather than wedging every future command.
+/// The lock file lives in the system temp dir, keyed by a hash of the guarded
+/// path — *not* under the state home — so it leaves no residue there: the
+/// contract test `state_writes_stay_under_home` asserts the home's file set
+/// exhaustively. This mirrors the control socket, the one other state artifact
+/// the plugin keeps in the temp dir. The empty lock file itself may persist in
+/// the temp dir between runs; it is reused, never a source of corruption,
+/// because exclusion comes from the `flock`, not the file's existence.
 struct StateLock {
-    path: PathBuf,
+    // Held for the guard's lifetime; dropping it closes the fd and releases the
+    // advisory `flock`. Never read directly.
+    _file: std::fs::File,
 }
-
-/// Age after which an unreleased lock marker is assumed abandoned (its holder
-/// crashed) and is reclaimed. Generous enough that no real critical section —
-/// a few filesystem reads and one atomic write — ever approaches it.
-const LOCK_STALE_MS: u128 = 30_000;
 
 impl StateLock {
-    /// Acquire the exclusive lock guarding `path`'s sibling `<file>.lock`,
-    /// spinning briefly until the current holder releases it. `path` is the
-    /// guarded state file (e.g. `config.json`); the marker is derived from it.
+    /// Acquire the exclusive lock guarding `path`, blocking until any current
+    /// holder — in this or another process — releases it. `path` is the guarded
+    /// state file (e.g. `config.json`); the lock file is derived from it.
     fn acquire(path: &std::path::Path) -> Result<StateLock> {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("state path has no valid file name")?;
-        let lock_path = path.with_file_name(format!("{file_name}.lock"));
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+        use fs2::FileExt;
+        let lock_path = Self::lock_file_for(path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The lock file lives in a shared temp dir; keep it owner-only.
+            opts.mode(0o600);
         }
-        loop {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&lock_path)
-            {
-                Ok(_) => return Ok(StateLock { path: lock_path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Held by another process. Reclaim it if abandoned;
-                    // otherwise wait for the holder to finish and retry.
-                    Self::reclaim_if_stale(&lock_path);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("opening lock {}", lock_path.display()))
-                }
-            }
-        }
+        let file = opts
+            .open(&lock_path)
+            .with_context(|| format!("opening lock {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("locking {}", lock_path.display()))?;
+        Ok(StateLock { _file: file })
     }
 
-    /// If the marker is older than the stale threshold, remove it so a fresh
-    /// acquisition can proceed. Best-effort: a removal error just means the
-    /// next loop iteration retries.
-    fn reclaim_if_stale(lock_path: &std::path::Path) {
-        let stale = std::fs::metadata(lock_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|mtime| mtime.elapsed().ok())
-            .map(|age| age.as_millis() > LOCK_STALE_MS)
-            .unwrap_or(false);
-        if stale {
-            let _ = std::fs::remove_file(lock_path);
-        }
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        // Release by removing the marker. Because acquisition is the atomic
-        // create-new, a contender only proceeds once the path is gone, and it
-        // then creates a *fresh* marker it owns — no unlinked-inode window.
-        let _ = std::fs::remove_file(&self.path);
+    /// The lock file for `path`: `<tmp>/c8ctl-nano-fleet-<sha1(path)>.lock`.
+    /// Keyed by the full guarded path, so distinct state files (and distinct
+    /// state homes) never share a lock, while every writer of the *same* file
+    /// contends on the *same* lock.
+    fn lock_file_for(path: &std::path::Path) -> Result<PathBuf> {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(path.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(std::env::temp_dir().join(format!("c8ctl-nano-fleet-{}.lock", &hex[..16])))
     }
 }
 
@@ -268,10 +262,11 @@ impl Drop for StateLock {
 ///
 /// `hire`/`assign` are a read-modify-write over `config.json`; without
 /// serialization two concurrent commands each read the pre-image and the second
-/// commit silently overwrites the first's change. A `StateLock` on
-/// `config.json.lock` serializes the whole read→mutate→write cycle across
-/// processes, and the marker is removed on release (even on the error path, via
-/// `Drop`) so the home keeps only the documented file set.
+/// commit silently overwrites the first's change. A `StateLock` keyed on
+/// `config.json` serializes the whole read→mutate→write cycle across processes
+/// (an OS-released `flock`, dropped automatically on return — including the
+/// error path — and kept outside the home so the documented file set is
+/// unchanged).
 fn update_config<F>(mutate: F) -> Result<()>
 where
     F: FnOnce(&mut ConfigFile) -> Result<()>,
@@ -451,6 +446,34 @@ pub fn hire(args: HireArgs) -> Result<()> {
         );
     }
 
+    let terminal = args
+        .terminal
+        .as_deref()
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(default_terminal);
+    if !VALID_TERMINALS.contains(&terminal.as_str()) {
+        bail!(
+            "Invalid terminal \"{}\". Valid terminals: {}",
+            args.terminal.as_deref().unwrap_or_default(),
+            VALID_TERMINALS.join(", ")
+        );
+    }
+
+    let permission = args
+        .permission
+        .as_deref()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(default_permission);
+    if !VALID_PERMISSIONS.contains(&permission.as_str()) {
+        bail!(
+            "Invalid permission \"{}\". Valid permissions: {}",
+            args.permission.as_deref().unwrap_or_default(),
+            VALID_PERMISSIONS.join(", ")
+        );
+    }
+
     let hire = StoredHire {
         name: name.clone(),
         rank: rank.clone(),
@@ -460,19 +483,9 @@ pub fn hire(args: HireArgs) -> Result<()> {
         capabilities: capabilities.clone(),
         sandbox,
         image: args.image.clone().unwrap_or_default(),
-        terminal: args
-            .terminal
-            .clone()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(default_terminal),
+        terminal,
         protocol: protocol.clone(),
-        permission: args
-            .permission
-            .clone()
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(default_permission),
+        permission,
         env,
         created_at: serde_json::Value::String(now_iso8601()),
     };
@@ -965,6 +978,54 @@ mod tests {
         drop(cfg);
     }
 
+    /// `--terminal` is persisted verbatim and no runtime can interpret an
+    /// unknown transport, so hire must reject a typo like `--terminal typo`
+    /// (normalizing case/whitespace), exactly as it does for protocol/sandbox.
+    #[test]
+    fn hire_rejects_unknown_terminal() {
+        let cfg = TempCfg::new();
+        let mut args = hire_args("coder");
+        args.terminal = Some("typo".to_string());
+        let err = hire(args).unwrap_err().to_string();
+        assert!(err.contains("Invalid terminal \"typo\""), "{err}");
+        assert!(err.contains("pty, pipe"), "{err}");
+
+        for ok in ["pty", "pipe", " PIPE "] {
+            let mut args = hire_args("coder");
+            args.terminal = Some(ok.to_string());
+            hire(args).unwrap_or_else(|e| panic!("terminal {ok:?}: {e}"));
+        }
+        drop(cfg);
+    }
+
+    /// Only `yolo` is implemented (the ACP client unconditionally auto-allows);
+    /// a reserved-but-unenforced value like `ask`/`escalate` must be rejected,
+    /// not persisted as a policy that is silently not honoured. The default
+    /// (no `--permission`) must also resolve to `yolo`, never `ask`.
+    #[test]
+    fn hire_rejects_unsupported_permission() {
+        let cfg = TempCfg::new();
+        for bad in ["ask", "escalate", "filter", "typo"] {
+            let mut args = hire_args("coder");
+            args.permission = Some(bad.to_string());
+            let err = hire(args).unwrap_err().to_string();
+            assert!(err.contains("Invalid permission"), "{bad}: {err}");
+            assert!(err.contains("yolo"), "{bad}: {err}");
+        }
+
+        for ok in ["yolo", " YOLO "] {
+            let mut args = hire_args("coder");
+            args.permission = Some(ok.to_string());
+            hire(args).unwrap_or_else(|e| panic!("permission {ok:?}: {e}"));
+        }
+
+        // Omitting --permission defaults to the only implemented policy, yolo.
+        hire(hire_args("defaulted")).unwrap();
+        let stored = read_config().unwrap();
+        assert_eq!(stored.hires["defaulted"].permission, "yolo");
+        drop(cfg);
+    }
+
     /// `assign` SETS the capability list: a stale capability must be removable,
     /// not merged back in from the old set.
     #[test]
@@ -1066,8 +1127,9 @@ mod tests {
 
     /// `hire` must commit `config.json` atomically and leave no temp or lock
     /// file behind: the home keeps exactly the documented file set. The
-    /// `StateLock` marker (`config.json.lock`) is removed on release, so after
-    /// the command returns nothing but `config.json` may remain.
+    /// `StateLock` is an `flock` on a temp-dir file (not under the home), and
+    /// the atomic write renames its deterministic temp away, so after the
+    /// command returns nothing but `config.json` may remain under the home.
     #[test]
     fn hire_writes_config_atomically_without_residue() {
         let _cfg = TempCfg::new();
