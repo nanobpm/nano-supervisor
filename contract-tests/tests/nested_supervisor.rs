@@ -32,8 +32,8 @@ fn nested_start_args(target: Target) -> &'static [&'static str] {
 }
 
 /// With `NANO_AGENT_RUN` set and no opt-in, starting the supervisor/worker exits
-/// non-zero with an explanatory message and binds no control socket, so nothing
-/// from the run can survive the job.
+/// non-zero with an explanatory message and leaves no surviving process, so
+/// nothing from the run can outlive the job.
 #[test]
 fn refuses_to_start_inside_an_agent_run() {
     let target = Target::from_env();
@@ -73,17 +73,18 @@ fn refuses_to_start_inside_an_agent_run() {
     // so a non-zero exit from a process that has already terminated leaves nothing
     // behind. (A control-socket check would be meaningless for the Rust target,
     // which never binds the Node plugin's `supervisor.sock`.) The end-to-end test
-    // below adds a direct PID liveness probe for the agent-mediated path.
+    // below proves the same refusal through a real agent subprocess under a
+    // worker job.
 }
 
 /// End-to-end form of the issue #40 acceptance: a *real agent subprocess* — the
 /// scripted fake agent, running under a worker job — attempts to start the
 /// nested supervisor. The worker must have propagated `NANO_AGENT_RUN` into the
 /// agent's environment, so the nested start refuses (the agent's shell gate
-/// fails, the job FAILs rather than completing) and no control socket is bound.
-/// Unlike the direct-subprocess test above, this catches a regression where the
-/// worker stops stamping the marker, and observes the state the job leaves
-/// behind once the worker exits.
+/// fails, the job FAILs rather than completing) and the daemon process exits
+/// before it can detach. Unlike the direct-subprocess test above, this catches
+/// a regression where the worker stops stamping the marker, and observes the
+/// state the job leaves behind once the worker exits.
 #[test]
 fn agent_run_under_a_job_cannot_start_a_supervisor() {
     let target = Target::from_env();
@@ -114,18 +115,13 @@ fn agent_run_under_a_job_cannot_start_a_supervisor() {
         .to_string_lossy()
         .into_owned();
 
-    // The agent's shell captures two durable survival signals into the suite's
-    // own temp dir (absolute paths, so they resolve from the agent's cwd):
-    //   * the nested daemon's stderr — to prove it was refused by the #40 guard
-    //     SPECIFICALLY (mentions `NANO_AGENT_RUN`), not by an unrelated failure
-    //     like a missing binary or "no hires"; and
-    //   * the nested daemon's PID — so after the job we can probe directly that
-    //     no such process survived (the Rust daemon never binds the Node
-    //     plugin's `supervisor.sock`, so socket-absence proves nothing here).
+    // The agent's shell captures the nested daemon's stderr into the suite's own
+    // temp dir (an absolute path, so it resolves from the agent's cwd) — to
+    // prove the refusal was the #40 guard's SPECIFICALLY (mentions
+    // `NANO_AGENT_RUN`), not an unrelated failure like a missing binary or
+    // "no hires".
     let probe_dir = tempfile::tempdir().expect("probe temp dir");
-    let pid_path = probe_dir.path().join("nested.pid");
     let stderr_path = probe_dir.path().join("nested.stderr");
-    let pid_path_s = pid_path.to_string_lossy().into_owned();
     let stderr_path_s = stderr_path.to_string_lossy().into_owned();
 
     let outcome = run_worker_job(
@@ -138,20 +134,16 @@ fn agent_run_under_a_job_cannot_start_a_supervisor() {
             // on this process's environment, so the nested start must refuse
             // (exit non-zero). A failing shell step aborts the turn, so the
             // `write_result` below runs only if the nested start succeeded.
-            //
-            // `$$` is the shell's PID; `exec` replaces it IN PLACE with the
-            // daemon, so the recorded PID *is* the daemon's — a post-job liveness
-            // probe on it directly observes whether the process survived. The
-            // daemon's stderr is captured (not discarded) so the assertions can
-            // confirm the refusal is the #40 guard's, not an unrelated error.
-            json!({ "shell": "printf '%s' \"$$\" > \"$NS_NEST_PID\"; exec \"$NS_BIN\" daemon 2> \"$NS_NEST_STDERR\"" }),
+            // The daemon's stderr is captured (not discarded) so the assertions
+            // can confirm the refusal is the #40 guard's, not an unrelated
+            // error.
+            json!({ "shell": "exec \"$NS_BIN\" daemon 2> \"$NS_NEST_STDERR\"" }),
             json!({ "write_result": { "nested_started": true } }),
         ],
         json!({ "prompt": "try to run a supervisor" }),
         &[],
         &[
             ("NS_BIN", ns_bin_abs.as_str()),
-            ("NS_NEST_PID", pid_path_s.as_str()),
             ("NS_NEST_STDERR", stderr_path_s.as_str()),
         ],
     );
@@ -193,36 +185,15 @@ fn agent_run_under_a_job_cannot_start_a_supervisor() {
          stderr must mention NANO_AGENT_RUN, not fail for an unrelated reason; \
          captured stderr was: {nested_stderr:?}"
     );
-    // Direct survival probe: the recorded PID is the daemon's own (via `exec`),
-    // so after the job settles and the worker exits, that process must be gone.
-    // This replaces the Node-only `supervisor.sock` check, which the Rust daemon
-    // never creates and so could never have detected a surviving Rust process.
-    let nested_pid = std::fs::read_to_string(&pid_path).unwrap_or_default();
-    let nested_pid = nested_pid.trim();
-    assert!(
-        !nested_pid.is_empty(),
-        "the agent's shell step must have recorded the nested daemon's PID at {}",
-        pid_path.display()
-    );
-    assert!(
-        !pid_is_alive(nested_pid),
-        "no nested supervisor process may survive the job — nothing from the run \
-         can outlive it; PID {nested_pid} is still alive"
-    );
-    // `probe_dir` holds the captured pid/stderr files; keep it alive until here.
+    // No post-job PID-liveness probe is needed here: the Rust daemon refuses
+    // synchronously (it exits non-zero before it can fork/`setsid` — only the
+    // Node plugin daemonises), so the failed shell step above already proves
+    // the process is gone. A delayed `kill -0` on the recorded PID would also
+    // be flake-prone: by the time it runs (after job settle + worker exit) the
+    // OS may have recycled that PID to an unrelated live process we own,
+    // failing the test spuriously.
+    // `probe_dir` holds the captured stderr file; keep it alive until here.
     drop(probe_dir);
-}
-
-/// Whether `pid` names a live process we can signal. `kill -0` performs the
-/// kernel's existence+permission check without delivering a signal; a non-zero
-/// status (e.g. ESRCH "No such process") means the process is gone. The daemon
-/// ran under our own uid, so permission is never the reason it fails.
-fn pid_is_alive(pid: &str) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", pid])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// The engine-visible "the job failed" signal, in either of its settled forms:
