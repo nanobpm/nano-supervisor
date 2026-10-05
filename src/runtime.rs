@@ -99,8 +99,11 @@ fn rand_fraction() -> f64 {
 /// follows it can finish — not merely start — before the deadline. A lease
 /// with less than the reserve left yields no budget.
 ///
-/// Returns `None` when the lease has already effectively expired (the caller
-/// should make one last immediate attempt, whose 404/409 then fences the job).
+/// Returns `None` only when a normally-sized lease (`window > REQUEST_MARGIN`)
+/// has effectively expired — the caller then makes one last immediate attempt,
+/// whose 404/409 fences the job. A lease whose whole `window` is no larger than
+/// the reserve can never satisfy it, so rather than returning `None` (which the
+/// caller would busy-spin on), it falls back to the steady refresh cadence.
 /// Pure and testable.
 fn refresh_budget(
     now: Instant,
@@ -116,16 +119,46 @@ fn refresh_budget(
         let capped = exp.min(window.max(every));
         Duration::from_millis((capped.as_millis() as u64 as f64 * rand_fraction()) as u64)
     };
-    // The lease time left after `now`, less the reserve for the request that
-    // follows this sleep: an extend can take up to `EXTEND_TIMEOUT` to finish
-    // (or be abandoned), so the retry must START at least that far ahead of
-    // the deadline to have finished — not merely started — before it.
-    let remaining = deadline
-        .checked_duration_since(now)?
-        .checked_sub(REQUEST_MARGIN);
-    // `None` (no budget left) means the lease is effectively up — the caller
-    // makes a final immediate attempt rather than sleeping past the deadline.
-    remaining.map(|budget| wait.min(budget))
+    // The lease time left after `now`. `None` here means the deadline has
+    // already passed: the lease is genuinely expired, so the caller should make
+    // one last immediate attempt (whose 404/409 fences the job).
+    let left = deadline.checked_duration_since(now)?;
+    // The lease time left, less the reserve for the request that follows this
+    // sleep: an extend can take up to `EXTEND_TIMEOUT` to finish (or be
+    // abandoned), so the retry must START at least that far ahead of the
+    // deadline to have finished — not merely started — before it. A *positive*
+    // budget is required: a zero budget (`left == REQUEST_MARGIN` exactly) would
+    // clamp the sleep to zero and spin, so it is routed through the same
+    // reserve-exceeded handling below as an underflow.
+    if let Some(budget) = left.checked_sub(REQUEST_MARGIN) {
+        if !budget.is_zero() {
+            return Some(wait.min(budget));
+        }
+    }
+    // The reserve meets or exceeds the lease time left. Two very different
+    // situations reach here, and they must NOT be conflated:
+    //
+    //   * A normally-sized lease (`window > REQUEST_MARGIN`) genuinely near its
+    //     deadline — most of its window is already spent. Return `None` so the
+    //     caller makes one last immediate attempt before the lease lapses.
+    //
+    //   * A lease whose WHOLE window is no larger than the reserve
+    //     (`window <= REQUEST_MARGIN`, e.g. a user-set `--recovery-window` below
+    //     ~32s). Here the reserve can NEVER be satisfied — even a freshly
+    //     extended lease (`deadline ≈ now + window`) underflows on every
+    //     iteration. Returning `None` would map to a zero sleep and busy-spin
+    //     the refresh loop, hammering the engine back-to-back with extends
+    //     (the exact nanobpm/nano-supervisor#23 behaviour the cadence floor
+    //     exists to prevent). For such a window the reserve is meaningless, so
+    //     fall back to the steady refresh cadence (`wait`, floored at `every`)
+    //     rather than spinning: extend at `window / 3` and accept that a slow
+    //     extend on a sub-reserve lease may miss — which no sleep policy can
+    //     prevent once the window is smaller than one request's bounded lifetime.
+    if window > REQUEST_MARGIN {
+        None
+    } else {
+        Some(wait)
+    }
 }
 
 pub(crate) async fn refresh_loop(
@@ -251,7 +284,9 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use crate::jobs::status_of;
-    use crate::runtime::{activation_backoff, refresh_budget, ACTIVATION_BACKOFF_MAX};
+    use crate::runtime::{
+        activation_backoff, refresh_budget, ACTIVATION_BACKOFF_MAX, REQUEST_MARGIN,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -335,6 +370,87 @@ mod tests {
             refresh_budget(now, deadline, every, window, 1),
             None,
             "an expired lease leaves no refresh budget"
+        );
+    }
+
+    #[test]
+    fn refresh_budget_does_not_busy_spin_a_sub_reserve_window() {
+        // Regression (nanobpm/nano-supervisor#23): a user-set `--recovery-window`
+        // smaller than the request reserve must NOT degenerate the refresh loop
+        // into a back-to-back extend storm. `REQUEST_MARGIN` (~32s) exceeds the
+        // whole window here, so `deadline - now` underflows the reserve on EVERY
+        // iteration — including the healthy, freshly-extended steady state. The
+        // old code returned `None` there, which the caller maps to a zero sleep
+        // and busy-spins. The budget must instead fall back to the steady
+        // cadence so the loop always yields between extends.
+        for &secs in &[1u64, 5, 10, 20, 31] {
+            let window = Duration::from_secs(secs);
+            assert!(
+                window <= REQUEST_MARGIN,
+                "test premise: window must be within the reserve"
+            );
+            let every = (window / 3).max(Duration::from_millis(1));
+
+            // Steady state right after a successful extend: deadline ≈ now + window.
+            let now = Instant::now();
+            let deadline = now + window;
+            let w = refresh_budget(now, deadline, every, window, 0)
+                .expect("a sub-reserve window must yield a cadence sleep, never None");
+            assert_eq!(
+                w, every,
+                "a fresh sub-reserve lease ({secs}s) must wait the steady cadence, not spin"
+            );
+            assert!(
+                !w.is_zero(),
+                "a sub-reserve window ({secs}s) must never produce a zero-length (busy-spin) sleep"
+            );
+
+            // Under a failure streak the loop still yields a positive, bounded
+            // backoff rather than spinning.
+            for failures in [1u32, 2, 5, 20] {
+                let w = refresh_budget(now, deadline, every, window, failures)
+                    .expect("a sub-reserve window must never return None (busy-spin) on failures");
+                assert!(
+                    w <= window.max(every),
+                    "backoff {w:?} (failures={failures}) must stay bounded by the window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_budget_does_not_spin_at_the_reserve_boundary() {
+        // Knife-edge: a window exactly equal to the reserve, and a lease whose
+        // remaining time is exactly the reserve, both make `left - REQUEST_MARGIN`
+        // zero. A zero budget must NOT clamp the sleep to zero (a busy-spin); the
+        // sub-reserve window falls back to the cadence instead.
+        let window = REQUEST_MARGIN;
+        let every = (window / 3).max(Duration::from_millis(1));
+        let now = Instant::now();
+        let deadline = now + window; // left == REQUEST_MARGIN exactly
+        let w = refresh_budget(now, deadline, every, window, 0)
+            .expect("a reserve-sized window must yield a cadence sleep, not None");
+        assert!(
+            !w.is_zero(),
+            "a window == reserve must not produce a zero-length (busy-spin) sleep"
+        );
+        assert_eq!(w, every, "a reserve-sized window waits the steady cadence");
+    }
+
+    #[test]
+    fn refresh_budget_still_fences_a_normal_lease_near_expiry() {
+        // A normally-sized lease (window > reserve) that is genuinely near its
+        // deadline must still return `None` so the caller makes its final
+        // immediate fence attempt — the sub-reserve fallback must not swallow
+        // this path.
+        let window = Duration::from_secs(300);
+        let every = window / 3;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5); // < REQUEST_MARGIN, but window >> reserve
+        assert_eq!(
+            refresh_budget(now, deadline, every, window, 1),
+            None,
+            "a large lease near expiry must still fence with a final immediate attempt"
         );
     }
 
