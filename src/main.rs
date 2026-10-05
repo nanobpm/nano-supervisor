@@ -201,8 +201,12 @@ const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
 /// testable without touching process-global env. Returns the explanatory error
 /// message when the command must be refused, or `None` when it may run.
 ///
-/// * `run` — the value of `NANO_AGENT_RUN` (`None`/empty ⇒ not inside an agent
-///   run ⇒ never refused).
+/// * `run` — the value of `NANO_AGENT_RUN`. **Presence** is what marks an agent
+///   run: `Some` (even an empty string) ⇒ inside an agent run ⇒ refused unless
+///   opted in; only `None` (unset) ⇒ outside. The worker stamps this var on
+///   every agent's environment, so an empty-but-present value is still the
+///   worker's mark — treating it as "outside" would let `NANO_AGENT_RUN=
+///   nano-supervisor daemon` bypass the refusal.
 /// * `foreground_for_tests` — the `--foreground-for-tests` flag.
 /// * `allow_nested` — the value of `NANO_ALLOW_NESTED_SUPERVISOR` (`"1"` opts in).
 fn nested_refusal(
@@ -211,13 +215,16 @@ fn nested_refusal(
     foreground_for_tests: bool,
     allow_nested: Option<&str>,
 ) -> Option<String> {
-    let run = run.filter(|v| !v.is_empty())?;
+    let run = run?;
     if foreground_for_tests || allow_nested == Some("1") {
         return None;
     }
+    // An empty marker still names the run: display it as such rather than
+    // rendering `NANO_AGENT_RUN=` (which reads like the var was unset).
+    let run_display = if run.is_empty() { "<empty>" } else { run };
     Some(format!(
         "refusing to start `nano-supervisor {command}` inside an agent run \
-         ({AGENT_RUN_ENV}={run}). A supervisor or worker started by an agent \
+         ({AGENT_RUN_ENV}={run_display}). A supervisor or worker started by an agent \
          escapes the job's teardown and becomes a phantom that can lease real \
          jobs and misreport the fleet. Agents must never start a real supervisor \
          or daemon outside the hermetic test harness. If this IS a contract test, \
@@ -247,12 +254,15 @@ fn guard_nested_supervisor(command: &str, foreground_for_tests: bool) -> Result<
     ) {
         anyhow::bail!(msg);
     }
-    if run.as_deref().is_some_and(|r| !r.is_empty()) {
+    if run.is_some() {
         // Opted in: run attached. Bind to the invoking agent's death so the job's
         // process-group kill (or the agent exiting) takes this process down too.
-        // Fail startup when the binding cannot be installed: running the opted-in
-        // supervisor without it would recreate the phantom the guard exists to
-        // prevent.
+        // Presence semantics match the refusal above: an empty-but-present
+        // marker is still the worker's mark, so the opted-in empty marker must
+        // bind too — otherwise it runs unbound, recreating the phantom the
+        // guard exists to prevent. Fail startup when the binding cannot be
+        // installed: running the opted-in supervisor without it would recreate
+        // the phantom the guard exists to prevent.
         pdeath::bind_self_to_parent_death().map_err(|e| {
             anyhow::anyhow!(
                 "could not bind this nested supervisor to the invoking agent's \
@@ -580,9 +590,26 @@ mod tests {
 
     #[test]
     fn nested_refusal_allows_outside_an_agent_run() {
-        // Not inside an agent run: never refused, regardless of opt-in.
+        // Not inside an agent run (marker unset): never refused, regardless of
+        // opt-in.
         assert!(nested_refusal("daemon", None, false, None).is_none());
-        assert!(nested_refusal("work", Some(""), false, None).is_none());
+        assert!(nested_refusal("work", None, false, None).is_none());
+    }
+
+    #[test]
+    fn nested_refusal_treats_an_empty_marker_as_inside_a_run() {
+        // Presence, not non-emptiness, marks an agent run: the worker stamps
+        // `NANO_AGENT_RUN` on every agent's environment, so an empty-but-present
+        // value is still the worker's mark. Treating it as "outside" would let
+        // `NANO_AGENT_RUN= nano-supervisor daemon` bypass the refusal.
+        let msg = nested_refusal("daemon", Some(""), false, None)
+            .expect("an empty-but-present marker must still refuse");
+        assert!(msg.contains("NANO_AGENT_RUN"), "message: {msg}");
+        assert!(msg.contains("daemon"), "message names the command: {msg}");
+        assert!(nested_refusal("work", Some(""), false, None).is_some());
+        // ... and the opt-ins still release an empty marker.
+        assert!(nested_refusal("daemon", Some(""), true, None).is_none());
+        assert!(nested_refusal("daemon", Some(""), false, Some("1")).is_none());
     }
 
     #[test]

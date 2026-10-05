@@ -236,15 +236,72 @@ fn agent_run_under_a_job_cannot_start_a_supervisor() {
          stderr must mention NANO_AGENT_RUN, not fail for an unrelated reason; \
          captured stderr was: {nested_stderr:?}"
     );
-    // No post-job PID-liveness probe is needed here: the Rust daemon refuses
-    // synchronously (it exits non-zero before it can fork/`setsid` — only the
-    // Node plugin daemonises), so the failed shell step above already proves
-    // the process is gone. A delayed `kill -0` on the recorded PID would also
-    // be flake-prone: by the time it runs (after job settle + worker exit) the
-    // OS may have recycled that PID to an unrelated live process we own,
-    // failing the test spuriously.
+    // The issue's acceptance criterion is that NO process from the run
+    // survives — a detached descendant could remain even while the job fails
+    // and emits the refusal above. Probe for one directly, keyed on the run's
+    // UNIQUE identity rather than a recorded PID: `NANO_AGENT_RUN` is the job
+    // key (stamped by the worker, captured in the agent's env record), so any
+    // process still carrying that exact marker in its environment after the
+    // job settles is a survivor of THIS run. Unlike a delayed `kill -0` on a
+    // recorded PID this is immune to PID reuse — it never trusts a number the
+    // OS may have recycled to an unrelated live process.
+    let run_marker = record
+        .env
+        .get("NANO_AGENT_RUN")
+        .cloned()
+        .expect("the worker must stamp NANO_AGENT_RUN (asserted above)");
+    assert!(
+        !run_marker.is_empty(),
+        "the run identity must be a non-empty unique marker; got an empty NANO_AGENT_RUN"
+    );
+    let survivors = processes_with_env_marker("NANO_AGENT_RUN", &run_marker);
+    assert!(
+        survivors.is_empty(),
+        "no process from the agent run may survive the settled job, but \
+         {} still carry NANO_AGENT_RUN={run_marker} in their environment: {survivors:?}",
+        survivors.len()
+    );
     // `probe_dir` holds the captured stderr file; keep it alive until here.
     drop(probe_dir);
+}
+
+/// PIDs of every live process whose environment carries `name=value` exactly.
+///
+/// Linux-only scan of `/proc/<pid>/environ` (the contract suite's Linux CI is
+/// where the end-to-end worker job runs); on any other platform — or if `/proc`
+/// is unreadable — returns an empty Vec so the caller's "no survivors"
+/// assertion stays a no-op rather than failing spuriously off Linux. The
+/// current test process is excluded: it never carries the marker itself, but
+/// the guard keeps the check honest if a future caller probes for a var the
+/// suite DOES set. Best-effort by design: a process that exits mid-scan simply
+/// fails a read and is skipped.
+fn processes_with_env_marker(name: &str, value: &str) -> Vec<u32> {
+    let needle = format!("{name}={value}");
+    let self_pid = std::process::id();
+    let mut hits = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return hits,
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        // environ is NUL-separated; an exact full-field match avoids a
+        // substring false positive (e.g. marker "42" matching "...=421").
+        if let Ok(env) = std::fs::read(entry.path().join("environ")) {
+            if env
+                .split(|b| *b == 0)
+                .any(|field| field == needle.as_bytes())
+            {
+                hits.push(pid);
+            }
+        }
+    }
+    hits
 }
 
 /// The engine-visible "the job failed" signal, in either of its settled forms:
