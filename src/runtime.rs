@@ -38,16 +38,37 @@ const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_MARGIN: Duration = EXTEND_TIMEOUT.saturating_add(Duration::from_secs(2));
 
 /// The activation-failure backoff for a streak of `failures` consecutive
-/// failures (1 = the first), with full jitter: `random(0, min(max, base *
-/// 2^(failures-1)))`. Full jitter spreads a fleet's retries across the whole
-/// window so N slots started together do not reconnect in lockstep (a
-/// thundering herd on a gateway that has just come back), and the bound keeps
-/// the aggregate retry rate low no matter how long the outage lasts.
+/// failures (1 = the first), with equal jitter: `cap/2 + random(0, cap/2)`
+/// where `cap = min(max, base * 2^(failures-1))`. Equal jitter spreads a
+/// fleet's retries across the upper half of the window so N slots started
+/// together do not reconnect in lockstep (a thundering herd on a gateway that
+/// has just come back), while its NONZERO floor (`cap/2`) bounds the aggregate
+/// retry rate no matter how the draws fall. Full jitter (`random(0, cap)`) was
+/// rejected: it permits an unbounded run of near-zero delays, which would let a
+/// fleet hammer a recovering gateway far faster than the advertised ~one
+/// attempt per `cap` and weaken the storm guard behind nanobpm/nano-supervisor#23.
 pub(crate) fn activation_backoff(failures: u32) -> Duration {
     let shift = failures.saturating_sub(1).min(20);
     let exp = ACTIVATION_BACKOFF_BASE.saturating_mul(1u32 << shift);
     let capped = exp.min(ACTIVATION_BACKOFF_MAX);
-    Duration::from_millis((capped.as_millis() as u64 as f64 * rand_fraction()) as u64)
+    equal_jitter(capped)
+}
+
+/// Equal-jitter delay in `[cap/2, cap)`: a fixed `cap/2` floor plus a random
+/// share of the remaining half. The floor is the point — unlike full jitter
+/// (`random(0, cap)`, whose draws can collapse arbitrarily close to zero any
+/// number of times in a row), equal jitter guarantees every slot waits at least
+/// `cap/2`, so a 16-slot fleet cannot probe a recovering gateway faster than
+/// ~one attempt per `cap/2` per slot. That is what bounds the aggregate retry
+/// rate (the TCP-`TIME_WAIT` storm guard behind nanobpm/nano-supervisor#23),
+/// while the random upper half still de-synchronises slots started in the same
+/// tick so they do not reconnect in lockstep. Jitter only (load spreading), not
+/// security. `cap/2` rounds down, so a sub-millisecond `cap` floors at zero —
+/// harmless, since such a `cap` is already below any meaningful cadence.
+fn equal_jitter(cap: Duration) -> Duration {
+    let half = cap / 2;
+    let span = (half.as_millis() as u64 as f64 * rand_fraction()) as u64;
+    half.saturating_add(Duration::from_millis(span))
 }
 
 /// A small, dependency-free pseudo-random fraction in `[0, 1)`, used only for
@@ -84,8 +105,9 @@ fn rand_fraction() -> f64 {
 ///
 /// `failures` is the consecutive-failure streak (0 = the healthy steady state,
 /// which waits the `every` cadence). On a failure the loop backs off
-/// exponentially from `every` (full jitter) so a DOWN engine is not re-probed at
-/// the refresh cadence. But the delay is then capped to what is actually left on
+/// exponentially from `every` (equal jitter, `cap/2 + random(0, cap/2)`) so a
+/// DOWN engine is not re-probed at the refresh cadence and the per-slot delay
+/// never collapses toward zero. But the delay is then capped to what is actually left on
 /// the lease (`deadline - now`), less a margin to issue the request: an extend
 /// that fails after a long (e.g. 30s) timeout has already burned lease time, so
 /// a delay sized from the FULL window could push the retry past the activation's
@@ -117,7 +139,7 @@ fn refresh_budget(
     } else {
         let exp = every.saturating_mul(1u32 << failures.min(20));
         let capped = exp.min(window.max(every));
-        Duration::from_millis((capped.as_millis() as u64 as f64 * rand_fraction()) as u64)
+        equal_jitter(capped)
     };
     // The lease time left after `now`. `None` here means the deadline has
     // already passed: the lease is genuinely expired, so the caller should make
@@ -189,7 +211,8 @@ pub(crate) async fn refresh_loop(
         // refresh cadence, or a fleet of long-running jobs would churn TCP
         // connections into `TIME_WAIT` exactly like an activation storm
         // (nanobpm/nano-supervisor#23). Back off exponentially from the cadence
-        // (with full jitter) — but cap the sleep to the lease time REMAINING,
+        // (with equal jitter — a nonzero `cap/2` floor, so the per-slot retry
+        // rate stays bounded) — but cap the sleep to the lease time REMAINING,
         // not the full window: an extend that fails after a long timeout has
         // already burned lease time, so a window-sized delay could push the
         // retry past expiry and lose in-flight work. `refresh_budget` returns
@@ -302,9 +325,10 @@ mod tests {
                 );
             }
         }
-        // Full jitter over a growing window: the first-failure delay must
-        // sometimes land below the 1s base (it is random(0, base)), and the
-        // ceiling-reached delays must vary rather than pinning to one value.
+        // Equal jitter over a growing window: the first-failure delay is drawn
+        // from `[cap/2, cap)` = `[0.5s, 1s)`, so it still sometimes lands below
+        // the 1s base, and the ceiling-reached delays must vary rather than
+        // pinning to one value.
         let mut saw_sub_base = false;
         let mut capped = std::collections::HashSet::new();
         for _ in 0..256 {
@@ -317,6 +341,43 @@ mod tests {
             capped.len() > 1,
             "capped backoff must be jittered, not a fixed delay"
         );
+        // The storm-guard invariant: equal jitter keeps a NONZERO floor of
+        // `cap/2`, so no run of unlucky draws can collapse the reconnect rate
+        // toward zero (which full jitter permitted). Every draw must sit at or
+        // above `cap/2` for both the first-failure cap (1s -> 0.5s floor) and
+        // the ceiling-reached cap (30s -> 15s floor).
+        for _ in 0..512 {
+            assert!(
+                activation_backoff(1) >= Duration::from_millis(500),
+                "first-failure backoff fell below the cap/2 floor"
+            );
+            assert!(
+                activation_backoff(50) >= ACTIVATION_BACKOFF_MAX / 2,
+                "ceiling backoff fell below the cap/2 floor"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_budget_backoff_keeps_a_nonzero_floor() {
+        // The failure-path sleep must also keep the equal-jitter floor (`cap/2`)
+        // when the lease has ample time left, so a fleet retrying a DOWN engine
+        // cannot reconnect in an unbounded near-zero storm
+        // (nanobpm/nano-supervisor#23). With `every = 100s` and `failures = 1`
+        // the cap is `min(every*2, window) = 200s`, so the floor is `100s`; the
+        // 300s lease (268s budget after the reserve) never clamps below it.
+        let every = Duration::from_secs(100);
+        let window = Duration::from_secs(300);
+        let now = Instant::now();
+        let deadline = now + window;
+        for _ in 0..512 {
+            let w = refresh_budget(now, deadline, every, window, 1)
+                .expect("an ample lease yields a budget");
+            assert!(
+                w >= every,
+                "failure backoff {w:?} fell below the cap/2 floor"
+            );
+        }
     }
 
     #[test]
