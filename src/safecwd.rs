@@ -522,11 +522,76 @@ fn open_nofollow_chain(path: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// Is this fd a symlink? Used on Linux to catch a symlinked intermediate:
+    /// the traversal-only `O_PATH` open does not fail on a symlink (it opens
+    /// the link itself), so the no-follow guarantee must be enforced with an
+    /// `fstat` after the open. Only the intermediate `O_PATH` fds are checked;
+    /// the leaf and the non-Linux backends refuse a symlink at the `openat`.
+    #[cfg(target_os = "linux")]
+    fn fd_is_symlink(fd: &OwnedFd) -> io::Result<bool> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid, writable `stat`; `fd` is a live descriptor.
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st.st_mode & libc::S_IFMT == libc::S_IFLNK)
+    }
+
+    // Flags for the FINAL component (the directory we pin and hand back). The
+    // leaf is opened `O_RDONLY` because the returned fd is used for more than
+    // traversal: `fchdir` into it at launch, `/proc/self/fd` / `F_GETPATH`
+    // path recovery, and `open_child` re-anchoring all want a real readable
+    // directory handle. `O_NOFOLLOW` refuses a symlinked leaf.
     let base_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     let step_flags = base_flags | libc::O_NOFOLLOW;
 
+    // Flags for INTERMEDIATE components, which we only ever traverse *through*
+    // to reach the next component — never read, never `fchdir`, never hand
+    // back. Opening those `O_RDONLY` would require **read** permission on every
+    // ancestor, where ordinary path traversal needs only **search** (execute)
+    // permission: a run directory beneath a search-only ancestor (mode `0111`,
+    // no read bit) would then fail the walk with `EACCES` even though the leaf
+    // itself is reachable. The Linux `openat2` backend imposes no such extra
+    // ancestor-read requirement, so this chain must not either. Use a
+    // traversal-only open for the intermediates and reserve `O_RDONLY` for the
+    // leaf.
+    //
+    // The traversal-only open is platform-specific, and on Linux it changes how
+    // a symlinked intermediate is caught:
+    // - Linux: `O_PATH` obtains a handle referencing the location without
+    //   needing read *or* search permission on the component, and it can serve
+    //   as the `dirfd` for the next `openat`. But `O_PATH` changes `O_NOFOLLOW`
+    //   semantics: instead of *failing* on a symlink it opens the symlink
+    //   itself, so the walk must detect that with an `fstat` `S_ISLNK` check
+    //   (below) and refuse — otherwise the no-follow guarantee would be lost.
+    //   (`O_PATH` fds reject `fchdir`/`read`, which is exactly why they are
+    //   used only for intermediates, never the leaf.)
+    // - macOS (no `O_PATH`): `O_SEARCH` opens the directory with search-only
+    //   access — enough to use as the next `openat`'s `dirfd` — without
+    //   requiring the read bit, and `O_NOFOLLOW` still refuses a symlink
+    //   outright (`ELOOP`), so no `fstat` check is needed.
+    // - Any other Unix host has no traversal-only open; fall back to `O_RDONLY`
+    //   + `O_NOFOLLOW` there (the pre-fix behaviour, which refuses a symlink).
+    #[cfg(target_os = "linux")]
+    let trav_flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let trav_flags = libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let trav_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    // The components of `path`, so the walk can tell the final component (pin
+    // it `O_RDONLY`) apart from the intermediates (traverse-only).
+    let components: Vec<Component> = path.components().collect();
+    let last_normal = components
+        .iter()
+        .rposition(|c| matches!(c, Component::Normal(_)));
+
     let mut cur: Option<OwnedFd> = None;
-    for comp in path.components() {
+    for (i, comp) in components.iter().enumerate() {
+        // Only a `Normal` component is opened `O_NOFOLLOW` as the pinned leaf;
+        // the anchor (`/` / `.`) and `..` are structural and use the anchor
+        // flags. `is_leaf_normal` marks the single final `Normal` component.
+        let is_leaf_normal = Some(i) == last_normal;
         match comp {
             // `/` and `.` are never symlinks; open the anchor without
             // `O_NOFOLLOW` so a legitimate root/relative base is accepted.
@@ -552,7 +617,28 @@ fn open_nofollow_chain(path: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
                 };
                 let c = CString::new(name.as_bytes())
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL"))?;
-                let next = openat_dir(dir.as_raw_fd(), &c, step_flags)?;
+                // Intermediate components are traversal-only; only the final
+                // component is opened `O_RDONLY` as the pinned leaf.
+                let flags = if is_leaf_normal {
+                    step_flags
+                } else {
+                    trav_flags
+                };
+                let next = openat_dir(dir.as_raw_fd(), &c, flags)?;
+                // On Linux the traversal-only `O_PATH` open does NOT fail on a
+                // symlink — it opens the symlink itself — so detect a symlinked
+                // intermediate here and refuse, preserving the no-follow
+                // guarantee the chain exists to enforce. (On macOS `O_SEARCH` +
+                // `O_NOFOLLOW` already failed the open with `ELOOP`, as did
+                // `O_NOFOLLOW` on the `O_RDONLY` fallback, so this check is
+                // Linux-only.)
+                #[cfg(target_os = "linux")]
+                if !is_leaf_normal && fd_is_symlink(&next)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing symlinked path component",
+                    ));
+                }
                 cur = Some(next);
             }
             // `..` is resolved against the pinned parent fd — matching the
@@ -741,6 +827,76 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression for the portability finding that the no-follow chain opened
+    /// EVERY path component `O_RDONLY`: a run directory beneath a search-only
+    /// ancestor (mode `0111`, no read bit) must still pin and launch, because
+    /// ordinary traversal needs only the ancestor's search permission, not its
+    /// read permission. The leaf is still opened `O_RDONLY`; only the
+    /// intermediate ancestors use a traversal-only open. Runs unprivileged
+    /// (skipped under root, which bypasses the permission check).
+    ///
+    /// This exercises [`open_nofollow_chain`] DIRECTLY (not `CwdHandle::open`,
+    /// which on a modern Linux kernel resolves via `openat2` and never reaches
+    /// the chain): the chain is the sole backend on macOS and pre-5.6 Linux,
+    /// which is exactly where the finding bites.
+    #[test]
+    fn pins_a_run_dir_beneath_a_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses the ancestor permission check");
+            return;
+        }
+
+        let base = scratch("search-only-ancestor");
+        let ancestor = base.join("locked");
+        let run = ancestor.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        // Search-only ancestor: traversal (`x`) is allowed, reading (`r`) is
+        // not. The pre-fix chain failed this pin with EACCES.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let opened = open_nofollow_chain(&run);
+        // Restore writability so cleanup can descend, whatever the outcome.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fd = opened.expect(
+            "the no-follow chain must pin a run dir beneath a search-only (0111) \
+             ancestor: traversal needs only the ancestor's search bit, not its \
+             read bit",
+        );
+        // The pinned fd must be a real, readable directory handle (the leaf is
+        // opened `O_RDONLY`): a child `fchdir`s into it at launch.
+        let handle = CwdHandle { fd };
+        assert_eq!(
+            std::fs::canonicalize(child_cwd(&handle)).unwrap(),
+            std::fs::canonicalize(&run).unwrap(),
+            "the child must launch in the pinned dir beneath the search-only ancestor"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The traversal-only intermediate open must NOT weaken the no-follow
+    /// guarantee: a symlinked intermediate is still refused. On Linux, an
+    /// `O_PATH` + `O_NOFOLLOW` open returns the link itself rather than
+    /// failing, so the chain detects it with `fstat`. This exercises the chain
+    /// directly so the Linux-specific check is covered even on a kernel where
+    /// `CwdHandle::open` would otherwise use `openat2`.
+    #[test]
+    fn chain_refuses_a_symlinked_intermediate() {
+        let base = scratch("chain-symlink");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("child")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // `<base>/link/child` reaches a real dir only *through* the symlink;
+        // the chain must refuse it at the intermediate component.
+        assert!(
+            open_nofollow_chain(&link.join("child")).is_err(),
+            "the no-follow chain must refuse a symlinked intermediate"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
