@@ -425,4 +425,52 @@ mod tests {
             "a lapsed lease must produce a deadline at/before now so the refresher fences"
         );
     }
+
+    #[test]
+    fn lease_anchor_bounds_overrun_under_positive_engine_clock_skew() {
+        // Positive engine-clock skew — the engine's wall clock runs AHEAD of the
+        // worker's — understates `dispatch_ago` (it can even saturate to zero),
+        // so the wall-clock reconciliation places the anchor slightly later than
+        // the true dispatch. The `decoded_at` clamp bounds that residual: the
+        // refresher deadline can exceed the true server-side expiry by at most
+        // the response transit (dispatch -> decode), never by the full skew.
+        //
+        // Clamping the anchor to a monotonic instant captured BEFORE
+        // `activate_jobs` (the fix the reviewer proposed) is NOT a safe
+        // tightening here: that call long-polls for up to `poll_timeout`, so a
+        // legitimately-later dispatch is indistinguishable from skew and the
+        // clamp would drag the anchor back by the whole poll wait, fencing
+        // still-valid leases up to a full poll early. The `min(REQUEST_MARGIN,
+        // window/2)` reserve in `refresh_budget` already absorbs this
+        // transit-bounded residual, so the fence still fires before real expiry.
+        let window = Duration::from_secs(300);
+        let transit = Duration::from_secs(2); // dispatch -> decode gap
+        for skew in [Duration::from_secs(1), Duration::from_secs(5)] {
+            let decoded_at = Instant::now();
+            let wall_now = SystemTime::now();
+            // Engine is `skew` AHEAD: it stamped the deadline from a clock
+            // reading `skew` larger than ours, dispatching `transit` ago, so
+            // `deadline = (wall_now + skew) + (window - transit)`.
+            let deadline_wall = wall_now + skew + window - transit;
+            let deadline_ms = deadline_wall
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let anchor = lease_anchor(deadline_ms, window, decoded_at, wall_now);
+            let deadline = anchor + window;
+            // True server-side expiry in the monotonic frame is
+            // `true_dispatch + window = (decoded_at - transit) + window`.
+            let true_expiry = decoded_at + window - transit;
+            assert!(
+                deadline <= true_expiry + transit + Duration::from_millis(50),
+                "positive skew {skew:?}: overrun exceeds the response transit"
+            );
+            // The anchor must never rise above the decode instant, so the
+            // deadline never grants more than the decode-anchor bound.
+            assert!(
+                deadline <= decoded_at + window + Duration::from_millis(50),
+                "positive skew {skew:?}: deadline exceeds the decode-anchor clamp"
+            );
+        }
+    }
 }
