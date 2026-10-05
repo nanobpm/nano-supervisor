@@ -23,6 +23,18 @@ use serde_json::Value;
 pub struct Job {
     pub job: ActivatedJobResult,
     pub lease: Option<String>,
+    /// A conservative lower bound on when the engine started this job's lease.
+    ///
+    /// The engine starts the lease when it *dispatches* the job, which is before
+    /// the activation response crosses the wire and is decoded here. The anchor
+    /// is derived in [`Jobs::activate`] from the engine-provided `deadline` (the
+    /// authoritative server-side lease expiry) via [`lease_anchor`], falling
+    /// back to the decode instant when the wall clock cannot be reconciled.
+    /// Either way it is a *lower* bound on the true dispatch instant, so the
+    /// refresher's initial deadline (`dispatched_at + window`) lands at or
+    /// *before* the true server-side expiry: the refresher fences slightly
+    /// early, never late — a delayed response cannot let it run past the lease.
+    pub dispatched_at: std::time::Instant,
 }
 
 /// Reject any job key that is not the engine's canonical numeric key format
@@ -92,6 +104,68 @@ fn token_of(lease: &Option<String>) -> Option<Option<JobLeaseToken>> {
         .map(|t| Some(JobLeaseToken::assume_exists(t.clone())))
 }
 
+/// Derive a monotonic lease-start anchor from the engine-provided `deadline`.
+///
+/// The engine starts a job's lease when it *dispatches* the job and reports the
+/// resulting lease expiry in `ActivatedJobResult.deadline` ("when the job can be
+/// activated again", a UNIX epoch timestamp in milliseconds). That expiry is
+/// `dispatch_wall + window` on the engine's clock — the authoritative
+/// server-side lease boundary — so the dispatch instant is `deadline - window`.
+/// The refresher, however, works on a monotonic [`std::time::Instant`], so this
+/// converts the wall-clock dispatch into the local monotonic frame:
+///
+/// ```text
+/// dispatch_ago = local_wall_now - (deadline_wall - window)
+/// anchor       = decoded_at - dispatch_ago
+/// ```
+///
+/// Because the response transits and is decoded *after* dispatch, `decoded_at`
+/// is itself an upper bound on the true dispatch, so the resulting anchor is a
+/// conservative LOWER bound: the refresher's `anchor + window` deadline lands at
+/// or *before* the real server-side expiry, never after it — the overrun a
+/// decode-time-only anchor allowed.
+///
+/// Two guards keep a wrong clock conservative rather than dangerous:
+///   * the anchor is clamped to `<= decoded_at` (a deadline far in the future
+///     would otherwise push the anchor — and the fence — *later* than decode);
+///   * if the wall clock is unusable (before the UNIX epoch) the anchor falls
+///     back to `decoded_at`, which is still no later than the even-later
+///     handle-task start the previous code used.
+pub(crate) fn lease_anchor(
+    deadline_ms: i64,
+    window: Duration,
+    decoded_at: std::time::Instant,
+    wall_now: std::time::SystemTime,
+) -> std::time::Instant {
+    use std::time::{Duration as D, UNIX_EPOCH};
+    let wall_since_epoch = match wall_now.duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        // Local wall clock before the epoch: cannot reconcile with the engine's
+        // epoch deadline, so fall back to the (still conservative) decode instant.
+        Err(_) => return decoded_at,
+    };
+    // The engine's deadline is `dispatch + window`, so the dispatch wall instant
+    // is `deadline - window`. A deadline smaller than the window (or negative)
+    // means the lease has already lapsed; saturating to the epoch makes
+    // `dispatch_ago` the whole local wall age, which clamps the anchor to the
+    // monotonic floor — conservatively early, so the refresher fences at once.
+    let deadline_wall = D::from_millis(deadline_ms.max(0) as u64);
+    let dispatch_wall = deadline_wall.saturating_sub(window);
+    // How long ago dispatch happened on the local monotonic clock. `saturating_sub`
+    // yields 0 when dispatch is at/after now (deadline in the future), which
+    // leaves the anchor at `decoded_at` — never later.
+    let dispatch_ago = wall_since_epoch.saturating_sub(dispatch_wall);
+    // Subtract, clamping at the monotonic floor (a lapsed lease collapses to the
+    // earliest representable instant so its deadline is already past and the
+    // refresher fences) and never rising above `decoded_at` (`dispatch_ago` of 0
+    // yields exactly `decoded_at`). `Instant::saturating_sub` is not on the
+    // pinned toolchain, so use `checked_sub` against a far-past reference floor.
+    let floor = decoded_at
+        .checked_sub(D::from_secs(60 * 60 * 24 * 365 * 30))
+        .unwrap_or(decoded_at);
+    decoded_at.checked_sub(dispatch_ago).unwrap_or(floor)
+}
+
 impl Jobs {
     /// Build the shared job client from an SDK `CamundaClient`.
     pub fn new(client: CamundaClient) -> Self {
@@ -116,11 +190,24 @@ impl Jobs {
             req.with_lease = Some(Some(true));
         }
         let r = self.client.activate_jobs(req).await.map_err(sdk_error)?;
+        // The lease anchor must be a LOWER bound on when the engine started each
+        // job's lease (at dispatch — before the response crossed the wire and was
+        // decoded here). Anchor it on the engine-provided `deadline` (the
+        // server-side lease expiry), which is authoritative; only when that is
+        // unusable (clock skew) fall back to the decode instant, which is still
+        // no later than the even-later handle-task start the previous code used.
+        let decoded_at = std::time::Instant::now();
+        let wall_now = std::time::SystemTime::now();
         Ok(r.jobs
             .into_iter()
             .map(|j| {
                 let lease = j.job_lease_token.as_ref().map(|t| t.value().to_string());
-                Job { job: j, lease }
+                let dispatched_at = lease_anchor(j.deadline, timeout, decoded_at, wall_now);
+                Job {
+                    job: j,
+                    lease,
+                    dispatched_at,
+                }
             })
             .collect())
     }
@@ -185,7 +272,8 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::validate_job_key;
-    use super::{sdk_error, status_of};
+    use super::{lease_anchor, sdk_error, status_of};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn sdk_api_status_is_authoritative_over_a_body_echoed_marker() {
@@ -251,6 +339,163 @@ mod tests {
                 validate_job_key(bad).is_err(),
                 "expected {bad:?} to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn lease_anchor_uses_the_engine_deadline_not_the_late_decode_instant() {
+        // Regression for the review finding that a decode-time `Instant::now()`
+        // anchor is an UPPER bound on dispatch: the engine started the lease
+        // `transit` before the response was decoded, so anchoring at decode lets
+        // `anchor + window` overrun the real server-side expiry by `transit`.
+        //
+        // The engine reports the authoritative expiry in `deadline` (epoch ms =
+        // dispatch_wall + window). Drive the real `lease_anchor` and assert the
+        // resulting deadline lands at the engine's expiry — NOT a full window
+        // past the (late) decode instant.
+        let window = Duration::from_secs(300);
+        let transit = Duration::from_secs(2); // dispatch -> decode gap
+        let decoded_at = Instant::now();
+        // The engine dispatched `transit` ago: its deadline (dispatch + window)
+        // is therefore `window - transit` in the future on the wall clock.
+        let wall_now = SystemTime::now();
+        let deadline_wall = wall_now + (window - transit);
+        let deadline_ms = deadline_wall
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let anchor = lease_anchor(deadline_ms, window, decoded_at, wall_now);
+        let deadline = anchor + window;
+
+        // The deadline must sit ~`window - transit` out (the engine's expiry),
+        // not ~`window` out (the over-granting decode anchor). Allow a few ms of
+        // slop for the two clock reads straddling the call.
+        let out = deadline.saturating_duration_since(decoded_at);
+        assert!(
+            out <= window - transit + Duration::from_millis(50),
+            "deadline {out:?} out overruns the engine expiry (~{:?} out)",
+            window - transit
+        );
+        assert!(
+            out >= window - transit - Duration::from_millis(50),
+            "deadline {out:?} out fences implausibly early (~{:?} expected)",
+            window - transit
+        );
+        // And it must never grant MORE than the decode anchor the old code used.
+        assert!(
+            deadline <= decoded_at + window,
+            "engine-deadline anchor must never grant a later deadline than decode-anchoring"
+        );
+    }
+
+    #[test]
+    fn lease_anchor_never_exceeds_decode_on_a_future_deadline() {
+        // A deadline far in the future (clock skew, or a freshly extended lease
+        // observed mid-flight) must not push the anchor — and thus the fence —
+        // later than the decode instant. Clamp to `decoded_at`.
+        let window = Duration::from_secs(300);
+        let decoded_at = Instant::now();
+        let wall_now = SystemTime::now();
+        // Deadline a full window in the future => dispatch "now" => anchor at decode.
+        let deadline_ms = (wall_now + window)
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let anchor = lease_anchor(deadline_ms, window, decoded_at, wall_now);
+        assert!(
+            anchor <= decoded_at + Duration::from_millis(50),
+            "a future deadline must not move the anchor past decode"
+        );
+    }
+
+    #[test]
+    fn lease_anchor_fences_immediately_on_a_lapsed_lease() {
+        // A deadline already in the past (or smaller than one window) means the
+        // lease has lapsed: the anchor must collapse to the monotonic floor so
+        // `anchor + window` is already in the past and the refresher fences.
+        let window = Duration::from_secs(300);
+        let decoded_at = Instant::now();
+        let wall_now = SystemTime::now();
+        // Deadline one second after the epoch — long lapsed.
+        let anchor = lease_anchor(1_000, window, decoded_at, wall_now);
+        let deadline = anchor + window;
+        assert!(
+            deadline <= decoded_at,
+            "a lapsed lease must produce a deadline at/before now so the refresher fences"
+        );
+    }
+
+    #[test]
+    fn lease_anchor_bounds_overrun_under_positive_engine_clock_skew() {
+        // Positive engine-clock skew — the engine's wall clock runs AHEAD of the
+        // worker's — understates `dispatch_ago` (it can even saturate to zero),
+        // so the wall-clock reconciliation places the anchor slightly later than
+        // the true dispatch. The `decoded_at` clamp bounds that residual: the
+        // refresher deadline can exceed the true server-side expiry by at most
+        // the response transit (dispatch -> decode), never by the full skew.
+        //
+        // Clamping the anchor to a monotonic instant captured BEFORE
+        // `activate_jobs` (the fix the reviewer proposed) is NOT a safe
+        // tightening here: that call long-polls for up to `poll_timeout`, so a
+        // legitimately-later dispatch is indistinguishable from skew and the
+        // clamp would drag the anchor back by the whole poll wait, fencing
+        // still-valid leases up to a full poll early. The `min(REQUEST_MARGIN,
+        // window/2)` reserve in `refresh_budget` already absorbs this
+        // transit-bounded residual, so the fence still fires before real expiry.
+        let window = Duration::from_secs(300);
+        let transit = Duration::from_secs(2); // dispatch -> decode gap
+        for skew in [Duration::from_secs(1), Duration::from_secs(5)] {
+            let decoded_at = Instant::now();
+            let wall_now = SystemTime::now();
+            // Engine is `skew` AHEAD: it stamped the deadline from a clock
+            // reading `skew` larger than ours, dispatching `transit` ago, so
+            // `deadline = (wall_now + skew) + (window - transit)`.
+            let deadline_wall = wall_now + skew + window - transit;
+            let deadline_ms = deadline_wall
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let anchor = lease_anchor(deadline_ms, window, decoded_at, wall_now);
+            let deadline = anchor + window;
+            // True server-side expiry in the monotonic frame is
+            // `true_dispatch + window = (decoded_at - transit) + window`.
+            let true_expiry = decoded_at + window - transit;
+            // Reconciliation pulls the anchor back by `transit - skew` (saturating
+            // at zero when `skew >= transit`), so the deadline overruns the true
+            // server-side expiry by EXACTLY `min(skew, transit)` — never the full
+            // `window`-scale skew. Asserting the exact residual (not just an upper
+            // bound the `anchor <= decoded_at` clamp already guarantees) makes this
+            // a real regression test: a no-op anchor that ignored reconciliation
+            // and returned `decoded_at` would overrun by the full `transit` even
+            // for `skew = 1s`, failing the `skew < transit` case below.
+            let tol = Duration::from_millis(50);
+            let expected_overrun = skew.min(transit);
+            let overrun = deadline.saturating_duration_since(true_expiry);
+            assert!(
+                overrun <= expected_overrun + tol,
+                "positive skew {skew:?}: overrun {overrun:?} exceeds the \
+                 reconciled residual {expected_overrun:?}"
+            );
+            assert!(
+                overrun + tol >= expected_overrun,
+                "positive skew {skew:?}: overrun {overrun:?} falls short of the \
+                 reconciled residual {expected_overrun:?} — anchor was not pulled \
+                 back by reconciliation"
+            );
+            // LOWER bound: when `skew < transit` the reconciliation pulls the
+            // anchor strictly earlier than the decode instant, so the deadline
+            // lands strictly before the naive decode-anchor bound. This fails
+            // against a no-op `return decoded_at`, proving the test exercises the
+            // wall-clock reconciliation rather than only the `anchor <= decoded_at`
+            // clamp.
+            if skew < transit {
+                assert!(
+                    deadline + tol < decoded_at + window,
+                    "positive skew {skew:?}: reconciliation should pull the \
+                     deadline strictly before the decode-anchor bound"
+                );
+            }
         }
     }
 }

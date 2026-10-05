@@ -87,6 +87,10 @@ pub async fn run(
     ));
     let mut next = 0usize;
     let mut handled = 0usize;
+    // Consecutive activation failures, for the reconnect backoff below. Reset by
+    // any successful activation (even an empty batch — reaching the engine at
+    // all means the connection is healthy again).
+    let mut activation_failures = 0u32;
     loop {
         if cfg.max_jobs.is_some_and(|max| handled >= max) {
             log(&format!(
@@ -122,14 +126,34 @@ pub async fn run(
         let batch = match batch {
             Ok(b) => b,
             Err(e) => {
+                activation_failures = activation_failures.saturating_add(1);
+                // Bounded exponential backoff with equal jitter, interruptible by
+                // the drain watch. A fixed 5s retry let a fleet of idle slots
+                // hammer an unreachable gateway — each attempt opening fresh TCP
+                // connections the kernel then holds in `TIME_WAIT` — until the
+                // host's ephemeral port range was exhausted and the gateway (and
+                // every other local client) became unreachable
+                // (nanobpm/nano-supervisor#23). The backoff bounds each slot to
+                // ~one reconnect attempt per 30s at the ceiling, and the equal
+                // jitter's nonzero `cap/2` floor spreads a fleet's retries so a
+                // recovering gateway is not hit by every slot in the same tick.
+                // The engine is still polled promptly once it answers: the
+                // streak resets on the first successful activation.
+                let wait = crate::runtime::activation_backoff(activation_failures);
                 log(&format!(
-                    "slot {} activation of {job_type:?} failed: {e:#}; retrying in 5s",
-                    cfg.worker_name
+                    "slot {} activation of {job_type:?} failed ({activation_failures} in a row): {e:#}; retrying in {:.1}s",
+                    cfg.worker_name,
+                    wait.as_secs_f64()
                 ));
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => continue,
+                    _ = tokio::time::sleep(wait) => {}
+                }
                 continue;
             }
         };
+        activation_failures = 0;
         // Re-check the drain watch before touching the returned batch: `select!`
         // resolves the activation the instant it is ready, but a SIGTERM may have
         // set `shutdown` while `activate` was in flight. Starting these jobs now
@@ -297,9 +321,22 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
+async fn handle(
+    jobs: Jobs,
+    cfg: Arc<SlotConfig>,
+    Job {
+        job,
+        lease,
+        dispatched_at,
+    }: Job,
+) {
     let key = job.job_key.value().to_string();
-    let started = Instant::now();
+    // The lease was started by the engine at dispatch; `dispatched_at` (derived
+    // in `Jobs::activate` from the engine's `deadline`) is the conservative
+    // lower bound we thread into the refresher. A separate `Instant::now()` here
+    // would be LATER than dispatch by the response-transit + spawn gap, so it
+    // would over-grant the first window — the exact overrun the reviewer flagged.
+    let started = dispatched_at;
     // Validate the engine-supplied key BEFORE it is used to build any request
     // path. The refresher below (`extend`) and the `complete`/`fail` settle all
     // interpolate it into `/jobs/{key}` on the Nano backend, so a malformed key
@@ -328,6 +365,13 @@ async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
         key.clone(),
         lease.clone(),
         cfg.recovery_window,
+        // Base the refresher's initial lease deadline on `started` (=
+        // `dispatched_at`, derived in `Jobs::activate` from the engine's
+        // `deadline` — before validation/logging/spawn) rather than an
+        // `Instant::now()` taken inside the loop: the lease began at dispatch,
+        // so the earlier timestamp avoids over-granting the first window by the
+        // response-transit + validation/logging/spawn gap.
+        started,
         refreshes.clone(),
         lost_tx,
         stop_rx,
