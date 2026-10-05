@@ -790,9 +790,15 @@ pub fn fake_agent_path() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
-/// Resolve the target CLI and a reachable local engine together, or a [`Skip`]
-/// reason. Engine-dependent worker tests start with this.
-pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
+/// Resolve just the target CLI, or a [`Skip`] reason — WITHOUT probing any
+/// engine. Tests that point the worker at a closed port (the engine-down
+/// regression) never talk to the live engine, so requiring one is unnecessary
+/// AND flaky: this suite runs concurrently, and the recovery test SIGSTOPs the
+/// shared engine for longer than the reachability probe, which would make an
+/// engine-dependent guard skip nondeterministically. These tests still keep the
+/// target-availability check (a target that is not runnable here skips
+/// cleanly); they only drop the engine probe.
+pub fn require_target() -> Result<Target, Skip> {
     let target = Target::from_env();
     if !target.available() {
         return Err(Skip(format!(
@@ -800,6 +806,13 @@ pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
             target.label()
         )));
     }
+    Ok(target)
+}
+
+/// Resolve the target CLI and a reachable local engine together, or a [`Skip`]
+/// reason. Engine-dependent worker tests start with this.
+pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
+    let target = require_target()?;
     let engine = Engine::try_from_env()?;
     Ok((engine, target))
 }
@@ -1529,57 +1542,6 @@ fn hire_profile(target: Target, home: &TempHome, profile: &str) {
 /// a closed port rather than through the blocking `run_worker_job` harness).
 pub fn hire_fake_agent(target: Target, home: &TempHome, profile: &str) {
     hire_profile(target, home, profile);
-}
-
-/// Run the worker-under-test to completion against an ALREADY-deployed job
-/// type — the blocking counterpart of [`with_worker_running_on`], for tests
-/// that deploy/create the job themselves first (e.g. the engine-down → up
-/// recovery scenario, which must have the job waiting BEFORE the worker comes
-/// up). The worker runs under `home` with the fake agent scripted by `script`;
-/// the returned [`JobOutcome`] carries the settled state. The caller keeps
-/// `home` alive.
-pub fn run_deployed_job(
-    engine: &Engine,
-    target: &Target,
-    home: &TempHome,
-    job_type: &str,
-    process_instance_key: &str,
-    script: &[serde_json::Value],
-    worker_flags: &[&str],
-) -> JobOutcome {
-    let work = tempfile::Builder::new()
-        .prefix("ns-run-")
-        .tempdir()
-        .unwrap();
-    let record_path = work.path().join("record.json");
-    let script_json = serde_json::to_string(&serde_json::Value::Array(script.to_vec())).unwrap();
-
-    let profile = format!("ctfake{}", rand_suffix());
-    hire_profile(*target, home, &profile);
-    let mut cmd = work_command(*target, &profile, job_type, worker_flags);
-    home.apply(&mut cmd);
-    cmd.env("NS_FAKE_SCRIPT", &script_json)
-        .env("NS_FAKE_RECORD", &record_path)
-        .env("CAMUNDA_REST_ADDRESS", engine.url());
-
-    let output = match target {
-        Target::Rust => output_within(cmd, WORKER_TEST_TIMEOUT),
-        Target::Node => run_node_worker(cmd, &record_path, || {
-            engine
-                .job(job_type)
-                .map_or(Settlement::Pending, |j| job_settlement(&j))
-        }),
-    };
-    JobOutcome {
-        job_type: job_type.to_string(),
-        process_instance_key: process_instance_key.to_string(),
-        engine: engine.clone(),
-        record_path,
-        output,
-        home_path: home.path().to_path_buf(),
-        _home: None,
-        _work: work,
-    }
 }
 
 /// Build the `work <profile>` command that services one test job type: the

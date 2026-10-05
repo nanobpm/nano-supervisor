@@ -22,7 +22,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
-use contract_tests::{require_engine_and_target, skip, Skip, Target, TempHome};
+use contract_tests::{require_engine_and_target, require_target, skip, Skip, Target, TempHome};
 // `bpmn` / `json!` are used only by the Linux-gated recovery test below, so the
 // imports are gated too — otherwise the `-D warnings` macOS build fails on them.
 #[cfg(target_os = "linux")]
@@ -170,7 +170,13 @@ fn stderr_has_activity(text: &str) -> bool {
 /// the outage has lasted many backoff cycles.
 #[test]
 fn offline_worker_bounds_its_reconnect_rate_and_stays_up() {
-    let (_engine, target) = match require_engine_and_target() {
+    // This test only ever talks to the closed port created below — never the
+    // live engine — so it selects the target WITHOUT probing the engine
+    // (`require_target`). Probing the shared engine would be not just
+    // unnecessary but flaky: this binary runs its tests concurrently, and the
+    // recovery test below SIGSTOPs that shared engine for longer than the
+    // reachability probe, which would make this guard skip nondeterministically.
+    let target = match require_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
@@ -656,7 +662,11 @@ fn wait_for_settled(
 /// together fails here even though the single-worker test above passes.
 #[test]
 fn offline_fleet_bounds_its_aggregate_reconnect_rate() {
-    let (_engine, target) = match require_engine_and_target() {
+    // Like the single-worker outage test above, this fleet only ever dials the
+    // closed port created below — never the live engine — so it selects the
+    // target WITHOUT probing the engine (`require_target`), avoiding the flaky
+    // skip a concurrent engine freeze (the recovery test's SIGSTOP) would cause.
+    let target = match require_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };

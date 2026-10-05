@@ -12,10 +12,13 @@ use crate::jobs::Jobs;
 /// First activation-failure delay. Small enough that a single transient error
 /// barely slows pickup, large enough that a down engine is not hammered.
 const ACTIVATION_BACKOFF_BASE: Duration = Duration::from_secs(1);
-/// Ceiling for the activation-failure backoff: an idle slot polls a DOWN engine
-/// at most ~once per 30s (plus the SDK's own bounded in-call retries), so a
-/// 16-slot fleet cannot churn the host's ephemeral TCP ports into `TIME_WAIT`
-/// while the gateway is unreachable (the incident behind nanobpm/nano-supervisor#23).
+/// Ceiling for the activation-failure backoff: at the 30s cap, equal jitter
+/// (`cap/2 + random(0, cap/2)`) returns a delay in `[15s, 30s)`, so an idle
+/// slot polls a DOWN engine once per 15–30s — as often as once per 15s, ~22.5s
+/// on average (plus the SDK's own bounded in-call retries). That nonzero floor
+/// is what keeps a 16-slot fleet from churning the host's ephemeral TCP ports
+/// into `TIME_WAIT` while the gateway is unreachable (the incident behind
+/// nanobpm/nano-supervisor#23).
 const ACTIVATION_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// The hard ceiling on one lease-`extend` request. The tuned reqwest client
@@ -52,10 +55,11 @@ const REQUEST_MARGIN: Duration = EXTEND_TIMEOUT.saturating_add(Duration::from_se
 /// fleet's retries across the upper half of the window so N slots started
 /// together do not reconnect in lockstep (a thundering herd on a gateway that
 /// has just come back), while its NONZERO floor (`cap/2`) bounds the aggregate
-/// retry rate no matter how the draws fall. Full jitter (`random(0, cap)`) was
-/// rejected: it permits an unbounded run of near-zero delays, which would let a
-/// fleet hammer a recovering gateway far faster than the advertised ~one
-/// attempt per `cap` and weaken the storm guard behind nanobpm/nano-supervisor#23.
+/// retry rate no matter how the draws fall: every slot waits at least `cap/2`,
+/// so a slot retries at most once per `cap/2` (mean `3cap/4`). Full jitter
+/// (`random(0, cap)`) was rejected: it permits an unbounded run of near-zero
+/// delays, which would let a fleet hammer a recovering gateway far faster than
+/// that `cap/2` floor and weaken the storm guard behind nanobpm/nano-supervisor#23.
 pub(crate) fn activation_backoff(failures: u32) -> Duration {
     let shift = failures.saturating_sub(1).min(20);
     let exp = ACTIVATION_BACKOFF_BASE.saturating_mul(1u32 << shift);
