@@ -1103,10 +1103,15 @@ fn sweep_stale_runs_pinned(
         Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    // `execute` registers each in-flight run by its ABSOLUTE path, so resolve
-    // the root once to compare entries against the active set correctly even
-    // when `runs_dir` is relative.
-    let runs_abs = std::path::absolute(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
+    // `execute` registers each in-flight run by its `normalize_run_path` form
+    // (absolute AND lexically parent-free), so derive the comparison key with
+    // the matching lexical resolver — even when `runs_dir` is relative or
+    // parent-relative. `std::path::absolute` would keep an interior `..`,
+    // producing a different registry key for the same directory and letting
+    // the sweep reap a live run (#36). `resolve_run_path` collapses rather
+    // than refuses, so the key always resolves.
+    let runs_abs =
+        crate::safecwd::resolve_run_path(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
     let now = SystemTime::now();
     let self_pid = std::process::id() as i32;
     for name in root.entry_names().map_err(PinError::Io)? {
@@ -1260,8 +1265,10 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
         if !recurse_namespaces {
             // Top-level entry IS a job run: age it by its own mtime, never
             // descend into it (its repo checkout / scratch dirs are not runs).
-            // Atomic check-and-remove (see the pinned branch).
-            let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+            // Atomic check-and-remove (see the pinned branch). Resolve with the
+            // same lexical form `execute` registers by, so the key matches even
+            // for a relative/parent-relative `runs_dir` (#36).
+            let abs = crate::safecwd::resolve_run_path(&path).unwrap_or_else(|_| path.clone());
             if is_aged_out(meta.modified().ok(), now, max_age) {
                 remove_if_inactive(&abs, || reap_path(&path, max_age));
             }
@@ -1296,7 +1303,9 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
             if !cmeta.is_dir() {
                 continue;
             }
-            let cabs = std::path::absolute(&cpath).unwrap_or_else(|_| cpath.clone());
+            // Resolve with the same lexical form `execute` registers by, so the
+            // key matches even for a relative runs root (#36).
+            let cabs = crate::safecwd::resolve_run_path(&cpath).unwrap_or_else(|_| cpath.clone());
             if !is_aged_out(cmeta.modified().ok(), now, max_age) {
                 continue;
             }
@@ -3070,6 +3079,58 @@ mod tests {
         assert!(!run.exists(), "a deregistered aged dir is swept normally");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sweep_recognises_an_active_run_under_a_parent_relative_root() {
+        // Regression for the relative runs-dir mismatch (#36): `execute`
+        // registers an in-flight run by its `normalize_run_path` form (absolute
+        // AND lexically parent-free, e.g. `/parent/runs/123`), while a daemon
+        // `--runs-dir ../runs` reaches the sweep as a path whose
+        // `std::path::absolute` form keeps an interior `..`
+        // (`/parent/cwd/../runs/123`). Those are different `active_runs` keys
+        // for the SAME directory, so a sweep keyed on the un-normalized form
+        // would reap a live workspace. The sweep must normalize its lookup key
+        // with the same `normalize_run_path`, so the active registration is
+        // honoured however the root was spelled.
+        let base = std::env::temp_dir().join(format!(
+            "nano-relroot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd_dir = base.join("cwd");
+        let runs = base.join("runs");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        std::fs::create_dir_all(&runs).unwrap();
+        // Resolve platform symlinks (macOS /var -> /private/var) so the lexical
+        // `..` below resolves honestly against the on-disk tree.
+        let base = std::fs::canonicalize(&base).unwrap();
+        let cwd_dir = std::fs::canonicalize(&cwd_dir).unwrap();
+        let runs = std::fs::canonicalize(&runs).unwrap();
+
+        let live = runs.join("live-run");
+        std::fs::create_dir_all(&live).unwrap();
+        // Register exactly as `execute` does: the normalized, parent-free form
+        // (`normalize_run_path` and `resolve_run_path` agree on this valid,
+        // parent-free path).
+        let live_normalized = crate::safecwd::normalize_run_path(&live).unwrap();
+        let _guard = ActiveRunGuard::new(&live_normalized);
+        assert!(is_active_run(&live_normalized));
+
+        // Sweep through a PARENT-RELATIVE spelling of the same root
+        // (`<base>/cwd/../runs`), the shape a relative `--runs-dir` produces.
+        let parent_relative_root = cwd_dir.join("..").join("runs");
+        sweep_stale_runs(&parent_relative_root, Duration::ZERO, false);
+        assert!(
+            live.exists(),
+            "an active run must survive a sweep keyed by a parent-relative root spelling"
+        );
+
+        drop(_guard);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

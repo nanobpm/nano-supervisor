@@ -112,6 +112,51 @@ pub(crate) fn normalize_run_path(path: &Path) -> io::Result<PathBuf> {
     Ok(out)
 }
 
+/// Lexically resolve a run path to the SAME absolute, `.`-/`..`-collapsed form
+/// [`normalize_run_path`] produces for a valid run path — but NEVER refuse:
+/// where `normalize_run_path` rejects an interior `..` (fail-closed for
+/// VALIDATING operator/run input at the trust boundary), this resolver
+/// collapses it lexically instead. Use it only to derive a COMPARISON key that
+/// must match a path `normalize_run_path` already registered (e.g. the
+/// retention sweep's `active_runs` lookups), never to validate a path before
+/// trusting it: a lexical `name/..` collapse is unsafe across a symlinked
+/// component, which is exactly why validation refuses it. Purely lexical —
+/// touches no filesystem, follows no symlink.
+pub(crate) fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let mut out: PathBuf = if path.is_absolute() {
+        let mut root = PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                Component::Prefix(p) => root.push(p.as_os_str()),
+                Component::RootDir => {
+                    root.push(comp.as_os_str());
+                    break;
+                }
+                _ => break,
+            }
+        }
+        root
+    } else {
+        std::env::current_dir()?
+    };
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => out.push(name),
+            // Collapse `..` lexically wherever it appears, clamping at the
+            // root like the kernel rather than escaping above it.
+            Component::ParentDir => {
+                let _ = out.pop();
+                if out.as_os_str().is_empty() {
+                    out.push(Component::RootDir.as_os_str());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A directory resolved no-follow and pinned by its fd, used to launch a child
 /// with its cwd set to the validated inode (via `fchdir` in `pre_exec`) rather
 /// than by re-resolving a path at spawn time.
