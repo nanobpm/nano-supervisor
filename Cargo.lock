@@ -344,6 +344,7 @@ name = "contract-tests"
 version = "0.0.1"
 dependencies = [
  "insta",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
