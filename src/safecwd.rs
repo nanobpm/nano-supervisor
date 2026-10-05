@@ -209,6 +209,18 @@ impl CwdHandle {
         Ok(CwdHandle { fd: self.dup_fd()? })
     }
 
+    /// Non-Unix `try_clone`: there is no fd to dup, so cloning the retained
+    /// path cannot fail — mirror the non-Unix [`Clone`] and return `Ok`. This
+    /// keeps `slot::execute`'s unconditional `try_clone()` calls (the agent
+    /// directory and both HEAD probes) compiling on non-Unix hosts, where the
+    /// launch falls back to the validated path.
+    #[cfg(not(unix))]
+    pub(crate) fn try_clone(&self) -> io::Result<CwdHandle> {
+        Ok(CwdHandle {
+            path: self.path.clone(),
+        })
+    }
+
     /// Wrap an already-pinned, no-follow directory fd — e.g. the child handle a
     /// run-dir preparation pinned — as a `CwdHandle`, without re-resolving any
     /// path. Lets preparation hand its exact validated inode straight to the
@@ -912,19 +924,56 @@ mod tests {
     /// `slot.rs` HEAD-probe fix relies on: `try_clone().ok()`-style degradation
     /// only works if `try_clone` actually yields `Err` on `EMFILE`.
     ///
-    /// Simulates exhaustion by capping `RLIMIT_NOFILE` just above the current
-    /// open-fd count, so the very next `F_DUPFD_CLOEXEC` fails with `EMFILE`.
-    /// Runs in its own process (a `#[test]` is a thread of the test binary, but
-    /// the rlimit is restored before returning, so sibling tests are
-    /// unaffected); skipped if the rlimit cannot be tightened.
+    /// The exhaustion check lowers the process-wide `RLIMIT_NOFILE` to a full
+    /// table, so it must NOT run as an ordinary `#[test]` thread: sibling test
+    /// threads share the process and would see spurious `EMFILE` on their own
+    /// opens (and their descriptor closures could make this probe unexpectedly
+    /// succeed). It therefore runs in an isolated child process: the parent
+    /// re-executes the test binary with `NANO_SAFECWD_EMFILE_CHILD` set, the
+    /// child runs ONLY this body (no sibling threads) and exits 0 on a genuine
+    /// `Err`, and the parent asserts on the child's exit status.
     #[cfg(unix)]
     #[test]
     fn try_clone_is_fallible_under_descriptor_exhaustion() {
+        const CHILD_ENV: &str = "NANO_SAFECWD_EMFILE_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Parent: spawn the isolated child running only this test body.
+            // `--exact` needs the FULL module path; a bare name matches 0 tests
+            // and the child would exit 0 without testing anything (a false
+            // pass).
+            let exe = std::env::current_exe().expect("current test binary");
+            let out = Command::new(exe)
+                .arg("safecwd::tests::try_clone_is_fallible_under_descriptor_exhaustion")
+                .arg("--exact")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("spawn EMFILE child");
+            // Guard against a 0-match filter false-pass: the child must have
+            // actually RUN the one test (libtest prints "running 1 test").
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                stdout.contains("running 1 test") || stderr.contains("running 1 test"),
+                "EMFILE child must run exactly one test (filter matched 0?)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                out.status.success(),
+                "EMFILE child must observe try_clone -> Err; status={:?}\nstdout:\n{}\nstderr:\n{}",
+                out.status.code(),
+                stdout,
+                stderr
+            );
+            return;
+        }
+
+        // Child (own process, no sibling threads): tighten RLIMIT_NOFILE to a
+        // full table so the very next `F_DUPFD_CLOEXEC` fails with EMFILE.
         let dir = scratch("try-clone-emfile");
         let handle = CwdHandle::open(&dir).expect("open dir");
 
-        // Tighten RLIMIT_NOFILE to the number of fds currently open, so the
-        // next dup exceeds the soft limit and fails with EMFILE.
         let mut lim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,

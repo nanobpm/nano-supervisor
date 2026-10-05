@@ -95,8 +95,14 @@ fn cstr(name: &OsStr) -> io::Result<CString> {
 /// The common open-flag set for a directory handle we only stat/read/unlink
 /// through: read-only, must be a directory, close-on-exec, never follow the
 /// final component.
-fn dir_open_flags() -> u64 {
-    (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64
+///
+/// Returns `i32` — the natural type of the `libc::O_*` constants and of the
+/// portable `libc::openat` flags argument. The Linux `openat2` path takes a
+/// `u64` `flags` field, so it widens this with `as u64` at its call site.
+/// Sharing the helper across both backends keeps it used on every Unix host
+/// (a Linux-only caller would leave it dead on macOS, failing `-D warnings`).
+fn dir_open_flags() -> i32 {
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
 /// Raw `openat2` wrapper. `dirfd`/`path` anchor the resolution; `resolve`
@@ -319,7 +325,7 @@ impl DirHandle {
             match openat2_raw(
                 self.fd.as_raw_fd(),
                 &c,
-                dir_open_flags(),
+                dir_open_flags() as u64,
                 RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
             ) {
                 Ok(fd) => return Ok(DirHandle { fd }),
@@ -333,7 +339,7 @@ impl DirHandle {
             libc::openat(
                 self.fd.as_raw_fd(),
                 c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                dir_open_flags(),
             )
         };
         if fd < 0 {
@@ -668,6 +674,12 @@ mod tests {
         // Attacker replaces the child by path with a different (0755) directory.
         handle.remove_tree(OsStr::new("run")).unwrap();
         std::fs::create_dir_all(root.join("run")).unwrap();
+        // `create_dir_all` applies the process umask, so under a restrictive
+        // umask (e.g. 0077) the replacement would be 0700, not 0755 — colliding
+        // with the prepared mode and defeating the distinction this test draws.
+        // Set the replacement's mode explicitly so the 0755-vs-0700 assertion
+        // holds regardless of the inherited umask.
+        std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             std::fs::metadata(root.join("run"))
                 .unwrap()

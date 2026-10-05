@@ -3337,7 +3337,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
-        p
+        // Canonicalize away any symlinked temp-dir ancestor (macOS `temp_dir()`
+        // is commonly under the platform `/var` → `/private/var` symlink). The
+        // no-follow prepare/sweep paths legitimately refuse a symlinked
+        // component, so an unresolved `/var/...` scratch root would be rejected
+        // (or its entries skipped) and the owner-only/symlink tests below would
+        // fail on macOS. `saferoot::tests::scratch_root` canonicalizes for the
+        // same reason.
+        std::fs::canonicalize(&p).unwrap()
     }
 
     #[cfg(unix)]
