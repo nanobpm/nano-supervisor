@@ -133,7 +133,7 @@ jobs:
           cargo test -p contract-tests --locked \
             --test worker_prompt --test worker_env --test worker_result \
             --test worker_lease --test worker_finalize --test worker_selection \
-            --test worker_resume --test worker_sweeps -- --nocapture
+            --test worker_resume --test worker_sweeps --test pin -- --nocapture
 
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:

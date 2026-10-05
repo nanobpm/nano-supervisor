@@ -335,6 +335,43 @@ impl DirHandle {
         Ok(DirHandle { fd })
     }
 
+    /// Create a direct child **regular file** (`name`) relative to this handle,
+    /// write `contents`, and set it to `mode` — all no-follow and beneath this
+    /// directory (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, plus
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW`). `O_EXCL` makes the create **fail
+    /// closed** if `name` already exists as anything (a planted symlink, a
+    /// pre-existing file, a FIFO): a same-UID sibling cannot pre-plant
+    /// `name` as a symlink and have this write land on its target.
+    ///
+    /// Used to seed the agent's isolated c8ctl config files (issue #41) through
+    /// the pinned per-run directory handle, so the write cannot be redirected
+    /// outside the run dir onto the operator's global c8ctl config.
+    pub(crate) fn write_new_child_file(
+        &self,
+        name: &OsStr,
+        contents: &[u8],
+        mode: u32,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        let c = cstr(name)?;
+        let fd = openat2_raw(
+            self.fd.as_raw_fd(),
+            &c,
+            (libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                as u64,
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        )?;
+        let mut f = std::fs::File::from(fd);
+        // `openat2` created the file with mode 0 (we pass `mode: 0` in the
+        // `open_how`), narrower than the target; `fchmod` on the fd makes the
+        // final mode exact and immune to umask, without re-resolving the path.
+        if unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        f.write_all(contents)?;
+        f.flush()
+    }
+
     /// `lstat` a direct child (relative, never following the entry).
     pub(crate) fn symlink_metadata(&self, name: &OsStr) -> io::Result<EntryMeta> {
         let c = cstr(name)?;

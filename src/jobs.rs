@@ -102,6 +102,29 @@ fn token_of(lease: &Option<String>) -> Option<Option<JobLeaseToken>> {
         .map(|t| Some(JobLeaseToken::assume_exists(t.clone())))
 }
 
+/// True when `prefixes` is non-empty and every entry looks like a throwaway
+/// test type (`probe-*` / `ct-*`). Pure classifier behind
+/// [`Jobs::looks_like_test_engine`], unit-tested without a live client.
+fn all_test_looking(prefixes: &[String]) -> bool {
+    !prefixes.is_empty()
+        && prefixes
+            .iter()
+            .all(|t| t.starts_with("probe-") || t.starts_with("ct-"))
+}
+
+/// The one-shot issue-#41 sanity-warning decision, factored out of
+/// [`Jobs::should_warn_sanity`] so it is testable without an engine round-trip.
+/// Fires only when the activation returned jobs AND every served type looks
+/// test-ish AND the latch had not already tripped; latches `true` on the first
+/// qualifying call so the warning is emitted at most once per worker.
+fn warn_sanity_decision(
+    got_jobs: bool,
+    looks_test: bool,
+    latch: &std::sync::atomic::AtomicBool,
+) -> bool {
+    got_jobs && looks_test && !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Jobs {
     /// Build the shared job client from an SDK `CamundaClient`.
     pub fn new(client: CamundaClient) -> Self {
@@ -130,11 +153,17 @@ impl Jobs {
     /// workers whose whole purpose is test types (an explicit `--job-type`
     /// selection, or a hire configured for them).
     fn looks_like_test_engine(&self) -> bool {
-        !self.test_type_prefixes.is_empty()
-            && self
-                .test_type_prefixes
-                .iter()
-                .all(|t| t.starts_with("probe-") || t.starts_with("ct-"))
+        all_test_looking(&self.test_type_prefixes)
+    }
+
+    /// Decide whether the issue-#41 sanity warning should fire for this
+    /// activation, and latch it so it fires at most once per worker. Pure given
+    /// the receiver's state: it is `true` only when the activation returned
+    /// jobs, every served type looks test-ish ([`Self::looks_like_test_engine`]),
+    /// and the one-shot latch had not already tripped. Extracted so the decision
+    /// is unit-testable without a live engine round-trip.
+    fn should_warn_sanity(&self, got_jobs: bool) -> bool {
+        warn_sanity_decision(got_jobs, self.looks_like_test_engine(), &self.sanity_warned)
     }
 
     pub async fn activate(
@@ -160,10 +189,7 @@ impl Jobs {
         // next retarget is diagnosable from the log instead of from burned
         // tokens. The worker keeps running: a contract-test fleet is a
         // legitimate configuration, so this must inform, never block.
-        if !r.jobs.is_empty()
-            && self.looks_like_test_engine()
-            && !self.sanity_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.should_warn_sanity(!r.jobs.is_empty()) {
             crate::runtime::log(&format!(
                 "WARNING: worker {worker} is connected to {} but every job type it serves is \
                  test-looking ({:?}); if this is not a throwaway test engine, the worker was \
@@ -242,7 +268,41 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::validate_job_key;
+    use super::{all_test_looking, warn_sanity_decision};
     use super::{sdk_error, status_of};
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn all_test_looking_classifies_prefix_sets() {
+        // Empty matrix is never "all test-looking" (a plain worker, no types).
+        assert!(!all_test_looking(&[]));
+        // A pure test fleet (`ct-*` / `probe-*`) matches.
+        assert!(all_test_looking(&["ct-foo".into(), "probe-bar".into()]));
+        // A single production type anywhere in the matrix disqualifies it.
+        assert!(!all_test_looking(&[
+            "ct-foo".into(),
+            "senior:feature".into()
+        ]));
+        assert!(!all_test_looking(&["senior".into()]));
+    }
+
+    #[test]
+    fn warn_sanity_decision_is_one_shot_and_gated() {
+        // No jobs → never warn, and the latch stays untripped so a later live
+        // answer can still warn.
+        let latch = AtomicBool::new(false);
+        assert!(!warn_sanity_decision(false, true, &latch));
+        assert!(!latch.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Jobs but not a test-looking engine → never warn, latch untouched.
+        assert!(!warn_sanity_decision(true, false, &latch));
+        assert!(!latch.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Jobs on a test-looking engine → warn exactly once, then latched off.
+        assert!(warn_sanity_decision(true, true, &latch));
+        assert!(!warn_sanity_decision(true, true, &latch));
+        assert!(!warn_sanity_decision(true, true, &latch));
+    }
 
     #[test]
     fn sdk_api_status_is_authoritative_over_a_body_echoed_marker() {

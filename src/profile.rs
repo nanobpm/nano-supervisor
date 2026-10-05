@@ -27,6 +27,31 @@ pub struct Profile {
     pub default_tenant_id: Option<String>,
 }
 
+impl Profile {
+    /// A copy carrying only the **non-secret connection identity** — `name`,
+    /// `baseUrl`, and `defaultTenantId` — with every credential field cleared
+    /// (`clientId`/`clientSecret`, the OAuth coordinates, and the basic-auth
+    /// `username`/`password`).
+    ///
+    /// Issue #41: the worker seeds this into the agent's isolated c8ctl
+    /// `profiles.json`. The agent runs as the **same OS user** as the daemon,
+    /// so a `0600` file does not hide its contents from the agent — serializing
+    /// the full profile would copy the daemon's engine `clientSecret` / basic
+    /// auth `password` into an agent-readable file and bypass the credential
+    /// boundary the launchers enforce elsewhere. The agent only needs to know
+    /// *which engine* the job is pinned to, so only the connection identity is
+    /// seeded; authenticated `c8` access, if ever required, must come from a
+    /// deliberately scoped agent credential, never the daemon's.
+    pub fn connection_identity(&self) -> Profile {
+        Profile {
+            name: self.name.clone(),
+            base_url: self.base_url.clone(),
+            default_tenant_id: self.default_tenant_id.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ProfilesFile {
     #[serde(default)]
@@ -250,5 +275,36 @@ mod tests {
         let m = sdk_settings(&p);
         assert_eq!(m["CAMUNDA_REST_ADDRESS"], "http://192.168.0.21:8080");
         assert_eq!(m["CAMUNDA_AUTH_STRATEGY"], "NONE");
+    }
+
+    /// Issue #41: the identity seeded into the agent's isolated c8ctl dir must
+    /// carry ONLY non-secret connection identity. Serializing the stripped
+    /// profile must not leak the daemon's engine `clientSecret`/`password` (or
+    /// any other credential) into an agent-readable file.
+    #[test]
+    fn connection_identity_strips_every_credential() {
+        let p = profile(
+            r#"{"name":"saas","baseUrl":"https://x.camunda.io","clientId":"id","clientSecret":"SECRET",
+                "oAuthUrl":"https://login/oauth/token","audience":"zeebe.camunda.io","scope":"sc",
+                "username":"u","password":"PASSWORD","defaultTenantId":"t1"}"#,
+        );
+        let id = p.connection_identity();
+        // Non-secret identity is preserved…
+        assert_eq!(id.name, "saas");
+        assert_eq!(id.base_url.as_deref(), Some("https://x.camunda.io"));
+        assert_eq!(id.default_tenant_id.as_deref(), Some("t1"));
+        // …and every credential field is cleared.
+        assert!(id.client_id.is_none());
+        assert!(id.client_secret.is_none());
+        assert!(id.o_auth_url.is_none());
+        assert!(id.audience.is_none());
+        assert!(id.scope.is_none());
+        assert!(id.username.is_none());
+        assert!(id.password.is_none());
+        // The serialized form (what the worker writes to profiles.json) leaks
+        // no secret substring.
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(!json.contains("SECRET"), "clientSecret leaked: {json}");
+        assert!(!json.contains("PASSWORD"), "password leaked: {json}");
     }
 }

@@ -19,8 +19,10 @@
 
 mod common;
 
-use contract_tests::{require_target, Target, TempHome};
-
+use contract_tests::{
+    require_engine_and_target, require_target, run_worker_job, skip, Skip, Target, TempHome,
+};
+use serde_json::json;
 /// The two c8ctl profiles the acceptance scenario switches between: `alpha`
 /// (the fleet's engine) and `beta` (the engine an agent's `c8 use profile`
 /// would select). Written into an isolated `C8CTL_CONFIG_DIR` per test.
@@ -402,5 +404,46 @@ fn test_looking_job_types_still_start_and_banner() {
             .contains("engine: alpha (http://alpha.invalid:8080)"),
         "stderr was:\n{}",
         out.stderr
+    );
+}
+
+/// Proposal 4, end-to-end: a worker whose entire job-type matrix is
+/// test-looking (`run_worker_job` serves a single `ct-*` type) and that gets a
+/// LIVE job from the engine emits the issue-#41 sanity warning — exactly once —
+/// naming the engine. This is the retargeted-fleet alarm the incident lacked;
+/// the unit tests in `src/jobs.rs` cover the predicate, this proves it fires on
+/// a real activation. Engine-gated: skips without an engine + Rust target.
+#[test]
+fn live_job_on_a_test_looking_fleet_warns_once() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    if target != Target::Rust {
+        skip!("the sanity guard is the Rust worker's issue-#41 instrumentation");
+    }
+    let outcome = run_worker_job(
+        &engine,
+        &target,
+        "sanity-warn",
+        &[
+            json!({ "emit": "ok" }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({ "prompt": "note your environment" }),
+        &[],
+        &[],
+    );
+    let stderr = outcome.stderr();
+    let hits = stderr
+        .matches("every job type it serves is test-looking")
+        .count();
+    assert_eq!(
+        hits, 1,
+        "a live job on an all-test-looking fleet must warn exactly once; stderr was:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("(issue #41)"),
+        "the sanity warning must cite issue #41; stderr was:\n{stderr}"
     );
 }

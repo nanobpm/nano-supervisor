@@ -241,10 +241,12 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // The worker's startup banner names the engine it is about to serve — the
     // issue-#41 incident's only clue was a job-type line deep in the log.
     log(&format!("engine: {engine_desc}"));
-    let pinned_name = decision.pin.profile.clone();
+    // Connect with the profile the pin already resolved — never a fresh
+    // re-resolve — so the client, the banner, and the pin are one snapshot
+    // (issue #41). The env-only pin carries its baseUrl fingerprint instead.
     let pinned_base_url = decision.pin.base_url.clone();
-    let (_profile, jobs) = match engine::connect(
-        pinned_name.as_deref(),
+    let jobs = match engine::connect(
+        decision.profile.as_ref(),
         &engine_desc,
         &job_types,
         pinned_base_url.as_deref(),

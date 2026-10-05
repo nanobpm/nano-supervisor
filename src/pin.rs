@@ -73,22 +73,41 @@ pub fn state_file(state_home: &Path) -> PathBuf {
     state_home.join("supervisor.json")
 }
 
-/// Read the pinned connection, if `supervisor.json` exists and carries one.
-/// A malformed file is treated as unpinned (and reported) rather than fatal:
-/// the supervisor must still start, and the next successful start re-pins.
-pub fn read(state_home: &Path) -> Option<ConnectionPin> {
+/// Read the pinned connection. `Ok(None)` means `supervisor.json` does not
+/// exist — genuinely unpinned, so the next start resolves and pins. A file that
+/// exists but is unreadable or malformed is a HARD ERROR ([`Err`]), never
+/// silently treated as unpinned: a truncated or externally corrupted
+/// `supervisor.json` would otherwise fall back to resolving the mutable ambient
+/// profile and recreate the exact fleet-retargeting incident this pin exists to
+/// prevent (issue #41). The operator must repair or deliberately delete the
+/// file to re-pin.
+pub fn read(state_home: &Path) -> Result<Option<ConnectionPin>> {
+    Ok(read_state(state_home)?.and_then(|s| s.connection))
+}
+
+/// Read and parse `supervisor.json`, distinguishing "absent" (`Ok(None)`) from
+/// "present but corrupt" ([`Err`]). Only a `NotFound` means unpinned; every
+/// other read error and every parse error fails closed, so no corrupt state can
+/// be mistaken for a clean, unpinned home.
+fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
     let path = state_file(state_home);
-    let bytes = std::fs::read(&path).ok()?;
-    match serde_json::from_slice::<SupervisorState>(&bytes) {
-        Ok(s) => s.connection,
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            log(&format!(
-                "warning: {} is not valid JSON ({e}); ignoring it and re-pinning the connection",
-                path.display()
-            ));
-            None
+            return Err(e).with_context(|| format!("reading {}", path.display()));
         }
-    }
+    };
+    let state = serde_json::from_slice::<SupervisorState>(&bytes).with_context(|| {
+        format!(
+            "{} exists but is not valid supervisor state JSON; refusing to start with a corrupt \
+             connection pin (an unpinned fallback would re-resolve the mutable ambient profile \
+             and could silently retarget the fleet — issue #41). Repair the file, or delete it \
+             to deliberately re-pin",
+            path.display()
+        )
+    })?;
+    Ok(Some(state))
 }
 
 /// Persist the pin, preserving any other fields already in the file. The state
@@ -103,10 +122,11 @@ fn write(state_home: &Path, pin: &ConnectionPin) -> Result<()> {
         let _ = std::fs::set_permissions(state_home, std::fs::Permissions::from_mode(0o700));
     }
     let path = state_file(state_home);
-    let mut state: SupervisorState = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    // Preserve the Node supervisor's own fields on rewrite — but fail closed on
+    // a corrupt existing file rather than silently discarding it (which would
+    // drop those fields AND any pin). `read_state` already turned a `NotFound`
+    // into `Ok(None)`, so a fresh home starts from the default.
+    let mut state: SupervisorState = read_state(state_home)?.unwrap_or_default();
     state.connection = Some(pin.clone());
     let json = serde_json::to_string_pretty(&state).context("serializing supervisor.json")?;
     std::fs::write(&path, format!("{json}\n"))
@@ -144,7 +164,7 @@ pub struct PinDecision {
 ///   is resolved once and pinned for every later start.
 pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDecision> {
     let active_profile = profile::active_profile_name();
-    let existing = read(state_home);
+    let existing = read(state_home)?;
 
     // Choose the profile NAME this start connects with, then resolve it once.
     let (name, created) = match (explicit, &existing) {
@@ -297,7 +317,7 @@ mod tests {
             r#"{"socket":"/tmp/x.sock","pid":1234,"connection":{"profile":"merlin","baseUrl":"http://m:8080"}}"#,
         )
         .unwrap();
-        let pin = read(&home).expect("pin read back");
+        let pin = read(&home).expect("pin read ok").expect("pin present");
         assert_eq!(pin.profile.as_deref(), Some("merlin"));
         assert_eq!(pin.base_url.as_deref(), Some("http://m:8080"));
         // Rewriting the pin must not drop the Node supervisor's own fields.
@@ -318,17 +338,34 @@ mod tests {
     }
 
     #[test]
-    fn malformed_state_file_reads_as_unpinned() {
+    fn malformed_state_file_is_a_hard_error_not_unpinned() {
+        // Issue #41: a corrupt `supervisor.json` must FAIL CLOSED. Treating it
+        // as unpinned would re-resolve the mutable ambient profile on the next
+        // start and could silently retarget the fleet — the very incident the
+        // pin prevents. Only a MISSING file means unpinned.
         let home = temp_home("malformed");
         std::fs::write(state_file(&home), b"not json").unwrap();
-        assert!(read(&home).is_none());
+        let err = read(&home).expect_err("malformed state must be a hard error");
+        assert!(
+            err.to_string().contains("corrupt connection pin")
+                || err.chain().any(|c| c.to_string().contains("corrupt")),
+            "the error must explain the corrupt pin: {err:#}"
+        );
+        // `resolve_or_pin` must surface the same failure rather than re-pinning
+        // the ambient profile over a corrupt file.
+        assert!(
+            resolve_or_pin(&home, None).is_err(),
+            "resolve_or_pin must refuse to run over corrupt state"
+        );
+        // A truncated/garbage file must also never be silently overwritten by a
+        // rewrite that drops the operator's own fields and pin.
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn missing_state_file_reads_as_unpinned() {
         let home = temp_home("missing");
-        assert!(read(&home).is_none());
+        assert!(read(&home).expect("missing reads ok").is_none());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -385,7 +422,7 @@ mod tests {
             "the env pin must keep its recorded fingerprint across env drift"
         );
         // …and the on-disk pin is untouched either.
-        let on_disk = read(&home).expect("pin on disk");
+        let on_disk = read(&home).expect("read ok").expect("pin on disk");
         assert_eq!(on_disk.base_url.as_deref(), Some("http://engine-a:8080"));
         let _ = std::fs::remove_dir_all(&home);
     }

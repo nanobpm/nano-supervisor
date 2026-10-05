@@ -94,14 +94,34 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     // Every slot of this daemon connects through the PINNED profile — never
     // the ambient session — so a moved active profile cannot split the fleet.
-    let pinned_name = decision.pin.profile.clone();
     let pinned_base_url = decision.pin.base_url.clone();
-    let all_types: Vec<String> = selected
+    // The sanity guard's engine identity must be built from the hires this
+    // daemon will ACTUALLY run — not every selected hire. A selected-but-invalid
+    // hire (rejected by `validate` below) contributes no job types the daemon
+    // serves; folding its production-looking matrix into the identity could make
+    // `looks_like_test_engine` false even when every runnable hire is
+    // `probe-*`/`ct-*`, suppressing the issue-#41 warning. So partition first.
+    let mut runnable: Vec<&Hire> = Vec::new();
+    for hire in &selected {
+        if let Err(reason) = validate(hire) {
+            log(&format!("skipping hire {:?}: {reason}", hire.name));
+            continue;
+        }
+        runnable.push(hire);
+    }
+    if runnable.is_empty() {
+        bail!("no runnable hires (all were skipped — see the warnings above)");
+    }
+    let all_types: Vec<String> = runnable
         .iter()
         .flat_map(|h| state::job_type_matrix(&h.rank, &h.capabilities))
         .collect();
-    let (_profile, jobs) = engine::connect(
-        pinned_name.as_deref(),
+    // Connect with the profile the pin already resolved (issue #41): passing the
+    // pinned snapshot in rather than re-resolving `profiles.json` here closes
+    // the window where a concurrent profile change could connect the client to
+    // a different engine than the pin and banner.
+    let jobs = engine::connect(
+        decision.profile.as_ref(),
         &engine_desc,
         &all_types,
         pinned_base_url.as_deref(),
@@ -111,11 +131,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
-    for hire in &selected {
-        if let Err(reason) = validate(hire) {
-            log(&format!("skipping hire {:?}: {reason}", hire.name));
-            continue;
-        }
+    for hire in &runnable {
         let job_types = state::job_type_matrix(&hire.rank, &hire.capabilities);
         log(&format!(
             "hire {:?} [{}]: {} slot(s) over job types {:?}",
@@ -124,7 +140,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         running_hires += 1;
         for slot_idx in 0..opts.slots {
             let cfg = Arc::new(SlotConfig {
-                hire: hire.clone(),
+                hire: (*hire).clone(),
                 worker_name: format!("{host}-nanod-{}-{slot_idx}", hire.name),
                 job_types: job_types.clone(),
                 recovery_window: opts.recovery_window,
@@ -150,7 +166,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     }
 
     if handles.is_empty() {
-        bail!("no runnable hires (all were skipped — see the warnings above)");
+        bail!("no slots started (is --slots 0?)");
     }
     log(&format!(
         "daemon up: {} hire(s), {} slot(s) total; waiting for jobs. Ctrl-C to drain.",
