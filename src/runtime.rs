@@ -47,6 +47,19 @@ const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// STARTS before the deadline but can still be in flight when the lease
 /// expires loses the in-flight work it was protecting, so the reserve must
 /// cover the request's maximum latency, not just its dispatch.
+///
+/// This is only the CEILING of the reserve. The reserve `refresh_budget`
+/// actually subtracts is `min(REQUEST_MARGIN, window / 2)` — never more than
+/// half the window — because a lease's USABLE lifetime is `window - RTT` (the
+/// server starts the new lease when it RECEIVES the extend; the worker learns
+/// of it one round-trip later). A fixed 32s reserve exceeds the usable
+/// lifetime of any window up to ~32s, and for a window just ABOVE it (e.g.
+/// `--recovery-window 32001`) a fresh lease's `left - REQUEST_MARGIN` is ~1ms,
+/// which would clamp the healthy ~10.7s cadence to ~1ms and storm a HEALTHY
+/// engine with extends — re-arming on every success. Halving the window keeps
+/// the reserve below the usable lifetime on every window, so the healthy
+/// cadence is never clamped below itself and there is no discontinuity at the
+/// boundary (see `refresh_budget`).
 const REQUEST_MARGIN: Duration = EXTEND_TIMEOUT.saturating_add(Duration::from_secs(2));
 
 /// The activation-failure backoff for a streak of `failures` consecutive
@@ -129,17 +142,17 @@ fn rand_fraction() -> f64 {
 /// once the budget is exhausted rather than letting the activation lapse
 /// silently. The deadline is reset by the caller after each successful extend.
 ///
-/// The reserve (`REQUEST_MARGIN`) covers the request's WHOLE bounded lifetime
-/// (`EXTEND_TIMEOUT` plus slack): the sleep is clamped so the retry that
-/// follows it can finish — not merely start — before the deadline. A lease
-/// with less than the reserve left yields no budget.
+/// The reserve (`REQUEST_MARGIN`, halved once it exceeds half the window)
+/// covers the request's WHOLE bounded lifetime (`EXTEND_TIMEOUT` plus slack):
+/// the sleep is clamped so the retry that follows it can finish — not merely
+/// start — before the deadline. A lease with less than the reserve left yields
+/// no budget.
 ///
-/// Returns `None` only when a normally-sized lease (`window > REQUEST_MARGIN`)
-/// has effectively expired — the caller then makes one last immediate attempt,
-/// whose 404/409 fences the job. A lease whose whole `window` is no larger than
-/// the reserve can never satisfy it, so rather than returning `None` (which the
-/// caller would busy-spin on), it falls back to the steady refresh cadence.
-/// Pure and testable.
+/// Returns `None` only when a normally-sized lease has effectively expired —
+/// the caller then makes one last immediate attempt, whose 404/409 fences the
+/// job. A lease whose reserve can never be satisfied (see below) falls back to
+/// the steady refresh cadence rather than returning `None` (which the caller
+/// would busy-spin on). Pure and testable.
 fn refresh_budget(
     now: Instant,
     deadline: Instant,
@@ -158,14 +171,28 @@ fn refresh_budget(
     // already passed: the lease is genuinely expired, so the caller should make
     // one last immediate attempt (whose 404/409 fences the job).
     let left = deadline.checked_duration_since(now)?;
+    // The reserve this sleep must leave for the request that follows it. A
+    // lease's USABLE lifetime is `window - RTT` (the server starts the new
+    // lease when it RECEIVES the extend; the worker learns of it one round-trip
+    // later), so a fixed `REQUEST_MARGIN` reserve exceeds the usable lifetime
+    // of any window up to ~32s — and for a window just ABOVE it (e.g.
+    // `--recovery-window 32001`) a fresh lease's `left - REQUEST_MARGIN` is
+    // ~1ms, which would clamp the healthy cadence to ~1ms and storm a HEALTHY
+    // engine with extends, re-arming on every success (while a window of
+    // exactly 32s takes the cadence fallback and behaves normally — a severe
+    // discontinuity). Halving the window once the fixed reserve would eat more
+    // than half of it keeps the reserve below the usable lifetime on EVERY
+    // window, so the healthy cadence is never clamped below itself and the
+    // policy is continuous across the boundary.
+    let reserve = REQUEST_MARGIN.min(window / 2);
     // The lease time left, less the reserve for the request that follows this
     // sleep: an extend can take up to `EXTEND_TIMEOUT` to finish (or be
     // abandoned), so the retry must START at least that far ahead of the
     // deadline to have finished — not merely started — before it. A *positive*
-    // budget is required: a zero budget (`left == REQUEST_MARGIN` exactly) would
+    // budget is required: a zero budget (`left == reserve` exactly) would
     // clamp the sleep to zero and spin, so it is routed through the same
     // reserve-exceeded handling below as an underflow.
-    if let Some(budget) = left.checked_sub(REQUEST_MARGIN) {
+    if let Some(budget) = left.checked_sub(reserve) {
         if !budget.is_zero() {
             return Some(wait.min(budget));
         }
@@ -173,22 +200,24 @@ fn refresh_budget(
     // The reserve meets or exceeds the lease time left. Two very different
     // situations reach here, and they must NOT be conflated:
     //
-    //   * A normally-sized lease (`window > REQUEST_MARGIN`) genuinely near its
-    //     deadline — most of its window is already spent. Return `None` so the
-    //     caller makes one last immediate attempt before the lease lapses.
+    //   * A normally-sized lease (`window > REQUEST_MARGIN`, so its reserve is
+    //     the full `REQUEST_MARGIN`) genuinely near its deadline — most of its
+    //     window is already spent. Return `None` so the caller makes one last
+    //     immediate attempt before the lease lapses.
     //
-    //   * A lease whose WHOLE window is no larger than the reserve
-    //     (`window <= REQUEST_MARGIN`, e.g. a user-set `--recovery-window` below
-    //     ~32s). Here the reserve can NEVER be satisfied — even a freshly
-    //     extended lease (`deadline ≈ now + window`) underflows on every
-    //     iteration. Returning `None` would map to a zero sleep and busy-spin
-    //     the refresh loop, hammering the engine back-to-back with extends
-    //     (the exact nanobpm/nano-supervisor#23 behaviour the cadence floor
-    //     exists to prevent). For such a window the reserve is meaningless, so
-    //     fall back to the steady refresh cadence (`wait`, floored at `every`)
-    //     rather than spinning: extend at `window / 3` and accept that a slow
-    //     extend on a sub-reserve lease may miss — which no sleep policy can
-    //     prevent once the window is smaller than one request's bounded lifetime.
+    //   * A lease whose reserve is a fraction of its window (`window <=
+    //     REQUEST_MARGIN`, e.g. a user-set `--recovery-window` below ~32s, so
+    //     `reserve == window / 2`). Here the reserve can NEVER be satisfied —
+    //     even a freshly extended lease (`deadline ≈ now + window`) underflows
+    //     on every iteration. Returning `None` would map to a zero sleep and
+    //     busy-spin the refresh loop, hammering the engine back-to-back with
+    //     extends (the exact nanobpm/nano-supervisor#23 behaviour the cadence
+    //     floor exists to prevent). For such a window the reserve is
+    //     meaningless, so fall back to the steady refresh cadence (`wait`,
+    //     floored at `every`) rather than spinning: extend at `window / 3` and
+    //     accept that a slow extend on a sub-reserve lease may miss — which no
+    //     sleep policy can prevent once the window is smaller than one
+    //     request's bounded lifetime.
     if window > REQUEST_MARGIN {
         None
     } else {
@@ -655,6 +684,64 @@ mod tests {
             "a window == reserve must not produce a zero-length (busy-spin) sleep"
         );
         assert_eq!(w, every, "a reserve-sized window waits the steady cadence");
+    }
+
+    #[test]
+    fn refresh_budget_does_not_storm_a_healthy_engine_just_above_the_reserve() {
+        // Regression (review): a recovery window just ABOVE the request reserve
+        // must NOT degenerate the healthy refresh into a storm. With a FIXED
+        // 32s reserve, `--recovery-window 32001` gives a fresh lease only ~1ms
+        // of `left - REQUEST_MARGIN`, clamping the ~10.7s healthy cadence to
+        // ~1ms; each successful extend re-arms the same 1ms sleep, hammering a
+        // HEALTHY engine — while a window of exactly 32s takes the cadence
+        // fallback and behaves normally (a severe discontinuity). The reserve
+        // is halved once it exceeds half the window, so the healthy cadence is
+        // never clamped below itself on ANY window.
+        //
+        // Sweep a contiguous band across the old fixed-reserve boundary (32s)
+        // and far above it: every healthy, freshly-extended lease must wait the
+        // FULL steady cadence, never a collapsed sub-cadence sleep.
+        for millis in [
+            31_000u64, 31_999, 32_000, 32_001, 32_500, 33_000, 40_000, 63_999, 64_000, 64_001,
+            100_000,
+        ] {
+            let window = Duration::from_millis(millis);
+            let every = (window / 3).max(Duration::from_millis(1));
+            let now = Instant::now();
+            let deadline = now + window; // fresh lease, as right after a successful extend
+            let w = refresh_budget(now, deadline, every, window, 0)
+                .expect("a healthy lease must yield a sleep, not None");
+            assert_eq!(
+                w, every,
+                "a fresh {millis}ms lease must wait the full steady cadence {every:?}, not a \
+                 collapsed {w:?} (the healthy-engine storm)"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_budget_healthy_cadence_is_continuous_across_the_reserve_boundary() {
+        // The sleep must be CONTINUOUS across the reserve boundary: there is no
+        // window where the healthy cadence suddenly collapses. Sweep a fine
+        // band around `REQUEST_MARGIN` and assert the healthy sleep always
+        // equals the steady cadence (never a near-zero clamp).
+        for delta_ms in -2000i64..=2000 {
+            let offset = Duration::from_millis(delta_ms.unsigned_abs());
+            let window = if delta_ms < 0 {
+                REQUEST_MARGIN - offset
+            } else {
+                REQUEST_MARGIN + offset
+            };
+            let every = (window / 3).max(Duration::from_millis(1));
+            let now = Instant::now();
+            let deadline = now + window;
+            let w = refresh_budget(now, deadline, every, window, 0)
+                .expect("a healthy lease must yield a sleep");
+            assert_eq!(
+                w, every,
+                "healthy cadence collapsed at window {window:?} ({delta_ms}ms from the reserve)"
+            );
+        }
     }
 
     #[test]
