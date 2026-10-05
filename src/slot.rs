@@ -2531,6 +2531,7 @@ fn seed_c8ctl_files(
 /// I/O (the dir itself is created and restricted by the caller). The
 /// path-based fallback's file writer; the Linux path uses pinned no-follow
 /// handles instead. `profile` must already be the non-secret identity.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> Result<()> {
     for (name, body) in seed_c8ctl_files(profile)? {
         let path = dir.join(name);
@@ -2670,12 +2671,13 @@ mod tests {
         // it tries to start can refuse to daemonise and a host sweep can find its
         // descendants by cwd.
         let job = ActivatedJobResult::default();
-        let rf = std::path::Path::new("/tmp/r.json");
-        let env =
-            build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/runs/42")).unwrap();
+        let run = tmp_run("agent-run");
+        let rf = run.join("result.json");
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("NANO_AGENT_RUN"), Some("42"));
-        assert_eq!(get("NANO_AGENT_RUN_DIR"), Some("/tmp/runs/42"));
+        assert_eq!(get("NANO_AGENT_RUN_DIR"), Some(run.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]

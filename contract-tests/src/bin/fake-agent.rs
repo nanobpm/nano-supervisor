@@ -33,7 +33,10 @@ struct Record {
     argv: Vec<String>,
     cwd: String,
     /// Every `AGENT_*` and `NANO_*` variable (sorted), the observable environment
-    /// the worker hands the agent.
+    /// the worker hands the agent, plus `C8CTL_DATA_DIR` — the worker hands the
+    /// agent an isolated per-run c8ctl config dir (issue #41), and the
+    /// `worker_isolates_the_agents_c8ctl_session` contract asserts on it, so it
+    /// must be recorded even though it carries neither prefix.
     env: BTreeMap<String, String>,
     /// The `session/prompt` texts (pipe: the stdin payload) in order, across
     /// every agent process that shared this record: a worker that re-invokes
@@ -58,7 +61,9 @@ struct Record {
 impl Record {
     fn capture_env() -> BTreeMap<String, String> {
         std::env::vars()
-            .filter(|(k, _)| k.starts_with("AGENT_") || k.starts_with("NANO_"))
+            .filter(|(k, _)| {
+                k.starts_with("AGENT_") || k.starts_with("NANO_") || k == "C8CTL_DATA_DIR"
+            })
             .collect()
     }
 

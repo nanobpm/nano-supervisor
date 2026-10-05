@@ -69,7 +69,7 @@ fn is_fleet_var(key: &str) -> bool {
 /// fleet-related variable (see [`is_fleet_var`]), then set the isolated
 /// `C8CTL_NANO_HOME` and the launchd/update-notifier suppressors. Shared by
 /// [`Target::available`] and [`TempHome`] so both isolate identically.
-fn apply_hermetic_env(c: &mut Command, home: &Path) {
+fn apply_hermetic_env(c: &mut Command, home: &Path, target: Target) {
     for (key, _) in std::env::vars_os() {
         if let Some(k) = key.to_str() {
             if is_fleet_var(k) {
@@ -77,17 +77,28 @@ fn apply_hermetic_env(c: &mut Command, home: &Path) {
             }
         }
     }
-    c.env("C8CTL_NANO_HOME", home)
-        // Also isolate the c8ctl *data* dir (profiles.json / session.json).
-        // Without this a Rust worker under test reads the developer's real
-        // ~/.config/c8ctl, and the issue-#41 first-start precedence (the ambient
-        // active profile is resolved before `CAMUNDA_REST_ADDRESS`) could pin
-        // the operator's global profile and poll a REAL engine instead of the
-        // guarded local test one. Point it at an empty per-home dir; a test that
-        // needs seeded profiles overrides this key with a later
-        // `.env("C8CTL_DATA_DIR", …)` (a later set on the same key wins).
-        .env("C8CTL_DATA_DIR", home.join("c8ctl"))
-        .env("C8CTL_NANO_NO_LAUNCHD", "1")
+    c.env("C8CTL_NANO_HOME", home);
+    // Also isolate the c8ctl *data* dir (profiles.json / session.json) — but
+    // ONLY for the Rust target. Without this a Rust worker under test reads the
+    // developer's real ~/.config/c8ctl, and the issue-#41 first-start
+    // precedence (the ambient active profile is resolved before
+    // `CAMUNDA_REST_ADDRESS`) could pin the operator's global profile and poll
+    // a REAL engine instead of the guarded local test one. Point it at an
+    // empty per-home dir; a test that needs seeded profiles overrides this key
+    // with a later `.env("C8CTL_DATA_DIR", …)` (a later set on the same key
+    // wins).
+    //
+    // The Node target runs `c8 nano`, and the `c8` CLI resolves its plugins —
+    // including the nano plugin itself — from the data dir. Pointing
+    // `C8CTL_DATA_DIR` at an empty dir makes c8 unable to find the nano plugin,
+    // so every Node-target test fails with `Unknown command: nano hire`. The
+    // Node plugin does not read profiles/session from `C8CTL_DATA_DIR` the way
+    // the Rust binary does, so it must keep c8's real data dir and is left
+    // unset here.
+    if target == Target::Rust {
+        c.env("C8CTL_DATA_DIR", home.join("c8ctl"));
+    }
+    c.env("C8CTL_NANO_NO_LAUNCHD", "1")
         .env("NANO_NO_UPDATE_NOTIFIER", "1");
 }
 
@@ -192,7 +203,7 @@ impl Target {
             Err(_) => return false,
         };
         let mut probe = self.cmd(&["--help"]);
-        apply_hermetic_env(&mut probe, probe_home.path());
+        apply_hermetic_env(&mut probe, probe_home.path(), self);
         probe
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -254,7 +265,7 @@ impl TempHome {
     /// variable cleared. Used by the worker harness, which builds its command
     /// from [`Target::cmd`] and then layers this home on top.
     pub fn apply(&self, cmd: &mut Command) {
-        apply_hermetic_env(cmd, self.path());
+        apply_hermetic_env(cmd, self.path(), self.target);
     }
 
     /// A `Command` for the bound target, with this home and the standard
@@ -266,7 +277,7 @@ impl TempHome {
     /// `.env(...)` on the returned `Command` (a later set on the same key wins).
     pub fn cmd(&self, args: &[&str]) -> Command {
         let mut c = self.target.cmd(args);
-        apply_hermetic_env(&mut c, self.path());
+        apply_hermetic_env(&mut c, self.path(), self.target);
         c
     }
 
