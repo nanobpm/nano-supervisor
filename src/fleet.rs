@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -42,7 +42,7 @@ const VALID_SANDBOXES: [&str; 3] = ["none", "docker", "podman"];
 /// can interpret and the Node-compatible CLI would reject.
 const VALID_TERMINALS: [&str; 2] = ["pty", "pipe"];
 
-/// The permission policies a hire may declare. The Node 1.69.2 surface accepts
+/// The permission policies a hire may declare. The Node 1.70.1 surface accepts
 /// and persists all three; only `yolo` is *enforced* today (the Rust ACP client
 /// unconditionally applies the yolo allow policy, `src/acp.rs`), while
 /// `escalate`/`filter` are RESERVED (pending nano-workforce#559) and behave like
@@ -106,26 +106,26 @@ struct StoredHire {
     name: String,
     rank: String,
     command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    capabilities: Vec<String>,
-    #[serde(default = "default_sandbox")]
-    sandbox: String,
-    #[serde(default)]
-    image: String,
-    #[serde(default = "default_terminal")]
-    terminal: String,
-    #[serde(default = "default_protocol")]
-    protocol: String,
-    #[serde(default = "default_permission")]
-    permission: String,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    #[serde(rename = "createdAt", default)]
-    created_at: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capabilities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env: Option<BTreeMap<String, String>>,
+    #[serde(rename = "createdAt", default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<serde_json::Value>,
     /// Unmodelled per-profile fields, preserved verbatim across a rewrite.
     #[serde(flatten)]
     other: BTreeMap<String, serde_json::Value>,
@@ -180,6 +180,13 @@ fn read_config() -> Result<ConfigFile> {
 /// truncated or partial `config.json` — and a crash mid-write leaves the
 /// previous copy intact.
 ///
+/// On Unix, the parent directory is opened with `O_NOFOLLOW` and all temp-file
+/// and publish operations are performed via that pinned directory fd (`openat`,
+/// `renameat`, `unlinkat`). A symlinked final parent component is refused, a
+/// planted symlink at `.<file>.tmp` is refused, and a parent-dir swap after the
+/// walk cannot redirect the write. Non-Unix builds keep the plain filesystem
+/// fallback.
+///
 /// The temp name is **deterministic** (`.<file>.tmp`), not unique per
 /// (pid, nanos): every writer of a given state file first takes that file's
 /// `StateLock` (see `update_config`/`workforce_add`), so two writers never race
@@ -189,7 +196,7 @@ fn read_config() -> Result<ConfigFile> {
 /// forever under the state home. On the success path the temp is renamed away,
 /// never left behind: the contract test `state_writes_stay_under_home` asserts
 /// the exact set of files under the home, so nothing extra may persist.
-fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<()> {
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -197,43 +204,159 @@ fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<(
     let mut json = serde_json::to_string_pretty(value)?;
     json.push('\n');
 
+    #[cfg(unix)]
+    {
+        write_json_atomic_unix(path, json.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        write_json_atomic_fallback(path, json.as_bytes())
+    }
+}
+
+#[cfg(unix)]
+struct RawFdGuard(libc::c_int);
+
+#[cfg(unix)]
+impl Drop for RawFdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl RawFdGuard {
+    fn into_file(mut self) -> std::fs::File {
+        use std::os::fd::FromRawFd;
+        let fd = self.0;
+        self.0 = -1;
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    }
+}
+
+#[cfg(unix)]
+fn cstring_from_path(path: &Path) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path contains NUL byte: {}", path.display()))
+}
+
+#[cfg(unix)]
+fn cstring_from_component(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes()).context("state path component contains NUL byte")
+}
+
+#[cfg(unix)]
+fn temp_component_for(file_name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = Vec::with_capacity(file_name.as_bytes().len() + 5);
+    bytes.push(b'.');
+    bytes.extend_from_slice(file_name.as_bytes());
+    bytes.extend_from_slice(b".tmp");
+    std::ffi::CString::new(bytes).context("state temp path component contains NUL byte")
+}
+
+#[cfg(unix)]
+fn write_json_atomic_unix(path: &Path, json: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("state path has no parent directory")?;
+    let file_name = path.file_name().context("state path has no file name")?;
+    let parent_c = cstring_from_path(parent)?;
+    let final_c = cstring_from_component(file_name)?;
+    let tmp_c = temp_component_for(file_name)?;
+
+    let dirfd = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "opening state directory without following symlinks: {}",
+                parent.display()
+            )
+        });
+    }
+    let dirfd = RawFdGuard(dirfd);
+
+    let write_result = (|| -> Result<()> {
+        let fd = unsafe {
+            libc::openat(
+                dirfd.0,
+                tmp_c.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("creating temp state file next to {}", path.display()));
+        }
+        let fd = RawFdGuard(fd);
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.0, &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("statting temp state file next to {}", path.display()));
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            bail!(
+                "temp state path is not a regular file: .{}.tmp",
+                file_name.to_string_lossy()
+            );
+        }
+        if unsafe { libc::fchmod(fd.0, 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("restricting temp state file next to {}", path.display())
+            });
+        }
+
+        let mut f = fd.into_file();
+        f.write_all(json)
+            .with_context(|| format!("writing temp state file next to {}", path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("syncing temp state file next to {}", path.display()))?;
+        drop(f);
+
+        if unsafe { libc::renameat(dirfd.0, tmp_c.as_ptr(), dirfd.0, final_c.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("renaming temp state file over {}", path.display()));
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        unsafe {
+            libc::unlinkat(dirfd.0, tmp_c.as_ptr(), 0);
+        }
+    }
+    write_result
+}
+
+#[cfg(not(unix))]
+fn write_json_atomic_fallback(path: &Path, json: &[u8]) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .context("state path has no valid file name")?;
-    // Deterministic, lock-protected temp sibling: callers hold this file's
-    // `StateLock`, so there is no cross-writer collision, and a crashed temp is
-    // overwritten (not accumulated) by the next write rather than orphaned.
     let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
-
     let write_result = (|| -> Result<()> {
-        // Create the temp owner-only (0600): a state file can carry credentials
-        // (profiles persist arbitrary `--env` values), and `File::create` honours
-        // the process umask — so a previously owner-only `config.json` would
-        // otherwise become 0644 after a rewrite, exposing it to other local
-        // users. OpenOptions' `mode` applies only when the file is *created*, so
-        // also reset the mode when reusing a crash-left temp (which may predate
-        // this hardening or have been created with a permissive umask).
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
             .open(&tmp_path)
             .with_context(|| format!("creating {}", tmp_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("restricting permissions on {}", tmp_path.display()))?;
-        }
-        f.write_all(json.as_bytes())
+        f.write_all(json)
             .with_context(|| format!("writing {}", tmp_path.display()))?;
-        // Flush user-space buffers and fsync so the bytes are durable before
-        // the rename publishes them.
         f.sync_all()
             .with_context(|| format!("syncing {}", tmp_path.display()))?;
         std::fs::rename(&tmp_path, path)
@@ -241,8 +364,6 @@ fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<(
         Ok(())
     })();
     if write_result.is_err() {
-        // Best-effort cleanup so a failed write never leaks a temp file under
-        // the home (the contract asserts the exact written-file set).
         let _ = std::fs::remove_file(&tmp_path);
     }
     write_result
@@ -251,6 +372,44 @@ fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<(
 fn write_config(cfg: &ConfigFile) -> Result<()> {
     let path = config_path()?;
     write_json_atomic(&path, cfg)
+}
+
+fn normalized_identity(path: &Path) -> PathBuf {
+    let mut suffix = Vec::new();
+    if let Some(file_name) = path.file_name() {
+        suffix.push(file_name.to_os_string());
+    }
+
+    let mut anchor = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    while !anchor.exists() {
+        match anchor.file_name() {
+            Some(name) => {
+                suffix.push(name.to_os_string());
+                anchor = anchor
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+            }
+            None => break,
+        }
+    }
+
+    let mut identity = std::fs::canonicalize(anchor).unwrap_or_else(|_| {
+        if anchor.is_absolute() {
+            anchor.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(anchor)
+        }
+    });
+    for component in suffix.iter().rev() {
+        identity.push(component);
+    }
+    identity
 }
 
 /// A cross-process mutual-exclusion guard for a state file's read-modify-write
@@ -304,14 +463,15 @@ impl StateLock {
         Ok(StateLock { _file: file })
     }
 
-    /// The lock file for `path`: `<tmp>/c8ctl-nano-fleet-<sha1(path)>.lock`.
-    /// Keyed by the full guarded path, so distinct state files (and distinct
-    /// state homes) never share a lock, while every writer of the *same* file
-    /// contends on the *same* lock.
+    /// The lock file for `path`: `<tmp>/c8ctl-nano-fleet-<sha1(identity)>.lock`.
+    /// Keyed by a normalized absolute identity for the guarded file, so distinct
+    /// state files (and distinct state homes) never share a lock, while relative
+    /// and absolute spellings of the *same* file contend on the *same* lock.
     fn lock_file_for(path: &std::path::Path) -> Result<PathBuf> {
         use sha1::{Digest, Sha1};
         let mut hasher = Sha1::new();
-        hasher.update(path.to_string_lossy().as_bytes());
+        let identity = normalized_identity(path);
+        hasher.update(identity.to_string_lossy().as_bytes());
         let digest = hasher.finalize();
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         Ok(std::env::temp_dir().join(format!("c8ctl-nano-fleet-{}.lock", &hex[..16])))
@@ -446,9 +606,7 @@ pub fn hire(args: HireArgs) -> Result<()> {
     // The profile name participates in worker IDs (`wf-<manifest>-<name>-<i>`),
     // so it must match the established character set, not merely be non-empty.
     if !is_valid_name_charset(&name) {
-        bail!(
-            "Invalid profile name \"{name}\". Use letters, digits, dot, dash or underscore."
-        );
+        bail!("Invalid profile name \"{name}\". Use letters, digits, dot, dash or underscore.");
     }
     let rank_raw = args
         .rank
@@ -528,7 +686,9 @@ pub fn hire(args: HireArgs) -> Result<()> {
     // rejects `docker`/`podman` unless `--image` is non-empty, rather than
     // persisting a profile that can never run.
     if matches!(sandbox.as_str(), "docker" | "podman") && image.is_empty() {
-        bail!("--sandbox {sandbox} requires --image <ref> (the container image the agent runs in).");
+        bail!(
+            "--sandbox {sandbox} requires --image <ref> (the container image the agent runs in)."
+        );
     }
 
     let terminal = args
@@ -571,16 +731,16 @@ pub fn hire(args: HireArgs) -> Result<()> {
         name: name.clone(),
         rank: rank.clone(),
         command: command.clone(),
-        args: args.args.clone(),
-        model: args.model.clone().unwrap_or_default().trim().to_string(),
-        capabilities: capabilities.clone(),
-        sandbox,
-        image,
-        terminal,
-        protocol: protocol.clone(),
-        permission,
-        env,
-        created_at: serde_json::Value::String(now_iso8601()),
+        args: Some(args.args.clone()),
+        model: Some(args.model.clone().unwrap_or_default().trim().to_string()),
+        capabilities: Some(capabilities.clone()),
+        sandbox: Some(sandbox),
+        image: Some(image),
+        terminal: Some(terminal),
+        protocol: Some(protocol.clone()),
+        permission: Some(permission),
+        env: Some(env),
+        created_at: Some(serde_json::Value::String(now_iso8601())),
         // A freshly created hire has no unmodelled fields to preserve.
         other: BTreeMap::new(),
     };
@@ -604,7 +764,10 @@ pub fn hire(args: HireArgs) -> Result<()> {
     println!("  capabilities: {caps_display}");
     println!("  job types: {job_types}");
     println!("  protocol: {protocol}");
-    println!("  permission: {}", hire.permission);
+    println!(
+        "  permission: {}",
+        hire.permission.as_deref().unwrap_or("yolo")
+    );
     Ok(())
 }
 
@@ -626,29 +789,50 @@ fn build_agent_command_line(command: &str, args: &[String]) -> String {
     format!("{} {}", command, quoted.join(" "))
 }
 
-/// One `hire --list` line, reproducing the Node 1.69.2 surface exactly (scripts
+/// One `hire --list` line, reproducing the Node 1.70.1 surface exactly (scripts
 /// parse it): the command line includes any persisted `--arg`s; empty model and
 /// capabilities print as `-`; and the optional `terminal`/`protocol`/`permission`
 /// fields are appended only when they hold a non-default value (`pty`, `acp`, or
 /// a recognized non-`yolo` permission respectively).
 fn hire_line(h: &StoredHire) -> String {
-    let model = if h.model.is_empty() { "-" } else { &h.model };
-    let caps = if h.capabilities.is_empty() {
+    let model_value = h.model.as_deref().unwrap_or("");
+    let model = if model_value.is_empty() {
+        "-"
+    } else {
+        model_value
+    };
+    let caps_value = h.capabilities.as_deref().unwrap_or(&[]);
+    let caps = if caps_value.is_empty() {
         "-".to_string()
     } else {
-        h.capabilities.join(", ")
+        caps_value.join(", ")
     };
     let mut optional = String::new();
-    if h.terminal.trim().eq_ignore_ascii_case("pty") {
+    if h.terminal
+        .as_deref()
+        .unwrap_or("pipe")
+        .trim()
+        .eq_ignore_ascii_case("pty")
+    {
         optional.push_str("; terminal: pty");
     }
-    if h.protocol.trim().eq_ignore_ascii_case("acp") {
+    if h.protocol
+        .as_deref()
+        .unwrap_or("pipe")
+        .trim()
+        .eq_ignore_ascii_case("acp")
+    {
         optional.push_str("; protocol: acp");
     }
     // Only surface recognized non-default permission modes; unknown/legacy
     // values are coerced back to yolo at runtime, so showing them here would
     // make --list disagree with actual behavior.
-    let perm = h.permission.trim().to_ascii_lowercase();
+    let perm = h
+        .permission
+        .as_deref()
+        .unwrap_or("yolo")
+        .trim()
+        .to_ascii_lowercase();
     if perm != "yolo" && VALID_PERMISSIONS.contains(&perm.as_str()) {
         optional.push_str(&format!("; permission: {perm}"));
     }
@@ -656,7 +840,7 @@ fn hire_line(h: &StoredHire) -> String {
         "  {}  [{}]  {}  (model: {}; caps: {}{})",
         h.name,
         h.rank,
-        build_agent_command_line(&h.command, &h.args),
+        build_agent_command_line(&h.command, h.args.as_deref().unwrap_or(&[])),
         model,
         caps,
         optional
@@ -696,7 +880,11 @@ pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
             .hires
             .get_mut(profile_owned.as_str())
             .with_context(|| format!("no hire named \"{profile_owned}\""))?;
-        hire.capabilities = caps_for_set;
+        hire.capabilities = Some(caps_for_set);
+        hire.other.insert(
+            "updatedAt".to_string(),
+            serde_json::Value::String(now_iso8601()),
+        );
         Ok(())
     })?;
     println!("Reassigned {profile} — capabilities: {}", caps.join(", "));
@@ -881,6 +1069,45 @@ struct Manifest {
     other: BTreeMap<String, serde_json::Value>,
 }
 
+impl Manifest {
+    fn validate(&self) -> Result<()> {
+        if self.version != 1 {
+            bail!("unsupported manifest version {}", self.version);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for worker in &self.workers {
+            if !is_valid_name_charset(&worker.profile) {
+                bail!(
+                    "invalid worker profile \"{}\": use letters, digits, dot, dash or underscore",
+                    worker.profile
+                );
+            }
+            if !seen.insert(worker.profile.as_str()) {
+                bail!("duplicate worker profile \"{}\"", worker.profile);
+            }
+            if worker.instances == 0 {
+                bail!(
+                    "invalid instances 0 for worker \"{}\": use a whole number between 1 and {MAX_WORKER_INSTANCES}",
+                    worker.profile
+                );
+            }
+            if worker.instances > MAX_WORKER_INSTANCES {
+                bail!(
+                    "invalid instances {} for worker \"{}\": supported maximum is {MAX_WORKER_INSTANCES}",
+                    worker.instances,
+                    worker.profile
+                );
+            }
+            if let Roles::List(roles) = &worker.roles {
+                if roles.is_empty() {
+                    bail!("worker \"{}\" roles list must not be empty", worker.profile);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn manifest_path(name: &str) -> Result<PathBuf> {
     // The manifest name becomes a filename under the home's `workforce/`
     // directory AND rides in the deterministic `wf-<name>-` worker-id prefix, so
@@ -903,9 +1130,7 @@ fn manifest_path(name: &str) -> Result<PathBuf> {
     if !is_valid_name_charset(name) {
         return Err(bad());
     }
-    Ok(home_dir()?
-        .join("workforce")
-        .join(format!("{name}.json")))
+    Ok(home_dir()?.join("workforce").join(format!("{name}.json")))
 }
 
 fn read_manifest(name: &str) -> Result<Option<Manifest>> {
@@ -914,8 +1139,9 @@ fn read_manifest(name: &str) -> Result<Option<Manifest>> {
         return Ok(None);
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let m =
+    let m: Manifest =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    m.validate()?;
     Ok(Some(m))
 }
 
@@ -933,7 +1159,12 @@ pub fn workforce_list(name: &str) -> Result<()> {
         Some(m) => {
             println!("Workforce \"{name}\":");
             for w in &m.workers {
-                println!("  {} × {} (roles: {})", w.profile, w.instances, w.roles.describe());
+                println!(
+                    "  {} × {} (roles: {})",
+                    w.profile,
+                    w.instances,
+                    w.roles.describe()
+                );
             }
         }
     }
@@ -982,6 +1213,10 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
     // file) but atomicity alone does not serialize the mutate, so guard the whole
     // read→mutate→write behind a per-manifest lock, exactly like `update_config`.
     let manifest_file = manifest_path(name)?;
+    if let Some(parent) = manifest_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     let _guard = StateLock::acquire(&manifest_file)?;
     let mut manifest = read_manifest(name)?.unwrap_or(Manifest {
         version: 1,
@@ -1322,12 +1557,18 @@ mod tests {
             hire(args).unwrap_or_else(|e| panic!("permission {ok:?}: {e}"));
         }
         let stored = read_config().unwrap();
-        assert_eq!(stored.hires["coder"].permission, "escalate");
+        assert_eq!(
+            stored.hires["coder"].permission.as_deref(),
+            Some("escalate")
+        );
 
         // Omitting --permission defaults to the only enforced policy, yolo.
         hire(hire_args("defaulted")).unwrap();
         let stored = read_config().unwrap();
-        assert_eq!(stored.hires["defaulted"].permission, "yolo");
+        assert_eq!(
+            stored.hires["defaulted"].permission.as_deref(),
+            Some("yolo")
+        );
         drop(cfg);
     }
 
@@ -1340,11 +1581,64 @@ mod tests {
         assign("coder", "feature,pr-review").unwrap();
         assign("coder", "fix").unwrap();
         let cfg = read_config().unwrap();
+        let expected = vec!["fix".to_string()];
         assert_eq!(
-            cfg.hires["coder"].capabilities,
-            vec!["fix".to_string()],
-            "assign must replace, not merge with, the old set"
+            cfg.hires["coder"].capabilities.as_deref(),
+            Some(expected.as_slice())
         );
+    }
+
+    #[test]
+    fn assign_stamps_updated_at_and_leaves_other_profiles_untouched() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        hire(hire_args("other")).unwrap();
+        let dir = home_dir().unwrap();
+        let before: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let other_before = before["hires"]["other"].clone();
+
+        assign("coder", "fix").unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert!(
+            after["hires"]["coder"]["updatedAt"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "assign must stamp a non-empty updatedAt"
+        );
+        assert_eq!(
+            after["hires"]["other"], other_before,
+            "assigning one profile must not rewrite an unrelated profile"
+        );
+    }
+
+    #[test]
+    fn config_rewrite_does_not_inject_optional_defaults_into_legacy_hires() {
+        let _cfg = TempCfg::new();
+        let dir = home_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = serde_json::json!({"name":"legacy","rank":"senior","command":"nano-legacy"});
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({"hires":{"legacy":legacy.clone()}}).to_string(),
+        )
+        .unwrap();
+
+        hire(hire_args("other")).unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["hires"]["legacy"], legacy);
+        for injected in ["args", "model", "capabilities", "sandbox", "createdAt"] {
+            assert!(
+                value["hires"]["legacy"].get(injected).is_none(),
+                "legacy hire must not gain {injected}"
+            );
+        }
     }
 
     /// The write destination comes from the requested name: a manifest whose
@@ -1601,6 +1895,63 @@ mod tests {
         assert!(err.contains("supported maximum"), "{err}");
     }
 
+    #[test]
+    fn read_manifest_validates_v1_schema() {
+        let _cfg = TempCfg::new();
+        let dir = home_dir().unwrap().join("workforce");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases = [
+            (
+                "bad-version",
+                r#"{"version":2,"name":"bad-version","workers":[]}"#,
+                "unsupported manifest version 2",
+            ),
+            (
+                "zero",
+                r#"{"version":1,"name":"zero","workers":[{"profile":"coder","instances":0,"roles":"auto"}]}"#,
+                "invalid instances 0",
+            ),
+            (
+                "too-many",
+                r#"{"version":1,"name":"too-many","workers":[{"profile":"coder","instances":65,"roles":"auto"}]}"#,
+                "supported maximum is 64",
+            ),
+            (
+                "empty-roles",
+                r#"{"version":1,"name":"empty-roles","workers":[{"profile":"coder","instances":1,"roles":[]}]}"#,
+                "roles list must not be empty",
+            ),
+            (
+                "bad-profile",
+                r#"{"version":1,"name":"bad-profile","workers":[{"profile":"bad profile","instances":1,"roles":"auto"}]}"#,
+                "invalid worker profile",
+            ),
+            (
+                "dupe",
+                r#"{"version":1,"name":"dupe","workers":[{"profile":"coder","instances":1,"roles":"auto"},{"profile":"coder","instances":1,"roles":"auto"}]}"#,
+                "duplicate worker profile",
+            ),
+        ];
+        for (name, json, needle) in cases {
+            std::fs::write(dir.join(format!("{name}.json")), json).unwrap();
+            let err = match read_manifest(name) {
+                Ok(_) => panic!("{name}: manifest should have failed validation"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+
+        std::fs::write(
+            dir.join("valid.json"),
+            r#"{"version":1,"name":"valid","workers":[{"profile":"coder","instances":64,"roles":["fix"]}]}"#,
+        )
+        .unwrap();
+        let manifest = read_manifest("valid").unwrap().unwrap();
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.workers[0].profile, "coder");
+    }
+
     /// `hire` must commit `config.json` atomically and leave no temp or lock
     /// file behind: the home keeps exactly the documented file set. The
     /// `StateLock` is an `flock` on a temp-dir file (not under the home), and
@@ -1626,6 +1977,84 @@ mod tests {
         // The committed config parses and holds the hire.
         let cfg = read_config().unwrap();
         assert!(cfg.hires.contains_key("coder"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_atomic_refuses_symlinked_parent() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let real = home.join("real-parent");
+        let link = home.join("linked-parent");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = write_json_atomic(&link.join("config.json"), &serde_json::json!({"ok":true}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("opening state directory"), "{err}");
+        assert!(
+            !real.join("config.json").exists(),
+            "a symlinked parent must not redirect the state write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_atomic_refuses_preplanted_temp_symlink() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let state = home.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let victim = home.join("victim.txt");
+        std::fs::write(&victim, "do not touch").unwrap();
+        std::os::unix::fs::symlink(&victim, state.join(".config.json.tmp")).unwrap();
+
+        let err = write_json_atomic(&state.join("config.json"), &serde_json::json!({"ok":true}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("creating temp state file"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch");
+        assert!(
+            !state.join("config.json").exists(),
+            "a planted temp symlink must not publish a state file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_atomic_round_trips_and_reuses_regular_temp() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let path = home.join("state").join("config.json");
+        write_json_atomic(&path, &serde_json::json!({"a":1})).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"a":1}));
+
+        std::fs::write(path.with_file_name(".config.json.tmp"), "leftover").unwrap();
+        write_json_atomic(&path, &serde_json::json!({"b":2})).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"b":2}));
+        assert!(!path.with_file_name(".config.json.tmp").exists());
+    }
+
+    #[test]
+    fn state_lock_normalizes_relative_and_absolute_identity() {
+        let cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let state = home.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&home).unwrap();
+        let relative = Path::new("state").join("config.json");
+        let absolute = state.join("config.json");
+        let rel_lock = StateLock::lock_file_for(&relative).unwrap();
+        let abs_lock = StateLock::lock_file_for(&absolute).unwrap();
+        std::env::set_current_dir(old_cwd).unwrap();
+        drop(cfg);
+        assert_eq!(rel_lock, abs_lock);
     }
 
     /// Two `update_config` mutations running on *concurrent* threads both
@@ -1682,7 +2111,11 @@ mod tests {
             h.join().unwrap().unwrap();
         }
         let manifest = read_manifest("default").unwrap().unwrap();
-        let mut profiles: Vec<_> = manifest.workers.iter().map(|w| w.profile.as_str()).collect();
+        let mut profiles: Vec<_> = manifest
+            .workers
+            .iter()
+            .map(|w| w.profile.as_str())
+            .collect();
         profiles.sort();
         assert_eq!(
             profiles,
@@ -1725,9 +2158,12 @@ mod tests {
         assign("coder", "fix").unwrap();
         let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(value["hires"]["coder"]["updatedAt"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
         assert_eq!(
-            value["hires"]["coder"]["updatedAt"],
-            serde_json::json!("2026-01-01T00:00:00.000Z")
+            value["hires"]["coder"]["customField"],
+            serde_json::json!({"nested": 1})
         );
         assert_eq!(
             value["hires"]["coder"]["capabilities"],
@@ -1753,8 +2189,19 @@ mod tests {
             assert!(
                 matches!(
                     *k,
-                    "name" | "rank" | "command" | "args" | "model" | "capabilities" | "sandbox"
-                        | "image" | "terminal" | "protocol" | "permission" | "env" | "createdAt"
+                    "name"
+                        | "rank"
+                        | "command"
+                        | "args"
+                        | "model"
+                        | "capabilities"
+                        | "sandbox"
+                        | "image"
+                        | "terminal"
+                        | "protocol"
+                        | "permission"
+                        | "env"
+                        | "createdAt"
                 ),
                 "fresh hire must not write unmodelled field {k:?}"
             );
@@ -1771,10 +2218,7 @@ mod tests {
             let mut args = hire_args("coder");
             args.name = Some(bad.to_string());
             let err = hire(args).unwrap_err().to_string();
-            assert!(
-                err.contains("Invalid profile name"),
-                "{bad:?}: {err}"
-            );
+            assert!(err.contains("Invalid profile name"), "{bad:?}: {err}");
         }
         assert!(
             read_config().unwrap().hires.is_empty(),
@@ -1826,13 +2270,15 @@ mod tests {
         hire(hire_args("coder")).unwrap();
         // Default (auto) persists the string "auto".
         workforce_add("default", "coder", 1, "auto").unwrap();
-        let raw = std::fs::read_to_string(home_dir().unwrap().join("workforce/default.json")).unwrap();
+        let raw =
+            std::fs::read_to_string(home_dir().unwrap().join("workforce/default.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["workers"][0]["roles"], serde_json::json!("auto"));
 
         // An explicit `--roles a,b` persists a normalized array, not a string.
         workforce_add("default", "coder", 1, "Pr-Review, Fix ,pr-review").unwrap();
-        let raw = std::fs::read_to_string(home_dir().unwrap().join("workforce/default.json")).unwrap();
+        let raw =
+            std::fs::read_to_string(home_dir().unwrap().join("workforce/default.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             value["workers"][0]["roles"],
@@ -1871,8 +2317,7 @@ mod tests {
         let cfg = read_config().unwrap();
         let line = hire_line(&cfg.hires["coder"]);
         assert_eq!(
-            line,
-            "  coder  [senior]  nano-coder '--allow-all'  (model: -; caps: -)",
+            line, "  coder  [senior]  nano-coder '--allow-all'  (model: -; caps: -)",
             "default pipe hire with --arg: {line}"
         );
 
@@ -1892,8 +2337,6 @@ mod tests {
             "non-default modes appended: {line}"
         );
     }
-
-
 
     /// A minimal `C8CTL_NANO_HOME` guard: points the state home at a fresh temp
     /// dir for the duration of a state-mutating test. Tests mutate the process
