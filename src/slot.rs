@@ -419,17 +419,11 @@ async fn stop_refresher(stop_tx: watch::Sender<bool>, refresher: tokio::task::Jo
 
 /// Restrict a directory to owner-only access (mode 0700) on Unix, so job data
 /// placed under the shared temp directory is not readable/traversable by other
-/// local users. A no-op on non-Unix platforms and when the path is absent.
+/// local users. A no-op when the path is absent. Used only by the non-Unix
+/// path-based prepare fallback (Unix preparation chmods through the pinned fd
+/// instead); kept non-Unix-only so a Unix build has no dead code.
+#[cfg(not(unix))]
 fn restrict_dir_mode(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if dir.exists() {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("restricting permissions on {}", dir.display()))?;
-        }
-    }
-    #[cfg(not(unix))]
     let _ = dir;
     Ok(())
 }
@@ -440,6 +434,11 @@ fn restrict_dir_mode(dir: &Path) -> Result<()> {
 /// the agent cwd and `restrict_dir_mode` would otherwise target a path outside
 /// `runs_dir`. `symlink_metadata` inspects the link itself rather than
 /// following it, so a dangling or replaced link is still caught.
+///
+/// On Unix the pinned prepare/sweep paths refuse a symlink atomically at the
+/// no-follow open instead, so this path-based check is only reached by the
+/// non-Unix fallback (and the tests exercising the rejection).
+#[cfg(any(not(unix), test))]
 pub(crate) fn reject_symlink(dir: &Path) -> Result<()> {
     if std::fs::symlink_metadata(dir)
         .map(|m| m.file_type().is_symlink())
@@ -465,6 +464,12 @@ pub(crate) fn reject_symlink(dir: &Path) -> Result<()> {
 /// is skipped: `create_dir_all` will materialise it as a fresh real directory,
 /// not follow a link. Paired with the leaf [`reject_symlink`] and re-run after
 /// the non-atomic create, this closes the whole chain to symlink redirection.
+///
+/// On Unix the runs root is now materialised no-follow component-by-component
+/// ([`crate::saferoot::DirHandle::open_or_create_root_nofollow`]), so this
+/// path-based whole-chain check is only reached by the non-Unix fallback (and
+/// the tests exercising the rejection) — exactly like [`reject_symlink`].
+#[cfg(any(not(unix), test))]
 pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
     for ancestor in dir.ancestors() {
         if std::fs::symlink_metadata(ancestor)
@@ -493,6 +498,11 @@ pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
 /// `anchor` must be an ancestor of `dir` (or equal to it); components at or
 /// above `anchor` are trusted and skipped. A non-existent component is skipped:
 /// `create_dir_all` materialises it as a fresh real directory, not a link.
+/// Only the non-Unix fallback (and the tests exercising the rejection) use this
+/// now: on Unix the worker-namespace bootstrap materialises the root via the
+/// component-wise pinned `open_or_create_root_nofollow` instead, which closes
+/// the check→create race rather than merely re-checking after it.
+#[cfg(any(not(unix), test))]
 pub(crate) fn reject_symlinked_ancestors_below(dir: &Path, anchor: &Path) -> Result<()> {
     // Walk dir's ancestors from the leaf up to (but not past) `anchor`, stopping
     // before the anchor's own (trusted) ancestors. The anchor itself is trusted:
@@ -562,6 +572,25 @@ pub(crate) fn canonicalize_existing_base(dir: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// The per-job run directory, prepared once and carried as a pinned, no-follow
+/// capability: every later step that needs to *enter* or *name* the run dir
+/// derives it from this handle (fd-relative `open_child` / fd-recovered
+/// `path()`), never by re-resolving the path — so a same-UID actor swapping or
+/// replacing a path component after preparation cannot redirect a launch or
+/// the ACP session workspace outside the validated tree (#35).
+pub(crate) struct PreparedRun {
+    /// The pinned run directory (opened no-follow, held by fd).
+    cwd: crate::safecwd::CwdHandle,
+}
+
+impl PreparedRun {
+    /// The pinned run directory itself, for a job with no repository (the
+    /// agent and the HEAD probe run in the run dir directly).
+    pub(crate) fn agent_cwd(&self) -> &crate::safecwd::CwdHandle {
+        &self.cwd
+    }
+}
+
 /// Prepare a per-job run directory under `runs_dir` with the full symlink and
 /// permission hardening, wiping any stale prior-attempt contents. Shared by the
 /// `daemon` and `work` (both run jobs through [`execute`]) so every run gets
@@ -571,24 +600,22 @@ pub(crate) fn canonicalize_existing_base(dir: &Path) -> Result<PathBuf> {
 /// the clone, prompt-derived files, and `result.json` are not readable by other
 /// local users regardless of umask — this still matters when `runs_dir` falls
 /// back to a shared system temp location.
-pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
+pub(crate) fn prepare_run_dir(
+    runs_dir: &Path,
+    run_dir: &Path,
+) -> Result<crate::safecwd::CwdHandle> {
+    #[cfg(unix)]
     {
-        match prepare_run_dir_pinned(runs_dir, run_dir) {
-            Ok(()) => return Ok(()),
-            // Kernel too old for `openat2` (pre-5.6): fall through to the
-            // best-effort path-based checks below.
-            Err(crate::saferoot::PinError::Unsupported) => {}
-            // A refused symlinked component (ELOOP) or any other error is a
-            // real, security-relevant outcome — surface it, never retry the
-            // weaker path-based version.
-            Err(crate::saferoot::PinError::Io(e)) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("preparing run dir {}", run_dir.display())));
+        prepare_run_dir_pinned(runs_dir, run_dir).map_err(|e| match e {
+            crate::saferoot::PinError::Io(e) => {
+                anyhow::Error::new(e).context(format!("preparing run dir {}", run_dir.display()))
             }
-        }
+        })
     }
-    prepare_run_dir_path_based(runs_dir, run_dir)
+    #[cfg(not(unix))]
+    {
+        prepare_run_dir_path_based(runs_dir, run_dir)
+    }
 }
 
 /// `prepare_run_dir` dispatched to the blocking pool. Preparing a run dir wipes
@@ -597,7 +624,10 @@ pub(crate) fn prepare_run_dir(runs_dir: &Path, run_dir: &Path) -> Result<()> {
 /// refresher (especially on a single-core host) and lose the very lease this job
 /// is running under. Use this from async contexts; `prepare_run_dir` remains for
 /// synchronous callers and tests.
-pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf) -> Result<()> {
+pub(crate) async fn prepare_run_dir_blocking(
+    runs_dir: PathBuf,
+    run_dir: PathBuf,
+) -> Result<crate::safecwd::CwdHandle> {
     // The wipe/create is synchronous; a panic in the blocking task surfaces as a
     // `JoinError`, which we treat as the prepare failing (the run dir state is
     // then unknown, so failing the job is the safe outcome).
@@ -606,72 +636,22 @@ pub(crate) async fn prepare_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf
         .map_err(|e| anyhow::Error::new(e).context("prepare_run_dir blocking task panicked"))?
 }
 
-/// Establish the worker's `runs_dir` as a safe run **root** at startup, closing
-/// the same bootstrap TOCTOU that [`prepare_run_dir`] closes for per-job dirs.
-///
-/// `work <hire>` must create `runs_dir` (and then sweep its shared parent)
-/// before any job runs. Doing that with a path-based
-/// [`reject_symlinked_ancestors_below`] → `create_dir_all` → re-check is a
-/// check-then-create race: a same-UID actor can swap a tail ancestor for a
-/// symlink during the `create_dir_all` and restore it before the re-check, so
-/// the tree (and the recursive stale-run sweep that follows) is materialised
-/// inside the link target even though both checks pass. On Linux 5.6+ this
-/// instead builds every component through pinned no-follow handles
-/// ([`DirHandle::create_root_nofollow`]), which refuses a swapped/planted
-/// symlink component rather than following it. `anchor` is the trusted,
-/// already-canonicalized base; it is used only by the path-based fallback
-/// (non-Linux, or a pre-5.6 kernel without `openat2`), whose weaker check
-/// spares legitimate platform symlinks at/above the anchor.
-pub(crate) fn create_runs_root(runs_dir: &Path, anchor: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use crate::saferoot::{DirHandle, PinError};
-        match DirHandle::create_root_nofollow(runs_dir) {
-            // The pinned runs-root handle is dropped; the directories it created
-            // through no-follow handles persist on disk.
-            Ok(_root) => return Ok(()),
-            // Kernel too old for `openat2` (pre-5.6): fall through to the
-            // best-effort path-based bootstrap below.
-            Err(PinError::Unsupported) => {}
-            // A refused symlinked component (ELOOP) or any other error is a
-            // real, security-relevant outcome — surface it, never retry the
-            // weaker path-based create that would follow the very link we
-            // refused.
-            Err(PinError::Io(e)) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("creating runs root {}", runs_dir.display())));
-            }
-        }
-    }
-    // Path-based fallback (non-Linux, or a pre-5.6 kernel): reject a symlinked
-    // tail component, create, then re-validate. This cannot fully close the
-    // TOCTOU window — hence the pinned-handle path above — but is the best
-    // available guarantee where `openat2` is unavailable.
-    reject_symlinked_ancestors_below(runs_dir, anchor)?;
-    std::fs::create_dir_all(runs_dir)
-        .with_context(|| format!("creating runs root {}", runs_dir.display()))?;
-    reject_symlinked_ancestors_below(runs_dir, anchor)?;
-    Ok(())
-}
-
-/// `prepare_run_dir` via `openat2(RESOLVE_NO_SYMLINKS)` handles pinned to the
-/// runs root: the root itself is first *established as a private root* through
-/// no-follow directory handles ([`DirHandle::create_root_nofollow`] mkdir+opens
-/// every component relative to a pinned parent, never resolving the path as a
-/// string), then the stale-wipe, create, and 0700 chmod of both the root and
-/// the job dir all happen *relative to that pinned handle*. A same-UID actor
-/// therefore cannot swap `runs_dir` (or an ancestor) for a symlink between a
-/// check and the operation and redirect the create/remove outside the
-/// workspace — the no-follow open refuses the swapped component rather than
-/// following it. This is the atomic fix the path-based `reject_symlink`
-/// re-checks can only approximate. `run_dir` is always `<runs_dir>/<key>` (a
-/// single, engine-validated numeric component), so its `file_name()` is the
-/// child directory to prepare.
-#[cfg(target_os = "linux")]
+/// `prepare_run_dir` via a no-follow handle pinned to the runs root: the
+/// stale-wipe, create, and 0700 chmod of both the root and the job dir all
+/// happen *relative to that pinned handle*, so a same-UID actor cannot swap
+/// `runs_dir` (or an ancestor) for a symlink between a check and the operation
+/// and redirect the remove/create outside the workspace — and the job-dir
+/// handle preparation returns is the *exact* inode it wiped and secured, so the
+/// launch never reopens `run_dir` by path (which a same-UID actor could have
+/// replaced with an ordinary, unprepared tree in between). This is the atomic
+/// fix the path-based `reject_symlink` re-checks can only approximate.
+/// `run_dir` is always `<runs_dir>/<key>` (a single, engine-validated numeric
+/// component), so its `file_name()` is the child directory to prepare.
+#[cfg(unix)]
 fn prepare_run_dir_pinned(
     runs_dir: &Path,
     run_dir: &Path,
-) -> std::result::Result<(), crate::saferoot::PinError> {
+) -> std::result::Result<crate::safecwd::CwdHandle, crate::saferoot::PinError> {
     use crate::saferoot::{DirHandle, PinError};
     let name = run_dir.file_name().ok_or_else(|| {
         PinError::Io(std::io::Error::new(
@@ -679,24 +659,36 @@ fn prepare_run_dir_pinned(
             format!("run dir {} has no final component", run_dir.display()),
         ))
     })?;
-    // Establish the runs root as a PRIVATE ROOT through no-follow directory
-    // handles: `create_root_nofollow` mkdir+opens every component relative to a
-    // pinned parent with `RESOLVE_NO_SYMLINKS`, so a planted or swapped symlink
-    // ancestor is refused by the open rather than followed. This replaces the
-    // former path-based bootstrap (`reject_symlinked_ancestors` + a
-    // symlink-following `create_dir_all`, then a separate `open_root_nofollow`),
-    // which left a check-then-create TOCTOU window the issue's path checks could
-    // only approximate. The returned handle is the pinned runs root.
-    let root = DirHandle::create_root_nofollow(runs_dir)?;
-    root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
-    Ok(())
+    // Bootstrap: the runs root must exist before it can be opened no-follow.
+    // Materialise it by walking and creating each missing component RELATIVE to
+    // its already-pinned parent (`open_or_create_root_nofollow`), never via a
+    // path-based `create_dir_all`: a path-based create *follows* a symlinked
+    // ancestor, so a same-UID actor swapping a writable ancestor for a symlink
+    // between a no-follow check and the create could redirect the materialised
+    // root into an attacker-chosen target — building the run dir outside the
+    // workspace before the no-follow open ever ran. The component-wise
+    // create+pin closes that window: each step is anchored on the previous
+    // step's pinned inode, and an existing or swapped-in symlinked component is
+    // refused by the no-follow open rather than followed.
+    let root = DirHandle::open_or_create_root_nofollow(runs_dir, 0o700)?;
+    let child = root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
+    // Carry the EXACT pinned child inode preparation just created and secured
+    // into the launch — never reopen `run_dir` by path, which a same-UID actor
+    // could have swapped for an ordinary (unwiped, unsecured) tree in between.
+    Ok(crate::safecwd::CwdHandle::from_fd(child.into_fd()))
 }
 
-/// Path-based `prepare_run_dir`: the pre-`openat2` fallback (non-Linux, or a
-/// Linux kernel older than 5.6). Rejects a symlinked leaf / ancestor before
-/// *and* after the non-atomic remove+create — a best-effort approximation of
-/// the pinned-handle guarantee that cannot fully close the TOCTOU window.
-fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
+/// Path-based `prepare_run_dir`: the non-Unix fallback (no `openat`/`fchmod`
+/// pinned-handle support — not a supported daemon host). Rejects a symlinked
+/// leaf / ancestor before *and* after the non-atomic remove+create — a
+/// best-effort approximation of the pinned-handle guarantee that cannot fully
+/// close the TOCTOU window. Every Unix host uses the pinned
+/// [`prepare_run_dir_pinned`] instead.
+#[cfg(not(unix))]
+fn prepare_run_dir_path_based(
+    runs_dir: &Path,
+    run_dir: &Path,
+) -> Result<crate::safecwd::CwdHandle> {
     reject_symlink(runs_dir)?;
     reject_symlink(run_dir)?;
     reject_symlinked_ancestors(run_dir)?;
@@ -710,29 +702,30 @@ fn prepare_run_dir_path_based(runs_dir: &Path, run_dir: &Path) -> Result<()> {
     reject_symlinked_ancestors(run_dir)?;
     restrict_dir_mode(runs_dir)?;
     restrict_dir_mode(run_dir)?;
-    Ok(())
+    // Pin the prepared dir no-follow and hand the handle back, so the caller
+    // carries the validated inode into the launch rather than reopening the
+    // path (this backend cannot pin atomically, but a leaf re-open right after
+    // the final no-follow checks above is the closest this fallback gets).
+    crate::safecwd::CwdHandle::open(run_dir)
+        .with_context(|| format!("pinning prepared run dir {}", run_dir.display()))
 }
 
 /// Reap a completed run directory under `runs_dir` with the same pinned
 /// no-follow guarantee as [`prepare_run_dir`]: the removal happens *relative to*
-/// an `openat2(RESOLVE_NO_SYMLINKS)` handle on the runs root, so a same-UID
-/// actor cannot swap `run_dir` (or an ancestor) for a symlink between the
-/// job's completion and this cleanup and redirect a path-based
-/// `remove_dir_all` into deleting an unrelated tree outside the workspace.
-/// Falls back to a plain `remove_dir_all` only where the pinned path is
-/// unavailable (non-Linux, or a pre-5.6 kernel without `openat2`). `run_dir` is
-/// always `<runs_dir>/<key>` (a single engine-validated component), so its
+/// a no-follow pinned handle on the runs root, so a same-UID actor cannot swap
+/// `run_dir` (or an ancestor) for a symlink between the job's completion and
+/// this cleanup and redirect a path-based `remove_dir_all` into deleting an
+/// unrelated tree outside the workspace. Falls back to a plain `remove_dir_all`
+/// only on a non-Unix host (no pinned-handle support). `run_dir` is always
+/// `<runs_dir>/<key>` (a single engine-validated component), so its
 /// `file_name()` is the child to remove. A missing dir is treated as success.
 pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use crate::saferoot::{DirHandle, PinError};
         if let Some(name) = run_dir.file_name() {
-            match DirHandle::open_root_nofollow(runs_dir) {
+            match DirHandle::open_root_nofollow(runs_dir, false) {
                 Ok(root) => return root.remove_tree(name),
-                // Kernel too old for `openat2` (pre-5.6): fall through to the
-                // best-effort path-based remove below.
-                Err(PinError::Unsupported) => {}
                 // A refused symlinked root (ELOOP) or any other error is a real,
                 // security-relevant outcome — surface it, never retry the weaker
                 // path-based remove that would follow the very link we refused.
@@ -740,7 +733,7 @@ pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<(
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     let _ = runs_dir;
     match std::fs::remove_dir_all(run_dir) {
         Ok(()) => Ok(()),
@@ -1018,26 +1011,24 @@ fn remove_if_inactive(path: &Path, remove: impl FnOnce()) -> bool {
 ///     reap its aged, inactive child runs — then removes that namespace only if
 ///     it is left empty.
 pub(crate) fn sweep_stale_runs(runs_dir: &Path, max_age: Duration, recurse_namespaces: bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        match sweep_stale_runs_pinned(runs_dir, max_age, recurse_namespaces) {
-            Ok(()) => return,
-            // Kernel too old for `openat2` (pre-5.6): fall through to the
-            // best-effort path-based sweep below.
-            Err(crate::saferoot::PinError::Unsupported) => {}
+        // The pinned sweep handles every outcome on Unix (reaping, or skipping
+        // with a log on a refused/errored root), so there is nothing further.
+        if let Err(crate::saferoot::PinError::Io(e)) =
+            sweep_stale_runs_pinned(runs_dir, max_age, recurse_namespaces)
+        {
             // A refused symlinked root (ELOOP) or any other error: skip the
             // sweep entirely rather than risk traversing a redirected root —
             // exactly the behaviour the path-based version's up-front reject
             // provided, now enforced atomically at open time.
-            Err(crate::saferoot::PinError::Io(e)) => {
-                log(&format!(
-                    "skipping stale-run sweep of {}: {e} (possible local symlink attack)",
-                    runs_dir.display()
-                ));
-                return;
-            }
+            log(&format!(
+                "skipping stale-run sweep of {}: {e} (possible local symlink attack)",
+                runs_dir.display()
+            ));
         }
     }
+    #[cfg(not(unix))]
     sweep_stale_runs_path_based(runs_dir, max_age, recurse_namespaces);
 }
 
@@ -1101,24 +1092,29 @@ fn process_is_alive(_pid: i32) -> bool {
 /// sweep's deletions outside the workspace — the race path-based re-checks
 /// cannot atomically close. Descent into an aged run dir is likewise no-follow,
 /// so a symlink *inside* a swept dir deletes the link, never its target.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn sweep_stale_runs_pinned(
     runs_dir: &Path,
     max_age: Duration,
     recurse_namespaces: bool,
 ) -> std::result::Result<(), crate::saferoot::PinError> {
     use crate::saferoot::{DirHandle, PinError};
-    let root = match DirHandle::open_root_nofollow(runs_dir) {
+    let root = match DirHandle::open_root_nofollow(runs_dir, false) {
         Ok(h) => h,
         // A missing runs_dir (first job) is nothing to sweep — not an error;
         // the prepare path will (re)create and validate it.
         Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    // `execute` registers each in-flight run by its ABSOLUTE path, so resolve
-    // the root once to compare entries against the active set correctly even
-    // when `runs_dir` is relative.
-    let runs_abs = std::path::absolute(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
+    // `execute` registers each in-flight run by its `normalize_run_path` form
+    // (absolute AND lexically parent-free), so derive the comparison key with
+    // the matching lexical resolver — even when `runs_dir` is relative or
+    // parent-relative. `std::path::absolute` would keep an interior `..`,
+    // producing a different registry key for the same directory and letting
+    // the sweep reap a live run (#36). `resolve_run_path` collapses rather
+    // than refuses, so the key always resolves.
+    let runs_abs =
+        crate::safecwd::resolve_run_path(runs_dir).unwrap_or_else(|_| runs_dir.to_path_buf());
     let now = SystemTime::now();
     let self_pid = std::process::id() as i32;
     for name in root.entry_names().map_err(PinError::Io)? {
@@ -1158,8 +1154,9 @@ fn sweep_stale_runs_pinned(
             Some((_, alive)) => !alive,
         };
         // Our own namespace, or a dead worker's: descend one level (pinned,
-        // no-follow) and reap aged, inactive child runs.
-        let child = match root.open_child_dir(&name) {
+        // no-follow) and reap aged, inactive child runs. Readable (`trav =
+        // false`): the child is enumerated and stat'd, not merely traversed.
+        let child = match root.open_child_dir(&name, false) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -1200,7 +1197,7 @@ fn sweep_stale_runs_pinned(
 
 /// Reap a single aged run dir `name` (relative to pinned `dir`), logging the
 /// outcome. Shared by the top-level and one-level-descent sweep paths.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn reap_pinned(
     dir: &crate::saferoot::DirHandle,
     name: &std::ffi::OsStr,
@@ -1229,10 +1226,12 @@ fn is_aged_out(modified: Option<SystemTime>, now: SystemTime, max_age: Duration)
         .is_some_and(|age| age >= max_age)
 }
 
-/// Path-based `sweep_stale_runs`: the pre-`openat2` fallback (non-Linux, or a
-/// Linux kernel older than 5.6). Rejects a symlinked root/ancestor up front,
-/// then reads and removes by path — a best-effort approximation that cannot
-/// fully close the check/traverse TOCTOU the pinned version does.
+/// Path-based `sweep_stale_runs`: the non-Unix fallback (no pinned-handle
+/// support — not a supported daemon host). Rejects a symlinked root/ancestor up
+/// front, then reads and removes by path — a best-effort approximation that
+/// cannot fully close the check/traverse TOCTOU the pinned version does. Every
+/// Unix host uses the pinned [`sweep_stale_runs_pinned`] instead.
+#[cfg(not(unix))]
 fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_namespaces: bool) {
     // Refuse to traverse a symlinked root, or one reached through a symlinked
     // ancestor, before touching it: `read_dir` (and the `remove_dir_all` below)
@@ -1272,8 +1271,10 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
         if !recurse_namespaces {
             // Top-level entry IS a job run: age it by its own mtime, never
             // descend into it (its repo checkout / scratch dirs are not runs).
-            // Atomic check-and-remove (see the pinned branch).
-            let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+            // Atomic check-and-remove (see the pinned branch). Resolve with the
+            // same lexical form `execute` registers by, so the key matches even
+            // for a relative/parent-relative `runs_dir` (#36).
+            let abs = crate::safecwd::resolve_run_path(&path).unwrap_or_else(|_| path.clone());
             if is_aged_out(meta.modified().ok(), now, max_age) {
                 remove_if_inactive(&abs, || reap_path(&path, max_age));
             }
@@ -1308,7 +1309,9 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
             if !cmeta.is_dir() {
                 continue;
             }
-            let cabs = std::path::absolute(&cpath).unwrap_or_else(|_| cpath.clone());
+            // Resolve with the same lexical form `execute` registers by, so the
+            // key matches even for a relative runs root (#36).
+            let cabs = crate::safecwd::resolve_run_path(&cpath).unwrap_or_else(|_| cpath.clone());
             if !is_aged_out(cmeta.modified().ok(), now, max_age) {
                 continue;
             }
@@ -1332,8 +1335,9 @@ fn sweep_stale_runs_path_based(runs_dir: &Path, max_age: Duration, recurse_names
     }
 }
 
-/// Reap a single aged run dir at `path` by path (fallback sweep), logging the
-/// outcome.
+/// Reap a single aged run dir at `path` by path (the non-Unix fallback sweep),
+/// logging the outcome. Unix sweeps reap through the pinned handle instead.
+#[cfg(not(unix))]
 fn reap_path(path: &Path, max_age: Duration) {
     match std::fs::remove_dir_all(path) {
         Ok(()) => log(&format!(
@@ -1467,7 +1471,7 @@ struct RunResult {
 /// therefore runs under [`GIT_HEAD_TIMEOUT`]: a git that has not exited by then
 /// is killed and reaped, and the read reports `None` ("no commits" — the safe
 /// default above) instead of hanging settlement.
-fn git_head(dir: &Path) -> Option<String> {
+fn git_head(dir: &crate::safecwd::CwdHandle) -> Option<String> {
     git_head_timeout(dir, GIT_HEAD_TIMEOUT)
 }
 
@@ -1480,7 +1484,7 @@ fn git_head(dir: &Path) -> Option<String> {
 /// under. Use this from async contexts; `git_head` remains for synchronous
 /// callers and tests. Best-effort like the probe itself: a panicked or
 /// cancelled blocking task reads as `None` ("no commits"), the safe default.
-pub(crate) async fn git_head_blocking(dir: PathBuf) -> Option<String> {
+pub(crate) async fn git_head_blocking(dir: crate::safecwd::CwdHandle) -> Option<String> {
     tokio::task::spawn_blocking(move || git_head(&dir))
         .await
         .ok()
@@ -1497,12 +1501,11 @@ const GIT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for the bounded `git rev-parse` probe to exit.
 const GIT_HEAD_POLL: Duration = Duration::from_millis(10);
 
-fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
+fn git_head_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(dir)
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--verify", "HEAD"])
         // An agent-controlled checkout could carry a prompt/sidebar config; keep
         // the invocation minimal and non-interactive.
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1513,9 +1516,16 @@ fn git_head_timeout(dir: &Path, timeout: Duration) -> Option<String> {
         // instead of blocking unboundedly inside `Child::wait_with_output`.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // Enter the checkout through the pinned run-dir capability (`fchdir` in the
+    // child's `pre_exec`) rather than re-resolving a path at spawn time: the
+    // handle was opened no-follow at provisioning, so a same-UID actor swapping
+    // a path component between provisioning and this probe cannot redirect
+    // `git rev-parse` to an attacker repo and spoof the pre/post HEAD that is
+    // the empty-job detector's only "did the agent commit" signal (#35, as for
+    // the git()/agent launches).
+    dir.apply_std(&mut cmd).ok()?;
+    let mut child = cmd.spawn().ok()?;
     // Bounded wait: poll `try_wait` so a git wedged on agent-planted blocking
     // metadata (e.g. `.git/HEAD` a FIFO) is killed and reaped at the deadline
     // rather than waited on forever. Killing also guarantees no git child is
@@ -1590,15 +1600,26 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // *before* joining it to a path (a malformed `../` key must never make
     // `remove_dir_all` / `create_dir_all` operate outside `runs_dir`).
     crate::jobs::validate_job_key(&key)?;
-    // Absolute, so the agent (whose cwd is inside `run_dir`) and the worker
-    // resolve `AGENT_RESULT_FILE` identically. Purely lexical — the symlink
-    // hardening in `prepare_run_dir` still inspects the real on-disk structure.
-    let run_dir = std::path::absolute(cfg.runs_dir.join(&key)).with_context(|| {
-        format!(
-            "resolving absolute run dir under {}",
-            cfg.runs_dir.display()
-        )
-    })?;
+    // Absolute AND lexically resolved, so the agent (whose cwd is inside
+    // `run_dir`) and the worker resolve `AGENT_RESULT_FILE` identically, and so
+    // every launch backend resolves the same path. `normalize_run_path`
+    // resolves only a LEADING `..` (e.g. a parent-relative `--runs-dir ../runs`)
+    // against the trusted cwd and REFUSES any interior `..`: a lexical collapse
+    // of an interior `..` is unsafe across a symlinked component (the Linux
+    // `openat2` open would accept it while the portable `O_NOFOLLOW` chain
+    // resolves it fd-relative — NOT path resolution — so a renamed ancestor
+    // could silently redirect the descent). Resolving at this input boundary
+    // (trusted prefix only; the not-yet-created job-dir tail stays literal)
+    // gives both backends one identical, parent-free path (#35/#36). Purely
+    // lexical — the symlink hardening in `prepare_run_dir` still inspects the
+    // real on-disk structure.
+    let run_dir =
+        crate::safecwd::normalize_run_path(&cfg.runs_dir.join(&key)).with_context(|| {
+            format!(
+                "resolving absolute run dir under {}",
+                cfg.runs_dir.display()
+            )
+        })?;
     // Claim exclusive ownership of this run dir BEFORE wiping/preparing it, so a
     // concurrent attempt for the same key (a lease-recovery redelivery to another
     // slot) cannot wipe our live checkout or share the workspace. The claim is
@@ -1617,7 +1638,16 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     if !cfg.keep_runs {
         sweep_stale_runs_blocking(cfg.runs_dir.clone(), FAILED_RUN_RETENTION, false).await;
     }
-    prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?;
+    // Prepare the run dir and carry the EXACT pinned capability it returns
+    // through provisioning, the agent launches, and the HEAD probes. Preparation
+    // pins the inode it wiped and secured (0700) and hands that fd back, so we
+    // never reopen the job dir by path afterwards — a same-UID actor replacing
+    // the job dir (or an ancestor) with an ordinary directory tree between
+    // preparation and a reopen would pass no-follow resolution yet bind a
+    // different, unsecured inode from the one preparation validated (#35).
+    let prepared = PreparedRun {
+        cwd: prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?,
+    };
     let agent_cwd = match &env.repository {
         Some(repo) => {
             log(&format!(
@@ -1625,11 +1655,24 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
                 redact_url(&repo.url),
                 repo.provider
             ));
-            crate::provision::provision(repo, &run_dir, cfg.clone_timeout)
+            // `provision` returns the pinned checkout handle it used for every
+            // git step; carry THAT exact inode into the agent/HEAD launches
+            // rather than reopening `repo` by name (which a same-UID actor could
+            // swap between the opens) (#35).
+            crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
                 .await
                 .context("provisioning repository")?
         }
-        None => run_dir.clone(),
+        None => {
+            // No repository: the agent and HEAD probes run in the run dir
+            // itself. Dup the pinned handle fallibly — a dup failure (e.g.
+            // descriptor exhaustion, EMFILE) must surface as a normal job
+            // error here, not a worker-crashing panic from `Clone`.
+            prepared
+                .agent_cwd()
+                .try_clone()
+                .context("dup the pinned run-dir handle")?
+        }
     };
     // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
     // the empty-job detector can tell whether the agent committed anything.
@@ -1638,7 +1681,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // "commits" signal from a pre/post `rev-parse` of this HEAD (any advance =
     // a commit) and reports no push. `None` for a non-git run dir (no
     // repository) or when HEAD can't be read — treated as "no commits".
-    let start_head = git_head_blocking(agent_cwd.clone()).await;
+    // Dup the pinned handle FALLIBLY: this probe is best-effort (a failure is
+    // already `None` = "HEAD unreadable"), so a dup failure (descriptor
+    // exhaustion, EMFILE) must yield `None` here, never a worker-crashing
+    // panic from `Clone` — the same class as the launch-cwd dup above.
+    let start_head = match agent_cwd.try_clone() {
+        Ok(cwd) => git_head_blocking(cwd).await,
+        Err(_) => None,
+    };
 
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file, &run_dir);
@@ -1755,11 +1805,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // AND gates reaping (a provisioned checkout that advanced HEAD holds commits
     // that, absent a push stage, exist ONLY in the run dir).
     let provisioned = env.repository.is_some();
-    let has_commits = detect_commits(
-        start_head.as_deref(),
-        git_head_blocking(agent_cwd.clone()).await.as_deref(),
-        provisioned,
-    );
+    // The post-run HEAD probe is best-effort too: dup the pinned handle
+    // fallibly so a dup failure (EMFILE) reads as `None` ("HEAD unreadable"),
+    // not a `Clone` panic — mirroring `start_head` above.
+    let end_head = match agent_cwd.try_clone() {
+        Ok(cwd) => git_head_blocking(cwd).await,
+        Err(_) => None,
+    };
+    let has_commits = detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned);
 
     let settle = if !run.ok {
         let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {
@@ -1833,7 +1886,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
 async fn run_agent(
     cfg: &SlotConfig,
     key: &str,
-    cwd: &Path,
+    cwd: &crate::safecwd::CwdHandle,
     stdin: &str,
     env: &[(String, String)],
 ) -> RunResult {
@@ -1854,10 +1907,17 @@ async fn run_agent(
                     }
                 }
             };
+            // Name the pinned directory for the log line, recovered through
+            // the fd so a post-prepare rename cannot put a stale pathname in
+            // the log; fall back to the raw handle debug if it cannot be read.
+            let whereami = cwd
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<pinned run dir>".to_string());
             log(&format!(
                 "job {key}: acp agent pid {} in {}",
                 agent.pid().unwrap_or(0),
-                cwd.display()
+                whereami
             ));
             let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
             agent.shutdown().await;
@@ -1892,7 +1952,11 @@ async fn run_agent(
             }
         }
         Protocol::Pipe => {
-            log(&format!("job {key}: pipe agent in {}", cwd.display()));
+            let whereami = cwd
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<pinned run dir>".to_string());
+            log(&format!("job {key}: pipe agent in {whereami}"));
             match crate::pipe::run(
                 &cfg.hire.command,
                 &cfg.hire.args,
@@ -3081,6 +3145,58 @@ mod tests {
     }
 
     #[test]
+    fn sweep_recognises_an_active_run_under_a_parent_relative_root() {
+        // Regression for the relative runs-dir mismatch (#36): `execute`
+        // registers an in-flight run by its `normalize_run_path` form (absolute
+        // AND lexically parent-free, e.g. `/parent/runs/123`), while a daemon
+        // `--runs-dir ../runs` reaches the sweep as a path whose
+        // `std::path::absolute` form keeps an interior `..`
+        // (`/parent/cwd/../runs/123`). Those are different `active_runs` keys
+        // for the SAME directory, so a sweep keyed on the un-normalized form
+        // would reap a live workspace. The sweep must normalize its lookup key
+        // with the same `normalize_run_path`, so the active registration is
+        // honoured however the root was spelled.
+        let base = std::env::temp_dir().join(format!(
+            "nano-relroot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd_dir = base.join("cwd");
+        let runs = base.join("runs");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        std::fs::create_dir_all(&runs).unwrap();
+        // Resolve platform symlinks (macOS /var -> /private/var) so the lexical
+        // `..` below resolves honestly against the on-disk tree.
+        let base = std::fs::canonicalize(&base).unwrap();
+        let cwd_dir = std::fs::canonicalize(&cwd_dir).unwrap();
+        let runs = std::fs::canonicalize(&runs).unwrap();
+
+        let live = runs.join("live-run");
+        std::fs::create_dir_all(&live).unwrap();
+        // Register exactly as `execute` does: the normalized, parent-free form
+        // (`normalize_run_path` and `resolve_run_path` agree on this valid,
+        // parent-free path).
+        let live_normalized = crate::safecwd::normalize_run_path(&live).unwrap();
+        let _guard = ActiveRunGuard::new(&live_normalized);
+        assert!(is_active_run(&live_normalized));
+
+        // Sweep through a PARENT-RELATIVE spelling of the same root
+        // (`<base>/cwd/../runs`), the shape a relative `--runs-dir` produces.
+        let parent_relative_root = cwd_dir.join("..").join("runs");
+        sweep_stale_runs(&parent_relative_root, Duration::ZERO, false);
+        assert!(
+            live.exists(),
+            "an active run must survive a sweep keyed by a parent-relative root spelling"
+        );
+
+        drop(_guard);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn active_run_guard_is_refcounted_across_overlapping_retries() {
         // A job dir is keyed by job key and reused across retries, so an old
         // attempt's guard can still be dropping while the retry has already
@@ -3207,6 +3323,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&runs).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (macOS `temp_dir()`
+        // is under the platform `/var` → `/private/var` symlink). The no-follow
+        // reap legitimately refuses a symlinked ancestor, so an unresolved
+        // `/var/...` runs root would be rejected (ENOTDIR) on macOS — mirror the
+        // `unique_tmp` helper and the canonical runs root production reaps under.
+        let runs = std::fs::canonicalize(&runs).unwrap();
         let run = runs.join("42");
         std::fs::create_dir_all(run.join("nested")).unwrap();
         std::fs::write(run.join("nested").join("result.json"), b"{}").unwrap();
@@ -3258,7 +3380,7 @@ mod tests {
     }
 
     /// A unique scratch dir under the system temp root (no tempfile dep here).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn unique_tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "nano-{tag}-{}-{}",
@@ -3269,10 +3391,17 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
-        p
+        // Canonicalize away any symlinked temp-dir ancestor (macOS `temp_dir()`
+        // is commonly under the platform `/var` → `/private/var` symlink). The
+        // no-follow prepare/sweep paths legitimately refuse a symlinked
+        // component, so an unresolved `/var/...` scratch root would be rejected
+        // (or its entries skipped) and the owner-only/symlink tests below would
+        // fail on macOS. `saferoot::tests::scratch_root` canonicalizes for the
+        // same reason.
+        std::fs::canonicalize(&p).unwrap()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn prepare_run_dir_pinned_creates_owner_only_and_wipes_stale() {
         use std::os::unix::fs::PermissionsExt;
@@ -3301,7 +3430,7 @@ mod tests {
         std::fs::remove_dir_all(&runs).ok();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn prepare_run_dir_pinned_refuses_symlinked_root() {
         // A symlinked runs root must be refused by the pinned open (ELOOP),
@@ -3324,7 +3453,81 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_pinned_does_not_materialise_root_through_a_symlinked_ancestor() {
+        // Regression for the runs-root creation race (#36, review r4181639033):
+        // the bootstrap used to no-follow-check the ancestors and then call the
+        // path-based `create_dir_all(runs_dir)`. Between that check and the
+        // create a same-UID actor could swap a writable ancestor for a symlink,
+        // and `create_dir_all` would FOLLOW it — materialising the missing
+        // runs-root suffix inside the attacker's target before the no-follow
+        // open ever ran. The fix creates each missing component relative to its
+        // pinned parent, so a symlinked component is refused, never followed.
+        let base = unique_tmp("prep-root-race");
+        let outside = base.join("attacker-target");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // A missing runs root whose PARENT is a symlink to the attacker target:
+        // `runs_dir` = `<link>/runs`, where `link` -> `outside`. The old code
+        // would create `<outside>/runs`; the fix must refuse the symlinked
+        // `link` and create nothing outside.
+        //
+        // NOTE (adversarial-review caveat): this plants the symlink BEFORE the
+        // call, so it is NOT red-before — the pre-fix `reject_symlinked_ancestors`
+        // pre-check already bails on the static `link` ancestor, so these
+        // assertions also pass against the old code. It pins the "refuse a
+        // pre-existing symlinked ancestor, create nothing outside" guarantee the
+        // fix must preserve, but it does NOT exercise the check→create race
+        // window itself. A deterministic red-before race test would require a
+        // test-only pause hook inside the pre-fix `create_dir_all`→`open_root`
+        // window; the pre-fix `open_root_nofollow` resolves the whole path in one
+        // atomic `openat2`, so there is no shared per-component seam to hook and
+        // such a test is not feasible here. The race is instead closed by
+        // construction: the fix creates each component relative to its pinned
+        // parent, so a swapped-in symlink is refused by the no-follow open.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let runs = link.join("runs");
+        let run = runs.join("42");
+
+        let err = prepare_run_dir(&runs, &run).unwrap_err();
+        let _ = err;
+        assert!(
+            !outside.join("runs").exists(),
+            "a symlinked ancestor must not be followed to materialise the runs root in the target"
+        );
+        assert!(
+            !run.exists() && !outside.join("runs/42").exists(),
+            "no run dir may be created through the symlinked ancestor"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_pinned_creates_missing_root_components_owner_only() {
+        // The handle-relative bootstrap must still materialise a multi-level
+        // MISSING runs root (the common first-run case), locking each created
+        // component to 0700 — now without any path-based create.
+        use std::os::unix::fs::PermissionsExt;
+        let base = unique_tmp("prep-root-missing");
+        let runs = base.join("a/b/runs");
+        let run = runs.join("7");
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "run dir must exist after prepare");
+        for dir in [&runs, &run] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be owner-only 0700", dir.display());
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn sweep_pinned_does_not_follow_symlinked_entry_inside_aged_dir() {
         // An aged run dir containing a symlink to an outside directory must be
@@ -3363,6 +3566,11 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nano-git-head-ok-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         std::fs::create_dir_all(&base).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (e.g. macOS
+        // `/var`→`/private/var`): the probe now binds the run dir through the
+        // no-follow handle, which legitimately refuses a symlinked component —
+        // real daemon run dirs are provisioned through that same handle.
+        let base = std::fs::canonicalize(&base).unwrap();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -3384,7 +3592,7 @@ mod tests {
             "-m",
             "x",
         ]);
-        let head = git_head(&base);
+        let head = git_head(&crate::safecwd::CwdHandle::open(&base).unwrap());
         assert!(
             head.as_deref()
                 .is_some_and(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())),
@@ -3399,7 +3607,148 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nano-git-head-nogit-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         std::fs::create_dir_all(&base).unwrap();
-        assert_eq!(git_head(&base), None);
+        let base = std::fs::canonicalize(&base).unwrap();
+        assert_eq!(
+            git_head(&crate::safecwd::CwdHandle::open(&base).unwrap()),
+            None
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_head_refuses_a_symlinked_ancestor() {
+        // The #35 class, for the HEAD probe: the probe now binds a pinned
+        // handle, so a run dir REACHED THROUGH a symlinked ancestor cannot even
+        // be pinned — `CwdHandle::open` refuses the path (fail closed) and the
+        // caller reads the safe `None` ("no commits"). Before the fix the probe
+        // used `current_dir(dir)`, re-resolved the symlink at spawn, and
+        // returned the attacker's sha.
+        let base = std::env::temp_dir().join(format!(
+            "nano-git-head-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        // An attacker-controlled real git repo with a commit.
+        let evil = base.join("evil");
+        std::fs::create_dir_all(&evil).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&evil, &["init", "-q"]);
+        git(
+            &evil,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        // `<base>/link` is a symlink to the attacker repo; the probe target
+        // `<base>/link` therefore reaches the attacker repo only through it.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&evil, &link).unwrap();
+        assert!(
+            crate::safecwd::CwdHandle::open(&link).is_err(),
+            "a run dir reached through a symlinked ancestor must be refused at pin time"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_head_stays_in_the_pinned_inode_after_an_ancestor_swap() {
+        // The carried-capability guarantee: the probe binds the handle pinned
+        // at provisioning, so swapping an ancestor for a symlink to an attacker
+        // repo AFTER the pin cannot redirect the probe — it still reads the
+        // real checkout's HEAD, never the attacker's.
+        let base = std::env::temp_dir().join(format!(
+            "nano-git-head-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        let base = std::fs::canonicalize({
+            std::fs::create_dir_all(&base).unwrap();
+            &base
+        })
+        .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        let commit = |dir: &Path, msg: &str| {
+            git(dir, &["init", "-q"]);
+            git(
+                dir,
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    msg,
+                ],
+            );
+        };
+        // The real checkout, pinned as at provisioning.
+        let ancestor = base.join("ancestor");
+        let real = ancestor.join("run");
+        std::fs::create_dir_all(&real).unwrap();
+        commit(&real, "real");
+        let handle = crate::safecwd::CwdHandle::open(&real).unwrap();
+
+        // Attacker swaps the ancestor for a symlink to their own repo.
+        let moved = base.join("ancestor-moved");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join("run")).unwrap();
+        commit(&evil.join("run"), "evil");
+        std::os::unix::fs::symlink(&evil, &ancestor).unwrap();
+
+        // The probe still reads the REAL checkout's HEAD (the pinned inode,
+        // now at `moved/run`), not the attacker's the path would resolve to.
+        let real_head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(moved.join("run"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(
+            git_head(&handle).as_deref(),
+            Some(real_head.as_str()),
+            "the probe must read the pinned inode's HEAD, not the swapped-in attacker repo"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -3414,6 +3763,11 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
         let git_dir = base.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor so the probe reaches
+        // `git` (which then wedges on the FIFO) instead of being refused by the
+        // no-follow cwd bind before it ever spawns — this test must exercise the
+        // deadline, not the symlink refusal.
+        let base = std::fs::canonicalize(&base).unwrap();
         // A FIFO never yields data, so git blocks reading HEAD.
         let mk = std::process::Command::new("mkfifo")
             .arg(git_dir.join("HEAD"))
@@ -3422,7 +3776,8 @@ mod tests {
         assert!(mk.status.success(), "mkfifo failed");
 
         let started = Instant::now();
-        let head = git_head_timeout(&base, Duration::from_millis(300));
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let head = git_head_timeout(&handle, Duration::from_millis(300));
         let elapsed = started.elapsed();
         assert_eq!(head, None, "a wedged probe must read as no commits");
         assert!(
@@ -3446,6 +3801,11 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
         let git_dir = base.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor so the probe reaches
+        // (and wedges on) git rather than being refused early by the no-follow
+        // cwd bind — this test must exercise the blocking-pool dispatch, not the
+        // symlink refusal.
+        let base = std::fs::canonicalize(&base).unwrap();
         // A FIFO never yields data, so git blocks reading HEAD until the
         // probe's deadline kills it — the probe takes the full timeout.
         let mk = std::process::Command::new("mkfifo")
@@ -3455,7 +3815,8 @@ mod tests {
         assert!(mk.status.success(), "mkfifo failed");
 
         let started = Instant::now();
-        let probe = tokio::spawn(git_head_blocking(base.clone()));
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let probe = tokio::spawn(git_head_blocking(handle));
         // Yield so the probe is dispatched to the blocking pool before the
         // concurrent task starts.
         tokio::task::yield_now().await;

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use tokio::sync::watch;
 
 use crate::engine;
@@ -73,6 +73,19 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let host = short_hostname();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // Normalize the runs root to the SAME absolute, parent-free lexical form
+    // `slot::execute` registers in `active_runs` (via
+    // `safecwd::normalize_run_path`). `execute` registers each in-flight run by
+    // that normalized path, so a `SlotConfig.runs_dir` left relative (or
+    // carrying a leading `..`) would make the retention sweep compare a
+    // DIFFERENT key for the same directory (`std::path::absolute` keeps an
+    // interior `..` that `normalize_run_path` resolves) and could reap a live
+    // workspace. Normalizing here, once, keeps the registration key, the sweep
+    // root, and the run-dir base identical (#36). This is purely lexical (the
+    // no-follow hardening still inspects the real on-disk structure later).
+    let runs_dir = crate::safecwd::normalize_run_path(&opts.runs_dir)
+        .context("resolving absolute daemon runs-dir")?;
+
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
     for hire in &selected {
@@ -95,7 +108,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 idle_timeout: opts.idle_timeout,
                 poll_timeout: opts.poll_timeout,
                 clone_timeout: opts.clone_timeout,
-                runs_dir: opts.runs_dir.clone(),
+                runs_dir: runs_dir.clone(),
                 with_lease: opts.with_lease,
                 require_lease: opts.with_lease,
                 max_jobs: None,
