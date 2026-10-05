@@ -67,13 +67,26 @@ pub async fn provision(
         .path()
         .context("recovering the pinned run dir path")?
         .join(CHECKOUT_DIR);
+    // `provision` binds every git step's cwd to the pinned run dir (#35), but a
+    // relative *local* source (e.g. `./origin.git`) is interpreted by git
+    // relative to *that* cwd — i.e. inside the still-empty run dir — so it would
+    // no longer resolve to the path the envelope author meant (which, before
+    // #35, was taken relative to the supervisor's own cwd). Re-anchor such
+    // sources to the supervisor's cwd *once*, here, so the single resolved
+    // `source` below drives clone, both fetches, AND the persisted origin
+    // consistently. Remote URLs, scp-like SSH sources, and absolute local paths
+    // are cwd-independent and pass through unchanged.
+    let supervisor_cwd =
+        std::env::current_dir().context("resolving the supervisor working directory")?;
+    let source = resolve_local_source(&repo.url, &supervisor_cwd);
+
     // Lift any `user:token@` credential out of the URL so it is delivered to git
     // out of band (via the credential helper in `git()`) instead of embedded in
     // argv, where it would sit in world-readable `/proc/<git-pid>/cmdline` for
     // the life of every clone/fetch. `fetch_url` (credential-free) is what goes
     // on the command line; the same handle authenticates the clone and both
     // fetches below.
-    let (fetch_url, cred) = split_url_credential(&repo.url);
+    let (fetch_url, cred) = split_url_credential(&source);
     let mut args: Vec<String> = vec!["clone".into(), "--no-tags".into()];
     if let Some(depth) = repo.depth.filter(|&d| d > 0) {
         args.push("--depth".into());
@@ -134,7 +147,7 @@ pub async fn provision(
     // persisted config. The clone and both fetches below authenticate via the
     // out-of-band credential helper (see `git()`), so the token is never written
     // to config or placed in argv.
-    let scrubbed_origin = scrub_url_credentials(&repo.url);
+    let scrubbed_origin = scrub_url_credentials(&source);
     if let Err(e) = git(
         &[
             "remote".into(),
@@ -443,6 +456,40 @@ struct GitCredential {
     host: String,
     username: String,
     password: String,
+}
+
+/// Re-anchor a *relative local* clone source against the supervisor's working
+/// directory.
+///
+/// `provision` runs every git step with its cwd bound to the pinned run dir
+/// (#35). A relative local source such as `./origin.git` or `../mirror` is
+/// interpreted by git relative to *that* cwd — i.e. inside the empty run dir —
+/// so it would no longer resolve where the envelope author meant it (before #35
+/// the clone ran from the supervisor's own cwd). Join such a source onto
+/// `supervisor_cwd` so clone, fetch, and the persisted origin all keep
+/// resolving it the same way they did before the run-dir binding.
+///
+/// Only genuinely *local relative* sources are rewritten. These pass through
+/// byte-for-byte because their meaning is independent of the launching cwd:
+///   * a remote URL (`scheme://…` — a colon before the first slash), and
+///   * an scp-like SSH source (`host:path` — likewise a colon before any
+///     slash, or a colon with no slash at all), and
+///   * an already-absolute local path.
+/// The "colon before the first slash" test mirrors git's own rule for telling a
+/// URL / scp-like remote from a local path, so a path containing a colon *after*
+/// a slash (e.g. `./weird:name`) is still treated as the local path it is.
+fn resolve_local_source(url: &str, supervisor_cwd: &Path) -> String {
+    let first_colon = url.find(':');
+    let first_slash = url.find('/');
+    let is_remote = match (first_colon, first_slash) {
+        (Some(c), Some(s)) => c < s,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if is_remote || Path::new(url).is_absolute() {
+        return url.to_string();
+    }
+    supervisor_cwd.join(url).to_string_lossy().into_owned()
 }
 
 /// Split a remote URL into `(url_for_argv, credential)`: the returned URL has
@@ -787,6 +834,38 @@ mod tests {
     }
 
     #[test]
+    fn resolve_local_source_reanchors_only_relative_local_paths() {
+        let cwd = Path::new("/supervisor/cwd");
+        let anchor = |u: &str| resolve_local_source(u, cwd);
+
+        // Relative local sources are re-anchored to the supervisor cwd — the
+        // bug: under the #35 run-dir binding these would otherwise resolve
+        // inside the empty run dir and the clone would fail.
+        assert_eq!(anchor("./origin.git"), "/supervisor/cwd/./origin.git");
+        assert_eq!(anchor("../mirror"), "/supervisor/cwd/../mirror");
+        assert_eq!(anchor("origin.git"), "/supervisor/cwd/origin.git");
+        assert_eq!(anchor("sub/dir/repo"), "/supervisor/cwd/sub/dir/repo");
+        // A colon *after* a slash is still a local path (git's own rule), so it
+        // too is re-anchored rather than mistaken for an scp-like remote.
+        assert_eq!(anchor("./weird:name"), "/supervisor/cwd/./weird:name");
+
+        // Sources whose meaning is independent of the launching cwd pass through
+        // byte-for-byte: absolute local paths, URLs, and scp-like SSH sources.
+        for passthrough in [
+            "/abs/local/path",
+            "https://github.com/o/r.git",
+            "http://example.com/r.git",
+            "git://example.com/r.git",
+            "ssh://git@example.com/o/r.git",
+            "file:///srv/mirror.git",
+            "git@github.com:o/r.git", // scp-like: colon before any slash
+            "host:path",              // scp-like: colon, no slash
+        ] {
+            assert_eq!(anchor(passthrough), passthrough, "{passthrough} must pass through unchanged");
+        }
+    }
+
+    #[test]
     fn scrub_credentials_from_git_stderr() {
         // A credential-bearing URL echoed in a git diagnostic is redacted.
         let line = "fatal: unable to access 'https://x-access-token:ghp_SECRET@github.com/org/repo.git/': The requested URL returned error: 403";
@@ -1128,6 +1207,70 @@ mod tests {
             std::fs::canonicalize(landed).unwrap(),
             std::fs::canonicalize(real_checkout).unwrap(),
             "the returned checkout handle must name the pinned inode"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A RELATIVE local source must still resolve against the supervisor's cwd,
+    /// even though the clone now runs with its cwd bound to the pinned run dir
+    /// (#35). Before the re-anchoring fix, git interpreted `./…`/`../…` relative
+    /// to the empty run dir and provisioning failed. We avoid mutating the
+    /// process cwd (racy under parallel tests) by computing a relative path from
+    /// the *actual* current dir to the source repo and passing that — exactly
+    /// what `provision` re-anchors via `std::env::current_dir()`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn provision_resolves_a_relative_local_source_from_supervisor_cwd() {
+        fn relativize(from: &Path, to: &Path) -> std::path::PathBuf {
+            let fc: Vec<_> = from.components().collect();
+            let tc: Vec<_> = to.components().collect();
+            let mut i = 0;
+            while i < fc.len() && i < tc.len() && fc[i] == tc[i] {
+                i += 1;
+            }
+            let mut rel = std::path::PathBuf::new();
+            for _ in i..fc.len() {
+                rel.push("..");
+            }
+            for c in &tc[i..] {
+                rel.push(c.as_os_str());
+            }
+            rel
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "nano-provision-relsrc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let _ = make_source_repo(&base); // creates `base/src-repo`
+        let src = base.join("src-repo");
+
+        // A relative source spelled from the real supervisor cwd — never a URL,
+        // never absolute — so only the re-anchoring makes it resolve.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = relativize(&cwd, &src);
+        assert!(!rel.is_absolute(), "test must exercise a RELATIVE source");
+        let rel_url = rel.to_string_lossy().into_owned();
+
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let workdir = CwdHandle::open(&run).unwrap();
+
+        let checkout = provision(&repo_envelope(rel_url), &workdir, Duration::from_secs(60))
+            .await
+            .expect("provision must resolve a relative local source from the supervisor cwd");
+
+        let landed = checkout.path().expect("checkout path");
+        assert!(
+            landed.join("f.txt").exists(),
+            "the relative-source clone must land a real checkout in the run dir"
         );
         std::fs::remove_dir_all(&base).ok();
     }
