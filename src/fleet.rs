@@ -180,12 +180,18 @@ fn read_config() -> Result<ConfigFile> {
 /// truncated or partial `config.json` — and a crash mid-write leaves the
 /// previous copy intact.
 ///
-/// On Unix, the parent directory is opened with `O_NOFOLLOW` and all temp-file
-/// and publish operations are performed via that pinned directory fd (`openat`,
-/// `renameat`, `unlinkat`). A symlinked final parent component is refused, a
-/// planted symlink at `.<file>.tmp` is refused, and a parent-dir swap after the
-/// walk cannot redirect the write. Non-Unix builds keep the plain filesystem
-/// fallback.
+/// On Unix, the configured state home is the **trusted anchor**: it is opened
+/// *following* symlinks (the operator may legitimately point `C8CTL_NANO_HOME`
+/// at a symlink — e.g. macOS's `/var` -> `/private/var` — and `hire`/`assign`
+/// already read through such a home), and then every path component *below* the
+/// home is opened with `O_NOFOLLOW` via that pinned directory fd (`openat`,
+/// `renameat`, `unlinkat`). So a symlinked state home no longer makes every
+/// write fail with `ELOOP`/`ENOTDIR` while reads succeed, yet a planted symlink
+/// anywhere in the operator-controlled tail (a symlinked descendant directory or
+/// a `.<file>.tmp` entry) is still refused and a parent-dir swap after the walk
+/// cannot redirect the write. The lock identity (control-socket hash) keeps the
+/// caller's original path spelling, not the resolved anchor. Non-Unix builds keep
+/// the plain filesystem fallback.
 ///
 /// The temp name is **deterministic** (`.<file>.tmp`), not unique per
 /// (pid, nanos): every writer of a given state file first takes that file's
@@ -267,25 +273,67 @@ fn write_json_atomic_unix(path: &Path, json: &[u8]) -> Result<()> {
         .parent()
         .context("state path has no parent directory")?;
     let file_name = path.file_name().context("state path has no file name")?;
-    let parent_c = cstring_from_path(parent)?;
     let final_c = cstring_from_component(file_name)?;
     let tmp_c = temp_component_for(file_name)?;
 
-    let dirfd = unsafe {
+    // The configured state home is the TRUSTED ANCHOR: open it following
+    // symlinks (a symlinked home is operator-controlled trust, not an
+    // attacker-plantable tail component), then walk every component BELOW it
+    // with `O_NOFOLLOW` so a planted symlink in the operator-controlled tail
+    // cannot redirect the write out of the home. For `config.json` the parent IS
+    // the anchor, so there is no tail to walk and a symlinked home is simply
+    // resolved; for `workforce/<name>.json` the `workforce` component is opened
+    // no-follow. Paths outside the home fail closed.
+    let anchor = home_dir()?;
+    let tail = parent.strip_prefix(&anchor).map_err(|_| {
+        anyhow::anyhow!(
+            "state path {} is not under the trusted state home {}",
+            path.display(),
+            anchor.display()
+        )
+    })?;
+
+    let anchor_c = cstring_from_path(&anchor)?;
+    let anchor_fd = unsafe {
         libc::open(
-            parent_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            anchor_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    if dirfd < 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "opening state directory without following symlinks: {}",
-                parent.display()
-            )
-        });
+    if anchor_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening trusted state home: {}", anchor.display()));
     }
-    let dirfd = RawFdGuard(dirfd);
+    let mut dirfd = RawFdGuard(anchor_fd);
+
+    for component in tail.components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::CurDir => continue,
+            other => bail!(
+                "state path {} escapes the trusted state home via {:?}",
+                path.display(),
+                other
+            ),
+        };
+        let name_c = cstring_from_component(name)?;
+        let fd = unsafe {
+            libc::openat(
+                dirfd.0,
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "opening state directory without following symlinks: {}",
+                    parent.display()
+                )
+            });
+        }
+        dirfd = RawFdGuard(fd);
+    }
 
     let write_result = (|| -> Result<()> {
         let fd = unsafe {
@@ -1102,6 +1150,28 @@ impl Manifest {
                 if roles.is_empty() {
                     bail!("worker \"{}\" roles list must not be empty", worker.profile);
                 }
+                // A stored role list must satisfy the same v1 contract the CLI
+                // enforces on input (`parse_roles_list`): `read_manifest` feeds
+                // `workforce add`'s read-modify-write, so an invalid token (e.g.
+                // `"bad:role"`) or a case-insensitive duplicate loaded from disk
+                // would otherwise be silently rewritten as valid state.
+                let mut seen_roles = std::collections::BTreeSet::new();
+                for role in roles {
+                    if !is_valid_role(role) {
+                        bail!(
+                            "worker \"{}\" has invalid role \"{}\": use letters, digits, and . _ + -",
+                            worker.profile,
+                            role
+                        );
+                    }
+                    if !seen_roles.insert(role.to_ascii_lowercase()) {
+                        bail!(
+                            "worker \"{}\" has duplicate role \"{}\"",
+                            worker.profile,
+                            role
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -1193,11 +1263,13 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
     // string `"auto"`; any other value is a comma-separated role list persisted
     // as a normalized array (`["a","b"]`), never the incompatible string `"a,b"`.
     // The CLI defaults `--roles` to `auto` when the flag is absent, matching
-    // Node's "neither --auto nor --roles → auto". The marker check is
-    // case-SENSITIVE (`auto` exactly): Node's `parseRolesList` lowercases a
-    // `--roles AUTO` into the *role* `auto` and persists the list `["auto"]`, so
-    // only the exact literal `auto` selects the auto marker here.
-    let roles_value = if roles.trim() == "auto" {
+    // Node's "neither --auto nor --roles → auto". The marker check is on the
+    // EXACT value — case-SENSITIVE and un-trimmed (`auto`, not `" auto "`):
+    // Node's `parseRolesList` lowercases a `--roles AUTO` and trims a
+    // `--roles " auto "` into the *role* `auto` and persists the list `["auto"]`,
+    // so only the exact literal `auto` selects the auto marker here; padded or
+    // cased spellings fall through to the role list and stay distinguishable.
+    let roles_value = if roles == "auto" {
         Roles::default()
     } else {
         match parse_roles_list(roles) {
@@ -2040,20 +2112,126 @@ mod tests {
         assert!(!path.with_file_name(".config.json.tmp").exists());
     }
 
+    /// Regression (symlinked trusted anchor): pointing `C8CTL_NANO_HOME` at a
+    /// symlink must NOT make state writes fail — the home is the trusted anchor,
+    /// opened following symlinks, while only components below it are no-follow.
+    /// Before the fix, `config.json` (whose parent IS the home) and every other
+    /// write failed with `ELOOP`/`ENOTDIR` even though `hire`/`assign` could read
+    /// through the same home.
+    #[cfg(unix)]
+    #[test]
+    fn write_json_atomic_allows_symlinked_state_home() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("C8CTL_NANO_HOME");
+        let base = std::env::temp_dir().join(format!(
+            "fleet-symhome-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let real = base.join("real-home");
+        let link = base.join("home-link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::env::set_var("C8CTL_NANO_HOME", &link);
+
+        // config.json: the parent IS the symlinked home (the anchor).
+        let cfg_path = config_path().unwrap();
+        write_json_atomic(&cfg_path, &serde_json::json!({"ok": true})).unwrap();
+        // A descendant path: the home symlink is followed, the created
+        // `workforce` tail component is opened no-follow.
+        let man_path = manifest_path("demo").unwrap();
+        write_json_atomic(&man_path, &serde_json::json!({"version": 1})).unwrap();
+
+        // Both land in the REAL target through the symlinked home.
+        let cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(real.join("config.json")).unwrap()).unwrap();
+        assert_eq!(cfg, serde_json::json!({"ok": true}));
+        assert!(real.join("workforce").join("demo.json").is_file());
+
+        match prev {
+            Some(v) => std::env::set_var("C8CTL_NANO_HOME", v),
+            None => std::env::remove_var("C8CTL_NANO_HOME"),
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Regression (stored-role validation): a manifest loaded from disk must
+    /// satisfy the same v1 role contract the CLI enforces on input, so
+    /// `workforce add`'s read-modify-write cannot silently rewrite invalid or
+    /// duplicate role tokens as valid state.
+    #[test]
+    fn manifest_validate_rejects_invalid_and_duplicate_roles() {
+        let worker = |roles: Vec<&str>| ManifestWorker {
+            profile: "coder".to_string(),
+            instances: 1,
+            roles: Roles::List(roles.into_iter().map(String::from).collect()),
+            other: BTreeMap::new(),
+        };
+        let manifest = |w: ManifestWorker| Manifest {
+            version: 1,
+            name: "wf".to_string(),
+            workers: vec![w],
+            other: BTreeMap::new(),
+        };
+
+        let bad = manifest(worker(vec!["bad:role"]))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(bad.contains("invalid role"), "{bad}");
+
+        let dup = manifest(worker(vec!["Build", "build"]))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(dup.contains("duplicate role"), "{dup}");
+
+        assert!(manifest(worker(vec!["build", "review"])).validate().is_ok());
+    }
+
+    /// Regression (exact `auto` marker): only the un-trimmed, case-sensitive
+    /// literal `auto` selects the auto marker. A padded `--roles " auto "` is an
+    /// explicit role list `["auto"]`, matching Node's `parseRolesList`, so the
+    /// two valid shapes stay distinguishable in the persisted manifest.
+    #[test]
+    fn workforce_add_marker_is_exact_not_trimmed() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+
+        workforce_add("wfa", "coder", 1, "auto").unwrap();
+        let m = read_manifest("wfa").unwrap().unwrap();
+        assert!(
+            matches!(m.workers[0].roles, Roles::Auto(_)),
+            "exact `auto` must be the auto marker"
+        );
+
+        workforce_add("wfb", "coder", 1, " auto ").unwrap();
+        let m = read_manifest("wfb").unwrap().unwrap();
+        match &m.workers[0].roles {
+            Roles::List(rs) => assert_eq!(rs, &vec!["auto".to_string()]),
+            other => panic!("padded ` auto ` must persist as a role list, got {other:?}"),
+        }
+    }
+
     #[test]
     fn state_lock_normalizes_relative_and_absolute_identity() {
-        let cfg = TempCfg::new();
-        let home = home_dir().unwrap();
-        let state = home.join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&home).unwrap();
+        // Derive the relative/absolute identity from the EXISTING working
+        // directory rather than `set_current_dir`: mutating the process-wide cwd
+        // races other parallel tests that also touch it (e.g. the saferoot cwd
+        // test) and can leave a later test in the wrong directory.
+        // `normalized_identity` resolves a relative path against the current dir,
+        // so the same file spelled relatively and absolutely must hash to one
+        // lock. Hold the shared cwd guard so a concurrent `set_current_dir`
+        // cannot shift the cwd between the two resolutions.
+        let _cwd = crate::cwd_test_guard();
+        let cwd = std::env::current_dir().unwrap();
         let relative = Path::new("state").join("config.json");
-        let absolute = state.join("config.json");
+        let absolute = cwd.join("state").join("config.json");
         let rel_lock = StateLock::lock_file_for(&relative).unwrap();
         let abs_lock = StateLock::lock_file_for(&absolute).unwrap();
-        std::env::set_current_dir(old_cwd).unwrap();
-        drop(cfg);
         assert_eq!(rel_lock, abs_lock);
     }
 

@@ -38,6 +38,20 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+/// Serializes unit tests that read or mutate the **process-wide** current
+/// working directory. Rust runs tests in parallel threads and the cwd is a
+/// single process-wide value, so two tests that `set_current_dir` (or that
+/// resolve a relative path against the cwd) can interleave and leave each
+/// other — or a later test — observing the wrong directory. Every test that
+/// touches the cwd must hold this guard for the duration of that access.
+#[cfg(test)]
+pub(crate) fn cwd_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Parser)]
 #[command(
     name = "nano-supervisor",
@@ -206,11 +220,14 @@ enum Cmd {
         #[arg(long = "env")]
         env: Vec<String>,
     },
-    /// Replace a hire's capability set (merged, deduplicated and sorted).
+    /// Replace a hire's entire capability set (the supplied list becomes the
+    /// new set, deduplicated and sorted; existing capabilities not listed are
+    /// removed).
     Assign {
         /// The hire to reassign.
         profile: String,
-        /// Comma-separated capabilities to add.
+        /// Comma-separated capabilities that become the hire's entire set,
+        /// replacing (not merged with) any existing capabilities.
         capabilities: String,
     },
     /// Supervisor daemon control.
