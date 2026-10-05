@@ -29,6 +29,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # containing spaces survives the CLI's shell-style `--agent` parsing.
 shlex = "1"
 
+# SIGSTOP/SIGCONT for the same-worker freeze/resume recovery test (unix only).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 insta = { version = "1", features = ["json", "redactions", "filters"] }
 # Process-group liveness probes (`kill(-pgid, 0)`) in the Linux-only

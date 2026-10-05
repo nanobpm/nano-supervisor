@@ -6,13 +6,14 @@
 //! fetch a base ref so `git diff base...HEAD` works. Push/finalize is a later
 //! issue; the agent (or a future finalize step) owns committing and pushing.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
 use crate::envelope::Repository;
+use crate::safecwd::CwdHandle;
 
 /// Upper bound on the size of a git metadata file (`config`, `FETCH_HEAD`, …)
 /// the credential scrubber will read into memory. These files are influenced by
@@ -21,13 +22,29 @@ use crate::envelope::Repository;
 /// git config/FETCH_HEAD while still bounding a hostile one.
 const MAX_SCRUB_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Clone `repo` into `<workdir>/repo` and return the checkout path. `default_timeout`
-/// caps each git invocation (overridden per-repo by `cloneTimeoutMs`).
+/// The checkout directory name, relative to the pinned run dir. A single
+/// literal component: it is passed to git as a *relative* clone destination
+/// (resolved against the pinned run-dir cwd) and to [`CwdHandle::open_child`]
+/// (opened fd-relative), so it must never carry a separator or a parent
+/// component.
+const CHECKOUT_DIR: &str = "repo";
+
+/// Clone `repo` into the `repo` child of the pinned run directory `workdir` and
+/// return the pinned checkout handle. `default_timeout` caps each git
+/// invocation (overridden per-repo by `cloneTimeoutMs`).
+///
+/// Every git step runs *through the capability*: the clone executes with its
+/// cwd bound to the pinned run dir and a RELATIVE `repo` destination (an
+/// absolute destination would be re-resolved by the kernel at spawn, so a
+/// same-UID actor swapping an ancestor after preparation could redirect the
+/// clone's writes outside the validated tree, #35), and the follow-on
+/// `set-url`/fetch/checkout steps bind the checkout pinned fd-relative to that
+/// same run dir — no path is ever re-resolved.
 pub async fn provision(
     repo: &Repository,
-    workdir: &Path,
+    workdir: &CwdHandle,
     default_timeout: Duration,
-) -> Result<PathBuf> {
+) -> Result<CwdHandle> {
     if repo.url.trim().is_empty() {
         bail!("repository has no url to clone");
     }
@@ -42,14 +59,34 @@ pub async fn provision(
         .map(Duration::from_millis)
         .unwrap_or(default_timeout);
 
-    let workspace = workdir.join("repo");
+    // The checkout's path, for the scrub/removal helpers (which operate on
+    // files, not cwds) and for messages. Recovered through the pinned fd so it
+    // names the real prepared inode even after an ancestor rename; these
+    // helpers re-validate each file no-follow before rewriting it.
+    let workspace = workdir
+        .path()
+        .context("recovering the pinned run dir path")?
+        .join(CHECKOUT_DIR);
+    // `provision` binds every git step's cwd to the pinned run dir (#35), but a
+    // relative *local* source (e.g. `./origin.git`) is interpreted by git
+    // relative to *that* cwd — i.e. inside the still-empty run dir — so it would
+    // no longer resolve to the path the envelope author meant (which, before
+    // #35, was taken relative to the supervisor's own cwd). Re-anchor such
+    // sources to the supervisor's cwd *once*, here, so the single resolved
+    // `source` below drives clone, both fetches, AND the persisted origin
+    // consistently. Remote URLs, scp-like SSH sources, and absolute local paths
+    // are cwd-independent and pass through unchanged.
+    let supervisor_cwd =
+        std::env::current_dir().context("resolving the supervisor working directory")?;
+    let source = resolve_local_source(&repo.url, &supervisor_cwd);
+
     // Lift any `user:token@` credential out of the URL so it is delivered to git
     // out of band (via the credential helper in `git()`) instead of embedded in
     // argv, where it would sit in world-readable `/proc/<git-pid>/cmdline` for
     // the life of every clone/fetch. `fetch_url` (credential-free) is what goes
     // on the command line; the same handle authenticates the clone and both
     // fetches below.
-    let (fetch_url, cred) = split_url_credential(&repo.url);
+    let (fetch_url, cred) = split_url_credential(&source);
     let mut args: Vec<String> = vec!["clone".into(), "--no-tags".into()];
     if let Some(depth) = repo.depth.filter(|&d| d > 0) {
         args.push("--depth".into());
@@ -75,9 +112,13 @@ pub async fn provision(
     // option (e.g. `--upload-pack`).
     args.push("--".into());
     args.push(fetch_url.clone());
-    args.push(workspace.to_string_lossy().into_owned());
+    // The destination is the RELATIVE `repo`, resolved by the clone child
+    // against its pinned run-dir cwd — an absolute `<workdir>/repo` would be
+    // re-resolved by the kernel at spawn, letting a same-UID actor redirect the
+    // clone's writes by swapping an ancestor after preparation (#35).
+    args.push(CHECKOUT_DIR.into());
 
-    if let Err(e) = git(&args, None, timeout, cred.as_ref()).await {
+    if let Err(e) = git(&args, Some(workdir), timeout, cred.as_ref()).await {
         // A failed clone can still leave a *partially populated* checkout — most
         // notably a `--recurse-submodules` clone whose submodule step failed
         // after the superproject was created — with the credential-bearing URL
@@ -89,6 +130,14 @@ pub async fn provision(
         return Err(e).context("git clone failed");
     }
 
+    // The clone wrote through the pinned run dir, so the checkout it created is
+    // a direct child of that pinned inode; pin it fd-relative (never following
+    // a symlink at the child) so every follow-on git step binds the same inode
+    // the clone wrote, even if a path component is swapped afterwards.
+    let checkout = workdir
+        .open_child(std::ffi::OsStr::new(CHECKOUT_DIR))
+        .context("pinning the freshly cloned checkout")?;
+
     // `git clone` now runs with a credential-free `fetch_url` in argv, so the
     // persisted `<workspace>/.git/config` origin already carries no `user:token@`
     // userinfo. This rewrite is kept as defense in depth — it re-canonicalises
@@ -98,7 +147,7 @@ pub async fn provision(
     // persisted config. The clone and both fetches below authenticate via the
     // out-of-band credential helper (see `git()`), so the token is never written
     // to config or placed in argv.
-    let scrubbed_origin = scrub_url_credentials(&repo.url);
+    let scrubbed_origin = scrub_url_credentials(&source);
     if let Err(e) = git(
         &[
             "remote".into(),
@@ -107,7 +156,7 @@ pub async fn provision(
             "--".into(),
             scrubbed_origin,
         ],
-        Some(&workspace),
+        Some(&checkout),
         timeout,
         None,
     )
@@ -148,7 +197,7 @@ pub async fn provision(
                 fetch_url.clone(),
                 sha.clone(),
             ],
-            Some(&workspace),
+            Some(&checkout),
             timeout,
             cred.as_ref(),
         )
@@ -162,7 +211,7 @@ pub async fn provision(
         }
         git(
             &["checkout".into(), "--detach".into(), sha.clone()],
-            Some(&workspace),
+            Some(&checkout),
             timeout,
             None,
         )
@@ -189,7 +238,7 @@ pub async fn provision(
                 fetch_url.clone(),
                 base.clone(),
             ],
-            Some(&workspace),
+            Some(&checkout),
             timeout,
             cred.as_ref(),
         )
@@ -205,7 +254,7 @@ pub async fn provision(
         return Err(e).context("scrubbing fetch metadata credentials failed");
     }
 
-    Ok(workspace)
+    Ok(checkout)
 }
 
 /// Best-effort removal of a partially provisioned checkout after a git step
@@ -231,14 +280,15 @@ async fn remove_partial_checkout(workspace: &Path) {
 /// since `submodule init` copies each submodule URL into a `submodule.<name>.url`
 /// entry there that the `origin` scrub does not reach.
 ///
-/// On Linux the recursion is performed entirely through `openat2`-pinned
-/// no-follow directory handles ([`scrub_config_tree_pinned`]): `.git/modules` is
-/// resolved **once** with `RESOLVE_NO_SYMLINKS` into a handle pinned by inode,
+/// On Linux the recursion is performed entirely through pinned no-follow
+/// directory handles (`scrub_config_tree_pinned`): `.git/modules` is resolved
+/// **once** no-follow (`openat2(RESOLVE_NO_SYMLINKS)` on 5.6+, the `O_NOFOLLOW`
+/// openat chain on older kernels) into a handle pinned by inode,
 /// and every descendant is `fstatat`/`openat`'d relative to that handle, so a
 /// same-UID actor cannot swap an approved directory for a symlink in the window
 /// between the triage and the `read_dir`/open (the residual TOCTOU this closes).
-/// Where `openat2` is unavailable (non-Linux, or a pre-5.6 kernel) the walk
-/// falls back to the path-based [`scrub_config_tree_path_based`], whose per-entry
+/// Elsewhere the walk falls back to the path-based `scrub_config_tree_path_based`,
+/// whose per-entry
 /// `file_type()` check and atomic no-follow leaf open are symlink-safe but do not
 /// pin the approved directory. Errors are propagated so the caller can remove the
 /// whole checkout rather than return one that may still hold a token.
@@ -268,26 +318,27 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         use crate::saferoot::{DirHandle, PinError};
-        match DirHandle::open_root_nofollow(&modules) {
-            Ok(root) => return scrub_config_tree_pinned(root, &modules),
-            // Kernel too old for `openat2` (pre-5.6): fall through to the
-            // best-effort path-based walk below.
-            Err(PinError::Unsupported) => {}
+        match DirHandle::open_root_nofollow(&modules, false) {
+            Ok(root) => scrub_config_tree_pinned(root, &modules),
             // The modules root was swapped for a symlink (or an ancestor
             // component became one) between the stat above and this pin: refuse
             // to traverse it rather than follow it outside the checkout.
-            Err(PinError::Io(e)) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
-            Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(PinError::Io(e)) if e.raw_os_error() == Some(libc::ELOOP) => Ok(()),
+            Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(PinError::Io(e)) => {
-                return Err(e).with_context(|| format!("pinning {}", modules.display()));
+                Err(e).with_context(|| format!("pinning {}", modules.display()))
             }
         }
     }
 
+    // Non-Linux: the strict no-follow chain would refuse legitimate platform
+    // symlinks in the workspace path (macOS `/var` -> `/private/var`), so use the
+    // symlink-safe path-based walk, as before.
+    #[cfg(not(target_os = "linux"))]
     scrub_config_tree_path_based(modules)
 }
 
-/// `openat2`-pinned recursion for [`scrub_submodule_config_credentials`]: every
+/// Pinned no-follow recursion for [`scrub_submodule_config_credentials`]: every
 /// directory under the pinned `.git/modules` root is enumerated and re-opened
 /// through a no-follow handle, and each `config` leaf is opened `O_NOFOLLOW`
 /// *through its pinned parent*, so no component swapped to a symlink after it was
@@ -338,7 +389,7 @@ fn scrub_config_dir_pinned(dir: &crate::saferoot::DirHandle, dir_path: &Path) ->
             continue;
         }
         if meta.is_dir {
-            match dir.open_child_dir(&name) {
+            match dir.open_child_dir(&name, false) {
                 // Descend with the child's handle held; it is dropped (closing
                 // the fd) when this recursion returns, before the next sibling
                 // is opened — so open fds track depth, not breadth.
@@ -361,7 +412,7 @@ fn scrub_config_dir_pinned(dir: &crate::saferoot::DirHandle, dir_path: &Path) ->
 }
 
 /// Path-based recursion for [`scrub_submodule_config_credentials`]: the
-/// pre-`openat2` fallback (non-Linux, or a pre-5.6 kernel). Directory recursion
+/// non-Linux fallback. Directory recursion
 /// uses `file_type()` (which does not follow symlinks), so a symlinked entry is
 /// never traversed into, and each `config` rewrite goes through an atomic
 /// no-follow open (`scrub_file_credentials_in_place`) so a symlink planted at the
@@ -369,7 +420,8 @@ fn scrub_config_dir_pinned(dir: &crate::saferoot::DirHandle, dir_path: &Path) ->
 /// It does not pin the approved directory, so a directory swapped for a symlink
 /// between the `file_type()` triage and the `read_dir` is the residual TOCTOU the
 /// pinned walk closes on Linux.
-fn scrub_config_tree_path_based(modules: PathBuf) -> Result<()> {
+#[cfg(not(target_os = "linux"))]
+fn scrub_config_tree_path_based(modules: std::path::PathBuf) -> Result<()> {
     let mut stack = vec![modules];
     while let Some(dir) = stack.pop() {
         let entries =
@@ -530,6 +582,42 @@ struct GitCredential {
     password: String,
 }
 
+/// Re-anchor a *relative local* clone source against the supervisor's working
+/// directory.
+///
+/// `provision` runs every git step with its cwd bound to the pinned run dir
+/// (#35). A relative local source such as `./origin.git` or `../mirror` is
+/// interpreted by git relative to *that* cwd — i.e. inside the empty run dir —
+/// so it would no longer resolve where the envelope author meant it (before #35
+/// the clone ran from the supervisor's own cwd). Join such a source onto
+/// `supervisor_cwd` so clone, fetch, and the persisted origin all keep
+/// resolving it the same way they did before the run-dir binding.
+///
+/// Only genuinely *local relative* sources are rewritten. These pass through
+/// byte-for-byte because their meaning is independent of the launching cwd:
+///
+///   * a remote URL (`scheme://…` — a colon before the first slash), and
+///   * an scp-like SSH source (`host:path` — likewise a colon before any
+///     slash, or a colon with no slash at all), and
+///   * an already-absolute local path.
+///
+/// The "colon before the first slash" test mirrors git's own rule for telling a
+/// URL / scp-like remote from a local path, so a path containing a colon *after*
+/// a slash (e.g. `./weird:name`) is still treated as the local path it is.
+fn resolve_local_source(url: &str, supervisor_cwd: &Path) -> String {
+    let first_colon = url.find(':');
+    let first_slash = url.find('/');
+    let is_remote = match (first_colon, first_slash) {
+        (Some(c), Some(s)) => c < s,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if is_remote || Path::new(url).is_absolute() {
+        return url.to_string();
+    }
+    supervisor_cwd.join(url).to_string_lossy().into_owned()
+}
+
 /// Split a remote URL into `(url_for_argv, credential)`: the returned URL has
 /// any `user:secret@` userinfo removed (safe to place in argv), and the
 /// credential — when the URL carried one — is returned separately for
@@ -652,7 +740,7 @@ fn scheme_of(prefix: &str) -> &str {
 
 async fn git(
     args: &[String],
-    cwd: Option<&Path>,
+    cwd: Option<&CwdHandle>,
     timeout: Duration,
     cred: Option<&GitCredential>,
 ) -> Result<()> {
@@ -687,7 +775,16 @@ async fn git(
     // mutate the workspace while a retry starts.
     cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        // Enter the working directory through the pinned, no-follow capability
+        // (`fchdir` in the child's `pre_exec`) rather than re-resolving a path
+        // at spawn time: the run dir can sit under a world-writable ancestor,
+        // so a same-UID actor could otherwise swap a component for a symlink
+        // between provisioning and this `clone`/`fetch`/`checkout`/`set-url`
+        // and redirect git outside the validated tree (#35). The caller holds
+        // the handle open from preparation, so the bind targets the prepared
+        // inode even across a post-prepare replacement of the path.
+        dir.apply(&mut cmd)
+            .context("binding git working directory")?;
     }
     // Never prompt for credentials interactively (would hang the slot).
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -863,6 +960,42 @@ mod tests {
         assert!(!is_hex_sha("xyz"));
         assert!(!is_hex_sha("short"));
         assert!(!is_hex_sha("0123456789abcdef0123456789abcdef012345678")); // 41 chars
+    }
+
+    #[test]
+    fn resolve_local_source_reanchors_only_relative_local_paths() {
+        let cwd = Path::new("/supervisor/cwd");
+        let anchor = |u: &str| resolve_local_source(u, cwd);
+
+        // Relative local sources are re-anchored to the supervisor cwd — the
+        // bug: under the #35 run-dir binding these would otherwise resolve
+        // inside the empty run dir and the clone would fail.
+        assert_eq!(anchor("./origin.git"), "/supervisor/cwd/./origin.git");
+        assert_eq!(anchor("../mirror"), "/supervisor/cwd/../mirror");
+        assert_eq!(anchor("origin.git"), "/supervisor/cwd/origin.git");
+        assert_eq!(anchor("sub/dir/repo"), "/supervisor/cwd/sub/dir/repo");
+        // A colon *after* a slash is still a local path (git's own rule), so it
+        // too is re-anchored rather than mistaken for an scp-like remote.
+        assert_eq!(anchor("./weird:name"), "/supervisor/cwd/./weird:name");
+
+        // Sources whose meaning is independent of the launching cwd pass through
+        // byte-for-byte: absolute local paths, URLs, and scp-like SSH sources.
+        for passthrough in [
+            "/abs/local/path",
+            "https://github.com/o/r.git",
+            "http://example.com/r.git",
+            "git://example.com/r.git",
+            "ssh://git@example.com/o/r.git",
+            "file:///srv/mirror.git",
+            "git@github.com:o/r.git", // scp-like: colon before any slash
+            "host:path",              // scp-like: colon, no slash
+        ] {
+            assert_eq!(
+                anchor(passthrough),
+                passthrough,
+                "{passthrough} must pass through unchanged"
+            );
+        }
     }
 
     #[test]
@@ -1288,5 +1421,225 @@ mod tests {
         assert!(got.contains("https://github.com/o/r.git"));
         assert!(got.contains("branch 'main' of"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A `file://` source repo with one commit, for provisioning tests.
+    #[cfg(unix)]
+    fn make_source_repo(base: &std::path::Path) -> String {
+        let src = base.join("src-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(src.join("f.txt"), b"hello").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        format!("file://{}", src.display())
+    }
+
+    #[cfg(unix)]
+    fn repo_envelope(url: String) -> Repository {
+        Repository {
+            provider: "github".into(),
+            url,
+            ref_: None,
+            sha: None,
+            depth: None,
+            single_branch: false,
+            filter: None,
+            base_ref: None,
+            base_sha: None,
+            submodules: false,
+            clone_timeout_ms: None,
+        }
+    }
+
+    /// The clone must write into the PINNED run dir: it runs with its cwd bound
+    /// to the pinned handle and a RELATIVE `repo` destination, so an ancestor
+    /// swapped for a symlink after the pin cannot redirect the clone's writes
+    /// into the attacker's tree — the checkout lands in the pinned inode (the
+    /// moved-aside real dir), and the returned handle names that same inode
+    /// (#35). Before the fix the clone ran with `cwd=None` and an ABSOLUTE
+    /// `<workdir>/repo` destination, which the kernel re-resolved at spawn —
+    /// straight into the swapped-in attacker path.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn clone_writes_into_the_pinned_run_dir_after_an_ancestor_swap() {
+        let base = std::env::temp_dir().join(format!(
+            "nano-provision-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (macOS /var).
+        let base = std::fs::canonicalize(&base).unwrap();
+        let url = make_source_repo(&base);
+
+        // The prepared run dir, pinned as at provisioning.
+        let ancestor = base.join("ancestor");
+        let run = ancestor.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let workdir = CwdHandle::open(&run).unwrap();
+
+        // Attacker swaps the ancestor for a symlink to their tree AFTER the
+        // pin, before the clone: an absolute destination path would now
+        // resolve into the attacker tree; the pinned fd must not.
+        let moved = base.join("ancestor-moved");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join("run")).unwrap();
+        std::os::unix::fs::symlink(&evil, &ancestor).unwrap();
+
+        let checkout = provision(&repo_envelope(url), &workdir, Duration::from_secs(60))
+            .await
+            .expect("provision through the pinned run dir");
+
+        // The clone landed in the PINNED inode (now at `moved/run/repo`), not
+        // the attacker tree the original path would resolve to.
+        let real_checkout = moved.join("run").join(CHECKOUT_DIR);
+        assert!(
+            real_checkout.join("f.txt").exists(),
+            "clone must land in the pinned run dir"
+        );
+        assert!(
+            !evil.join("run").join(CHECKOUT_DIR).join("f.txt").exists(),
+            "clone must not write into the swapped-in attacker tree"
+        );
+        // And the returned handle binds that same pinned checkout inode.
+        let landed = checkout.path().expect("checkout path");
+        assert_eq!(
+            std::fs::canonicalize(landed).unwrap(),
+            std::fs::canonicalize(real_checkout).unwrap(),
+            "the returned checkout handle must name the pinned inode"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A RELATIVE local source must still resolve against the supervisor's cwd,
+    /// even though the clone now runs with its cwd bound to the pinned run dir
+    /// (#35). Before the re-anchoring fix, git interpreted `./…`/`../…` relative
+    /// to the empty run dir and provisioning failed. We avoid mutating the
+    /// process cwd (racy under parallel tests) by computing a relative path from
+    /// the *actual* current dir to the source repo and passing that — exactly
+    /// what `provision` re-anchors via `std::env::current_dir()`.
+    ///
+    /// The red-before guard is the **persisted origin**, not merely that the
+    /// clone produced a checkout: `relativize(cwd, temp_src)` can climb to `/`
+    /// when the cwd is deeper than the temp base, and such an all-`..` path
+    /// resolves to the *same* absolute location whether git anchors it at the
+    /// run dir (the bug) or the supervisor cwd (the fix) — so a checkout-only
+    /// assertion passes against the broken code too (it did, from a deep cwd).
+    /// We therefore assert the stored `remote.origin.url` is the re-anchored
+    /// **absolute** path: the fix persists `supervisor_cwd.join(url)` (absolute),
+    /// whereas the pre-fix code would persist the raw **relative** input. That
+    /// distinction is independent of cwd depth, so the test is reliably red
+    /// before the fix wherever the test binary runs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn provision_resolves_a_relative_local_source_from_supervisor_cwd() {
+        fn relativize(from: &Path, to: &Path) -> std::path::PathBuf {
+            let fc: Vec<_> = from.components().collect();
+            let tc: Vec<_> = to.components().collect();
+            let mut i = 0;
+            while i < fc.len() && i < tc.len() && fc[i] == tc[i] {
+                i += 1;
+            }
+            let mut rel = std::path::PathBuf::new();
+            for _ in i..fc.len() {
+                rel.push("..");
+            }
+            for c in &tc[i..] {
+                rel.push(c.as_os_str());
+            }
+            rel
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "nano-provision-relsrc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let _ = make_source_repo(&base); // creates `base/src-repo`
+        let src = base.join("src-repo");
+
+        // A relative source spelled from the real supervisor cwd — never a URL,
+        // never absolute — so only the re-anchoring makes it resolve.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = relativize(&cwd, &src);
+        assert!(!rel.is_absolute(), "test must exercise a RELATIVE source");
+        let rel_url = rel.to_string_lossy().into_owned();
+
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let workdir = CwdHandle::open(&run).unwrap();
+
+        let checkout = provision(
+            &repo_envelope(rel_url.clone()),
+            &workdir,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("provision must resolve a relative local source from the supervisor cwd");
+
+        let landed = checkout.path().expect("checkout path");
+        assert!(
+            landed.join("f.txt").exists(),
+            "the relative-source clone must land a real checkout in the run dir"
+        );
+
+        // The real red-before guard (see the doc comment): the persisted origin
+        // must be the re-anchored ABSOLUTE path, not the raw relative input. The
+        // fix stores `supervisor_cwd.join(url)`; the pre-fix code would store the
+        // relative string verbatim. This distinction holds regardless of how
+        // deep the test binary's cwd is, so it catches a reintroduction of the
+        // bug even when an all-`..` relative path happens to clone successfully.
+        let origin = {
+            let out = std::process::Command::new("git")
+                .args(["config", "--get", "remote.origin.url"])
+                .current_dir(landed)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "reading remote.origin.url failed");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let origin_path = Path::new(&origin);
+        assert!(
+            origin_path.is_absolute(),
+            "persisted origin must be the re-anchored ABSOLUTE path, not the \
+             relative input {rel_url:?}; got {origin:?}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(origin_path).unwrap(),
+            std::fs::canonicalize(&src).unwrap(),
+            "the re-anchored origin must resolve to the real source repo"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

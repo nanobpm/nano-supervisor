@@ -139,6 +139,25 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
             }
         }
     };
+    // Collapse `.`/`..` in the OPERATOR-SUPPLIED runs root lexically (never
+    // touching the filesystem): a parent-relative `--runs-dir ../runs`
+    // otherwise reaches the launch backends with an interior `..`, which the
+    // Linux `openat2` no-follow open accepts but the portable `O_NOFOLLOW`
+    // chain resolves fd-relative — NOT path resolution — so the two backends
+    // would diverge on the same input (#35). Normalizing here, at the input
+    // boundary, keeps a parent-relative runs dir working identically on every
+    // backend; the per-job path is normalized again in `slot::execute`.
+    let runs_dir = crate::safecwd::normalize_run_path(&runs_dir)?;
+    // Normalize the anchor to the SAME absolute lexical form as `runs_dir`:
+    // `normalize_run_path` above makes `runs_dir` absolute (anchoring a
+    // relative input at the cwd), so a RELATIVE state-home anchor (e.g.
+    // `C8CTL_NANO_HOME=./state-link`) would otherwise fail the `strip_prefix`
+    // below — the canonical anchor is never reattached and the ancestor check
+    // rejects a previously supported configuration. Normalizing the anchor
+    // (never following symlinks: `.` collapses, a leading `..` climbs the cwd
+    // lexically) keeps both paths in the same lexical frame so the prefix
+    // strip and tail reattachment work for relative anchors too.
+    let anchor = crate::safecwd::normalize_run_path(&anchor)?;
     // Resolve the run root WITHOUT ever following a symlink in the
     // OPERATOR-CONTROLLED tail. Canonicalize ONLY the trusted `anchor` (resolving
     // its platform symlinks — the contract harness hands us a `C8CTL_NANO_HOME`
@@ -161,15 +180,47 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         Ok(tail) => canon_anchor.join(tail),
         Err(_) => runs_dir,
     };
-    // Establish the runs root through pinned no-follow handles on Linux 5.6+
-    // (path-based reject+create+recheck fallback elsewhere). An inline
-    // `reject_symlinked_ancestors_below` → `create_dir_all` → recheck here was a
-    // check-then-create TOCTOU: a same-UID actor could swap a tail ancestor for
-    // a symlink during the create and restore it before the recheck, redirecting
-    // the created tree — and the recursive stale-run sweep below — outside the
-    // workspace. `create_runs_root` builds every component relative to a pinned
-    // parent, so a swapped/planted symlink is refused by the open, not followed.
-    slot::create_runs_root(&runs_dir, &canon_anchor)?;
+    // Materialise the worker-namespace root. On Unix this MUST be the
+    // component-wise pinned create (`open_or_create_root_nofollow`), never a
+    // path-based `create_dir_all` sandwiched between two no-follow checks:
+    // `create_dir_all` FOLLOWS a symlinked ancestor, so a same-UID actor
+    // swapping a writable tail ancestor (the state-home `agent-runs` dir, or the
+    // predictable `rust-worker-<pid>` leaf under the sticky `/tmp` fallback) for
+    // a symlink between the check and the create would have the namespace root
+    // materialised inside the attacker-chosen target — and the re-check only
+    // detects the swap AFTER the tree is already built outside the workspace.
+    // This is the same TOCTOU class `prepare_run_dir_pinned` closes for the
+    // per-job runs root; close it here too by creating each missing component
+    // relative to its already-pinned parent, so a swapped-in symlink is refused
+    // (ELOOP), never followed (#36).
+    #[cfg(unix)]
+    {
+        crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs_dir, 0o700).map_err(
+            |e| match e {
+                crate::saferoot::PinError::Io(e) => anyhow::Error::new(e).context(format!(
+                    "creating worker-namespace runs root {}",
+                    runs_dir.display()
+                )),
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix fallback (no pinned-handle support — not a supported daemon
+        // host): best-effort check / create / re-check. This cannot close the
+        // TOCTOU window above; it only approximates it.
+        slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+        std::fs::create_dir_all(&runs_dir)?;
+        // Re-validate NO-FOLLOW now that the tail exists on disk: a same-UID
+        // process could swap the freshly created leaf (or any tail ancestor) for
+        // a symlink between the create above and first use. Do NOT
+        // `canonicalize` here — `canonicalize` FOLLOWS such a swap to the
+        // attacker-chosen target and the checks would then pass against it.
+        // `reject_symlinked_ancestors_below` inspects every component below the
+        // (already canonical) anchor with `symlink_metadata` (no-follow) and
+        // REJECTS a swapped-in link.
+        slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+    }
     // Sweep at the SHARED parent of this worker's namespace, not the namespace
     // itself: a crashed worker leaves `rust-worker-<old-pid>` as a sibling of
     // the next launch's root, so sweeping only `runs_dir` could never discover

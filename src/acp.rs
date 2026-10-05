@@ -7,7 +7,6 @@
 //! policy); everything else gets "method not found".
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,15 +84,23 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Start `program args…` in `cwd`, in its own process group.
+    /// Start `program args…` in the pinned working directory `cwd`, in its own
+    /// process group.
     pub fn spawn(
         program: &str,
         args: &[String],
-        cwd: &Path,
+        cwd: &crate::safecwd::CwdHandle,
         env: &[(String, String)],
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args).current_dir(cwd);
+        cmd.args(args);
+        // Enter the working directory through the pinned, no-follow directory
+        // handle (`fchdir` in the child's `pre_exec`) rather than re-resolving
+        // a path at spawn time, so a same-UID actor cannot swap an ancestor for
+        // a symlink between provisioning and launch and redirect the agent's
+        // cwd outside the validated run tree (#35).
+        cwd.apply(&mut cmd)
+            .context("binding agent working directory")?;
         // Strip the daemon's own engine-connection secrets from the inherited
         // environment before layering the agent env, so the agent can never read
         // or exfiltrate the credentials the daemon uses to talk to the engine.
@@ -200,7 +207,12 @@ impl Agent {
     }
 
     /// Run one prompt turn to completion.
-    pub async fn run(&mut self, cwd: &Path, prompt: &str, idle: Duration) -> Result<Outcome> {
+    pub async fn run(
+        &mut self,
+        cwd: &crate::safecwd::CwdHandle,
+        prompt: &str,
+        idle: Duration,
+    ) -> Result<Outcome> {
         let init = self
             .request(
                 "initialize",
@@ -216,8 +228,33 @@ impl Agent {
         if init.get("protocolVersion").is_none() {
             bail!("agent answered initialize without protocolVersion: {init}");
         }
+        // The session workspace must name the SAME directory the launch bound:
+        // recover it through the pinned fd (`fchdir`+`getcwd`) rather than
+        // re-sending the provisioning-time path, so an ancestor swapped after
+        // preparation cannot make the agent resolve a requested workspace that
+        // now points at the attacker's tree (#35). The value sent is the
+        // pinned inode's current path — the directory the agent is running in.
+        //
+        // DESIGN DECISION (maintainer, #36): we deliberately send the
+        // fd-recovered ABSOLUTE path here, not `.` or an omitted field. ACP's
+        // `session/new` takes a `cwd` STRING and offers no fd/capability
+        // handoff, so a path string is the strongest binding the protocol
+        // allows. The real protection is not this string: the agent process is
+        // already launched with its cwd `fchdir`-pinned to the validated
+        // checkout inode (via `CwdHandle::apply` in `pre_exec`), so it operates
+        // inside the pinned inode regardless. Recovering the name through the
+        // pinned fd (rather than reusing the stale provisioning path) keeps the
+        // string naming that same inode, so it is informational and consistent
+        // with the launch — the correct, ACP-compatible handoff.
+        let session_cwd = cwd
+            .path()
+            .context("recovering the pinned session workspace path")?;
         let session = self
-            .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }), idle)
+            .request(
+                "session/new",
+                json!({ "cwd": session_cwd, "mcpServers": [] }),
+                idle,
+            )
             .await
             .context("ACP session/new")?;
         let session_id = session["sessionId"]
@@ -1151,5 +1188,112 @@ mod tests {
         ] {
             assert_eq!(content_block_text(&v), None, "no text expected: {v}");
         }
+    }
+
+    /// A minimal fake ACP agent: answers `initialize`, records the
+    /// `session/new` params, replies with a sessionId, answers the prompt, and
+    /// exits. Used to observe what `session/new.cwd` the client sends.
+    #[cfg(unix)]
+    fn fake_agent_script() -> &'static str {
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+      ;;
+    *'"session/new"'*)
+      printf '%s\n' "$line" > "$NANO_FAKE_AGENT_CAPTURE"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
+      ;;
+    *'"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+      exit 0
+      ;;
+  esac
+done
+"#
+    }
+
+    /// The `session/new` workspace must name the SAME directory the launch
+    /// bound: recover it through the pinned fd, so an ancestor swapped for a
+    /// symlink after the pin cannot make the agent resolve a requested
+    /// workspace that now points at the attacker's tree (#35). The fake agent
+    /// captures the verbatim `session/new` request; the `cwd` in it must be the
+    /// pinned inode's current path (the moved-aside real dir), never the
+    /// swapped-in attacker path the provisioning-time string would now name.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_new_cwd_names_the_pinned_inode_after_an_ancestor_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "nano-acp-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (macOS /var).
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        // The real workspace the agent is pinned to.
+        let ancestor = base.join("ancestor");
+        let real = ancestor.join("run");
+        std::fs::create_dir_all(&real).unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&real).unwrap();
+
+        // The fake agent script + the file it captures the session/new into.
+        let script = base.join("fake-agent.sh");
+        std::fs::write(&script, fake_agent_script()).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = base.join("capture.json");
+        let env = vec![(
+            "NANO_FAKE_AGENT_CAPTURE".to_string(),
+            capture.to_string_lossy().into_owned(),
+        )];
+
+        let mut agent = Agent::spawn(
+            "sh",
+            &[script.to_string_lossy().into_owned()],
+            &handle,
+            &env,
+        )
+        .expect("spawn fake agent");
+
+        // Attacker swaps the ancestor for a symlink to their tree AFTER the
+        // pin but BEFORE session/new: the provisioning-time path string would
+        // now resolve to the attacker; the pinned fd must not.
+        let moved = base.join("ancestor-moved");
+        std::fs::rename(&ancestor, &moved).unwrap();
+        let evil = base.join("evil");
+        std::fs::create_dir_all(evil.join("run")).unwrap();
+        std::os::unix::fs::symlink(&evil, &ancestor).unwrap();
+
+        let out = agent
+            .run(&handle, "hi", Duration::from_secs(10))
+            .await
+            .expect("fake agent turn");
+        agent.shutdown().await;
+        assert_eq!(out.stop_reason, "end_turn");
+
+        // The captured session/new cwd must be the pinned inode's real
+        // (moved-aside) path, never the attacker tree the original path now
+        // resolves to.
+        let sent: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        let sent_cwd = sent["params"]["cwd"].as_str().expect("session/new cwd");
+        assert_eq!(
+            std::fs::canonicalize(sent_cwd).unwrap(),
+            std::fs::canonicalize(moved.join("run")).unwrap(),
+            "session/new cwd must name the pinned inode, not the swapped-in attacker path"
+        );
+        assert_ne!(
+            std::fs::canonicalize(sent_cwd).unwrap(),
+            std::fs::canonicalize(evil.join("run")).unwrap(),
+            "session/new cwd must not resolve into the attacker's tree"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }

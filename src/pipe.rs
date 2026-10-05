@@ -7,7 +7,6 @@
 //! Like the ACP client, the agent runs in its own process group (so a timeout
 //! kills the whole tree) and dies with the daemon via [`crate::pdeath`].
 
-use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -28,18 +27,26 @@ pub struct PipeOutcome {
     pub truncated: bool,
 }
 
-/// Spawn `program args…` in `cwd` with `env`, write `stdin_json` to its stdin,
-/// and collect stdout until the agent exits or goes idle for `idle`.
+/// Spawn `program args…` in the pinned working directory `cwd` with `env`,
+/// write `stdin_json` to its stdin, and collect stdout until the agent exits or
+/// goes idle for `idle`.
 pub async fn run(
     program: &str,
     args: &[String],
-    cwd: &Path,
+    cwd: &crate::safecwd::CwdHandle,
     env: &[(String, String)],
     stdin_json: &str,
     idle: Duration,
 ) -> Result<PipeOutcome> {
     let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(cwd);
+    cmd.args(args);
+    // Enter the working directory through the pinned, no-follow directory
+    // handle (`fchdir` in the child's `pre_exec`) rather than by re-resolving a
+    // path at spawn time: on a shared host a same-UID actor could otherwise
+    // swap an ancestor component for a symlink between provisioning and this
+    // launch and redirect the agent's cwd outside the validated run tree (#35).
+    cwd.apply(&mut cmd)
+        .context("binding agent working directory")?;
     // Strip the daemon's own engine-connection secrets from the inherited
     // environment before layering the agent env, so the agent can never read or
     // exfiltrate the credentials the daemon uses to talk to the engine.
