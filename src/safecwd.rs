@@ -115,6 +115,11 @@ pub(crate) fn normalize_run_path(path: &Path) -> io::Result<PathBuf> {
 /// A directory resolved no-follow and pinned by its fd, used to launch a child
 /// with its cwd set to the validated inode (via `fchdir` in `pre_exec`) rather
 /// than by re-resolving a path at spawn time.
+//
+// `Debug` is derived so callers can `unwrap_err()` a `Result<CwdHandle, _>`
+// (e.g. the pinned-open refusal tests in `slot.rs`): `unwrap_err` requires the
+// success type to be `Debug`. Both fields are `Debug` on every platform.
+#[derive(Debug)]
 pub(crate) struct CwdHandle {
     /// The path the handle was resolved from — the non-Unix `current_dir`
     /// fallback target (on Unix the launch binds the pinned fd, not a path).
@@ -372,10 +377,16 @@ impl CwdHandle {
     /// A close-on-exec dup of the pinned fd, moved into each `pre_exec` closure
     /// so the child-side `fchdir` target is owned by the `Command` itself and
     /// stays valid through the fork regardless of when this handle is dropped.
+    ///
+    /// The dup is allocated at descriptor **3 or above**: with a minimum of 0 a
+    /// closed standard descriptor would let the dup occupy stdin/stdout/stderr,
+    /// and the child's stdio setup can then replace that descriptor before
+    /// `pre_exec` runs — leaving `fchdir` aimed at a pipe or `/dev/null`
+    /// instead of the pinned directory (the launch fails with `ENOTDIR`).
     #[cfg(unix)]
     fn dup_fd(&self) -> io::Result<std::os::unix::io::OwnedFd> {
         use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-        let new = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let new = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
         if new < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -629,6 +640,41 @@ mod normalize_tests {
             );
         }
     }
+
+    #[test]
+    fn normalize_run_path_puts_a_relative_anchor_in_the_same_frame_as_the_runs_root() {
+        // Regression for the `C8CTL_NANO_HOME=./state-link` configuration: the
+        // worker normalizes the runs root AND the state-home anchor with this
+        // same function before `strip_prefix(&anchor)`, so both must land in
+        // one absolute lexical frame for the prefix strip (and the tail
+        // reattachment onto the canonical anchor) to succeed.
+        let cwd = std::env::current_dir().unwrap();
+
+        let anchor = normalize_run_path(Path::new("./state-link")).unwrap();
+        assert_eq!(anchor, cwd.join("state-link"));
+        let runs_root =
+            normalize_run_path(&anchor.join("agent-runs").join("rust-worker-1")).unwrap();
+        assert_eq!(
+            runs_root.strip_prefix(&anchor).unwrap(),
+            Path::new("agent-runs").join("rust-worker-1"),
+            "a normalized runs root must strip the normalized anchor"
+        );
+
+        // A `..`-relative anchor (e.g. `C8CTL_NANO_HOME=../state-link`) climbs
+        // the trusted cwd lexically and still prefixes its own runs root.
+        let anchor = normalize_run_path(Path::new("../state-link")).unwrap();
+        assert_eq!(anchor, cwd.parent().unwrap().join("state-link"));
+        let runs_root = normalize_run_path(&anchor.join("agent-runs")).unwrap();
+        assert_eq!(
+            runs_root.strip_prefix(&anchor).unwrap(),
+            Path::new("agent-runs"),
+        );
+
+        // An interior `..` in the anchor itself is refused outright, so a
+        // symlinked-anchor bypass cannot be smuggled past the prefix strip.
+        let err = normalize_run_path(Path::new("state/./x/../runs")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -672,6 +718,28 @@ mod tests {
             std::fs::canonicalize(&dir).unwrap(),
             "child cwd must be the pinned directory"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dup_fd_never_occupies_a_standard_descriptor() {
+        // The dup moved into a child's `pre_exec` must be allocated at
+        // descriptor 3 or above: with a closed stdin/stdout/stderr a minimum
+        // of 0 would let the dup occupy a standard descriptor that the child's
+        // stdio setup can then replace before `pre_exec` runs, leaving
+        // `fchdir` aimed at a pipe or `/dev/null` (ENOTDIR) instead of the
+        // pinned directory.
+        use std::os::unix::io::AsRawFd;
+        let dir = scratch("dup-min-fd");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        for _ in 0..8 {
+            let dup = handle.dup_fd().expect("dup the pinned fd");
+            assert!(
+                dup.as_raw_fd() >= 3,
+                "the pre_exec dup must never occupy a standard descriptor, got {}",
+                dup.as_raw_fd()
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

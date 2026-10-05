@@ -139,6 +139,16 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // boundary, keeps a parent-relative runs dir working identically on every
     // backend; the per-job path is normalized again in `slot::execute`.
     let runs_dir = crate::safecwd::normalize_run_path(&runs_dir)?;
+    // Normalize the anchor to the SAME absolute lexical form as `runs_dir`:
+    // `normalize_run_path` above makes `runs_dir` absolute (anchoring a
+    // relative input at the cwd), so a RELATIVE state-home anchor (e.g.
+    // `C8CTL_NANO_HOME=./state-link`) would otherwise fail the `strip_prefix`
+    // below — the canonical anchor is never reattached and the ancestor check
+    // rejects a previously supported configuration. Normalizing the anchor
+    // (never following symlinks: `.` collapses, a leading `..` climbs the cwd
+    // lexically) keeps both paths in the same lexical frame so the prefix
+    // strip and tail reattachment work for relative anchors too.
+    let anchor = crate::safecwd::normalize_run_path(&anchor)?;
     // Resolve the run root WITHOUT ever following a symlink in the
     // OPERATOR-CONTROLLED tail. Canonicalize ONLY the trusted `anchor` (resolving
     // its platform symlinks — the contract harness hands us a `C8CTL_NANO_HOME`
