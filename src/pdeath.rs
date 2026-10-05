@@ -118,12 +118,23 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// A process group has no kernel handle of its own, so its identity is pinned
 /// through its **leader**: the leader's start time (the same per-incarnation
 /// token [`parent_start_time`] uses for daemon PID-reuse detection) plus its
-/// real uid. While any member of the group is alive the pgid stays reserved and
-/// the leader's `/proc` entry keeps its original start time (a reaped leader
-/// survives as a zombie held by the group), so re-reading it and comparing
-/// proves the group currently holding the pgid is the one that was spawned —
-/// not a recycled one. The uid disambiguates a cross-user recycle that lands on
-/// the same clock tick (start times are only unique per tick).
+/// real uid. While any member of the group is alive the pgid stays reserved, and
+/// while the leader is *alive or an unreaped zombie* its `/proc` (or `proc_pidinfo`)
+/// entry keeps that original start time — so re-reading and comparing proves the
+/// group currently holding the pgid is the one that was spawned, not a recycled
+/// one. The uid disambiguates a cross-user recycle that lands on the same clock
+/// tick (start times are only unique per tick).
+///
+/// **A waited-on leader does *not* stay a zombie.** Once the leader is reaped —
+/// by us (`child.wait()`/`try_wait()`) or, for the detached watchdog, by `init`
+/// after the daemon is `kill -9`'d — its `/proc` entry vanishes even while
+/// descendants keep the group (and the pgid) alive. Re-reading then yields `None`:
+/// identity becomes unverifiable. That is the gap behind the review finding this
+/// addresses: the cleanup paths below therefore (a) hold the leader *unreaped*
+/// through the in-process terminate sequence so its identity stays readable, and
+/// (b) treat a *gone* leader (re-read `None`) as fail-**open** while treating a
+/// *live* leader with a *different* identity as fail-**closed**. See
+/// [`PgidGuard::still_ours`] for the policy and its residual recycle window.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GroupIdentity {
@@ -222,21 +233,45 @@ impl PgidGuard {
         self.pgid
     }
 
-    /// True only while the group holding this pgid is **still the group that
-    /// was captured** — i.e. it is alive *and* its leader's identity matches.
-    /// This is the check every cleanup SIGKILL must pass: a bare
-    /// `kill(-pgid, 0)` (`group_alive`) proves only that *some* group holds the
-    /// number, so on its own it can green-light signalling an unrelated group
-    /// that recycled the pgid after the agent exited.
+    /// True while the group holding this pgid is alive *and* is not positively
+    /// known to be a different (recycled) group. This is the check every cleanup
+    /// SIGKILL must pass: a bare `kill(-pgid, 0)` (`group_alive`) proves only
+    /// that *some* group holds the number, so on its own it can green-light
+    /// signalling an unrelated group that recycled the pgid after the agent
+    /// exited.
+    ///
+    /// Policy once the group is alive (`group_alive`):
+    /// - **No captured identity** (`self.identity == None`, e.g. a platform
+    ///   without an identity source): fall back to the numeric probe alone — the
+    ///   pre-#27 behaviour.
+    /// - **Leader still readable, identity matches**: ours — signal.
+    /// - **Leader still readable, identity differs**: the pgid was recycled by a
+    ///   *live* unrelated group — fail **closed**, do not signal (a live leader
+    ///   with a different identity is a definite recycle).
+    /// - **Leader gone** (re-read yields `None`): the leader was reaped while
+    ///   descendants kept the pgid reserved — almost certainly our own orphaned
+    ///   descendants — so fail **open** and signal. This is the case the earlier
+    ///   strict-equality check got wrong: it returned `false` here and *skipped*
+    ///   the SIGKILL, leaking the very `TERM`-resistant descendants the cleanup
+    ///   exists to kill. The residual risk is the nested recycle: the group
+    ///   emptied entirely, the pgid was recycled, *and* the recycled group's own
+    ///   leader was reaped too, all before this probe — then we signal an
+    ///   unrelated group. That window is accepted (it requires a full recycle
+    ///   plus a second leader reap inside one poll interval); it is the price of
+    ///   not leaking orphans, and the in-process paths close it entirely by
+    ///   holding the leader unreaped until after the SIGKILL.
     pub(crate) fn still_ours(&self) -> bool {
         if !group_alive(self.pgid) {
             return false;
         }
         match self.identity {
-            // Identity captured: require it to still match. A mismatch (or a
-            // now-unreadable leader) means the original group is gone and the
-            // pgid was recycled — do not signal.
-            Some(id) => leader_identity(self.pgid) == Some(id),
+            Some(id) => match leader_identity(self.pgid) {
+                // Live leader, identity matches: ours.
+                Some(cur) => cur == id,
+                // Leader reaped but the group is still alive: our orphaned
+                // descendants hold the pgid — fail open (see the doc above).
+                None => true,
+            },
             // No identity source on this platform: fall back to the numeric
             // probe alone (the pre-#27 behaviour).
             None => true,
@@ -256,14 +291,15 @@ impl PgidGuard {
 /// spawn), passed in rather than read from `child.id()`: a caller may already
 /// have reaped the leader (the pipe EOF path and ACP request path call
 /// `child.wait()`), which drops `child.id()` to `None`; keying the group kill off
-/// that would silently skip it and leak descendants. A reaped leader's pid stays
-/// reserved as a pgid while any descendant remains in the group, so probing it
-/// still identifies the right group.
+/// that would silently skip it and leak descendants.
 ///
 /// Every group signal is gated on [`PgidGuard::still_ours`]: the guard
 /// re-verifies the group's identity immediately before each SIGTERM/SIGKILL, so
 /// a pgid that was freed and recycled by an unrelated group in the window since
-/// the last check is never signalled (issue #27).
+/// the last check is never signalled (issue #27). The leader is held **unreaped**
+/// through the grace loop so that identity stays positively readable (and the
+/// pgid un-recyclable) until the final SIGKILL decision; it is reaped only by the
+/// `child.wait()` at the end.
 #[cfg(unix)]
 pub(crate) async fn terminate_group_and_reap(
     child: &mut tokio::process::Child,
@@ -286,24 +322,28 @@ pub(crate) async fn terminate_group_and_reap(
             sigterm_group(pgid);
             let deadline = std::time::Instant::now() + grace;
             loop {
-                // Reap the leader the instant it exits. Otherwise its unreaped
-                // zombie keeps `still_ours` true for the entire grace window,
-                // forcing a fixed multi-second wait on every clean shutdown. A
-                // live descendant keeps the pgid reserved, so reaping the leader
-                // here does not free the pid still needed for the group SIGKILL.
-                let _ = child.try_wait();
+                // Hold the leader **unreaped** through the grace loop. Reaping it
+                // (`child.try_wait()`) the instant it exits would free its `/proc`
+                // entry, so a later `still_ours` could no longer re-read the
+                // leader's identity — and while that check now fails *open* on a
+                // gone leader, keeping the leader as a zombie keeps the identity
+                // positively verifiable (and the pgid un-recyclable) for the whole
+                // window, so the deadline SIGKILL below is gated on a real match.
+                // The cost is that `group_alive` stays true on the zombie, so a
+                // clean shutdown waits out the full grace period rather than
+                // breaking early; correctness is preferred over that latency.
                 if !guard.still_ours() {
-                    // Leader reaped and no descendant left: the group is gone (or
-                    // its pgid was recycled). Don't re-signal.
+                    // The group is gone (every member exited). Don't re-signal.
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
                     // A `TERM`-resistant descendant survived; the pgid is still
-                    // ours (that descendant holds it). Re-verify the identity
-                    // immediately before the SIGKILL: the last survivor can exit
-                    // in the window since the loop's top-of-iteration check,
-                    // freeing the pgid to be recycled by an unrelated group —
-                    // only signal when the group is still verifiably ours.
+                    // ours (the leader zombie and/or that descendant holds it).
+                    // Re-verify the identity immediately before the SIGKILL: the
+                    // last survivor can exit in the window since the loop's
+                    // top-of-iteration check, freeing the pgid to be recycled by
+                    // an unrelated group — only signal when the group is still
+                    // verifiably ours.
                     if guard.still_ours() {
                         sigkill_group(pgid);
                     }
@@ -600,17 +640,34 @@ pub fn reap_watchdog(
     }
 }
 
-/// True while the group holding `pgid` is alive **and** still has the captured
-/// identity. With no captured identity (`expected == None`, e.g. a platform
-/// without an identity source) this degrades to the numeric liveness probe —
-/// the pre-#27 behaviour — rather than disabling the watchdog's cleanup.
+/// True while the group holding `pgid` is alive **and** is not positively known
+/// to be a different (recycled) group. With no captured identity (`expected ==
+/// None`, e.g. a platform without an identity source) this degrades to the
+/// numeric liveness probe — the pre-#27 behaviour — rather than disabling the
+/// watchdog's cleanup.
+///
+/// The policy mirrors [`PgidGuard::still_ours`]: a *live* leader whose identity
+/// differs from `expected` is a definite recycle, so fail **closed**; a leader
+/// that is *gone* (re-read yields `None`) means it was reaped while descendants
+/// kept the pgid reserved — almost certainly our own orphans — so fail **open**
+/// and reap them. Failing closed there (the earlier strict-equality behaviour)
+/// skipped the SIGKILL and leaked the very orphaned descendants the watchdog
+/// exists to kill. The residual nested-recycle window (group emptied, pgid
+/// recycled, recycled leader also reaped, all inside one poll interval) is
+/// accepted; see [`PgidGuard::still_ours`].
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn group_identity_matches(pgid: u32, expected: Option<GroupIdentity>) -> bool {
     if !group_alive(pgid) {
         return false;
     }
     match expected {
-        Some(id) => leader_identity(pgid) == Some(id),
+        Some(id) => match leader_identity(pgid) {
+            // Live leader, identity matches: ours.
+            Some(cur) => cur == id,
+            // Leader reaped but the group is still alive: our orphaned
+            // descendants hold the pgid — fail open (see the doc above).
+            None => true,
+        },
         None => true,
     }
 }
@@ -703,10 +760,17 @@ pub fn reap_watchdog(
 ) {
 }
 
-#[cfg(all(test, target_os = "linux"))]
+// The identity/watchdog unit tests run on both Linux and macOS — the two
+// platforms with a real `leader_identity` source and a watchdog — so the macOS
+// identity path (`proc_pidinfo`) and the shared fail-open/fail-closed policy get
+// runtime coverage, not just the Linux `/proc` one (review finding: macOS had
+// none). Linux-only helpers (`parent_start_time`, `parent_is_dead_or_zombie`)
+// keep their own `cfg(target_os = "linux")` tests below.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn parent_start_time_reads_own_incarnation() {
         // Our own process is alive, so its start time must be readable and stable
@@ -720,6 +784,7 @@ mod tests {
         assert!(a > 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn own_process_is_not_dead_or_zombie() {
         // Our own live, running process must not be classified as dead/zombie —
@@ -783,9 +848,11 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         // Once the group is gone the numeric probe fails, so still_ours is false.
-        // (If the pgid were recycled by an unrelated group the identity check —
-        // not just liveness — is what would refuse; that path is pinned by
-        // `pgid_guard_refuses_a_recycled_identity` below.)
+        // (If the pgid were recycled by an unrelated group whose leader is *live*,
+        // the identity mismatch — not just liveness — is what would refuse; that
+        // path is pinned by `pgid_guard_refuses_a_recycled_identity` below. A
+        // recycled group whose leader was *also* reaped is the accepted fail-open
+        // window, pinned by `pgid_guard_fails_open_on_reaped_leader`.)
         assert!(!guard.still_ours(), "a gone group must not verify as ours");
     }
 
@@ -833,5 +900,79 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(!group_identity_matches(pgid, None));
+    }
+
+    /// Spawn a `sleep` in the *same* process group as an existing leader, so it
+    /// survives as a descendant once that leader is reaped.
+    fn spawn_group_member(pgid: u32) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // Join the leader's group (pgid), rather than starting our own.
+        cmd.process_group(pgid as i32);
+        cmd.spawn().expect("spawn group member")
+    }
+
+    #[test]
+    fn pgid_guard_fails_open_on_reaped_leader() {
+        // The review-finding scenario: the leader exits and is reaped while a
+        // `TERM`-resistant descendant keeps the group (and pgid) alive. The
+        // leader's identity source then reads `None`, and the guard must fail
+        // *open* — returning true so the cleanup SIGKILL is *not* skipped and the
+        // orphaned descendant is reaped. (The earlier strict-equality check
+        // returned false here and leaked the descendant.)
+        let (mut leader, pgid) = spawn_group_leader();
+        let guard = PgidGuard::capture(pgid);
+        assert!(guard.identity.is_some(), "identity captured for live leader");
+        let mut member = spawn_group_member(pgid);
+
+        // Kill and reap the leader; the descendant keeps the group alive.
+        let _ = leader.kill();
+        let _ = leader.wait();
+        // Sanity: the leader's identity really is unreadable now (group alive,
+        // leader gone) — this is the `None` branch the policy keys on.
+        assert!(group_alive(pgid), "descendant keeps the group alive");
+        assert!(
+            leader_identity(pgid).is_none(),
+            "a reaped leader's identity is gone even though the group lives"
+        );
+
+        assert!(
+            guard.still_ours(),
+            "a reaped leader with a surviving descendant must fail open so the \
+             orphaned descendant is still reaped"
+        );
+        assert!(
+            group_identity_matches(pgid, guard.identity),
+            "group_identity_matches must fail open identically"
+        );
+
+        // Cleanup: kill the surviving descendant.
+        let _ = member.kill();
+        let _ = member.wait();
+    }
+
+    #[test]
+    fn pgid_guard_fails_closed_on_live_leader_mismatch() {
+        // The other half of the policy: while the leader is *live*, a captured
+        // identity that does not match it is a definite recycle — fail *closed*
+        // (do not signal), even though the group is alive. This guards the
+        // recycled-PGID race #27 cares about.
+        let (mut child, pgid) = spawn_group_leader();
+        let real = leader_identity(pgid).expect("live leader identity");
+        // A guard whose captured identity belongs to a *different* incarnation.
+        let stale = PgidGuard {
+            pgid,
+            identity: Some(GroupIdentity {
+                start: real.start.wrapping_add(1),
+                uid: real.uid,
+            }),
+        };
+        assert!(
+            !stale.still_ours(),
+            "a live leader with a mismatched identity must fail closed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
