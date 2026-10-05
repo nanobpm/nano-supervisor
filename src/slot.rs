@@ -723,7 +723,7 @@ pub(crate) fn reap_run_dir(runs_dir: &Path, run_dir: &Path) -> std::io::Result<(
     {
         use crate::saferoot::{DirHandle, PinError};
         if let Some(name) = run_dir.file_name() {
-            match DirHandle::open_root_nofollow(runs_dir) {
+            match DirHandle::open_root_nofollow(runs_dir, false) {
                 Ok(root) => return root.remove_tree(name),
                 // A refused symlinked root (ELOOP) or any other error is a real,
                 // security-relevant outcome — surface it, never retry the weaker
@@ -1098,7 +1098,7 @@ fn sweep_stale_runs_pinned(
     recurse_namespaces: bool,
 ) -> std::result::Result<(), crate::saferoot::PinError> {
     use crate::saferoot::{DirHandle, PinError};
-    let root = match DirHandle::open_root_nofollow(runs_dir) {
+    let root = match DirHandle::open_root_nofollow(runs_dir, false) {
         Ok(h) => h,
         // A missing runs_dir (first job) is nothing to sweep — not an error;
         // the prepare path will (re)create and validate it.
@@ -1153,8 +1153,9 @@ fn sweep_stale_runs_pinned(
             Some((_, alive)) => !alive,
         };
         // Our own namespace, or a dead worker's: descend one level (pinned,
-        // no-follow) and reap aged, inactive child runs.
-        let child = match root.open_child_dir(&name) {
+        // no-follow) and reap aged, inactive child runs. Readable (`trav =
+        // false`): the child is enumerated and stat'd, not merely traversed.
+        let child = match root.open_child_dir(&name, false) {
             Ok(c) => c,
             Err(_) => continue,
         };

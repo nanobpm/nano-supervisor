@@ -105,6 +105,21 @@ fn dir_open_flags() -> i32 {
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
+/// Is this fd a symlink? Linux-only: a traversal-only `O_PATH` open does not
+/// fail on a symlink (it opens the link itself), so the no-follow guarantee
+/// must be enforced with an `fstat` after the open. Only the intermediate
+/// `O_PATH` fds are checked; the leaf and the non-Linux backends refuse a
+/// symlink at the `openat`/`openat2`.
+#[cfg(target_os = "linux")]
+fn fd_is_symlink(fd: &OwnedFd) -> io::Result<bool> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a valid, writable `stat`; `fd` is a live descriptor.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
 /// Raw `openat2` wrapper. `dirfd`/`path` anchor the resolution; `resolve`
 /// carries the `RESOLVE_*` hardening flags.
 #[cfg(target_os = "linux")]
@@ -165,21 +180,6 @@ fn open_nofollow_chain(path: &Path) -> io::Result<OwnedFd> {
         }
         // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    /// Is this fd a symlink? Linux-only: the traversal-only `O_PATH`
-    /// intermediate open does not fail on a symlink (it opens the link
-    /// itself), so the no-follow guarantee must be enforced with an `fstat`
-    /// after the open. Only the intermediate `O_PATH` fds are checked; the
-    /// leaf and the non-Linux backends refuse a symlink at the `openat`.
-    #[cfg(target_os = "linux")]
-    fn fd_is_symlink(fd: &OwnedFd) -> io::Result<bool> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `st` is a valid, writable `stat`; `fd` is a live descriptor.
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(st.st_mode & libc::S_IFMT == libc::S_IFLNK)
     }
 
     // The leaf (the directory we pin and hand back) is opened `O_RDONLY`
@@ -290,17 +290,45 @@ impl DirHandle {
     /// `O_NOFOLLOW` `openat` chain, which gives the same no-symlink guarantee
     /// component by component. `path` may be absolute, so `RESOLVE_BENEATH` is
     /// intentionally NOT set on this anchoring open.
-    pub(crate) fn open_root_nofollow(path: &Path) -> Result<DirHandle, PinError> {
+    ///
+    /// `trav` selects a traversal-only handle (Linux `O_PATH`, macOS
+    /// `O_SEARCH`) for a root that is only descended *through* (e.g. the anchor
+    /// seeding [`DirHandle::open_or_create_root_nofollow`]), so it resolves
+    /// beneath a search-only ancestor without its read bit; `false` retains a
+    /// readable (`O_RDONLY`) handle. On the portable-chain backend this only
+    /// relaxes the *leaf* flags (intermediates are already traversal-only); on
+    /// Linux a traversal-only `O_PATH` open does not fail on a symlinked leaf,
+    /// so it is caught with a post-open `fstat` check.
+    pub(crate) fn open_root_nofollow(path: &Path, trav: bool) -> Result<DirHandle, PinError> {
         #[cfg(target_os = "linux")]
         {
             let c = cstr(path.as_os_str()).map_err(PinError::Io)?;
-            match openat2_raw(
-                libc::AT_FDCWD,
-                &c,
-                (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-                RESOLVE_NO_SYMLINKS,
-            ) {
-                Ok(fd) => return Ok(DirHandle { fd }),
+            let flags = if trav {
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            } else {
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC
+            };
+            match openat2_raw(libc::AT_FDCWD, &c, flags as u64, RESOLVE_NO_SYMLINKS) {
+                // Linux: a traversal-only `O_PATH` open does NOT fail on a
+                // symlinked leaf — it opens the link itself — so detect it here
+                // and refuse, preserving the no-follow guarantee. (`O_PATH`
+                // lacks `O_DIRECTORY`, so also refuse a non-directory.)
+                Ok(fd) => {
+                    if trav {
+                        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                        // SAFETY: `st` is valid/writable; `fd` is live.
+                        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+                            return Err(PinError::Io(io::Error::last_os_error()));
+                        }
+                        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                            return Err(PinError::Io(io::Error::new(
+                                ErrorKind::InvalidInput,
+                                "refusing non-directory or symlinked root",
+                            )));
+                        }
+                    }
+                    return Ok(DirHandle { fd });
+                }
                 // Pre-5.6 kernel without `openat2`: fall back to the portable
                 // chain below, which gives the same no-symlink guarantee
                 // component by component.
@@ -308,6 +336,11 @@ impl DirHandle {
                 Err(e) => return Err(PinError::Io(e)),
             }
         }
+        // `trav` only relaxes the open flags on the Linux `openat2` path above;
+        // the portable chain below already opens intermediates traversal-only
+        // and its leaf handling is unchanged, so the flag is unused there.
+        #[cfg(not(target_os = "linux"))]
+        let _ = trav;
         open_nofollow_chain(path)
             .map(|fd| DirHandle { fd })
             .map_err(PinError::Io)
@@ -318,37 +351,83 @@ impl DirHandle {
     /// `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)`; elsewhere a portable
     /// `openat` with `O_NOFOLLOW` anchored on this handle's fd (which cannot
     /// escape the pinned parent, since the open is relative to it).
-    pub(crate) fn open_child_dir(&self, name: &OsStr) -> io::Result<DirHandle> {
+    ///
+    /// `trav` selects a **traversal-only** handle for an intermediate component
+    /// that is only ever descended *through* (used as the `openat`/`mkdirat`
+    /// dirfd for the next step), never read or handed back. Where the platform
+    /// offers it (Linux `O_PATH`, macOS `O_SEARCH`) the child is opened without
+    /// its read bit, so the walk resolves beneath a search-only ancestor (mode
+    /// `0111`, no read bit) — matching the `openat2` backend and
+    /// `open_nofollow_chain`, which impose no such ancestor-read requirement.
+    /// `trav == false` retains a readable (`O_RDONLY`) handle for a component
+    /// that will be read or handed back (e.g. the pinned runs root). Any other
+    /// Unix falls back to `O_RDONLY` + `O_NOFOLLOW` for both, which needs the
+    /// read bit on every ancestor.
+    ///
+    /// The no-follow guarantee is preserved either way: on Linux an `O_PATH` +
+    /// `O_NOFOLLOW` open does not *fail* on a symlink — it opens the link
+    /// itself — so a symlinked intermediate is caught with an `fstat`
+    /// `S_ISLNK` check after the open (the `O_RDONLY` leaf and the macOS
+    /// `O_SEARCH` / fallback backends refuse a symlink at the `openat`
+    /// itself).
+    pub(crate) fn open_child_dir(&self, name: &OsStr, trav: bool) -> io::Result<DirHandle> {
         let c = cstr(name)?;
+        // Traversal-only intermediate flags (Linux `O_PATH`, macOS `O_SEARCH`);
+        // the readable-leaf / fallback flags are `dir_open_flags()`.
+        #[cfg(target_os = "linux")]
+        let trav_flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let trav_flags = libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let trav_flags = dir_open_flags();
+        let flags = if trav { trav_flags } else { dir_open_flags() };
         #[cfg(target_os = "linux")]
         {
             match openat2_raw(
                 self.fd.as_raw_fd(),
                 &c,
-                dir_open_flags() as u64,
+                flags as u64,
                 RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
             ) {
-                Ok(fd) => return Ok(DirHandle { fd }),
+                // Linux: a traversal-only `O_PATH` open does NOT fail on a
+                // symlink — it opens the link itself — so detect a symlinked
+                // intermediate here and refuse, preserving the no-follow
+                // guarantee. (`RESOLVE_NO_SYMLINKS` already refuses a symlink
+                // reached by *following*, but `O_PATH` opens the link rather
+                // than following it.)
+                Ok(fd) => {
+                    if trav && fd_is_symlink(&fd)? {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "refusing symlinked path component",
+                        ));
+                    }
+                    return Ok(DirHandle { fd });
+                }
                 // Pre-5.6 kernel without `openat2`: fall back to the portable
                 // openat below.
                 Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
                 Err(e) => return Err(e),
             }
         }
-        let fd = unsafe {
-            libc::openat(
-                self.fd.as_raw_fd(),
-                c.as_ptr(),
-                dir_open_flags(),
-            )
-        };
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
-        Ok(DirHandle {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
-        })
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // Linux pre-5.6 fallback: the portable `O_PATH` open also opens a
+        // symlink rather than failing, so apply the same post-open check. On
+        // macOS `O_SEARCH` + `O_NOFOLLOW` and the `O_RDONLY` + `O_NOFOLLOW`
+        // fallback already failed a symlinked child with `ELOOP` at the open.
+        #[cfg(target_os = "linux")]
+        if trav && fd_is_symlink(&fd)? {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "refusing symlinked path component",
+            ));
+        }
+        Ok(DirHandle { fd })
     }
 
     /// `lstat` a direct child (relative, never following the entry).
@@ -449,7 +528,7 @@ impl DirHandle {
         if meta.is_dir && !meta.is_symlink {
             // Descend through a pinned handle so the recursion cannot be
             // redirected by a component swapped after this stat.
-            let child = self.open_child_dir(name)?;
+            let child = self.open_child_dir(name, false)?;
             for entry in child.entry_names()? {
                 child.remove_tree(&entry)?;
             }
@@ -501,8 +580,9 @@ impl DirHandle {
             return Err(io::Error::last_os_error());
         }
         // Pin the child we just created (no-follow, beneath us) and set its mode
-        // through the fd, immune to a post-mkdir swap.
-        let child = self.open_child_dir(name)?;
+        // through the fd, immune to a post-mkdir swap. Readable (`trav = false`):
+        // the prepared child is handed back and carried into the launch.
+        let child = self.open_child_dir(name, false)?;
         child.restrict_mode(mode)?;
         self.restrict_mode(mode)?;
         Ok(child)
@@ -525,7 +605,12 @@ impl DirHandle {
     /// gets pinned. This is the handle-relative building block that lets the
     /// runs root be materialised component-by-component without any
     /// path-based `create_dir_all` that would follow a swapped ancestor (#36).
-    pub(crate) fn ensure_child_dir(&self, name: &OsStr, mode: u32) -> io::Result<DirHandle> {
+    ///
+    /// `trav` is forwarded to [`DirHandle::open_child_dir`]: `true` for an
+    /// intermediate component that is only descended *through* (opened
+    /// traversal-only, so the walk resolves beneath a search-only ancestor),
+    /// `false` for the final root (retained readable).
+    pub(crate) fn ensure_child_dir(&self, name: &OsStr, mode: u32, trav: bool) -> io::Result<DirHandle> {
         let c = cstr(name)?;
         if unsafe { libc::mkdirat(self.fd.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) } != 0 {
             let e = io::Error::last_os_error();
@@ -539,7 +624,7 @@ impl DirHandle {
         // Open no-follow, beneath us: if `name` is a symlink (planted before or
         // swapped in after the mkdirat), this open refuses it (ELOOP) rather
         // than following it to an attacker-chosen target.
-        self.open_child_dir(name)
+        self.open_child_dir(name, trav)
     }
 
     /// Resolve `path` from the current working directory like
@@ -557,17 +642,33 @@ impl DirHandle {
     /// refused the same way. `path` may be absolute; the anchor (`/` / `.`) is
     /// opened as-is (trusted, never a symlink).
     pub(crate) fn open_or_create_root_nofollow(path: &Path, mode: u32) -> Result<DirHandle, PinError> {
+        // The final `Normal` component is the runs root we retain (readable);
+        // every component before it is only traversed *through*, so it is
+        // opened traversal-only (Linux `O_PATH` / macOS `O_SEARCH`) and needs
+        // no read bit — letting the walk resolve beneath a search-only
+        // ancestor (mode `0111`). Compute the leaf position up front.
+        let components: Vec<Component> = path.components().collect();
+        let last_normal = components
+            .iter()
+            .rposition(|c| matches!(c, Component::Normal(_)));
         let mut cur: Option<DirHandle> = None;
-        for comp in path.components() {
+        for (i, comp) in components.iter().enumerate() {
+            // Only the final `Normal` component is the retained, readable root;
+            // everything before it (the anchor and each intermediate) is opened
+            // traversal-only, so the walk resolves beneath a search-only
+            // ancestor without needing its read bit.
+            let trav = Some(i) != last_normal;
             match comp {
                 // The anchor (`/` or a leading `.`) is structural and never a
-                // symlink; open it directly to seed the walk.
+                // symlink; open it directly to seed the walk. It is only ever
+                // traversed through (the runs root is always a `Normal`
+                // descendant), so open it traversal-only.
                 Component::RootDir => {
-                    cur = Some(DirHandle::open_root_nofollow(Path::new("/"))?);
+                    cur = Some(DirHandle::open_root_nofollow(Path::new("/"), true)?);
                 }
                 Component::CurDir => {
                     if cur.is_none() {
-                        cur = Some(DirHandle::open_root_nofollow(Path::new("."))?);
+                        cur = Some(DirHandle::open_root_nofollow(Path::new("."), true)?);
                     }
                 }
                 Component::Normal(name) => {
@@ -575,11 +676,11 @@ impl DirHandle {
                     let parent = match cur {
                         Some(ref p) => p,
                         None => {
-                            cur = Some(DirHandle::open_root_nofollow(Path::new("."))?);
+                            cur = Some(DirHandle::open_root_nofollow(Path::new("."), true)?);
                             cur.as_ref().unwrap()
                         }
                     };
-                    cur = Some(parent.ensure_child_dir(name, mode)?);
+                    cur = Some(parent.ensure_child_dir(name, mode, trav)?);
                 }
                 // `..` cannot be created through, and resolving it against the
                 // pinned parent would still leave the *named* components under it
@@ -638,7 +739,7 @@ mod tests {
         for name in ["aaa", "bbb", "ccc"] {
             std::fs::create_dir_all(root.join(name)).unwrap();
         }
-        let handle = DirHandle::open_root_nofollow(&root).expect("pin root");
+        let handle = DirHandle::open_root_nofollow(&root, false).expect("pin root");
 
         let mut first = handle.entry_names().expect("first list");
         first.sort();
@@ -746,6 +847,43 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// The *creation* walk (`open_or_create_root_nofollow`) must pin a
+    /// run dir that already exists beneath a search-only ancestor (mode
+    /// `0111`, no read bit) — the worker-startup / re-prepare path. The
+    /// intermediate components are only ever traversed *through*, so they need
+    /// only the ancestor's search permission, not its read bit; the final root
+    /// is retained readable. (Creating a *missing* dir under a `0111` ancestor
+    /// is impossible for any caller — `mkdirat` needs the parent's write bit —
+    /// so only the pre-existing case is reachable.) Runs unprivileged (skipped
+    /// under root, which bypasses the permission check).
+    #[test]
+    fn create_root_beneath_a_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses the ancestor permission check");
+            return;
+        }
+        let base = scratch_root("create-search-only");
+        let ancestor = base.join("locked");
+        let run = ancestor.join("run");
+        // The run dir already exists (a prior run created it while the ancestor
+        // was writable); only the ancestor is later locked to search-only.
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let created = DirHandle::open_or_create_root_nofollow(&run, 0o700);
+        // Restore writability so cleanup can descend, whatever the outcome.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let handle = created.expect(
+            "the creation walk must pin an existing run dir beneath a search-only (0111) \
+             ancestor: intermediates need only the ancestor's search bit, not its read bit",
+        );
+        assert!(run.is_dir(), "the run dir must still be on disk");
+        drop(handle);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// `prepare_child_dir` must return a handle to the *exact* inode it created
     /// and secured, so a post-prepare swap of the child by path cannot redirect
     /// a later operation. The prepared child is chmod'd to `mode` (0700); a
@@ -758,7 +896,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::io::AsRawFd;
         let root = scratch_root("prep-inode");
-        let handle = DirHandle::open_root_nofollow(&root).expect("pin root");
+        let handle = DirHandle::open_root_nofollow(&root, false).expect("pin root");
         let child = handle
             .prepare_child_dir(OsStr::new("run"), 0o700)
             .expect("prepare child");
