@@ -127,18 +127,18 @@ pub async fn run(
             Ok(b) => b,
             Err(e) => {
                 activation_failures = activation_failures.saturating_add(1);
-                // Bounded exponential backoff with full jitter, interruptible by
+                // Bounded exponential backoff with equal jitter, interruptible by
                 // the drain watch. A fixed 5s retry let a fleet of idle slots
                 // hammer an unreachable gateway — each attempt opening fresh TCP
                 // connections the kernel then holds in `TIME_WAIT` — until the
                 // host's ephemeral port range was exhausted and the gateway (and
                 // every other local client) became unreachable
                 // (nanobpm/nano-supervisor#23). The backoff bounds each slot to
-                // ~one reconnect attempt per 30s at the ceiling, and the jitter
-                // spreads a fleet's retries so a recovering gateway is not hit
-                // by every slot in the same tick. The engine is still polled
-                // promptly once it answers: the streak resets on the first
-                // successful activation.
+                // ~one reconnect attempt per 30s at the ceiling, and the equal
+                // jitter's nonzero `cap/2` floor spreads a fleet's retries so a
+                // recovering gateway is not hit by every slot in the same tick.
+                // The engine is still polled promptly once it answers: the
+                // streak resets on the first successful activation.
                 let wait = crate::runtime::activation_backoff(activation_failures);
                 log(&format!(
                     "slot {} activation of {job_type:?} failed ({activation_failures} in a row): {e:#}; retrying in {:.1}s",

@@ -190,10 +190,11 @@ fn offline_worker_bounds_its_reconnect_rate_and_stays_up() {
     let stderr_rx = spawn_stderr_reader(child.child());
 
     // Observe the worker through several backoff cycles. With the bounded
-    // backoff (1s base doubling to a 30s ceiling, full jitter) a 12s outage
-    // yields on the order of 4–8 retry log lines; a hot spin (the actual #23
-    // defect — no backoff between failed activations) would log thousands in
-    // the same window. The assertion that pins the CONTRACT is the upper bound:
+    // backoff (1s base doubling to a 30s ceiling, equal jitter with a `cap/2`
+    // floor) a 12s outage yields on the order of 4–8 retry log lines; a hot
+    // spin (the actual #23 defect — no backoff between failed activations)
+    // would log thousands in the same window. The assertion that pins the
+    // CONTRACT is the upper bound:
     // a worker that retries faster than the backoff allows fails here. (The
     // pre-#23 fixed-5s loop also passes this bound — it was never a hot spin —
     // so this test guards against a REGRESSION to unbounded retrying, while the
@@ -652,11 +653,12 @@ fn offline_fleet_bounds_its_aggregate_reconnect_rate() {
         all_alive,
         "every fleet worker must stay up through the outage; combined stderr:\n{combined}"
     );
-    // The aggregate bound: with a 1s base / 30s ceiling full-jitter backoff, one
-    // worker retries ~4–8 times in 12s, so 8 workers retry on the order of
-    // 32–64 times in aggregate. A hot-spinning fleet would log thousands. Cap
-    // the aggregate generously (8 × the single-worker bound) so the test fails
-    // only when the fleet as a whole is NOT bounded — the #23 storm.
+    // The aggregate bound: with a 1s base / 30s ceiling equal-jitter backoff
+    // (a nonzero `cap/2` floor), one worker retries ~4–8 times in 12s, so 8
+    // workers retry on the order of 32–64 times in aggregate. A hot-spinning
+    // fleet would log thousands. Cap the aggregate generously (8 × the
+    // single-worker bound) so the test fails only when the fleet as a whole is
+    // NOT bounded — the #23 storm.
     let aggregate_cap = 16 * FLEET;
     assert!(
         total_retries >= FLEET,
