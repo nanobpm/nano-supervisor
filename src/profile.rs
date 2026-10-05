@@ -138,13 +138,20 @@ pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
     // reuses keep-alive connections by default; these settings bound the pool's
     // CHURN instead:
     //
-    // - `pool_idle_timeout(30s)`: the engine's own keep-alive timeout can be
-    //   shorter than reqwest's 90s default, in which case a pooled connection
-    //   goes stale and the next request opens a fresh socket — each abandoned
-    //   one held by the kernel in `TIME_WAIT`. Dropping idle pool entries after
-    //   30s (the default long-poll window, so a poll response's connection is
-    //   reused for the immediately following poll) keeps the pool from
-    //   accumulating dead sockets between polls.
+    // - `pool_idle_timeout(None)`: NO client-side idle eviction. A fixed idle
+    //   timeout works against the reuse goal: the inter-request gap is the
+    //   refresh cadence `window / 3` (100s at the default 300s
+    //   `--recovery-window`, and unbounded above that since the window is
+    //   user-set), so any fixed client-side timeout either falls short of a
+    //   supported cadence (closing a connection the next refresh would have
+    //   reused — and making the WORKER the active closer, which is what
+    //   actually puts the socket in `TIME_WAIT`) or is so large it bounds
+    //   nothing. Dead sockets are still removed, just by the right party:
+    //   the engine's own keep-alive timeout closes them server-side (a server
+    //   FIN drops the pool entry without a client-side `TIME_WAIT`), and the
+    //   keepalive below reaps the half-dead ones. A socket that goes stale
+    //   anyway fails fast on the next request and reqwest retries on a fresh
+    //   one — one reconnect per stale socket, not a storm.
     // - `tcp_keepalive(60s)`: keep long-lived idle connections (a 30s+ long
     //   poll, a quiet fleet) fresh through NATs/LBs instead of discovering a
     //   half-dead socket on the next request and reconnecting.
@@ -154,7 +161,7 @@ pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
     // low so a fleet of slots shares a handful of sockets rather than churning
     // the ephemeral port range.
     let builder = reqwest::Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(Option::<std::time::Duration>::None)
         .tcp_keepalive(std::time::Duration::from_secs(60));
     // The SDK skips its own `tls::apply_tls` whenever a caller supplies a
     // pre-built client (`runtime/client.rs`: `Some(client) => client`), so a
