@@ -1912,11 +1912,14 @@ pub async fn finalize_git(
     // are agent-created — but still classify each tip by REACHABILITY (a tag
     // merely pinning a commit already on a branch, or already at a provision
     // tip, strands nothing) so the net does not over-retain the common case.
-    // Retain any POST-provisioning commit reachable from no local branch, no
-    // remote-tracking ref, and no provision-time ref tip. `refs/remotes/*` is
-    // agent-writable (a plain `git fetch`/`update-ref` advances it) yet is not
-    // covered by the local-head sweep above, so a commit parked ONLY under an
-    // advanced remote-tracking ref would otherwise have its sole copy reaped.
+    // Retain any POST-provisioning commit reachable from no local branch and no
+    // provision-time ref tip. `refs/remotes/*` is agent-writable (a plain
+    // `git fetch`/`update-ref` advances it, without the commit necessarily
+    // reaching the real remote) yet is not covered by the local-head sweep
+    // above, so a commit parked ONLY under an advanced remote-tracking ref would
+    // otherwise have its sole copy reaped. Classification is by the provision
+    // snapshot, NOT by mere presence on a remote-tracking ref (see the covered
+    // check below).
     //
     // FAIL CLOSED: a truncated/failed enumeration must not read as "no parked
     // work" — retain. Bound the candidate set like the reflog net so an
@@ -2027,12 +2030,24 @@ pub async fn finalize_git(
         }
         if !out.retain {
             for h in &candidates {
-                // Skip commits already reachable from some local branch tip
-                // (e.g. a tag on a commit the push will publish) OR from a
-                // remote-tracking ref (e.g. the agent fetched more of `origin`;
-                // that commit is durable on the remote, so reaping the run dir
-                // loses nothing). Only a commit reachable from NEITHER is
-                // potentially stranded.
+                // Skip commits already reachable from some LOCAL branch tip
+                // (e.g. a tag on a commit the push will publish) — the push
+                // makes those durable, so reaping the run dir loses nothing.
+                //
+                // Deliberately do NOT treat reachability from a `refs/remotes/*`
+                // ref as "covered": the candidate itself sits on such a ref, so
+                // a `--contains … refs/remotes/` probe would ALWAYS self-cover
+                // and defeat this very net (the gap it exists to close). A
+                // remote-tracking ref is agent-writable (`git update-ref
+                // refs/remotes/origin/x <local-only-commit>` advances it without
+                // the commit ever reaching the real remote), so "it's on a
+                // remote-tracking ref" does NOT prove durability. Durability of a
+                // genuinely-fetched origin commit is instead established below by
+                // the provision-time snapshot (`provision_shas` spans
+                // heads+remotes+tags at provision time), which classifies an
+                // UNCHANGED remote ref as pre-existing (not retained) while
+                // retaining only commits the agent ADVANCED a remote ref onto
+                // post-provision.
                 let covered = git(
                     &[
                         "for-each-ref".into(),
@@ -2040,7 +2055,6 @@ pub async fn finalize_git(
                         h.clone(),
                         "--format=%(refname)".into(),
                         "refs/heads/".into(),
-                        "refs/remotes/".into(),
                     ],
                     Some(workspace),
                     timeout,
@@ -2052,10 +2066,9 @@ pub async fn finalize_git(
                 if covered {
                     continue;
                 }
-                // Reachable from no local or remote-tracking ref: agent work iff
-                // reachable from no provision-time ref tip. FAIL CLOSED (agent
-                // work) on a missing snapshot or any error, mirroring the reflog
-                // net.
+                // Reachable from no local branch: agent work iff reachable from
+                // no provision-time ref tip. FAIL CLOSED (agent work) on a
+                // missing snapshot or any error, mirroring the reflog net.
                 let agent_made = match &prep.provision_shas {
                     None => true,
                     Some(shas) => {
@@ -2071,9 +2084,9 @@ pub async fn finalize_git(
                 if agent_made {
                     log(&format!(
                         "finalize: commit {h} is parked under a non-head ref (stash/tag/\
-                         remote-tracking) and is reachable from no local branch, no \
-                         remote-tracking ref, and no provision-time ref tip (stranded agent \
-                         work); retaining the run dir so its only copy is not reaped"
+                         remote-tracking) and is reachable from no local branch and no \
+                         provision-time ref tip (stranded agent work); retaining the run dir so \
+                         its only copy is not reaped"
                     ));
                     out.retain = true;
                     // Real work exists even though it is on no branch and
@@ -4774,12 +4787,43 @@ mod tests {
                 .await;
         assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
 
-        // The agent commits, then parks that commit under a remote-tracking ref
-        // and resets the work branch back to the provision tip — so the commit
-        // is reachable from NO local branch, only from `refs/remotes/origin/...`.
-        commit(&dir, "agent work parked on a remote-tracking ref").await;
+        // Build the agent commit WITHOUT moving HEAD (via `commit-tree`), then
+        // park it under a remote-tracking ref. A plain `git commit` + `reset`
+        // would move HEAD onto the commit and record it in the HEAD reflog, so
+        // the SIBLING detached-commit net (which scans the HEAD reflog) would
+        // independently catch it there — and this test could never go red if the
+        // `refs/remotes/*` sweep regressed. Keeping HEAD on the provision tip the
+        // whole time leaves the parked commit reachable from NO local branch and
+        // NO HEAD-reflog position — only from `refs/remotes/origin/parked` — so
+        // this test isolates that one sweep.
+        let head = git(&["rev-parse".into(), "HEAD".into()], Some(&dir), t, None)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = git(
+            &["rev-parse".into(), "HEAD^{tree}".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
         let parked = git(
-            &["rev-parse".into(), "HEAD".into()],
+            &[
+                "-c".into(),
+                "user.email=t@t".into(),
+                "-c".into(),
+                "user.name=t".into(),
+                "commit-tree".into(),
+                tree,
+                "-p".into(),
+                head,
+                "-m".into(),
+                "agent work parked on a remote-tracking ref".into(),
+            ],
             Some(&dir),
             t,
             None,
@@ -4794,15 +4838,6 @@ mod tests {
                 "refs/remotes/origin/parked".into(),
                 parked.clone(),
             ],
-            Some(&dir),
-            t,
-            None,
-        )
-        .await
-        .unwrap();
-        let start = prep.start_sha.clone().expect("non-empty base");
-        git(
-            &["reset".into(), "--hard".into(), start],
             Some(&dir),
             t,
             None,
