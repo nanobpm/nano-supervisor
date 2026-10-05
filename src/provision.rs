@@ -1428,7 +1428,17 @@ pub async fn finalize_git(
     // branch contains it), so without this sweep `retain` stays false and the
     // only copy is reaped (or the run is misread as empty and wiped on retry).
     {
-        match git(
+        // Read via `git_untruncated`: the forward-sorted `for-each-ref` listing
+        // keeps only the LAST bytes of stdout under the capture cap, so an
+        // oversized ref pile would silently drop the FIRST (early-sorting) refs —
+        // exactly where an agent's stranded side branch would hide. Endpoint
+        // probes cannot rescue a truncated tail: the capture can cut in the
+        // MIDDLE of a ref name, so an agent can pad the listing until the
+        // surviving suffix of a late ref equals the true minimum name and passes
+        // both the min and max anchors while earlier branches were dropped. Fail
+        // CLOSED on overflow (propagated `Err`) instead, exactly as the
+        // provision-time and non-head ref scans do.
+        match git_untruncated(
             &[
                 "for-each-ref".into(),
                 "--format=%(refname:short)".into(),
@@ -1441,144 +1451,24 @@ pub async fn finalize_git(
         .await
         {
             Ok(refs) => {
-                let refs: Vec<&str> = refs.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-                // `git()` keeps only a bounded TAIL of stdout (`GIT_STDOUT_TAIL`),
-                // so a repo with enough refs silently drops the FIRST lines here —
-                // exactly the older side branches an agent's stranded work would
-                // hide on. Prove the enumeration is COMPLETE rather than trust the
-                // tail. `for-each-ref` sorts by refname and the tail keeps the LAST
-                // lines, so:
-                //   * anchoring on the CHECKED-OUT branch (the prior guard) only
-                //     proves THAT branch survived — it sorts late (e.g. the prepared
-                //     `nano/agent-work/...` fallback), so an early-sorting stranded
-                //     branch is dropped while the cross-check still passes; and
-                //   * checking only the LAST parsed branch's successor misses a tail
-                //     that dropped LEADING refs while keeping the true maximum.
-                // There is no cheap total-count for `for-each-ref`, so anchor BOTH
-                // ends of the sorted listing with two independent, truncation-immune
-                // O(1) probes (each returns at most one short line, which can never
-                // fill the tail):
-                //   * FIRST: the global minimum branch is `for-each-ref --count=1
-                //     refs/heads/`'s single line. The parsed first branch MUST equal
-                //     it; if it does not, leading refs were dropped from the tail.
-                //   * LAST: the parsed last branch `z` is the maximum iff NO branch
-                //     sorts after it. Take the global maximum directly with a
-                //     reverse sort capped at one line (`--sort=-refname --count=1
-                //     refs/heads/`): one short line that can never fill the tail,
-                //     and it must equal the parsed last branch. If it differs,
-                //     trailing refs were dropped from the forward-sorted tail.
-                // Together these prove the parsed list is exactly the sorted set of
-                // branches: it starts at the true minimum, ends at the true maximum,
-                // and (being a contiguous sorted tail) contains everything between.
-                let min_branch = match git(
-                    &[
-                        "for-each-ref".into(),
-                        "--count=1".into(),
-                        "--format=%(refname:short)".into(),
-                        "refs/heads/".into(),
-                    ],
-                    Some(workspace),
-                    timeout,
-                    None,
-                )
-                .await
-                {
-                    Ok(p) => {
-                        let p = p.trim();
-                        if p.is_empty() {
-                            None
-                        } else {
-                            Some(p.to_string())
-                        }
-                    }
-                    Err(e) => {
-                        log(&format!(
-                            "finalize: side-branch minimum probe failed — {e}; treating the \
-                             scan as incomplete and retaining the run dir"
-                        ));
-                        out.retain = true;
-                        None
-                    }
-                };
-                match (refs.first(), &min_branch) {
-                    // The listing parsed nothing. A healthy finalize always has at
-                    // least the prepared work branch and/or the local base, so an
-                    // empty parse is an incomplete scan regardless of the probe:
-                    // fail closed and retain rather than sweep an empty list.
-                    (None, _) => {
-                        log(
-                            "finalize: side-branch enumeration parsed no branches; treating the \
-                             scan as incomplete and retaining the run dir rather than trusting \
-                             the empty list",
-                        );
-                        out.retain = true;
-                    }
-                    // The probe failed (retain already set): nothing more to prove.
-                    (_, None) => {}
-                    // Leading refs were dropped: the parsed first branch is not the
-                    // true minimum.
-                    (Some(first), Some(min)) if *first != min => {
-                        log(&format!(
-                            "finalize: side-branch enumeration begins at {first:?} but the true \
-                             first branch is {min:?} (stdout tail truncation dropped leading \
-                             refs); treating the scan as incomplete and retaining the run dir \
-                             rather than trusting the partial list"
-                        ));
-                        out.retain = true;
-                    }
-                    (Some(_), Some(_)) => {}
-                }
-                // Anchor the LAST end: the parsed last branch must equal the TRUE
-                // maximum `refs/heads/` ref.
-                if let Some(last) = refs.last() {
-                    match git(
-                        &[
-                            "for-each-ref".into(),
-                            "--count=1".into(),
-                            "--sort=-refname".into(),
-                            "--format=%(refname:short)".into(),
-                            "refs/heads/".into(),
-                        ],
-                        Some(workspace),
-                        timeout,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(max) => {
-                            let max = max.trim();
-                            if !max.is_empty() && max != *last {
-                                log(&format!(
-                                    "finalize: side-branch enumeration ended at {last:?} but the \
-                                     true last branch is {max:?} (stdout tail truncation dropped \
-                                     refs); treating the scan as incomplete and retaining the \
-                                     run dir rather than trusting the partial list"
-                                ));
-                                out.retain = true;
-                            }
-                        }
-                        Err(e) => {
-                            log(&format!(
-                                "finalize: side-branch maximum probe failed — {e}; treating \
-                                 the scan as incomplete and retaining the run dir"
-                            ));
-                            out.retain = true;
-                        }
-                    }
-                }
-                // Stop here once the enumeration is known INCOMPLETE. The 1 MiB
-                // stdout tail still permits tens of thousands of short refs, and
-                // the per-branch loop below launches serial Git processes for
-                // each — so scanning a retained (already-doomed) partial list
-                // would let an agent keep finalize running for an extremely long
-                // time outside its own run timeout. The partial list proves
-                // nothing (any subset may be missing), so retain and return
-                // instead of sweeping it.
-                if out.retain {
+                let refs: Vec<&str> = refs
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                // An untruncated read proves the listing is COMPLETE, so the
+                // parsed set is exactly the repo's `refs/heads/` branches with no
+                // endpoint anchoring. A healthy finalize always has at least the
+                // prepared work branch and/or the local base, so an empty parse
+                // is still treated as an incomplete scan: fail closed and retain
+                // rather than sweep an empty list.
+                if refs.is_empty() {
                     log(
-                        "finalize: side-branch enumeration is incomplete; skipping the per-branch \
-                         reachability scan and retaining the run dir",
+                        "finalize: side-branch enumeration parsed no branches; treating the \
+                         scan as incomplete and retaining the run dir rather than trusting \
+                         the empty list",
                     );
+                    out.retain = true;
                     return out;
                 }
                 // Bound the per-branch reachability scan even when the listing
@@ -1750,11 +1640,13 @@ pub async fn finalize_git(
                 }
             }
             Err(e) => {
-                // A failed branch sweep is an incomplete scan: fail closed and
-                // retain rather than risk missing a stranded side branch.
+                // A failed branch sweep OR a listing that overflowed the capture
+                // cap (`git_untruncated` fails closed on overflow) is an
+                // incomplete scan: retain rather than risk missing a stranded
+                // side branch dropped from a truncated tail.
                 log(&format!(
-                    "finalize: enumerating side branches failed — {e}; treating the scan as \
-                     incomplete and retaining the run dir"
+                    "finalize: enumerating side branches failed or overflowed the capture cap \
+                     — {e}; treating the scan as incomplete and retaining the run dir"
                 ));
                 out.retain = true;
             }
@@ -5998,6 +5890,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir_path(&dir));
         let _ = std::fs::remove_dir_all(&bare);
         let _ = std::fs::remove_dir_all(&attacker);
+    }
+
+    #[tokio::test]
+    async fn finalize_fails_closed_when_side_branch_listing_overflows_capture_cap() {
+        // The side-branch sweep enumerates `refs/heads/` with `git_untruncated`,
+        // which keeps only the LAST bytes of stdout under the 1 MiB capture cap.
+        // The prior probe-based "completeness proof" was defeatable: the capture
+        // can cut in the MIDDLE of a ref name, so an agent could pad the listing
+        // until the surviving suffix of a late ref equals the true minimum name
+        // and passes both the min and max anchors while the early-sorting
+        // branches hiding stranded work were dropped. `git_untruncated` closes
+        // that class structurally — a listing larger than the capture cap is
+        // refused outright, so finalize fails closed (retain, no push) rather
+        // than trusting a truncated tail.
+        let dir = git_workspace("fin-overflow").await;
+        let t = Duration::from_secs(30);
+        let prep =
+            prepare_work_branch(&dir, &test_repo(), None, Some("feat/work"), true, "ov1", t).await;
+        assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
+        commit(&dir, "work to push").await;
+        let sha = git(&["rev-parse".into(), "HEAD".into()], Some(&dir), t, None)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        // Pack enough long-named heads to drive the `refs/heads/` listing well
+        // past the 1 MiB capture cap (each `refname:short` line is ~230 bytes).
+        // Writing packed-refs directly keeps the fixture fast — no thousands of
+        // serial `git branch` invocations.
+        let packed = dir_path(&dir).join(".git").join("packed-refs");
+        let pad = "a".repeat(220);
+        let mut blob = String::new();
+        if !packed.exists() {
+            blob.push_str("# pack-refs with: peeled fully-peeled\n");
+        }
+        for i in 0..6000 {
+            blob.push_str(&format!("{sha} refs/heads/zpad/{pad}/{i:05}\n"));
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&packed)
+                .unwrap();
+            f.write_all(blob.as_bytes()).unwrap();
+        }
+        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        assert!(
+            res.retain,
+            "an overflowing side-branch listing must fail closed and retain the run dir"
+        );
+        assert!(
+            !res.pushed,
+            "the push is refused when the side-branch listing overflows the capture cap"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
 
     #[tokio::test]
