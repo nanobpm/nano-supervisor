@@ -27,6 +27,15 @@ const ACTIVATION_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// a retry that starts before the deadline also FINISHES (or is abandoned)
 /// before it. A timeout surfaces as a transient error (never a 404/409), so
 /// the caller's `failures >= 2` fence still applies.
+///
+/// This is only the *ceiling*: the loop bounds each attempt by the lease time
+/// actually remaining (`extend_timeout`), because a FIXED 30s timeout is unsafe
+/// on a short recovery window. The CLI floor is 1s (`MIN_RECOVERY_WINDOW`), so a
+/// 60s window refreshes every 20s; a single stalled extend starting near the
+/// deadline could otherwise run the full 30s past it — and a tolerated second
+/// attempt another 30s — publishing `lost` long after the lease expired while
+/// the job still ran on a dead activation. Clamping each attempt to
+/// `deadline - now` keeps the fence at or before the deadline on every window.
 const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The lease time `refresh_budget` reserves for the extend request that
@@ -183,6 +192,29 @@ fn refresh_budget(
     }
 }
 
+/// The timeout for a single lease-`extend` request: the `EXTEND_TIMEOUT` ceiling,
+/// but never longer than the lease time actually remaining (`deadline - now`).
+///
+/// A FIXED timeout is unsafe on short recovery windows. `refresh_budget` sizes
+/// the *sleep* so a retry starts early enough, but once the extend is in flight
+/// only its own timeout bounds it — and a fixed 30s ceiling can outlast the whole
+/// remaining lease (e.g. a 60s window whose first extend stalls near t=40 would
+/// run to t=70, 10s past expiry, before the `failures >= 2` fence fires; a
+/// tolerated second attempt would push `lost` another 30s out). Clamping each
+/// attempt to what the lease has left means a stalled extend is abandoned no
+/// later than the deadline, so the fence publishes before — not up to
+/// `EXTEND_TIMEOUT` after — the lease lapses. Both tolerated attempts together
+/// therefore cannot push `lost` past the deadline.
+///
+/// Floored at 1ms so the final fence attempt on an already-expired lease still
+/// ISSUES its request (and can observe a real 404/409) rather than being
+/// abandoned before it starts. Pure and testable.
+fn extend_timeout(now: Instant, deadline: Instant) -> Duration {
+    EXTEND_TIMEOUT
+        .min(deadline.saturating_duration_since(now))
+        .max(Duration::from_millis(1))
+}
+
 pub(crate) async fn refresh_loop(
     jobs: Jobs,
     key: String,
@@ -242,23 +274,28 @@ pub(crate) async fn refresh_loop(
         // mid-extend would drop the very request that detects the fence, letting
         // the caller settle a job whose activation was already revoked.
         //
-        // It IS, however, bounded by `EXTEND_TIMEOUT`: the HTTP client carries
-        // no per-request timeout, so an extend to a stalled (not refused)
-        // engine would otherwise hang for the kernel's whole TCP retransmit
-        // window — long past the lease deadline — with the job still running
-        // on a dead activation. The timeout is what lets `refresh_budget`'s
-        // reserve guarantee a retry FINISHES before the deadline rather than
-        // merely starting before it. Dropping the request future at the
-        // timeout cancels it like any other dropped in-flight call; the
-        // resulting error is transient (never a 404/409), so the
-        // `failures >= 2` fence below still applies — and because the sleep
-        // was clamped to `deadline - REQUEST_MARGIN`, that fence is published
-        // before the lease expires.
-        let extended = tokio::time::timeout(EXTEND_TIMEOUT, jobs.extend(&key, window, &lease))
+        // It IS, however, bounded — by `extend_timeout`, which is the
+        // `EXTEND_TIMEOUT` ceiling clamped to the lease time still REMAINING.
+        // The HTTP client carries no per-request timeout, so an extend to a
+        // stalled (not refused) engine would otherwise hang for the kernel's
+        // whole TCP retransmit window — long past the lease deadline — with the
+        // job still running on a dead activation. Bounding by the ceiling lets
+        // `refresh_budget`'s reserve guarantee a retry FINISHES before the
+        // deadline rather than merely starting; bounding ALSO by the remaining
+        // lease guarantees it even on a short recovery window the fixed ceiling
+        // would overrun (a 30s timeout cannot outlast a 20s-remaining lease).
+        // Dropping the request future at the timeout cancels it like any other
+        // dropped in-flight call; the resulting error is transient (never a
+        // 404/409), so the `failures >= 2` fence below still applies — and
+        // because the attempt is clamped to the lease, that fence is published
+        // at or before the deadline, never up to `EXTEND_TIMEOUT` past it.
+        let attempt_timeout = extend_timeout(Instant::now(), deadline);
+        let extended = tokio::time::timeout(attempt_timeout, jobs.extend(&key, window, &lease))
             .await
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
-                    "extend request exceeded the {EXTEND_TIMEOUT:?} budget"
+                    "extend request exceeded its {attempt_timeout:?} lease-bounded budget \
+                     (ceiling {EXTEND_TIMEOUT:?})"
                 ))
             });
         match extended {
@@ -308,9 +345,55 @@ pub fn log(msg: &str) {
 mod tests {
     use crate::jobs::status_of;
     use crate::runtime::{
-        activation_backoff, refresh_budget, ACTIVATION_BACKOFF_MAX, REQUEST_MARGIN,
+        activation_backoff, extend_timeout, refresh_budget, ACTIVATION_BACKOFF_MAX, EXTEND_TIMEOUT,
+        REQUEST_MARGIN,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn extend_timeout_never_outlasts_the_remaining_lease() {
+        let now = Instant::now();
+
+        // Ample lease: the full ceiling, so a healthy extend is unaffected.
+        assert_eq!(
+            extend_timeout(now, now + Duration::from_secs(300)),
+            EXTEND_TIMEOUT,
+            "an ample lease must allow the full extend ceiling"
+        );
+
+        // Short recovery window: the attempt is clamped to the lease time left,
+        // so a stalled extend is abandoned no later than the deadline and the
+        // `failures >= 2` fence publishes `lost` before the lease lapses — the
+        // regression the reviewer flagged (a fixed 30s timeout outliving a short
+        // window). The attempt must never reach past the deadline.
+        for &secs in &[1u64, 5, 10, 20, 29] {
+            let deadline = now + Duration::from_secs(secs);
+            let t = extend_timeout(now, deadline);
+            assert!(
+                now + t <= deadline,
+                "a {secs}s-remaining lease must bound the extend to at most that (got {t:?})"
+            );
+            assert_eq!(t, Duration::from_secs(secs));
+        }
+
+        // The ceiling still caps a huge remaining lease (a stalled extend must
+        // not hang for the kernel's whole retransmit window).
+        assert_eq!(
+            extend_timeout(now, now + Duration::from_secs(10_000)),
+            EXTEND_TIMEOUT
+        );
+
+        // At or past the deadline, the final fence attempt still ISSUES its
+        // request (positive floor) rather than being abandoned before it starts —
+        // so it can still observe a real 404/409 — while not sleeping into a
+        // request that outlives the lease.
+        assert_eq!(extend_timeout(now, now), Duration::from_millis(1));
+        assert_eq!(
+            extend_timeout(now, now - Duration::from_secs(10)),
+            Duration::from_millis(1),
+            "an already-expired lease must still issue a bounded final fence attempt"
+        );
+    }
 
     #[test]
     fn activation_backoff_is_bounded_and_jittered() {
