@@ -224,6 +224,94 @@ fn moved_active_profile_does_not_retarget_a_pinned_worker() {
     assert_eq!(state["connection"]["profile"], serde_json::json!("alpha"));
 }
 
+/// Issue #41, client-target verification (not just the banner): the banner and
+/// `supervisor.json` are both derived from the pin *decision*, so asserting
+/// them proves the decision, not that the worker's constructed client actually
+/// dials the pinned engine. This test closes that gap with distinguishable
+/// LIVE local endpoints: after the active profile moves from alpha to beta, the
+/// running worker must open a TCP connection to the PINNED engine (alpha) and
+/// never to the moved one (beta).
+#[test]
+fn pinned_worker_dials_the_pinned_engine_not_the_moved_one() {
+    let target = Target::from_env();
+    require_target!(target);
+    if target == Target::Node {
+        contract_tests::note_skip(module_path!(), "Rust target only (issue #41)");
+        return;
+    }
+    let home = TempHome::with_target(target);
+    hire(&home);
+    let c8ctl = tempfile::tempdir().expect("c8ctl dir");
+    std::fs::create_dir_all(c8ctl.path()).expect("create c8ctl config dir");
+
+    // Two real local endpoints, each reporting the first time it is dialed.
+    let (alpha_url, alpha_rx) = dial_probe("alpha");
+    let (beta_url, beta_rx) = dial_probe("beta");
+    std::fs::write(
+        c8ctl.path().join("profiles.json"),
+        format!(
+            "{{\"profiles\":[\
+             {{\"name\":\"alpha\",\"baseUrl\":\"{alpha_url}\"}},\
+             {{\"name\":\"beta\",\"baseUrl\":\"{beta_url}\"}}]}}"
+        ),
+    )
+    .expect("write profiles.json");
+
+    // Pin under alpha (the banner lands before any dial), then move to beta.
+    set_active_profile(c8ctl.path(), "alpha");
+    let _ = run_work(&home, c8ctl.path(), &[]);
+    set_active_profile(c8ctl.path(), "beta");
+
+    // Run the worker for real — past the banner, into the activation poll — so
+    // its client genuinely connects. A short poll makes it dial promptly and
+    // keep retrying; the unresponsive probe never lets it hang.
+    let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
+    cmd.env("C8CTL_DATA_DIR", c8ctl.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn work");
+
+    let dialed_alpha = alpha_rx.recv_timeout(std::time::Duration::from_secs(30));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        dialed_alpha.is_ok(),
+        "the worker never dialed the PINNED engine (alpha) within 30s — the pin did not reach the client"
+    );
+    assert!(
+        beta_rx.try_recv().is_err(),
+        "the worker dialed the MOVED engine (beta); the pin was not enforced at the constructed client"
+    );
+}
+
+/// Bind a throwaway local TCP listener and return its `http://127.0.0.1:PORT`
+/// URL plus a receiver that yields `label` the first time anything dials it.
+/// The accept loop drains and drops each connection so the worker's client
+/// never blocks; the thread owns the listener and ends when the test binary
+/// exits. Used to prove *which* engine the worker actually connects to,
+/// independent of the startup banner.
+fn dial_probe(label: &'static str) -> (String, std::sync::mpsc::Receiver<&'static str>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+    let port = listener.local_addr().expect("probe local addr").port();
+    let url = format!("http://127.0.0.1:{port}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    drop(s);
+                    if tx.send(label).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (url, rx)
+}
+
 /// An explicit `--profile` is the operator's deliberate override: it re-pins
 /// the connection even over an existing pin.
 #[test]

@@ -2183,19 +2183,28 @@ fn build_agent_env(
     Ok(env)
 }
 
+/// Synthetic c8ctl profile name for an env-only / `--base-url` pin that has no
+/// named c8ctl profile. Seeded as the agent's `activeProfile` so its `c8` still
+/// resolves the pinned engine (issue #41).
+const PINNED_ENGINE_PROFILE: &str = "pinned";
+
 /// Create the per-run isolated c8ctl config dir (`<run dir>/c8ctl`, `0700`)
 /// and seed it from the worker's pinned connection: a `session.json` whose
 /// `activeProfile` is the pinned profile and a `profiles.json` carrying only
 /// that profile's **non-secret connection identity**, both written `0600`.
 /// Returns the dir to export as `C8CTL_DATA_DIR`.
 ///
-/// The dir is created for EVERY job — including a `CAMUNDA_*`-env pin, which
-/// has no profile files to seed: an agent without `C8CTL_DATA_DIR` inherits
-/// the operator's ambient c8ctl session, and its `c8 use profile X` then
-/// rewrites the operator's global `~/.config/c8ctl/session.json` — the exact
-/// write that retargeted the fleet in the issue-#41 incident. With the env var
-/// pointing inside the run dir, that write lands in the (empty, per-run) dir
-/// instead and is reaped with the run.
+/// The dir is created for EVERY job. A `CAMUNDA_*`-env (or `--base-url`) pin
+/// has no c8ctl profile object, so the seed profile is SYNTHESIZED from the
+/// pinned `base_url` under a stable name (`PINNED_ENGINE_PROFILE`) — the agent
+/// still gets a `session.json`/`profiles.json` naming exactly the pinned
+/// engine, because the ACP/pipe launchers strip `CAMUNDA_REST_ADDRESS` so the
+/// agent's `c8` has no other way to see it. An agent without `C8CTL_DATA_DIR`
+/// would instead inherit the operator's ambient c8ctl session, and its
+/// `c8 use profile X` would rewrite the operator's global
+/// `~/.config/c8ctl/session.json` — the exact write that retargeted the fleet
+/// in the issue-#41 incident. With the env var pointing inside the run dir,
+/// that write lands in the (per-run) dir instead and is reaped with the run.
 ///
 /// FAILS CLOSED: every error propagates. The agent must never launch
 /// unisolated (its `c8` would reach the operator's global config), so the
@@ -2223,12 +2232,30 @@ fn seed_agent_c8ctl_dir(cfg: &SlotConfig, result_file: &std::path::Path) -> Resu
         .as_ref()
         .map(crate::profile::Profile::connection_identity)
         .or_else(|| {
+            // No cached `Profile` object to clone: synthesize the non-secret
+            // connection identity from the pinned `base_url` so the agent's
+            // `c8` still resolves the pinned engine. This covers the two pins
+            // that carry only a URL:
+            //   * a profile pin whose `Profile` was not cached — keep its name;
+            //   * an ENV-ONLY pin (`CAMUNDA_*` / `--base-url`, no c8ctl profile)
+            //     — give it a synthetic profile name so the seeded
+            //     `session.json`'s `activeProfile` can point at it. Without this
+            //     an env-only pin seeds NO files, and because the ACP/pipe
+            //     launchers strip `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`
+            //     the agent's `c8` would see no engine at all — contradicting
+            //     the pin's promise to show the agent exactly the pinned engine.
+            // Strip any embedded HTTP(S) userinfo exactly like
+            // `connection_identity` (the pinned URL may carry a credential).
             cfg.connection
-                .profile
-                .clone()
-                .map(|name| crate::profile::Profile {
-                    name,
-                    base_url: cfg.connection.base_url.clone(),
+                .base_url
+                .as_deref()
+                .map(|url| crate::profile::Profile {
+                    name: cfg
+                        .connection
+                        .profile
+                        .clone()
+                        .unwrap_or_else(|| PINNED_ENGINE_PROFILE.to_string()),
+                    base_url: Some(redact_url(url)),
                     ..Default::default()
                 })
         });
@@ -2309,6 +2336,28 @@ fn create_agent_c8ctl_dir_path_based(
     profile: Option<&crate::profile::Profile>,
 ) -> Result<()> {
     reject_symlink(dir)?;
+    // Wipe any pre-existing `c8ctl` entry before (re)creating it, so a planted
+    // child — e.g. a `session.json` symlink left inside an existing regular
+    // directory — cannot survive into the agent. Without this the path-based
+    // fallback accepts an existing dir and (when there is no profile to
+    // overwrite its children) ships whatever was planted there, redirecting the
+    // agent's `c8 use profile` back at the operator's session. This mirrors the
+    // pinned path's `prepare_child_dir`, which also wipes-and-recreates.
+    // `reject_symlink` above guarantees `dir` itself is a real leaf, so we
+    // delete it in place rather than following a link out of the run dir;
+    // `remove_dir_all` unlinks a nested symlink entry instead of following it.
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(dir).with_context(|| {
+            format!("clearing a stale agent c8ctl config dir {}", dir.display())
+        })?,
+        Ok(_) => std::fs::remove_file(dir)
+            .with_context(|| format!("clearing a stale agent c8ctl entry {}", dir.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("inspecting the agent c8ctl path {}", dir.display())))
+        }
+    }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating the agent's c8ctl config dir {}", dir.display()))?;
     reject_symlink(dir)?;
@@ -2568,12 +2617,13 @@ mod tests {
 
     /// Issue #41, the env-only gap: a worker pinned to the `CAMUNDA_*`
     /// environment (no c8ctl profile) must STILL hand every agent an isolated
-    /// per-run `C8CTL_DATA_DIR` — otherwise the agent inherits the operator's
-    /// ambient c8ctl session and its `c8 use profile X` rewrites the operator's
-    /// global `~/.config/c8ctl/session.json` (the incident's write). The dir is
-    /// created but NOT seeded (there is no profile to seed).
+    /// per-run `C8CTL_DATA_DIR`. It is also SEEDED with a synthetic profile
+    /// built from the pinned `base_url`: the ACP/pipe launchers strip
+    /// `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`, so without a seeded profile
+    /// the agent's own `c8` would see no engine at all — contradicting the pin's
+    /// promise to show the agent exactly the pinned engine.
     #[test]
-    fn env_only_pin_still_isolates_the_agents_c8ctl_dir() {
+    fn env_only_pin_seeds_a_synthetic_profile_for_the_agent() {
         let mut c = cfg();
         c.connection = crate::pin::ConnectionPin {
             profile: None,
@@ -2593,16 +2643,94 @@ mod tests {
             .map(|(_, v)| v.clone())
             .expect("an env-only pin must still export C8CTL_DATA_DIR");
         assert_eq!(dir, run.join("c8ctl").to_string_lossy());
-        // The dir exists, is owner-only, and carries NO seed files — the
-        // agent's c8ctl starts empty inside the run.
-        let meta = std::fs::metadata(&dir).expect("the isolated dir was created");
+        let dir = std::path::Path::new(&dir);
+        // The dir exists and is owner-only.
+        let meta = std::fs::metadata(dir).expect("the isolated dir was created");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(meta.permissions().mode() & 0o777, 0o700);
         }
-        assert!(!std::path::Path::new(&dir).join("session.json").exists());
-        assert!(!std::path::Path::new(&dir).join("profiles.json").exists());
+        // session.json points at the synthetic pinned profile, and
+        // profiles.json carries exactly that engine's address.
+        let session: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(session["activeProfile"], serde_json::json!("pinned"));
+        let profiles: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("profiles.json")).unwrap())
+                .unwrap();
+        assert_eq!(profiles["profiles"][0]["name"], serde_json::json!("pinned"));
+        assert_eq!(
+            profiles["profiles"][0]["baseUrl"],
+            serde_json::json!("http://env-engine:8080")
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, env-only base_url credential leak: an operator may embed
+    /// HTTP(S) userinfo in `CAMUNDA_REST_ADDRESS`. The synthesized seed profile
+    /// is a non-secret identity, so that userinfo must be stripped before it
+    /// lands in the agent-readable `profiles.json`.
+    #[test]
+    fn env_only_pin_strips_base_url_userinfo_from_the_seed() {
+        let mut c = cfg();
+        // Build the userinfo at runtime so no credential-like literal is stored
+        // in source.
+        let url = format!("http://{}:{}@env-engine:8080", "user", "SECRET");
+        c.connection = crate::pin::ConnectionPin {
+            profile: None,
+            base_url: Some(url),
+        };
+        c.connection_profile = None;
+        let run = std::env::temp_dir().join(format!(
+            "nano-slot-test-envpin-redact-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("an env-only pin must still export C8CTL_DATA_DIR");
+        let raw =
+            std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap();
+        assert!(
+            !raw.contains("SECRET") && !raw.contains("user@"),
+            "seeded env-only profiles.json leaked base_url userinfo: {raw}"
+        );
+        assert!(
+            raw.contains("http://env-engine:8080"),
+            "seeded env-only profiles.json must keep the engine location: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, the planted-session symlink class: the path-based fallback
+    /// (non-Linux / pre-5.6 kernel) must WIPE an existing `c8ctl` leaf before
+    /// recreating it, so a child planted in a pre-existing regular directory
+    /// cannot survive into the agent — even when there is no profile to
+    /// overwrite it. Without the wipe a planted `session.json` would redirect
+    /// the agent's `c8 use profile` back at the operator's session.
+    #[test]
+    fn path_based_seed_wipes_a_planted_leaf_even_without_a_profile() {
+        let run = std::env::temp_dir().join(format!("nano-slot-test-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        let dir = run.join("c8ctl");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stale/planted child from a previous (or hostile) occupant.
+        std::fs::write(dir.join("session.json"), "{\"activeProfile\":\"operator\"}").unwrap();
+        // No profile: the fallback must still clear the directory.
+        create_agent_c8ctl_dir_path_based(&dir, None).unwrap();
+        assert!(
+            !dir.join("session.json").exists(),
+            "the path-based fallback must wipe a planted session.json even with no profile"
+        );
+        assert!(dir.is_dir(), "the c8ctl dir must be recreated");
         let _ = std::fs::remove_dir_all(&run);
     }
 
