@@ -1,11 +1,11 @@
 //! #40 — agent-spawned supervisors must not escape job teardown.
 //!
-//! The worker stamps `NANO_AGENT_RUN` on every agent's environment. A supervisor
-//! or worker an agent then tries to start would daemonise (`setsid`, new session)
-//! and outlive the job as a phantom fleet that can lease real jobs. So when
-//! `NANO_AGENT_RUN` is set the command must refuse unless an explicit test-only
-//! opt-in (`--foreground-for-tests` / `NANO_ALLOW_NESTED_SUPERVISOR=1`) runs it
-//! attached instead.
+//! The worker stamps `NANO_AGENT_RUN` on every agent's environment. Left
+//! unguarded, an agent could start its own supervisor/worker and build an
+//! unintended nested fleet that leases real jobs outside the job's lifecycle.
+//! So when `NANO_AGENT_RUN` is set the command must refuse unless an explicit
+//! test-only opt-in (`--foreground-for-tests` / `NANO_ALLOW_NESTED_SUPERVISOR=1`)
+//! runs it attached instead.
 //!
 //! Contract: under a job (env `NANO_AGENT_RUN` set), starting the long-lived
 //! supervisor/worker exits non-zero with an explanatory message and leaves **no**
