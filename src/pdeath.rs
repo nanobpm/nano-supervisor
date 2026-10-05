@@ -155,35 +155,30 @@ fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
 
 #[cfg(target_os = "macos")]
 fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
-    // `kern.proc.pid` returns the `kinfo_proc` for a live (or zombie) process.
-    // `kp_proc.p_starttime` is the process's start `{sec, usec}`; fold to
-    // microseconds for a single comparable token. `kp_eproc.e_ucred.cr_uid` is
-    // the real uid.
+    // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` for a live (or
+    // zombie) process. `pbi_start_tvsec`/`pbi_start_tvusec` are the process's
+    // start time; fold to microseconds for a single comparable token.
+    // `pbi_ruid` is the real uid. (libc does not expose `kinfo_proc`/`sysctl
+    // KERN_PROC` on Apple targets, so this is the available identity source.)
     unsafe {
-        let mut mib = [
-            libc::CTL_KERN,
-            libc::KERN_PROC,
-            libc::KERN_PROC_PID,
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(
             pgid as libc::c_int,
-        ];
-        let mut info: libc::kinfo_proc = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::kinfo_proc>();
-        if libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            &mut info as *mut _ as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
+            libc::PROC_PIDTBSDINFO,
             0,
-        ) != 0
-        {
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        );
+        if n <= 0 {
             return None;
         }
-        let tv = info.kp_proc.p_starttime;
-        let start = (tv.tv_sec as u64).checked_mul(1_000_000)? + tv.tv_usec as u64;
+        let start = info
+            .pbi_start_tvsec
+            .checked_mul(1_000_000)?
+            .checked_add(info.pbi_start_tvusec)?;
         Some(GroupIdentity {
             start,
-            uid: info.kp_eproc.e_ucred.cr_uid,
+            uid: info.pbi_ruid,
         })
     }
 }
