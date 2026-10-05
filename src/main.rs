@@ -17,10 +17,15 @@ mod pipe;
 mod profile;
 mod provision;
 mod result;
-// Linux-only: `openat2(RESOLVE_NO_SYMLINKS)` pinned-handle hardening for the
-// run-dir sweep/provision paths. Other Unix platforms use the path-based checks.
 mod runtime;
-#[cfg(target_os = "linux")]
+// Cross-platform validated-cwd capability: launch git / the agent through a
+// pinned, no-follow directory handle (`fchdir`) instead of re-resolving the run
+// dir path at spawn time, closing the provisioning→launch symlink TOCTOU (#35).
+mod safecwd;
+// Inode-pinned, no-follow directory handles for the run-dir sweep/provision
+// paths: `openat2(RESOLVE_NO_SYMLINKS)` on Linux ≥5.6, falling back to a
+// portable `O_NOFOLLOW` openat chain elsewhere (macOS, older Linux, any Unix).
+#[cfg(unix)]
 mod saferoot;
 mod slot;
 mod state;
@@ -96,6 +101,12 @@ enum Cmd {
         /// Exit after handling this many jobs.
         #[arg(long)]
         max_jobs: Option<usize>,
+        /// Test-harness escape hatch: run attached inside an agent run instead of
+        /// refusing (see the `NANO_AGENT_RUN` guard). Bound to the invoking
+        /// process so the job's teardown still kills it. For the hermetic
+        /// contract tests only — never for a real fleet.
+        #[arg(long = "foreground-for-tests", hide = true)]
+        foreground_for_tests: bool,
     },
     /// Run the MVP daemon: N slots per hire (from config.json), one shared
     /// engine connection, host sandbox only.
@@ -139,6 +150,12 @@ enum Cmd {
         /// to opt out.
         #[arg(long, hide = true)]
         with_lease: bool,
+        /// Test-harness escape hatch: run attached inside an agent run instead of
+        /// refusing (see the `NANO_AGENT_RUN` guard). Bound to the invoking
+        /// process so the job's teardown still kills it. For the hermetic
+        /// contract tests only — never for a real fleet.
+        #[arg(long = "foreground-for-tests", hide = true)]
+        foreground_for_tests: bool,
     },
     /// Internal: the macOS parent-death watchdog (kills an agent's process group
     /// when the daemon dies). Not for direct use.
@@ -179,6 +196,108 @@ fn daemon_leases(no_lease: bool) -> bool {
     !no_lease
 }
 
+/// Env var the worker stamps on every agent process (`slot::build_agent_env`) to
+/// mark its process tree as belonging to an agent run. Its presence here means
+/// *this* `nano-supervisor` was launched by an agent.
+const AGENT_RUN_ENV: &str = "NANO_AGENT_RUN";
+/// Explicit opt-in letting a supervisor/worker run attached inside an agent run.
+const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
+
+/// Pure refusal decision for a nested supervisor/worker (#40), split out so it is
+/// testable without touching process-global env. Returns the explanatory error
+/// message when the command must be refused, or `None` when it may run.
+///
+/// * `run` — the value of `NANO_AGENT_RUN`. **Presence** is what marks an agent
+///   run: `Some` (even an empty string) ⇒ inside an agent run ⇒ refused unless
+///   opted in; only `None` (unset) ⇒ outside. The worker stamps this var on
+///   every agent's environment, so an empty-but-present value is still the
+///   worker's mark — treating it as "outside" would let `NANO_AGENT_RUN=
+///   nano-supervisor daemon` bypass the refusal.
+/// * `foreground_for_tests` — the `--foreground-for-tests` flag.
+/// * `allow_nested` — the value of `NANO_ALLOW_NESTED_SUPERVISOR` (`"1"` opts in).
+fn nested_refusal(
+    command: &str,
+    run: Option<&str>,
+    foreground_for_tests: bool,
+    allow_nested: Option<&str>,
+) -> Option<String> {
+    let run = run?;
+    if foreground_for_tests || allow_nested == Some("1") {
+        return None;
+    }
+    // An empty marker still names the run: display it as such rather than
+    // rendering `NANO_AGENT_RUN=` (which reads like the var was unset).
+    let run_display = if run.is_empty() { "<empty>" } else { run };
+    Some(format!(
+        "refusing to start `nano-supervisor {command}` inside an agent run \
+         ({AGENT_RUN_ENV}={run_display}). A supervisor or worker started by an agent \
+         would run as an unintended nested fleet that leases real jobs outside the \
+         job's lifecycle and misreports the fleet. Agents must never start a real supervisor \
+         or daemon outside the hermetic test harness. If this IS a contract test, \
+         opt in with `--foreground-for-tests` or `{ALLOW_NESTED_ENV}=1` to run \
+         attached (bound to the invoking process)."
+    ))
+}
+
+/// Presence-preserving decode of an environment marker.
+///
+/// Returns `Some` whenever the variable is **present**, even when its value is
+/// not valid UTF-8 — decoding lossily for display rather than discarding the
+/// value the way `std::env::var().ok()` does (it maps a present non-UTF-8 value
+/// to `None`). The `#40` guard keys on presence, so losing a present non-UTF-8
+/// marker would silently reopen the nested-fleet bypass it exists to prevent.
+fn marker_presence(value: Option<std::ffi::OsString>) -> Option<String> {
+    value.map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Refuse to start a long-lived supervisor/worker inside an agent run (#40).
+///
+/// The worker marks every agent's environment with `NANO_AGENT_RUN`. Left
+/// unguarded, an agent could start its own supervisor/worker and build an
+/// unintended nested fleet that leases real jobs outside the job's lifecycle and
+/// misreports the fleet. So when `NANO_AGENT_RUN` is set we refuse, unless the
+/// caller explicitly opts in — `--foreground-for-tests` or
+/// `NANO_ALLOW_NESTED_SUPERVISOR=1` — which the hermetic contract tests use to
+/// run **attached**: staying in the invoking process group, and bound to the
+/// invoking process so the job's teardown still takes it down.
+fn guard_nested_supervisor(command: &str, foreground_for_tests: bool) -> Result<()> {
+    // Presence-preserving read: the guard is presence-based, so a present but
+    // non-UTF-8 `NANO_AGENT_RUN` must still count as "inside a run". Reading it
+    // with `std::env::var().ok()` would drop a non-UTF-8 value to `None` and let
+    // a present marker bypass both the refusal and the parent-death binding;
+    // `var_os` keeps presence and we decode lossily only for the diagnostic.
+    let run = marker_presence(std::env::var_os(AGENT_RUN_ENV));
+    // `allow` is matched by value against the exact opt-in `"1"`, not by
+    // presence: a non-UTF-8 value can never equal `"1"`, so dropping it to
+    // `None` fails closed (stays refused) and needs no presence preservation.
+    let allow = std::env::var(ALLOW_NESTED_ENV).ok();
+    if let Some(msg) = nested_refusal(
+        command,
+        run.as_deref(),
+        foreground_for_tests,
+        allow.as_deref(),
+    ) {
+        anyhow::bail!(msg);
+    }
+    if run.is_some() {
+        // Opted in: run attached. Bind to the invoking agent's death so the job's
+        // process-group kill (or the agent exiting) takes this process down too.
+        // Presence semantics match the refusal above: an empty-but-present
+        // marker is still the worker's mark, so the opted-in empty marker must
+        // bind too — otherwise it runs unbound, recreating the phantom the
+        // guard exists to prevent. Fail startup when the binding cannot be
+        // installed: running the opted-in supervisor without it would recreate
+        // the phantom the guard exists to prevent.
+        pdeath::bind_self_to_parent_death().map_err(|e| {
+            anyhow::anyhow!(
+                "could not bind this nested supervisor to the invoking agent's \
+                 death ({e}); refusing to run attached without teardown containment"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -198,7 +317,9 @@ async fn main() -> Result<()> {
             runs_dir,
             config,
             max_jobs,
+            foreground_for_tests,
         } => {
+            guard_nested_supervisor("work", foreground_for_tests)?;
             work::run(work::WorkOptions {
                 hire,
                 job_types: job_type,
@@ -233,7 +354,9 @@ async fn main() -> Result<()> {
             config,
             no_lease,
             with_lease: _,
+            foreground_for_tests,
         } => {
+            guard_nested_supervisor("daemon", foreground_for_tests)?;
             let opts = daemon::DaemonOptions {
                 profile,
                 with_lease: daemon_leases(no_lease),
@@ -472,12 +595,85 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_recovery_window, daemon_leases, normalize_runs_dir, normalize_runs_dir_impl, Cli,
-        Cmd, MIN_RECOVERY_WINDOW,
+        clamp_recovery_window, daemon_leases, marker_presence, nested_refusal, normalize_runs_dir,
+        normalize_runs_dir_impl, Cli, Cmd, MIN_RECOVERY_WINDOW,
     };
     use clap::Parser;
     use std::path::{Component, Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn marker_presence_preserves_a_present_value_including_non_utf8() {
+        // A present marker is kept even when its value is not valid UTF-8, so a
+        // present-but-non-UTF-8 `NANO_AGENT_RUN` still reads as "inside a run".
+        // `std::env::var().ok()` would drop it to `None` and silently reopen the
+        // nested-fleet bypass the #40 guard exists to close.
+        use std::ffi::OsString;
+        assert_eq!(marker_presence(None), None);
+        assert_eq!(
+            marker_presence(Some(OsString::from("214829"))),
+            Some("214829".to_string())
+        );
+        // An empty-but-present value stays `Some` (presence, not non-emptiness).
+        assert_eq!(marker_presence(Some(OsString::new())), Some(String::new()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // Invalid UTF-8 (a lone 0xFF byte) must remain `Some` — presence is
+            // preserved, decoded lossily only for display.
+            let non_utf8 = OsString::from_vec(vec![0xff]);
+            assert!(
+                marker_presence(Some(non_utf8)).is_some(),
+                "a present non-UTF-8 marker must still count as present"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_refusal_blocks_an_agent_run_without_opt_in() {
+        // Inside an agent run (NANO_AGENT_RUN set), no opt-in: refused, and the
+        // message explains itself.
+        let msg = nested_refusal("daemon", Some("214829"), false, None)
+            .expect("must refuse inside an agent run");
+        assert!(msg.contains("NANO_AGENT_RUN"), "message: {msg}");
+        assert!(msg.contains("214829"), "message names the run: {msg}");
+        assert!(msg.contains("daemon"), "message names the command: {msg}");
+    }
+
+    #[test]
+    fn nested_refusal_allows_outside_an_agent_run() {
+        // Not inside an agent run (marker unset): never refused, regardless of
+        // opt-in.
+        assert!(nested_refusal("daemon", None, false, None).is_none());
+        assert!(nested_refusal("work", None, false, None).is_none());
+    }
+
+    #[test]
+    fn nested_refusal_treats_an_empty_marker_as_inside_a_run() {
+        // Presence, not non-emptiness, marks an agent run: the worker stamps
+        // `NANO_AGENT_RUN` on every agent's environment, so an empty-but-present
+        // value is still the worker's mark. Treating it as "outside" would let
+        // `NANO_AGENT_RUN= nano-supervisor daemon` bypass the refusal.
+        let msg = nested_refusal("daemon", Some(""), false, None)
+            .expect("an empty-but-present marker must still refuse");
+        assert!(msg.contains("NANO_AGENT_RUN"), "message: {msg}");
+        assert!(msg.contains("daemon"), "message names the command: {msg}");
+        assert!(nested_refusal("work", Some(""), false, None).is_some());
+        // ... and the opt-ins still release an empty marker.
+        assert!(nested_refusal("daemon", Some(""), true, None).is_none());
+        assert!(nested_refusal("daemon", Some(""), false, Some("1")).is_none());
+    }
+
+    #[test]
+    fn nested_refusal_opt_in_flag_and_env_bypass() {
+        // The flag opts in.
+        assert!(nested_refusal("daemon", Some("214829"), true, None).is_none());
+        // `NANO_ALLOW_NESTED_SUPERVISOR=1` opts in.
+        assert!(nested_refusal("daemon", Some("214829"), false, Some("1")).is_none());
+        // Any other value does NOT opt in.
+        assert!(nested_refusal("daemon", Some("214829"), false, Some("0")).is_some());
+        assert!(nested_refusal("daemon", Some("214829"), false, Some("")).is_some());
+    }
 
     #[test]
     fn clamp_recovery_window_floors_degenerate_values() {

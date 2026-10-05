@@ -842,11 +842,17 @@ mod tests {
         let home = temp_home("write-atomic-durable");
         let path = state_file(&home);
         write_atomic(&path, b"{\"first\":true}\n").expect("first write must succeed");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"first\":true}\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"first\":true}\n"
+        );
         // A re-pin over the existing file must also succeed (exercises the same
         // durability path a second time).
         write_atomic(&path, b"{\"second\":true}\n").expect("re-write must succeed");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"second\":true}\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"second\":true}\n"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1090,15 +1096,15 @@ mod tests {
             let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
             std::fs::write(
                 c8ctl.join("profiles.json"),
-                format!(
-                    r#"{{"profiles":[{{"name":"merlin","baseUrl":"{empty_url}"}}]}}"#
-                ),
+                format!(r#"{{"profiles":[{{"name":"merlin","baseUrl":"{empty_url}"}}]}}"#),
             )
             .unwrap();
             std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
-            let err = resolve_or_pin(&home, Some("merlin")).err().unwrap_or_else(|| {
-                panic!("baseUrl {empty_url:?} normalizes to empty and must fail closed")
-            });
+            let err = resolve_or_pin(&home, Some("merlin"))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("baseUrl {empty_url:?} normalizes to empty and must fail closed")
+                });
             assert!(
                 format!("{err:#}").contains("no engine base URL"),
                 "baseUrl {empty_url:?}: unexpected error: {err:#}"

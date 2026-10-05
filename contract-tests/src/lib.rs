@@ -799,9 +799,15 @@ pub fn fake_agent_path() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
-/// Resolve the target CLI and a reachable local engine together, or a [`Skip`]
-/// reason. Engine-dependent worker tests start with this.
-pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
+/// Resolve just the target CLI, or a [`Skip`] reason — WITHOUT probing any
+/// engine. Tests that point the worker at a closed port (the engine-down
+/// regression) never talk to the live engine, so requiring one is unnecessary
+/// AND flaky: this suite runs concurrently, and the recovery test SIGSTOPs the
+/// shared engine for longer than the reachability probe, which would make an
+/// engine-dependent guard skip nondeterministically. These tests still keep the
+/// target-availability check (a target that is not runnable here skips
+/// cleanly); they only drop the engine probe.
+pub fn require_target() -> Result<Target, Skip> {
     let target = Target::from_env();
     if !target.available() {
         return Err(Skip(format!(
@@ -809,6 +815,13 @@ pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
             target.label()
         )));
     }
+    Ok(target)
+}
+
+/// Resolve the target CLI and a reachable local engine together, or a [`Skip`]
+/// reason. Engine-dependent worker tests start with this.
+pub fn require_engine_and_target() -> Result<(Engine, Target), Skip> {
+    let target = require_target()?;
     let engine = Engine::try_from_env()?;
     Ok((engine, target))
 }
@@ -1579,6 +1592,13 @@ fn hire_profile_with_rank(target: Target, home: &TempHome, profile: &str, rank: 
     }
 }
 
+/// Public handle on [`hire_profile`] for tests that drive the worker process
+/// directly (e.g. the offline-storm regression, which spawns the worker against
+/// a closed port rather than through the blocking `run_worker_job` harness).
+pub fn hire_fake_agent(target: Target, home: &TempHome, profile: &str) {
+    hire_profile(target, home, profile);
+}
+
 /// Build the `work <profile>` command that services one test job type: the
 /// hired profile supplies the agent binding and `--job-type <t>` adds the
 /// unique test job type on top of the profile's rank matrix. The caller applies
@@ -1772,8 +1792,12 @@ const WORKER_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// them regardless of their group.
 /// Shells out to `kill(1)` so no libc dependency is needed; failures are ignored
 /// (a process may already be gone).
+///
+/// `pub` (but `#[doc(hidden)]`) so the offline contract tests can install the
+/// same panic-safe process-tree cleanup the harness uses internally.
 #[cfg(target_os = "linux")]
-fn kill_process_tree(pid: u32) {
+#[doc(hidden)]
+pub fn kill_process_tree(pid: u32) {
     use std::collections::HashMap;
     // Map ppid -> children, from every /proc/<pid>/stat (field 4 = ppid).
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -1816,7 +1840,8 @@ fn read_ppid(pid: u32) -> Option<u32> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn kill_process_tree(pid: u32) {
+#[doc(hidden)]
+pub fn kill_process_tree(pid: u32) {
     use std::collections::HashMap;
     // No /proc on macOS/BSD, so reconstruct the tree from `ps`. A plain
     // group-kill of the worker is NOT enough: the worker runs agents in their
