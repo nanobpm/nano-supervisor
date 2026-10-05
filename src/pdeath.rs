@@ -328,6 +328,15 @@ pub(crate) async fn terminate_group_and_reap(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
 }
 
+/// Non-Unix stub so [`GroupGuard`]'s field type resolves on every platform.
+/// `GroupGuard` is compiled unconditionally (it is referenced from
+/// platform-independent call sites), but the real [`PgidGuard`] is Unix-only; on
+/// Windows the guard is always `None` and never signals, so an empty placeholder
+/// is all the type system needs.
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PgidGuard;
+
 /// Cancellation cleanup guard: SIGKILLs the agent's process group when dropped,
 /// unless disarmed. Ensures a dropped (aborted) in-flight agent tears down the
 /// whole tree — not just the leader `kill_on_drop` reaps — while the normal path
@@ -349,6 +358,24 @@ impl GroupGuard {
         {
             let _ = pid;
             Self(None)
+        }
+    }
+
+    /// SIGKILL the captured group now, gated on the identity captured at
+    /// construction (spawn time) — **never** a fresh signal-time capture. A
+    /// caller that times out must reuse this guard rather than
+    /// `PgidGuard::capture`-ing the pgid again at signal time: a fresh capture
+    /// reads whatever group currently holds the number, so if the leader was
+    /// already reaped and the pgid recycled it would bless and SIGKILL an
+    /// unrelated group. The spawn-time identity held here instead fails the
+    /// check on a recycled pgid (issue #27). No-op if disarmed or the group is
+    /// no longer verifiably ours.
+    pub(crate) fn kill_group_if_ours(&self) {
+        #[cfg(unix)]
+        if let Some(guard) = self.0 {
+            if guard.still_ours() {
+                sigkill_group(guard.pgid());
+            }
         }
     }
 
