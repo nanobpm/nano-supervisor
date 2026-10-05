@@ -117,9 +117,18 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         None => {
             let ns = format!("rust-worker-{}", std::process::id());
             match state::state_home() {
-                Some(h) => (h.join("agent-runs").join(&ns), h),
+                // Normalize the environment-derived state home (`$C8CTL_NANO_HOME`
+                // / `$HOME` / `$XDG_DATA_HOME`) BEFORE it becomes the anchor, so a
+                // `.`/leading-`..` in those variables is resolved consistently
+                // with an explicit `--runs-dir` (main::normalize_runs_dir) and a
+                // stray `..` fails closed here with a clear error instead of
+                // breaking every job's no-follow preparation on Linux.
+                Some(h) => {
+                    let h = crate::normalize_runs_dir(&h)?;
+                    (h.join("agent-runs").join(&ns), h)
+                }
                 None => {
-                    let t = std::env::temp_dir();
+                    let t = crate::normalize_runs_dir(&std::env::temp_dir())?;
                     // Use the SAME `rust-worker-<pid>` namespace prefix as the
                     // normal paths: the shared-parent sweeper recognises only
                     // that prefix (`slot::namespace_owner_liveness`), so a
@@ -186,14 +195,14 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // (ELOOP), never followed (#36).
     #[cfg(unix)]
     {
-        crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs_dir, 0o700).map_err(|e| {
-            match e {
+        crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs_dir, 0o700).map_err(
+            |e| match e {
                 crate::saferoot::PinError::Io(e) => anyhow::Error::new(e).context(format!(
                     "creating worker-namespace runs root {}",
                     runs_dir.display()
                 )),
-            }
-        })?;
+            },
+        )?;
     }
     #[cfg(not(unix))]
     {

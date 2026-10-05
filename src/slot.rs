@@ -607,8 +607,9 @@ pub(crate) fn prepare_run_dir(
     #[cfg(unix)]
     {
         prepare_run_dir_pinned(runs_dir, run_dir).map_err(|e| match e {
-            crate::saferoot::PinError::Io(e) => anyhow::Error::new(e)
-                .context(format!("preparing run dir {}", run_dir.display())),
+            crate::saferoot::PinError::Io(e) => {
+                anyhow::Error::new(e).context(format!("preparing run dir {}", run_dir.display()))
+            }
         })
     }
     #[cfg(not(unix))]

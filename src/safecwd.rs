@@ -1012,7 +1012,11 @@ mod tests {
             cap -= 1;
         }
 
-        let result = if armed { Some(handle.try_clone()) } else { None };
+        let result = if armed {
+            Some(handle.try_clone())
+        } else {
+            None
+        };
 
         // Restore the limit before asserting/cleanup so a failure here does not
         // wedge the rest of the test binary.

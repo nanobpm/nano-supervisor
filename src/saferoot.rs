@@ -87,6 +87,23 @@ pub(crate) struct DirHandle {
     fd: OwnedFd,
 }
 
+/// Zero the calling thread's `errno` (so a NULL `readdir` with a clear `errno`
+/// is a genuine EOF). The thread-local accessor differs per libc.
+fn clear_errno() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    unsafe {
+        *libc::__error() = 0;
+    }
+    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    unsafe {
+        *libc::__errno() = 0;
+    }
+}
+
 fn cstr(name: &OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path component contains NUL"))
@@ -430,6 +447,56 @@ impl DirHandle {
         Ok(DirHandle { fd })
     }
 
+    /// Open a direct child **regular file** relative to this handle for
+    /// read+write, never following a symlink and never escaping this directory
+    /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, plus `O_NOFOLLOW` on the final
+    /// component). `O_NONBLOCK` guards against an attacker-planted FIFO whose
+    /// open would otherwise block the worker thread; the caller rejects any
+    /// non-regular file after the open via `fstat`.
+    ///
+    /// Used by the submodule-config credential scrub so each `config` is opened
+    /// *through the pinned parent handle* — a component swapped to a symlink
+    /// after the entry was triaged (or the leaf itself swapped) cannot redirect
+    /// the rewrite outside the checkout: the open is refused (`ELOOP`) rather
+    /// than followed.
+    ///
+    /// Elsewhere (non-Linux, or a pre-5.6 kernel) `name` must be a single
+    /// component — a `/`, `.` or `..` is refused — so the portable `openat`
+    /// with `O_NOFOLLOW` is anchored on this pinned handle and cannot escape it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_child_file_rw_nofollow(&self, name: &OsStr) -> io::Result<std::fs::File> {
+        let c = cstr(name)?;
+        let flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        #[cfg(target_os = "linux")]
+        {
+            match openat2_raw(
+                self.fd.as_raw_fd(),
+                &c,
+                flags as u64,
+                RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+            ) {
+                Ok(fd) => return Ok(std::fs::File::from(fd)),
+                // Pre-5.6 kernel without `openat2`: fall back to the portable
+                // single-component openat below.
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "refusing non-single-component child name",
+            ));
+        }
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
     /// `lstat` a direct child (relative, never following the entry).
     pub(crate) fn symlink_metadata(&self, name: &OsStr) -> io::Result<EntryMeta> {
         let c = cstr(name)?;
@@ -469,7 +536,31 @@ impl DirHandle {
     /// Enumerate this directory's entry names (excluding `.` and `..`),
     /// relative to the pinned handle. `fdopendir` consumes the fd it is given,
     /// so a duplicate is used and the original pinned fd is left intact.
+    ///
+    /// Best-effort: a mid-stream `readdir` error ends enumeration and the
+    /// partial listing is returned as `Ok`. That is right for the sweep / slot
+    /// reaping (a truncated list merely defers reaping to the next pass), but
+    /// NOT for a security decision — callers that must not act on a partial
+    /// listing (e.g. the credential scrub) use [`entry_names_strict`].
     pub(crate) fn entry_names(&self) -> io::Result<Vec<OsString>> {
+        self.collect_entry_names(false)
+    }
+
+    /// Like [`entry_names`](Self::entry_names) but **strict**: a mid-stream
+    /// `readdir` error is surfaced as `Err` rather than silently treated as
+    /// end-of-directory. Use this wherever a partial listing would be a
+    /// security hole — e.g. the submodule-config credential scrub, which must
+    /// fail (and so refuse to hand out the checkout) rather than report success
+    /// while an unenumerated `config` keeps its credentials.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn entry_names_strict(&self) -> io::Result<Vec<OsString>> {
+        self.collect_entry_names(true)
+    }
+
+    /// Shared enumeration core. When `strict` is false a NULL `readdir` return
+    /// is always end-of-directory; when true, `errno` is zeroed before each call
+    /// and a NULL return with a non-zero `errno` is an I/O error, not EOF.
+    fn collect_entry_names(&self, strict: bool) -> io::Result<Vec<OsString>> {
         // SAFETY: dup of a valid fd; ownership of `dupfd` is handed to
         // `fdopendir` (closed by `closedir`), or closed directly on the error
         // path below.
@@ -493,13 +584,24 @@ impl DirHandle {
         // sweep's post-reap emptiness check).
         unsafe { libc::rewinddir(dirp) };
         let mut names = Vec::new();
-        loop {
-            // The classic `while ((e = readdir(d)))` idiom: a NULL return is
-            // end-of-directory. (Best-effort: a rare mid-stream error also ends
-            // enumeration, which for the sweep merely defers reaping.)
+        let result = loop {
+            // Distinguish EOF from a mid-stream error: `readdir` returns NULL
+            // for both, setting `errno` only on error. Zero it first so a NULL
+            // return with a clear `errno` is a genuine EOF.
+            if strict {
+                clear_errno();
+            }
             let ent = unsafe { libc::readdir(dirp) };
             if ent.is_null() {
-                break;
+                if strict {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(0) {
+                        break Err(e);
+                    }
+                }
+                // Best-effort (non-strict) mode keeps the historical behaviour:
+                // a NULL ends enumeration whether it was EOF or a rare error.
+                break Ok(());
             }
             // SAFETY: `d_name` is a NUL-terminated C string within the entry.
             let cs = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
@@ -508,9 +610,9 @@ impl DirHandle {
                 continue;
             }
             names.push(OsStr::from_bytes(bytes).to_os_string());
-        }
+        };
         unsafe { libc::closedir(dirp) };
-        Ok(names)
+        result.map(|()| names)
     }
 
     /// Recursively remove a direct child (`name`) relative to this handle,
@@ -610,7 +712,12 @@ impl DirHandle {
     /// intermediate component that is only descended *through* (opened
     /// traversal-only, so the walk resolves beneath a search-only ancestor),
     /// `false` for the final root (retained readable).
-    pub(crate) fn ensure_child_dir(&self, name: &OsStr, mode: u32, trav: bool) -> io::Result<DirHandle> {
+    pub(crate) fn ensure_child_dir(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        trav: bool,
+    ) -> io::Result<DirHandle> {
         let c = cstr(name)?;
         if unsafe { libc::mkdirat(self.fd.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) } != 0 {
             let e = io::Error::last_os_error();
@@ -641,7 +748,10 @@ impl DirHandle {
     /// component is refused by the no-follow open, and a swapped-in symlink is
     /// refused the same way. `path` may be absolute; the anchor (`/` / `.`) is
     /// opened as-is (trusted, never a symlink).
-    pub(crate) fn open_or_create_root_nofollow(path: &Path, mode: u32) -> Result<DirHandle, PinError> {
+    pub(crate) fn open_or_create_root_nofollow(
+        path: &Path,
+        mode: u32,
+    ) -> Result<DirHandle, PinError> {
         // The final `Normal` component is the runs root we retain (readable);
         // every component before it is only traversed *through*, so it is
         // opened traversal-only (Linux `O_PATH` / macOS `O_SEARCH`) and needs
@@ -705,7 +815,12 @@ impl DirHandle {
                 }
             }
         }
-        cur.ok_or_else(|| PinError::Io(io::Error::new(ErrorKind::InvalidInput, "empty directory path")))
+        cur.ok_or_else(|| {
+            PinError::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "empty directory path",
+            ))
+        })
     }
 }
 
