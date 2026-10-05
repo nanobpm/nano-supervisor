@@ -975,6 +975,14 @@ type RemovePauseHook = Box<dyn FnOnce() + Send>;
 static REMOVE_IF_INACTIVE_PAUSE: Mutex<Option<(std::path::PathBuf, RemovePauseHook)>> =
     Mutex::new(None);
 
+/// Process-local monotonically increasing sequence folded into the per-activation
+/// fallback-branch suffix (`nano/agent-work/<base>-<pid>-<nanos>-<seq>`). All
+/// slots share the worker PID and can observe the same wall-clock tick, so the
+/// timestamp alone is not unique; this counter guarantees two activations in one
+/// process never mint the same suffix. `Relaxed` ordering suffices — only the
+/// fetch_add's atomicity/uniqueness matters, not any happens-before edge.
+static ACTIVATION_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Atomically check `path` against [`active_runs`] and, when it is not
 /// registered, remove it — all while holding the active-runs mutex. This closes
 /// the check/remove TOCTOU that a bare `is_active_run` + `remove_*` pair leaves
@@ -1764,13 +1772,21 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // and its later push is rejected non-fast-forward against the first
             // attempt's branch. A fresh per-activation id makes each attempt's
             // fallback distinct. `key` stays the job/run-directory identity.
+            //
+            // Uniqueness: `pid` + wall-clock nanos alone is NOT enough — every
+            // slot shares the worker PID, and two concurrent slots can observe
+            // the SAME clock tick (or the clock can move backward), recreating
+            // the very collision the suffix exists to prevent. Fold in a
+            // process-local monotonically increasing sequence so two activations
+            // can never mint the same suffix even on an identical timestamp.
             let activation = format!(
-                "{}-{}",
+                "{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
-                    .unwrap_or(0)
+                    .unwrap_or(0),
+                ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
             );
             let prep = crate::provision::prepare_work_branch(
                 &cwd,

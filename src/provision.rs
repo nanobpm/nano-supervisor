@@ -619,6 +619,28 @@ fn resolve_local_source(url: &str, supervisor_cwd: &Path) -> String {
     supervisor_cwd.join(url).to_string_lossy().into_owned()
 }
 
+/// The trusted source a finalize-time git operation (push, default-branch
+/// lookup, post-error remote verification) must target: the SAME source
+/// `provision()` cloned from. `provision()` re-anchors a relative *local* URL
+/// (e.g. `./origin.git`) against the supervisor's cwd before cloning
+/// (`resolve_local_source`); finalize runs with the *checkout* as its cwd, so
+/// re-splitting the raw `repo.url` would re-resolve that relative path against
+/// the wrong base and push/query the wrong (or a nonexistent) destination.
+/// Re-apply the same re-anchor here, then lift any embedded credential out of
+/// argv exactly as the clone did. Remote URLs and absolute paths pass through
+/// unchanged, so this is a no-op for the common case.
+fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
+    let supervisor_cwd = std::env::current_dir();
+    let resolved = match &supervisor_cwd {
+        Ok(cwd) => resolve_local_source(url, cwd),
+        // If the supervisor cwd is somehow unreadable, fall back to the raw URL
+        // rather than fail: remote/absolute sources are unaffected, and a
+        // relative local source simply resolves as it did before this fix.
+        Err(_) => url.to_string(),
+    };
+    split_url_credential(&resolved)
+}
+
 /// Split a remote URL into `(url_for_argv, credential)`: the returned URL has
 /// any `user:secret@` userinfo removed (safe to place in argv), and the
 /// credential — when the URL carried one — is returned separately for
@@ -891,7 +913,7 @@ async fn resolve_remote_default_branch(
     // Fallback: ask the trusted remote. Isolated config + credential-free URL +
     // out-of-band helper credential, mirroring the finalize push, so a private
     // default still resolves and no secret reaches argv.
-    let (fetch_url, cred) = split_url_credential(&repo.url);
+    let (fetch_url, cred) = trusted_fetch_source(&repo.url);
     let out = git_isolated(
         &[
             "ls-remote".into(),
@@ -1890,19 +1912,22 @@ pub async fn finalize_git(
     // are agent-created — but still classify each tip by REACHABILITY (a tag
     // merely pinning a commit already on a branch, or already at a provision
     // tip, strands nothing) so the net does not over-retain the common case.
-    // Retain any POST-provisioning commit reachable from no local branch and no
-    // provision-time ref tip.
+    // Retain any POST-provisioning commit reachable from no local branch, no
+    // remote-tracking ref, and no provision-time ref tip. `refs/remotes/*` is
+    // agent-writable (a plain `git fetch`/`update-ref` advances it) yet is not
+    // covered by the local-head sweep above, so a commit parked ONLY under an
+    // advanced remote-tracking ref would otherwise have its sole copy reaped.
     //
     // FAIL CLOSED: a truncated/failed enumeration must not read as "no parked
     // work" — retain. Bound the candidate set like the reflog net so an
     // agent-manufactured ref pile cannot stall finalize past its run timeout.
     {
-        // Every ref OUTSIDE `refs/heads`/`refs/remotes` (tags, the `refs/stash`
-        // tip, any other namespace). Capture the peeled commit too so an
-        // ANNOTATED tag classifies by the commit it points at, not its tag
-        // object. Filter the two covered namespaces in Rust rather than with
-        // `for-each-ref --exclude` (added only in git 2.39) so the sweep works
-        // on older git too. `git_untruncated` fails closed if the listing
+        // Every ref OUTSIDE `refs/heads` (remote-tracking refs, tags, the
+        // `refs/stash` tip, any other namespace). Capture the peeled commit too
+        // so an ANNOTATED tag classifies by the commit it points at, not its tag
+        // object. Filter the covered local-head namespace in Rust rather than
+        // with `for-each-ref --exclude` (added only in git 2.39) so the sweep
+        // works on older git too. `git_untruncated` fails closed if the listing
         // overflows the capture cap.
         let mut candidates: Vec<String> = Vec::new();
         match git_untruncated(
@@ -1921,9 +1946,7 @@ pub async fn finalize_git(
                 for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     let mut parts = line.split_whitespace();
                     let refname = parts.next().unwrap_or("");
-                    if refname.starts_with("refs/heads/")
-                        || refname.starts_with("refs/remotes/")
-                    {
+                    if refname.starts_with("refs/heads/") {
                         continue;
                     }
                     // `%(*objectname)` is the peeled commit for an annotated tag
@@ -2005,7 +2028,11 @@ pub async fn finalize_git(
         if !out.retain {
             for h in &candidates {
                 // Skip commits already reachable from some local branch tip
-                // (e.g. a tag on a commit the push will publish).
+                // (e.g. a tag on a commit the push will publish) OR from a
+                // remote-tracking ref (e.g. the agent fetched more of `origin`;
+                // that commit is durable on the remote, so reaping the run dir
+                // loses nothing). Only a commit reachable from NEITHER is
+                // potentially stranded.
                 let covered = git(
                     &[
                         "for-each-ref".into(),
@@ -2013,6 +2040,7 @@ pub async fn finalize_git(
                         h.clone(),
                         "--format=%(refname)".into(),
                         "refs/heads/".into(),
+                        "refs/remotes/".into(),
                     ],
                     Some(workspace),
                     timeout,
@@ -2024,9 +2052,10 @@ pub async fn finalize_git(
                 if covered {
                     continue;
                 }
-                // Reachable from no branch: agent work iff reachable from no
-                // provision-time ref tip. FAIL CLOSED (agent work) on a missing
-                // snapshot or any error, mirroring the reflog net.
+                // Reachable from no local or remote-tracking ref: agent work iff
+                // reachable from no provision-time ref tip. FAIL CLOSED (agent
+                // work) on a missing snapshot or any error, mirroring the reflog
+                // net.
                 let agent_made = match &prep.provision_shas {
                     None => true,
                     Some(shas) => {
@@ -2041,9 +2070,10 @@ pub async fn finalize_git(
                 };
                 if agent_made {
                     log(&format!(
-                        "finalize: commit {h} is parked under a non-head local ref (stash/tag) and \
-                         is reachable from no local branch and no provision-time ref tip (stranded \
-                         agent work); retaining the run dir so its only copy is not reaped"
+                        "finalize: commit {h} is parked under a non-head ref (stash/tag/\
+                         remote-tracking) and is reachable from no local branch, no \
+                         remote-tracking ref, and no provision-time ref tip (stranded agent \
+                         work); retaining the run dir so its only copy is not reaped"
                     ));
                     out.retain = true;
                     // Real work exists even though it is on no branch and
@@ -2109,7 +2139,12 @@ pub async fn finalize_git(
                         out.retain = true;
                     }
                     Ok(rewrites) => {
-                        let (fetch_url, cred) = split_url_credential(&repo.url);
+                        // Push to the SAME trusted source the clone used: a
+                        // relative local `repo.url` (e.g. `./origin.git`) must be
+                        // re-anchored to the supervisor cwd, not re-resolved
+                        // against the checkout (which would target the wrong — or
+                        // no — destination and report `pushed: false`).
+                        let (fetch_url, cred) = trusted_fetch_source(&repo.url);
                         // Re-assert each scrubbed rewrite's inverse so the push
                         // resolves the TRUSTED `fetch_url` even if an included
                         // file re-adds the rewrite: `url.<fetch_url>.insteadOf =
@@ -4700,6 +4735,116 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[tokio::test]
+    async fn finalize_strands_commit_parked_only_on_remote_tracking_ref() {
+        // Regression for the safety-sweep gap: a commit parked ONLY under an
+        // agent-advanced `refs/remotes/*` ref (reachable from no local branch)
+        // is stranded agent work — the run dir holds its only copy, so finalize
+        // must RETAIN, not push the prepared branch and reap it away.
+        let dir = git_workspace("fin-rt-park").await;
+        let t = Duration::from_secs(30);
+        let bare = std::env::temp_dir().join(format!(
+            "nano-bare-rt-park-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        git(
+            &[
+                "init".into(),
+                "--bare".into(),
+                "--".into(),
+                bare.to_string_lossy().into_owned(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut repo = test_repo();
+        repo.url = format!("file://{}", bare.display());
+
+        let prep =
+            prepare_work_branch(&dir, &repo, Some("main"), Some("feat/work"), true, "u-rtp", t)
+                .await;
+        assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
+
+        // The agent commits, then parks that commit under a remote-tracking ref
+        // and resets the work branch back to the provision tip — so the commit
+        // is reachable from NO local branch, only from `refs/remotes/origin/...`.
+        commit(&dir, "agent work parked on a remote-tracking ref").await;
+        let parked = git(
+            &["rev-parse".into(), "HEAD".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        git(
+            &[
+                "update-ref".into(),
+                "refs/remotes/origin/parked".into(),
+                parked.clone(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        let start = prep.start_sha.clone().expect("non-empty base");
+        git(
+            &["reset".into(), "--hard".into(), start],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let res = finalize_git(&dir, &prep, &repo, t).await;
+        assert!(
+            res.retain,
+            "a commit parked only on an agent-advanced remote-tracking ref must be retained, \
+             not reaped"
+        );
+        assert!(
+            !res.pushed,
+            "finalize must not report a clean push while stranded work is retained"
+        );
+        assert!(
+            res.work_found,
+            "the stranded commit is real work and must feed the empty-job detector"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[tokio::test]
+    async fn trusted_fetch_source_reanchors_relative_local_url() {
+        // Regression for the finalize push URL: a relative local `repo.url` must
+        // be re-anchored to the supervisor cwd (as `provision()` did for the
+        // clone), not re-resolved against the finalize checkout's cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let (fetch, cred) = trusted_fetch_source("./origin.git");
+        let want = cwd.join("./origin.git").to_string_lossy().into_owned();
+        assert_eq!(fetch, want, "a relative local source must be re-anchored");
+        assert!(cred.is_none(), "a credential-free source yields no credential");
+
+        // Remote URLs and absolute paths pass through unchanged.
+        let (remote, _) = trusted_fetch_source("https://github.com/o/r.git");
+        assert_eq!(remote, "https://github.com/o/r.git");
+        let abs = if cfg!(windows) { "C:/x/y.git" } else { "/x/y.git" };
+        let (abs_out, _) = trusted_fetch_source(abs);
+        assert_eq!(abs_out, abs);
     }
 
     async fn empty_base_workspace(tag: &str) -> CwdHandle {
