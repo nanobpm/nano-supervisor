@@ -223,8 +223,9 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // The pin in `supervisor.json` makes the connection a recorded decision —
     // an explicit `--profile` (re)pins; otherwise the existing pin wins over
     // the ambient session; a first start pins what it resolved.
-    let state_home = state::state_home()
-        .unwrap_or_else(|| config_exit("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)"));
+    let state_home = state::state_home().unwrap_or_else(|| {
+        config_exit("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
+    });
     let decision = match pin::resolve_or_pin(&state_home, opts.profile.as_deref()) {
         Ok(d) => d,
         Err(e) => config_exit(&format!("cannot resolve the pinned connection: {e:#}")),
@@ -241,7 +242,13 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // issue-#41 incident's only clue was a job-type line deep in the log.
     log(&format!("engine: {engine_desc}"));
     let pinned_name = decision.pin.profile.clone();
-    let (_profile, jobs) = match engine::connect(pinned_name.as_deref(), &engine_desc, &job_types) {
+    let pinned_base_url = decision.pin.base_url.clone();
+    let (_profile, jobs) = match engine::connect(
+        pinned_name.as_deref(),
+        &engine_desc,
+        &job_types,
+        pinned_base_url.as_deref(),
+    ) {
         Ok(v) => v,
         Err(e) => config_exit(&format!("cannot connect to the pinned engine: {e:#}")),
     };

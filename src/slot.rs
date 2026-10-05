@@ -2181,13 +2181,19 @@ fn build_agent_env(
     env
 }
 
-/// Seed the per-run isolated c8ctl config dir (`<run dir>/c8ctl`) from the
-/// worker's pinned connection: a `session.json` whose `activeProfile` is the
-/// pinned profile and a `profiles.json` carrying only that profile, both
-/// written `0600`. Returns the dir to export as `C8CTL_CONFIG_DIR`, or `None`
-/// when the pin carries no c8ctl profile (a `CAMUNDA_*`-env connection has no
-/// profile files to seed — the agent's c8ctl then starts empty and its writes
-/// still stay inside the run dir).
+/// Create the per-run isolated c8ctl config dir (`<run dir>/c8ctl`, `0700`)
+/// and seed it from the worker's pinned connection: a `session.json` whose
+/// `activeProfile` is the pinned profile and a `profiles.json` carrying only
+/// that profile, both written `0600`. Returns the dir to export as
+/// `C8CTL_CONFIG_DIR`.
+///
+/// The dir is created for EVERY job — including a `CAMUNDA_*`-env pin, which
+/// has no profile files to seed: an agent without `C8CTL_CONFIG_DIR` inherits
+/// the operator's ambient c8ctl session, and its `c8 use profile X` then
+/// rewrites the operator's global `~/.config/c8ctl/session.json` — the exact
+/// write that retargeted the fleet in the issue-#41 incident. With the env var
+/// pointing inside the run dir, that write lands in the (empty, per-run) dir
+/// instead and is reaped with the run.
 ///
 /// The dir is derived from `result_file` (`<run dir>/result.json` → its parent
 /// is the run dir) so the env builder stays pure for its unit tests — the seed
@@ -2195,47 +2201,73 @@ fn build_agent_env(
 /// failing the job, because the run dir was just prepared owner-only and a
 /// failure here means something is already very wrong with it.
 fn seed_agent_c8ctl_dir(cfg: &SlotConfig, result_file: &std::path::Path) -> Option<PathBuf> {
-    // Prefer the fully resolved profile; when the pin names one that no longer
-    // resolves (e.g. it was deleted after pinning), still seed the NAME with
-    // the pin's recorded baseUrl fingerprint, so the agent's `c8` sees the
-    // same engine identity the banner reported instead of nothing at all.
-    let profile = cfg.connection_profile.clone().or_else(|| {
-        cfg.connection.profile.clone().map(|name| crate::profile::Profile {
-            name,
-            base_url: cfg.connection.base_url.clone(),
-            ..Default::default()
-        })
-    })?;
     let run_dir = result_file.parent()?.to_path_buf();
     let dir = run_dir.join("c8ctl");
-    if let Err(e) = seed_c8ctl_dir(&dir, &profile) {
+    if let Err(e) = std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the agent's c8ctl config dir {}", dir.display()))
+    {
         log(&format!(
-            "warning: could not seed the agent's isolated c8ctl config dir {}: {e:#} \
+            "warning: could not create the agent's isolated c8ctl config dir {}: {e:#} \
              — the agent inherits the ambient c8ctl session for this job",
             dir.display()
         ));
         return None;
     }
-    Some(dir)
-}
-
-/// Write the isolated c8ctl config dir's two seed files. Split from
-/// [`seed_agent_c8ctl_dir`] so the contract test can drive it directly.
-pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating the agent's c8ctl config dir {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {}", dir.display()))?;
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", dir.display()))
+        {
+            log(&format!(
+                "warning: could not restrict the agent's isolated c8ctl config dir {}: {e:#} \
+                 — the agent inherits the ambient c8ctl session for this job",
+                dir.display()
+            ));
+            return None;
+        }
     }
+    // Prefer the fully resolved profile; when the pin names one that no longer
+    // resolves (e.g. it was deleted after pinning), still seed the NAME with
+    // the pin's recorded baseUrl fingerprint, so the agent's `c8` sees the
+    // same engine identity the banner reported instead of nothing at all. An
+    // env-only pin has no profile to seed — the empty dir above is the whole
+    // isolation then.
+    let profile = cfg.connection_profile.clone().or_else(|| {
+        cfg.connection
+            .profile
+            .clone()
+            .map(|name| crate::profile::Profile {
+                name,
+                base_url: cfg.connection.base_url.clone(),
+                ..Default::default()
+            })
+    });
+    if let Some(profile) = profile {
+        if let Err(e) = seed_c8ctl_dir(&dir, &profile) {
+            log(&format!(
+                "warning: could not seed the agent's isolated c8ctl config dir {}: {e:#} \
+                 — the agent's c8ctl starts empty inside the run dir",
+                dir.display()
+            ));
+        }
+    }
+    Some(dir)
+}
+
+/// Write the isolated c8ctl config dir's two seed files (the dir itself is
+/// created and restricted by [`seed_agent_c8ctl_dir`]). Split from it so the
+/// contract test can drive it directly.
+pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> Result<()> {
     let session = serde_json::json!({ "activeProfile": profile.name });
     let profiles = serde_json::json!({ "profiles": [profile] });
     for (name, value) in [("session.json", session), ("profiles.json", profiles)] {
         let path = dir.join(name);
-        std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&value)?))
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value)?),
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2415,6 +2447,70 @@ mod tests {
             .rfind(|(k, _)| k == "NANO_AGENTIC")
             .map(|(_, v)| v.as_str());
         assert_eq!(last, Some("off"));
+    }
+
+    /// Issue #41, the env-only gap: a worker pinned to the `CAMUNDA_*`
+    /// environment (no c8ctl profile) must STILL hand every agent an isolated
+    /// per-run `C8CTL_CONFIG_DIR` — otherwise the agent inherits the operator's
+    /// ambient c8ctl session and its `c8 use profile X` rewrites the operator's
+    /// global `~/.config/c8ctl/session.json` (the incident's write). The dir is
+    /// created but NOT seeded (there is no profile to seed).
+    #[test]
+    fn env_only_pin_still_isolates_the_agents_c8ctl_dir() {
+        let mut c = cfg();
+        c.connection = crate::pin::ConnectionPin {
+            profile: None,
+            base_url: Some("http://env-engine:8080".into()),
+        };
+        c.connection_profile = None;
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-envpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf);
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_CONFIG_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("an env-only pin must still export C8CTL_CONFIG_DIR");
+        assert_eq!(dir, run.join("c8ctl").to_string_lossy());
+        // The dir exists, is owner-only, and carries NO seed files — the
+        // agent's c8ctl starts empty inside the run.
+        let meta = std::fs::metadata(&dir).expect("the isolated dir was created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        assert!(!std::path::Path::new(&dir).join("session.json").exists());
+        assert!(!std::path::Path::new(&dir).join("profiles.json").exists());
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// The profiled counterpart: a pinned profile seeds the isolated dir with
+    /// exactly that profile, so the agent's own `c8` sees the job's engine.
+    #[test]
+    fn profiled_pin_seeds_the_agents_c8ctl_dir() {
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-profpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&cfg(), "1", &job, &rf);
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_CONFIG_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_CONFIG_DIR");
+        let session: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::path::Path::new(&dir).join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session["activeProfile"], serde_json::json!("merlin"));
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]

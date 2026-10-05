@@ -287,18 +287,21 @@ fn worker_isolates_the_agents_c8ctl_session() {
     // The agent's c8ctl is pointed INSIDE its own run dir — never at the
     // operator's global config — so its `c8 use profile` writes stay in the
     // run and the operator's session.json is untouched.
-    let dir = env
-        .get("C8CTL_CONFIG_DIR")
-        .unwrap_or_else(|| panic!("worker must set C8CTL_CONFIG_DIR for the agent; env was {env:?}"));
+    let dir = env.get("C8CTL_CONFIG_DIR").unwrap_or_else(|| {
+        panic!("worker must set C8CTL_CONFIG_DIR for the agent; env was {env:?}")
+    });
     assert!(
         dir.contains("agent-runs"),
         "the agent's c8ctl config dir must live under the per-run tree, not the operator's ~/.config; got {dir}"
     );
-    // The seed is exactly the pinned connection: the session's activeProfile
-    // and a profiles.json carrying only that profile, so the agent's own `c8`
-    // sees the job's engine and nothing else. The run dir outlives the job
-    // when it failed; on success it may be reaped, so read the seed only when
-    // it still exists and assert its shape then.
+    // The seed, when there is one, is exactly the pinned connection: the
+    // session's activeProfile and a profiles.json carrying only that profile,
+    // so the agent's own `c8` sees the job's engine and nothing else. (This
+    // engine-gated harness connects the worker via `CAMUNDA_REST_ADDRESS` — an
+    // env-only pin — so there is no profile to seed and the isolated dir stays
+    // EMPTY; the unit tests pin the seeded shape for a profiled connection.
+    // The run dir also outlives the job only when it failed, so read the seed
+    // only when it exists.)
     let session = std::path::Path::new(dir).join("session.json");
     if session.exists() {
         let seeded: serde_json::Value = serde_json::from_str(

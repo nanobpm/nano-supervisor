@@ -95,11 +95,17 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // Every slot of this daemon connects through the PINNED profile — never
     // the ambient session — so a moved active profile cannot split the fleet.
     let pinned_name = decision.pin.profile.clone();
+    let pinned_base_url = decision.pin.base_url.clone();
     let all_types: Vec<String> = selected
         .iter()
         .flat_map(|h| state::job_type_matrix(&h.rank, &h.capabilities))
         .collect();
-    let (_profile, jobs) = engine::connect(pinned_name.as_deref(), &engine_desc, &all_types)?;
+    let (_profile, jobs) = engine::connect(
+        pinned_name.as_deref(),
+        &engine_desc,
+        &all_types,
+        pinned_base_url.as_deref(),
+    )?;
     let host = short_hostname();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 

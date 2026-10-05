@@ -153,7 +153,20 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         (None, None) => (active_profile.clone(), true),
     };
     let resolved = profile::resolve(name.as_deref())?;
-    let base_url = profile::resolved_base_url(resolved.as_ref());
+    let mut base_url = profile::resolved_base_url(resolved.as_ref());
+    if !created {
+        // An env-only pin has no profile to re-resolve, so its baseUrl
+        // fingerprint is the RECORDED one: keep it stable across restarts.
+        // Re-reading the current `CAMUNDA_REST_ADDRESS` here would rewrite the
+        // pin to wherever the env drifted and the drift check below could
+        // never fire — the pin would ratify the very retarget it exists to
+        // catch.
+        if let (Some(pin), None) = (&existing, &resolved) {
+            if pin.base_url.is_some() {
+                base_url = pin.base_url.clone();
+            }
+        }
+    }
     let pin = ConnectionPin {
         profile: resolved.as_ref().map(|p| p.name.clone()).or(name),
         base_url,
@@ -169,14 +182,19 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
     })
 }
 
-/// The startup banner's drift warnings (issue #41, proposal 2). Two drift
-/// signals, both loud:
+/// The startup banner's drift warnings (issue #41, proposal 2). Three drift
+/// signals, all loud:
 ///
 /// * the pinned profile differs from the session's current active profile —
 ///   the classic `c8 use profile` retarget; the supervisor keeps following the
 ///   PIN, and says so;
 /// * the pinned profile now resolves to a different baseUrl than the pin's
-///   fingerprint — the profile itself was re-pointed under the same name.
+///   fingerprint — the profile itself was re-pointed under the same name (the
+///   worker connects to the profile's CURRENT baseUrl and warns);
+/// * an env-only pin's recorded baseUrl differs from the CURRENT
+///   `CAMUNDA_REST_ADDRESS` — the env drifted after pinning; the worker keeps
+///   connecting to the PINNED baseUrl (the fingerprint is enforced, not just
+///   recorded) and warns.
 pub fn warn_if_drifted(decision: &PinDecision) {
     if let (Some(pinned), Some(active)) = (&decision.pin.profile, &decision.active_profile) {
         if pinned != active {
@@ -189,14 +207,36 @@ pub fn warn_if_drifted(decision: &PinDecision) {
             ));
         }
     }
-    let now_url = profile::resolved_base_url(decision.profile.as_ref());
-    match (&decision.pin.base_url, &now_url) {
-        (Some(then), Some(now)) if then != now => {
-            log(&format!(
-                "WARNING: the pinned profile resolves to {now} but the pin was taken against \
-                 {then} — the profile's baseUrl changed under the same name; this supervisor \
-                 connects to {now}"
-            ));
+    match (&decision.pin.profile, &decision.pin.base_url) {
+        // Profile pin: the fingerprint is compared against what the pinned
+        // profile resolves to NOW.
+        (Some(_), Some(then)) => {
+            if let Some(now) = profile::resolved_base_url(decision.profile.as_ref()) {
+                if *then != now {
+                    log(&format!(
+                        "WARNING: the pinned profile resolves to {now} but the pin was taken \
+                         against {then} — the profile's baseUrl changed under the same name; \
+                         this supervisor connects to {now}"
+                    ));
+                }
+            }
+        }
+        // Env-only pin: the fingerprint is compared against the CURRENT
+        // environment, and the client build keeps following the PIN (see
+        // `engine::connect`'s `pinned_base_url`).
+        (None, Some(then)) => {
+            if let Some(now) = profile::resolved_base_url(None) {
+                if *then != now {
+                    log(&format!(
+                        "WARNING: the CAMUNDA_* environment now points at {now} but this \
+                         supervisor's connection was pinned against {then} — the env drifted \
+                         after pinning; this supervisor keeps connecting to the PINNED engine \
+                         {then} (restart with a changed environment AND --profile, or delete \
+                         the pin in {}, to re-pin)",
+                        state_file_display(decision)
+                    ));
+                }
+            }
         }
         _ => {}
     }
@@ -215,12 +255,35 @@ fn state_file_display(_decision: &PinDecision) -> String {
 mod tests {
     use super::*;
 
+    /// `resolve_or_pin` reads the process `CAMUNDA_*` environment, and cargo
+    /// runs tests in threads sharing that environment — so the env-pin test
+    /// below mutates `CAMUNDA_REST_ADDRESS` under a mutex and restores it on
+    /// drop. No other test in this binary may depend on those variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> EnvGuard {
+            let saved = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            EnvGuard { key, saved }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     fn temp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nano-pin-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nano-pin-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -287,5 +350,43 @@ mod tests {
             .describe(),
             "CAMUNDA_* env (http://localhost:8080)"
         );
+    }
+
+    /// Issue #41, the env-only gap: an env pin's baseUrl fingerprint must
+    /// survive a restart whose `CAMUNDA_REST_ADDRESS` drifted. Re-resolving the
+    /// current env would silently rewrite the pin to the drifted engine and the
+    /// drift warning could never fire — the pin would ratify the very retarget
+    /// it exists to catch.
+    #[test]
+    fn env_pin_keeps_its_base_url_fingerprint_across_env_drift() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("envdrift");
+        // Isolate from the host's real c8ctl session: an ambient active
+        // profile would be picked up as the pin's profile, and the test is
+        // about the profile-LESS (env) path.
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
+        let first = resolve_or_pin(&home, None).expect("first start pins");
+        assert!(first.created);
+        assert_eq!(first.pin.profile, None);
+        assert_eq!(first.pin.base_url.as_deref(), Some("http://engine-a:8080"));
+
+        // The environment drifts (a stray export, a systemd unit edit)…
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-b:8080");
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        assert!(!second.created);
+        assert_eq!(second.pin.profile, None);
+        // …but the pin's fingerprint is NOT rewritten to the drifted address…
+        assert_eq!(
+            second.pin.base_url.as_deref(),
+            Some("http://engine-a:8080"),
+            "the env pin must keep its recorded fingerprint across env drift"
+        );
+        // …and the on-disk pin is untouched either.
+        let on_disk = read(&home).expect("pin on disk");
+        assert_eq!(on_disk.base_url.as_deref(), Some("http://engine-a:8080"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

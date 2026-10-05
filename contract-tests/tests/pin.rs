@@ -72,7 +72,11 @@ fn hire(home: &TempHome) {
 /// it to fail its (unroutable) engine connection, and return its output. The
 /// worker must get far enough to pin and banner the engine — the pin write and
 /// the banner both happen BEFORE the first activation poll.
-fn run_work(home: &TempHome, c8ctl_dir: &std::path::Path, extra: &[&str]) -> contract_tests::CmdOutput {
+fn run_work(
+    home: &TempHome,
+    c8ctl_dir: &std::path::Path,
+    extra: &[&str],
+) -> contract_tests::CmdOutput {
     let mut args: Vec<&str> = vec!["work", "coder", "--poll-timeout", "200"];
     args.extend_from_slice(extra);
     let mut cmd = home.cmd(&args);
@@ -251,6 +255,118 @@ fn explicit_profile_re_pins() {
         "the banner must show the re-pinned engine; stderr was:\n{}",
         out.stderr
     );
+}
+
+/// The env-only pin (no c8ctl profile — how a systemd/env-deployed fleet and
+/// this repo's own contract harness run the worker): its recorded baseUrl
+/// fingerprint is ENFORCED, not just recorded. A start whose
+/// `CAMUNDA_REST_ADDRESS` drifted after pinning must keep connecting to the
+/// PINNED engine and warn loudly about the drift.
+#[test]
+fn env_pin_enforces_its_base_url_fingerprint_across_env_drift() {
+    let target = Target::from_env();
+    require_target!(target);
+    if target == Target::Node {
+        contract_tests::note_skip(module_path!(), "Rust target only (issue #41)");
+        return;
+    }
+    let home = TempHome::with_target(target);
+    hire(&home);
+    // No c8ctl config at all: the connection comes from CAMUNDA_REST_ADDRESS.
+    let c8ctl = tempfile::tempdir().expect("c8ctl dir");
+
+    // First start pins the env connection (engine A).
+    let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
+    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+        .env("CAMUNDA_REST_ADDRESS", "http://engine-a.invalid:8080");
+    let out = run_to_banner(cmd);
+    assert!(
+        out.stderr
+            .contains("engine: CAMUNDA_* env (http://engine-a.invalid:8080)"),
+        "first start must pin and banner the env engine; stderr was:\n{}",
+        out.stderr
+    );
+    let state = home.read_json("supervisor.json").expect("pinned");
+    assert_eq!(
+        state["connection"]["baseUrl"],
+        serde_json::json!("http://engine-a.invalid:8080")
+    );
+    assert!(state["connection"].get("profile").is_none());
+
+    // The environment drifts to engine B (a stray export, a unit edit). The
+    // next start must NOT follow it: the banner still names the PINNED engine
+    // A and a loud warning names the drift.
+    let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
+    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+        .env("CAMUNDA_REST_ADDRESS", "http://engine-b.invalid:8080");
+    let out = run_to_banner(cmd);
+    assert!(
+        out.stderr
+            .contains("engine: CAMUNDA_* env (http://engine-a.invalid:8080)"),
+        "the worker must keep following the PIN (engine A), not the drifted env; stderr was:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr
+            .contains("engine: CAMUNDA_* env (http://engine-b.invalid:8080)"),
+        "the banner must NOT adopt the drifted env engine; stderr was:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("WARNING") && out.stderr.contains("engine-b.invalid:8080"),
+        "the drift warning must name the env's new address; stderr was:\n{}",
+        out.stderr
+    );
+    // The pin on disk is untouched by the drift.
+    let state = home.read_json("supervisor.json").expect("supervisor.json");
+    assert_eq!(
+        state["connection"]["baseUrl"],
+        serde_json::json!("http://engine-a.invalid:8080")
+    );
+}
+
+/// Spawn `work` from a prepared command and collect its startup output up to
+/// the `engine: ` banner (everything under test here is logged before the
+/// first activation attempt).
+fn run_to_banner(mut cmd: std::process::Command) -> contract_tests::CmdOutput {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn work");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    collected.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&collected);
+                    if text.contains("engine: ") {
+                        let _ = seen_tx.send(text.into_owned());
+                        while matches!(stderr.read(&mut buf), Ok(n) if n > 0) {}
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = seen_tx.send(String::from_utf8_lossy(&collected).into_owned());
+    });
+    let banner = seen_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_default();
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("reap work");
+    contract_tests::CmdOutput {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: banner,
+    }
 }
 
 /// The sanity guard (proposal 4): a worker whose whole job-type matrix is

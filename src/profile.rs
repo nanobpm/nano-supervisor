@@ -76,14 +76,30 @@ pub fn active_profile_name() -> Option<String> {
 /// Pick the profile named `wanted`, else the session's active profile.
 /// Returns `None` when neither is set (the caller falls back to `CAMUNDA_*` env).
 pub fn resolve(wanted: Option<&str>) -> Result<Option<Profile>> {
+    resolve_with_base_override(wanted, None)
+}
+
+/// [`resolve`], plus an explicit base URL that beats the environment when the
+/// connection comes from the `CAMUNDA_*` env (no profile). This is how an
+/// env-only connection pin (issue #41) is ENFORCED rather than just recorded:
+/// the pin's baseUrl fingerprint is passed here, so a later start whose
+/// `CAMUNDA_REST_ADDRESS` drifted still builds its client for the PINNED
+/// engine. A resolved profile always keeps its own `baseUrl` — the override
+/// only ever applies to the env fallback.
+pub fn resolve_with_base_override(
+    wanted: Option<&str>,
+    base_url_override: Option<&str>,
+) -> Result<Option<Profile>> {
     let Some(dir) = c8ctl_config_dir() else {
         return Ok(None);
     };
     // An explicit engine address in the environment beats c8ctl's remembered
-    // active profile (but not an explicit --profile).
-    let env_address = ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    // active profile (but not an explicit --profile). A pinned baseUrl counts
+    // as such an address: the pin IS the recorded connection decision.
+    let env_address = base_url_override.is_some()
+        || ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
     let name = match wanted {
         Some(n) => Some(n.to_string()),
         None if env_address => None,
@@ -147,13 +163,23 @@ pub fn sdk_settings(p: &Profile) -> BTreeMap<&'static str, String> {
     m
 }
 
-/// Build an SDK client from the profile (if any) layered over the environment.
-pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
+/// Build an SDK client from the profile (if any) layered over the environment,
+/// plus an explicit base URL applied only when the connection has no profile
+/// of its own — the env-only connection pin's fingerprint (issue #41). Setting
+/// `CAMUNDA_REST_ADDRESS` on the options beats the process environment, so a
+/// drifted `CAMUNDA_*` env cannot retarget a pinned worker; a resolved
+/// profile's own `baseUrl` still wins over the override.
+pub fn client_with_base_override(
+    profile: Option<&Profile>,
+    base_url_override: Option<&str>,
+) -> Result<CamundaClient> {
     let mut opts = CamundaOptions::new();
     if let Some(p) = profile {
         for (k, v) in sdk_settings(p) {
             opts = opts.with(k, v);
         }
+    } else if let Some(url) = base_url_override {
+        opts = opts.with("CAMUNDA_REST_ADDRESS", url.to_string());
     }
     CamundaClient::new(opts).map_err(|e| anyhow::anyhow!("creating engine client: {e}"))
 }
