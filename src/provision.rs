@@ -319,14 +319,14 @@ fn scrub_submodule_config_credentials(workspace: &Path) -> Result<()> {
     {
         use crate::saferoot::{DirHandle, PinError};
         match DirHandle::open_root_nofollow(&modules, false) {
-            Ok(root) => return scrub_config_tree_pinned(root, &modules),
+            Ok(root) => scrub_config_tree_pinned(root, &modules),
             // The modules root was swapped for a symlink (or an ancestor
             // component became one) between the stat above and this pin: refuse
             // to traverse it rather than follow it outside the checkout.
-            Err(PinError::Io(e)) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
-            Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(PinError::Io(e)) if e.raw_os_error() == Some(libc::ELOOP) => Ok(()),
+            Err(PinError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(PinError::Io(e)) => {
-                return Err(e).with_context(|| format!("pinning {}", modules.display()));
+                Err(e).with_context(|| format!("pinning {}", modules.display()))
             }
         }
     }
