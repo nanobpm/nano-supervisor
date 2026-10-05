@@ -325,6 +325,20 @@ pub struct PinDecision {
     pub stored_base_url: Option<String>,
 }
 
+/// Does an engine base URL embed HTTP(S) userinfo (`user:pass@host`)? Such a
+/// URL would carry a credential into the persisted pin, so the pin rejects it
+/// (issue #41). The authority is everything between `://` and the first
+/// `/`, `?` or `#`; a `@` there is userinfo. Scheme-relative or opaque strings
+/// are treated as their own authority so a `user@host`-style value is caught.
+fn base_url_has_userinfo(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority.contains('@')
+}
+
 /// Resolve the connection for this start, honouring and maintaining the pin:
 ///
 /// * An explicit `--profile` (re)pins: the operator is deliberately choosing a
@@ -398,6 +412,58 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
             // URL (the client connects there); the recorded fingerprint stays
             // in `stored_base_url` purely for the drift comparison.
         }
+    }
+    // Fail CLOSED when the connection cannot be faithfully and safely pinned
+    // (issue #41). A pin that misrepresents, leaks, or cannot fingerprint the
+    // connection is worse than refusing to start: it either retargets the
+    // fleet silently or writes a credential a same-user agent can read.
+    //
+    // 1. A requested/pinned profile NAME that did not resolve (e.g. no c8ctl
+    //    config directory is locatable because `C8CTL_NANO_HOME` is set but
+    //    `HOME`/`XDG_CONFIG_HOME` is not) would otherwise be recorded verbatim
+    //    while the client connects from the ambient environment — the banner
+    //    and pin would claim a profile that is not actually in effect.
+    if resolved.is_none() {
+        if let Some(wanted) = &name {
+            anyhow::bail!(
+                "cannot resolve c8ctl profile {wanted:?}: no c8ctl config directory \
+                 was found (set HOME/XDG_CONFIG_HOME, or C8CTL_CONFIG_DIR). Refusing \
+                 to start with an ambient connection masquerading as this profile \
+                 (issue #41)."
+            );
+        }
+    }
+    // 2. An engine URL that embeds HTTP(S) userinfo (`user:pass@host`) would be
+    //    persisted into `<state home>/supervisor.json` in cleartext. The agent
+    //    runs as the same OS user and inherits the state-home context, so
+    //    `0600`/`0700` does not stop it reading that secret, and display/seed
+    //    redaction happens too late. Reject it and require dedicated auth
+    //    settings rather than carrying credentials in the URL.
+    if let Some(u) = &base_url {
+        if base_url_has_userinfo(u) {
+            anyhow::bail!(
+                "engine base URL embeds userinfo credentials, which would be \
+                 persisted to supervisor.json in cleartext and readable by \
+                 same-user agents. Remove the `user:pass@` from the engine URL \
+                 and supply authentication via a c8ctl profile or the \
+                 CAMUNDA_* auth environment instead (issue #41)."
+            );
+        }
+    }
+    // 3. A first pin with no resolvable base URL would persist `connection: {}`
+    //    — no fingerprint at all. The SDK then falls back to its ambient/default
+    //    endpoint, and a later restart with a freshly set address silently
+    //    follows it because there is nothing stored to restore or compare. That
+    //    is a pinned home that is still retargetable without an explicit re-pin.
+    //    Require a resolvable engine URL so the pin can record a fingerprint.
+    if created && base_url.is_none() {
+        anyhow::bail!(
+            "cannot pin the supervisor connection: no engine base URL could be \
+             resolved from a c8ctl profile or CAMUNDA_REST_ADDRESS/\
+             ZEEBE_REST_ADDRESS. Set an explicit engine address (or pass \
+             --profile) so the pin records a fingerprint instead of leaving the \
+             home retargetable (issue #41)."
+        );
     }
     let pin = ConnectionPin {
         profile: resolved.as_ref().map(|p| p.name.clone()).or(name),
@@ -832,6 +898,104 @@ mod tests {
         assert!(second.profile.is_none(), "no profile may be resolved");
         // …and keeps enforcing the recorded engine-A fingerprint, not engine B.
         assert_eq!(second.pin.base_url.as_deref(), Some("http://engine-a:8080"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn base_url_userinfo_is_detected() {
+        assert!(base_url_has_userinfo("http://user:pass@engine:8080"));
+        assert!(base_url_has_userinfo("https://user:pass@engine:8080/v2"));
+        assert!(base_url_has_userinfo("https://token@engine:8080"));
+        assert!(base_url_has_userinfo("user:pass@engine:8080"));
+        assert!(!base_url_has_userinfo("http://engine:8080"));
+        assert!(!base_url_has_userinfo("https://engine:8080/v2"));
+        // A `@` only in the path/query is not userinfo.
+        assert!(!base_url_has_userinfo("http://engine:8080/a@b"));
+        assert!(!base_url_has_userinfo("http://engine:8080/p?u=a@b"));
+    }
+
+    /// Issue #41, credential-in-pin: an engine URL that embeds `user:pass@host`
+    /// must NOT be persisted to `supervisor.json`, where a same-user agent could
+    /// read it. The pin fails closed and tells the operator to use dedicated
+    /// auth settings instead.
+    #[test]
+    fn env_pin_rejects_userinfo_bearing_engine_url() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("userinfo");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://admin:s3cr3t@engine:8080");
+        let err = match resolve_or_pin(&home, None) {
+            Ok(_) => panic!("userinfo URL must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("userinfo"),
+            "error must explain the credential leak: {err:#}"
+        );
+        // Nothing may have been persisted.
+        assert!(
+            read(&home).expect("read ok").is_none(),
+            "a rejected pin must not write any state"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41, empty-fingerprint pin: a first start with neither a profile
+    /// nor a `CAMUNDA_*` engine address must NOT persist `connection: {}` — an
+    /// empty pin leaves the home retargetable by a later restart with a freshly
+    /// set address, with no fingerprint to compare. The pin fails closed.
+    #[test]
+    fn initial_pin_without_resolvable_base_url_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("nobaseurl");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _a = EnvGuard::unset("CAMUNDA_REST_ADDRESS");
+        let _z = EnvGuard::unset("ZEEBE_REST_ADDRESS");
+        let err = match resolve_or_pin(&home, None) {
+            Ok(_) => panic!("a fingerprint-less pin must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no engine base URL could be resolved"),
+            "error must explain the missing fingerprint: {err:#}"
+        );
+        assert!(
+            read(&home).expect("read ok").is_none(),
+            "a rejected initial pin must not write any state"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41, unresolved-profile masquerade: when a profile NAME is
+    /// requested/pinned but no c8ctl config directory can be located,
+    /// `profile::resolve` returns `Ok(None)`. The pin must NOT record that name
+    /// while silently connecting from the ambient environment — it fails closed.
+    #[test]
+    fn explicit_profile_that_cannot_be_resolved_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("ghostprofile");
+        // Make `c8ctl_config_dir()` return None: no override and no HOME/XDG.
+        let _cfg = EnvGuard::unset("C8CTL_CONFIG_DIR");
+        let _home_env = EnvGuard::unset("HOME");
+        let _xdg = EnvGuard::unset("XDG_CONFIG_HOME");
+        let err = match resolve_or_pin(&home, Some("ghost")) {
+            Ok(_) => panic!("an unresolvable named profile must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ghost") && msg.contains("config directory"),
+            "error must name the unresolved profile and the cause: {err:#}"
+        );
+        assert!(
+            read(&home).expect("read ok").is_none(),
+            "a rejected profile pin must not write any state"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }
