@@ -215,11 +215,26 @@ fn extend_timeout(now: Instant, deadline: Instant) -> Duration {
         .max(Duration::from_millis(1))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a per-job refresher legitimately needs the client, job key, lease, window, \
+              activation instant, success counter, and two watch channels; bundling them into \
+              a one-shot struct would only move the same fields behind an indirection"
+)]
 pub(crate) async fn refresh_loop(
     jobs: Jobs,
     key: String,
     lease: Option<String>,
     window: Duration,
+    // The instant the activation response was received by the caller (captured
+    // in `handle` BEFORE validation/logging/spawn). The lease runs `window` from
+    // when the engine dispatched the job, i.e. essentially when that response was
+    // produced — NOT from the later instant this task starts executing. Basing
+    // the initial deadline on `Instant::now()` here would grant a full fresh
+    // window measured from an instant already past dispatch, over-granting by the
+    // post-response scheduling gap and letting the refresher run past the
+    // server-side lease. Take the caller's earlier timestamp instead.
+    activated_at: Instant,
     count: Arc<AtomicUsize>,
     lost: watch::Sender<bool>,
     mut stop: watch::Receiver<bool>,
@@ -231,11 +246,12 @@ pub(crate) async fn refresh_loop(
     let every = (window / 3).max(Duration::from_millis(1));
     let mut failures = 0u32;
     // The absolute instant the current lease expires. The activation was granted
-    // for `window` when this loop was spawned, so start there; each successful
-    // extend pushes it out by another `window`. Capping the retry sleep against
+    // for `window` as of `activated_at` (the activation response), so start
+    // there; each successful extend pushes it out by another `window` measured
+    // from when THAT extend was SENT (see below). Capping the retry sleep against
     // THIS deadline (not the full window) is what keeps a retry from landing
     // after the activation has already expired (see `refresh_budget`).
-    let mut deadline = Instant::now() + window;
+    let mut deadline = activated_at + window;
     loop {
         // After a transient failure, wait longer than the steady-state cadence
         // before retrying: an engine that is DOWN (connection refused — the
@@ -289,7 +305,8 @@ pub(crate) async fn refresh_loop(
         // 404/409), so the `failures >= 2` fence below still applies — and
         // because the attempt is clamped to the lease, that fence is published
         // at or before the deadline, never up to `EXTEND_TIMEOUT` past it.
-        let attempt_timeout = extend_timeout(Instant::now(), deadline);
+        let sent_at = Instant::now();
+        let attempt_timeout = extend_timeout(sent_at, deadline);
         let extended = tokio::time::timeout(attempt_timeout, jobs.extend(&key, window, &lease))
             .await
             .unwrap_or_else(|_| {
@@ -303,9 +320,16 @@ pub(crate) async fn refresh_loop(
                 failures = 0;
                 count.fetch_add(1, Ordering::Relaxed);
                 // The extend succeeded, so the lease now runs another full
-                // `window` from now: reset the absolute deadline so a transient
-                // timeout earlier in the streak cannot lose in-flight work.
-                deadline = Instant::now() + window;
+                // `window` — but measured from when the engine received this
+                // extend, not from now. Base the new deadline on `sent_at`
+                // (captured BEFORE the request) rather than `Instant::now()`:
+                // a slow extend response otherwise resets the deadline a full
+                // window past the response, over-granting by the round-trip and
+                // letting the refresher and agent run past the server-side lease.
+                // Resetting here (vs. only on the first success) still ensures a
+                // transient timeout earlier in the streak cannot lose in-flight
+                // work, now without the over-grant.
+                deadline = sent_at + window;
             }
             Err(e) => {
                 let msg = format!("{e:#}");

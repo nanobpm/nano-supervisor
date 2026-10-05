@@ -352,6 +352,12 @@ async fn handle(jobs: Jobs, cfg: Arc<SlotConfig>, Job { job, lease }: Job) {
         key.clone(),
         lease.clone(),
         cfg.recovery_window,
+        // Base the refresher's initial lease deadline on `started` (captured at
+        // the top of `handle`, right after the activation response) rather than
+        // an `Instant::now()` taken inside the loop: the lease began at dispatch,
+        // so the earlier timestamp avoids over-granting the first window by the
+        // validation/logging/spawn gap.
+        started,
         refreshes.clone(),
         lost_tx,
         stop_rx,
