@@ -1,4 +1,4 @@
-# Control-socket protocol (`supervisor.sock`) — c8ctl-plugin-nano 1.70.1
+# Control-socket protocol (`supervisor.sock`) — c8ctl-plugin-nano 1.69.2
 
 Recorded from the Node plugin. The Rust `nano-supervisor` must speak the same
 protocol so a Node client can drive a Rust daemon and vice-versa during the

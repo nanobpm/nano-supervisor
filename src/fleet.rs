@@ -166,11 +166,12 @@ fn config_path() -> Result<PathBuf> {
 
 fn read_config() -> Result<ConfigFile> {
     let path = config_path()?;
-    if !path.exists() {
-        return Ok(ConfigFile::default());
+    match read_confined(&path)? {
+        None => Ok(ConfigFile::default()),
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+        }
     }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
 }
 
 /// Serialize `value` to pretty JSON and commit it to `path` atomically: write a
@@ -267,23 +268,22 @@ fn temp_component_for(file_name: &std::ffi::OsStr) -> Result<std::ffi::CString> 
     std::ffi::CString::new(bytes).context("state temp path component contains NUL byte")
 }
 
+/// Open the directory that holds `path`, confined to the trusted state home.
+///
+/// The configured state home is the TRUSTED ANCHOR: open it *following* symlinks
+/// (a symlinked home is operator-controlled trust, not an attacker-plantable
+/// tail component), then walk every component BELOW it with `O_NOFOLLOW` so a
+/// planted symlink in the operator-controlled tail cannot redirect an access out
+/// of the home. For `config.json` the parent IS the anchor, so there is no tail
+/// to walk and a symlinked home is simply resolved; for `workforce/<name>.json`
+/// the `workforce` component is opened no-follow. Paths outside the home fail
+/// closed. Both the read and the write path pin their target through this same
+/// handle, so reads honour the exact same confinement invariant as writes.
 #[cfg(unix)]
-fn write_json_atomic_unix(path: &Path, json: &[u8]) -> Result<()> {
+fn open_confined_parent(path: &Path) -> Result<RawFdGuard> {
     let parent = path
         .parent()
         .context("state path has no parent directory")?;
-    let file_name = path.file_name().context("state path has no file name")?;
-    let final_c = cstring_from_component(file_name)?;
-    let tmp_c = temp_component_for(file_name)?;
-
-    // The configured state home is the TRUSTED ANCHOR: open it following
-    // symlinks (a symlinked home is operator-controlled trust, not an
-    // attacker-plantable tail component), then walk every component BELOW it
-    // with `O_NOFOLLOW` so a planted symlink in the operator-controlled tail
-    // cannot redirect the write out of the home. For `config.json` the parent IS
-    // the anchor, so there is no tail to walk and a symlinked home is simply
-    // resolved; for `workforce/<name>.json` the `workforce` component is opened
-    // no-follow. Paths outside the home fail closed.
     let anchor = home_dir()?;
     let tail = parent.strip_prefix(&anchor).map_err(|_| {
         anyhow::anyhow!(
@@ -334,6 +334,100 @@ fn write_json_atomic_unix(path: &Path, json: &[u8]) -> Result<()> {
         }
         dirfd = RawFdGuard(fd);
     }
+
+    Ok(dirfd)
+}
+
+/// True if any link in the error chain is an OS `NotFound` (`ENOENT`). Used by
+/// the confined read to map "the file (or a directory above it) does not exist"
+/// to `None` while still surfacing a symlinked/foreign tail (`ELOOP`/`ENOTDIR`)
+/// as a hard error.
+#[cfg(unix)]
+fn chain_is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+/// Read a state file confined to the trusted home: the home is the trusted
+/// anchor (opened following symlinks), every component below it — INCLUDING the
+/// file itself — is opened `O_NOFOLLOW`, and the opened file is verified to be a
+/// regular file before its bytes are returned. So a symlinked `config.json`,
+/// a symlinked `workforce/` tail, or a symlinked manifest can no longer make a
+/// read escape the home — the exact confinement invariant the write path
+/// enforces. `Ok(None)` means the file is simply absent (missing file, or a
+/// missing directory above it); `Err` means a planted symlink/foreign entry or
+/// a real I/O failure.
+#[cfg(unix)]
+fn read_confined(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let file_name = path.file_name().context("state path has no file name")?;
+    let final_c = cstring_from_component(file_name)?;
+
+    let dirfd = match open_confined_parent(path) {
+        Ok(fd) => fd,
+        // A missing anchor or tail directory means the file cannot exist; mirror
+        // the previous `path.exists()` check and report it absent rather than an
+        // error. A symlinked/foreign tail surfaces as a non-`NotFound` error.
+        Err(e) if chain_is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd.0,
+            final_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "opening state file without following symlinks: {}",
+                path.display()
+            )
+        });
+    }
+    let fd = RawFdGuard(fd);
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.0, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statting state file {}", path.display()));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        bail!("state path is not a regular file: {}", path.display());
+    }
+
+    let mut f = fd.into_file();
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+#[cfg(not(unix))]
+fn read_confined(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn write_json_atomic_unix(path: &Path, json: &[u8]) -> Result<()> {
+    let file_name = path.file_name().context("state path has no file name")?;
+    let final_c = cstring_from_component(file_name)?;
+    let tmp_c = temp_component_for(file_name)?;
+
+    let dirfd = open_confined_parent(path)?;
 
     let write_result = (|| -> Result<()> {
         let fd = unsafe {
@@ -475,17 +569,105 @@ fn normalized_identity(path: &Path) -> PathBuf {
 /// `flock`, a live-but-slow holder simply makes contenders *block* until it
 /// finishes (correct serialization), and a dead holder's lock is already gone.
 ///
-/// The lock file lives in the system temp dir, keyed by a hash of the guarded
-/// path — *not* under the state home — so it leaves no residue there: the
-/// contract test `state_writes_stay_under_home` asserts the home's file set
-/// exhaustively. This mirrors the control socket, the one other state artifact
-/// the plugin keeps in the temp dir. The empty lock file itself may persist in
-/// the temp dir between runs; it is reused, never a source of corruption,
-/// because exclusion comes from the `flock`, not the file's existence.
+/// The lock file lives in an **owner-private per-user directory**
+/// (`<base>/c8ctl-nano-fleet-<uid>/`, where `<base>` prefers `$XDG_RUNTIME_DIR`
+/// / `$XDG_STATE_HOME` / `$HOME/.local/state` and falls back to the system temp
+/// dir), keyed by a hash of the guarded path — *not* under the state home, so it
+/// leaves no residue there: the contract test `state_writes_stay_under_home`
+/// asserts the home's file set exhaustively. Preferring a user-private base
+/// means another local user cannot even pre-create the lock subdir; the
+/// directory is additionally created `0700` and verified to be a real directory
+/// (not a symlink) owned by the current user with no group/other access, and
+/// each lock file is opened `O_NOFOLLOW` and verified to be a regular file we
+/// own. A predictable name *directly* under world-writable `/tmp` would
+/// otherwise let another local user pre-create the path (as a mode-000 file or a
+/// symlink), wedging every `hire`/`assign`/`workforce add` for the known home
+/// with `EACCES`/`ELOOP` — the same pre-creation threat `default_runs_dir`
+/// avoids with the same precedence. The empty lock file itself may persist
+/// between runs; it is reused, never a source of corruption, because exclusion
+/// comes from the `flock`, not the file's existence.
 struct StateLock {
     // Held for the guard's lifetime; dropping it closes the fd and releases the
     // advisory `flock`. Never read directly.
     _file: std::fs::File,
+}
+
+/// The owner-private directory that holds the fleet lock files. Created `0700`
+/// if absent, then verified to be a real directory (not a symlink), owned by the
+/// current user, with no group/other permission bits — so no other local user
+/// can have pre-created it to plant or redirect our lock files. Returns the
+/// verified path.
+#[cfg(unix)]
+fn fleet_lock_dir() -> Result<PathBuf> {
+    fleet_lock_dir_in(&lock_base_dir())
+}
+
+/// Base directory under which the owner-private lock directory is created.
+///
+/// Prefer a **user-private** base no other local user can create entries in, so
+/// the per-user lock subdir cannot be *pre-created* by an attacker in the first
+/// place (the pre-creation DoS the reviewer flagged). This mirrors
+/// `default_runs_dir`'s precedence: `$XDG_RUNTIME_DIR` (per-user `0700` runtime
+/// dir), else `$XDG_STATE_HOME`, else `$HOME/.local/state`. Only when no home is
+/// known at all do we fall back to the shared system temp dir, where
+/// `fleet_lock_dir_in`'s ownership/permission verification still fails closed on
+/// a foreign pre-created directory.
+#[cfg(unix)]
+fn lock_base_dir() -> PathBuf {
+    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(x).join("c8ctl-nano");
+    }
+    if let Some(x) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(x).join("c8ctl-nano");
+    }
+    if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(h).join(".local/state/c8ctl-nano");
+    }
+    std::env::temp_dir()
+}
+
+#[cfg(unix)]
+fn fleet_lock_dir_in(base: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let dir = base.join(format!("c8ctl-nano-fleet-{}", crate::current_user_id()));
+    // Create any missing parent of the lock directory (e.g. `~/.local/state`),
+    // then create the lock directory itself `0700`. The parent's own mode is not
+    // our trust root — the lock directory below is verified owner-only next.
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating lock directory parent {}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("creating lock directory {}", dir.display()))
+        }
+    }
+    // `symlink_metadata` does NOT follow a final symlink, so a pre-planted
+    // symlink named like our dir is caught here instead of being trusted.
+    let meta = std::fs::symlink_metadata(&dir)
+        .with_context(|| format!("statting lock directory {}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        bail!(
+            "lock directory {} is not a directory (possible pre-creation attack)",
+            dir.display()
+        );
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        bail!(
+            "lock directory {} is not owned by the current user (possible pre-creation attack)",
+            dir.display()
+        );
+    }
+    if meta.mode() & 0o077 != 0 {
+        bail!(
+            "lock directory {} is accessible to other users; refusing to use it",
+            dir.display()
+        );
+    }
+    Ok(dir)
 }
 
 impl StateLock {
@@ -500,21 +682,42 @@ impl StateLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // The lock file lives in a shared temp dir; keep it owner-only.
+            // Keep it owner-only, and never follow a symlink in the lock file's
+            // place: inside the verified owner-private directory no other user
+            // can plant one, but refuse rather than follow if one somehow exists.
             opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
         }
         let file = opts
             .open(&lock_path)
             .with_context(|| format!("opening lock {}", lock_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = file
+                .metadata()
+                .with_context(|| format!("statting lock {}", lock_path.display()))?;
+            if !meta.file_type().is_file() {
+                bail!("lock {} is not a regular file", lock_path.display());
+            }
+            if meta.uid() != unsafe { libc::getuid() } {
+                bail!(
+                    "lock {} is not owned by the current user; refusing to use it",
+                    lock_path.display()
+                );
+            }
+        }
         file.lock_exclusive()
             .with_context(|| format!("locking {}", lock_path.display()))?;
         Ok(StateLock { _file: file })
     }
 
-    /// The lock file for `path`: `<tmp>/c8ctl-nano-fleet-<sha1(identity)>.lock`.
+    /// The lock file for `path`:
+    /// `<base>/c8ctl-nano-fleet-<uid>/c8ctl-nano-fleet-<sha1(identity)>.lock`.
     /// Keyed by a normalized absolute identity for the guarded file, so distinct
     /// state files (and distinct state homes) never share a lock, while relative
-    /// and absolute spellings of the *same* file contend on the *same* lock.
+    /// and absolute spellings of the *same* file contend on the *same* lock. The
+    /// containing directory is owner-private and verified (see `fleet_lock_dir`).
     fn lock_file_for(path: &std::path::Path) -> Result<PathBuf> {
         use sha1::{Digest, Sha1};
         let mut hasher = Sha1::new();
@@ -522,7 +725,14 @@ impl StateLock {
         hasher.update(identity.to_string_lossy().as_bytes());
         let digest = hasher.finalize();
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        Ok(std::env::temp_dir().join(format!("c8ctl-nano-fleet-{}.lock", &hex[..16])))
+        #[cfg(unix)]
+        {
+            Ok(fleet_lock_dir()?.join(format!("c8ctl-nano-fleet-{}.lock", &hex[..16])))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(std::env::temp_dir().join(format!("c8ctl-nano-fleet-{}.lock", &hex[..16])))
+        }
     }
 }
 
@@ -1205,10 +1415,10 @@ fn manifest_path(name: &str) -> Result<PathBuf> {
 
 fn read_manifest(name: &str) -> Result<Option<Manifest>> {
     let path = manifest_path(name)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = match read_confined(&path)? {
+        None => return Ok(None),
+        Some(bytes) => bytes,
+    };
     let m: Manifest =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     m.validate()?;
@@ -2049,6 +2259,126 @@ mod tests {
         // The committed config parses and holds the hire.
         let cfg = read_config().unwrap();
         assert!(cfg.hires.contains_key("coder"));
+    }
+
+    /// Regression (confined reads — findings `r4181391477`/`r4181391593`):
+    /// a symlinked `config.json` must NOT let a read escape the trusted home.
+    /// The write path already refuses a symlinked tail; the read path must honour
+    /// the same invariant, opening the file `O_NOFOLLOW` through the pinned home.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_refuses_symlinked_config_file() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let outside = home.join("outside-secret.json");
+        std::fs::write(&outside, serde_json::json!({"hires": {"leaked": {}}}).to_string()).unwrap();
+        // A symlinked `config.json` pointing outside must be refused, not read.
+        std::os::unix::fs::symlink(&outside, home.join("config.json")).unwrap();
+
+        let err = match read_config() {
+            Ok(_) => panic!("symlinked config.json must be refused, not read"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("opening state file without following symlinks")
+                || err.contains("Too many levels of symbolic links"),
+            "{err}"
+        );
+    }
+
+    /// Regression (confined reads — finding `r4181391593`): a symlinked
+    /// `workforce/` tail must NOT let `read_manifest` consume state outside the
+    /// home, matching the write path's refusal of the same symlinked tail.
+    #[cfg(unix)]
+    #[test]
+    fn read_manifest_refuses_symlinked_workforce_tail() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            elsewhere.join("demo.json"),
+            serde_json::json!({"version": 1, "name": "demo", "workers": []}).to_string(),
+        )
+        .unwrap();
+        // `<home>/workforce -> <home>/elsewhere`: the hardened write path rejects
+        // this tail, so the read path must too.
+        std::os::unix::fs::symlink(&elsewhere, home.join("workforce")).unwrap();
+
+        let err = match read_manifest("demo") {
+            Ok(_) => panic!("symlinked workforce/ tail must be refused, not read"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("opening state directory without following symlinks")
+                || err.contains("Too many levels of symbolic links"),
+            "{err}"
+        );
+    }
+
+    /// A confined read of an absent file (or absent directory above it) reports
+    /// absence, not an error, so a fresh home still reads as an empty config /
+    /// a missing manifest.
+    #[cfg(unix)]
+    #[test]
+    fn read_confined_reports_absence_and_round_trips() {
+        let _cfg = TempCfg::new();
+        // Fresh home: config is default-empty, manifest is absent.
+        assert!(read_config().unwrap().hires.is_empty());
+        assert!(read_manifest("demo").unwrap().is_none());
+
+        // After a normal write, the confined read sees the committed bytes.
+        let man_path = manifest_path("demo").unwrap();
+        write_json_atomic(
+            &man_path,
+            &serde_json::json!({"version": 1, "name": "demo", "workers": []}),
+        )
+        .unwrap();
+        let m = read_manifest("demo").unwrap().expect("manifest present");
+        assert_eq!(m.name, "demo");
+    }
+
+    /// The owner-private lock directory must fail closed on a pre-planted
+    /// foreign entry: a symlink (or any non-directory) in its place, or a
+    /// group/other-accessible directory, is a pre-creation attack and must be
+    /// refused rather than used to plant or redirect our lock files.
+    #[cfg(unix)]
+    #[test]
+    fn fleet_lock_dir_rejects_foreign_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "fleet-lockdir-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.join(format!("c8ctl-nano-fleet-{}", crate::current_user_id()));
+
+        // 1. A symlink in the directory's place is refused (not followed).
+        let target = base.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        let err = fleet_lock_dir_in(&base).unwrap_err().to_string();
+        assert!(err.contains("not a directory"), "{err}");
+        std::fs::remove_file(&dir).unwrap();
+
+        // 2. A group/other-accessible directory is refused.
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = fleet_lock_dir_in(&base).unwrap_err().to_string();
+        assert!(err.contains("accessible to other users"), "{err}");
+
+        // 3. A fresh, owner-only directory is accepted and is 0700.
+        std::fs::remove_dir(&dir).unwrap();
+        let made = fleet_lock_dir_in(&base).unwrap();
+        assert_eq!(made, dir);
+        let mode = std::fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "lock dir must be owner-only");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]
