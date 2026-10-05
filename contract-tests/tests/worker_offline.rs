@@ -15,7 +15,12 @@
 
 use std::process::Stdio;
 use std::sync::mpsc::sync_channel;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `Instant` is used only by the Linux-gated recovery test and `wait_for_settled`
+// below, so its import is gated too — otherwise the `-D warnings` macOS build
+// fails on an unused import.
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use contract_tests::{require_engine_and_target, skip, Skip, Target, TempHome};
 // `bpmn` / `json!` are used only by the Linux-gated recovery test below, so the
@@ -154,6 +159,8 @@ impl Drop for WorkerKillGuard {
 /// Whether the worker's stderr capture shows it made at least one activation
 /// (a job pickup or an empty poll) since it was last drained — i.e. it is
 /// talking to the engine again after a freeze.
+/// Linux-gated with the recovery test that is its only caller.
+#[cfg(target_os = "linux")]
 fn stderr_has_activity(text: &str) -> bool {
     text.contains("activated on") || text.contains("completed in")
 }
@@ -566,6 +573,8 @@ fn pids_listening_on(port: u16) -> Vec<u32> {
 
 /// Poll the engine until the job of `job_type` settles, returning it; panic if
 /// it never does within `timeout`.
+/// Linux-gated with the recovery test that is its only caller.
+#[cfg(target_os = "linux")]
 fn wait_for_settled(
     engine: &contract_tests::Engine,
     job_type: &str,
