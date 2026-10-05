@@ -12,10 +12,12 @@
 //! both targets.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{job_type_matrix, normalize_capabilities, state_home};
@@ -34,6 +36,15 @@ const VALID_PROTOCOLS: [&str; 2] = ["acp", "pipe"];
 /// time: the daemon refuses every sandbox but `none` (host), so a typo like
 /// `dokcer` accepted here would persist a profile that can never run.
 const VALID_SANDBOXES: [&str; 3] = ["none", "docker", "podman"];
+
+/// The largest supported `--instances` value for a workforce worker. `instances`
+/// is a `u32`, so an unbounded value (e.g. `--instances 4294967295`) makes
+/// `workforce status` eagerly construct billions of `StatusWorker` values and
+/// exhaust memory. This bound is enforced both when a manifest is written
+/// (`workforce add`) and when one is read for status expansion, so a hand-edited
+/// or legacy manifest cannot trigger the blow-up either. 1024 is far above any
+/// real fleet and matches the snapshot fixtures (which use 1–2).
+const MAX_WORKER_INSTANCES: u32 = 1024;
 
 /// One persisted hire in `config.json`. The field order is the golden order the
 /// `config_after_hire` snapshot pins; a `#[derive(Serialize)]` struct always
@@ -109,15 +120,112 @@ fn read_config() -> Result<ConfigFile> {
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Serialize `value` to pretty JSON and commit it to `path` atomically: write a
+/// uniquely-named sibling temp file, `fsync` it, then `rename` over `path`.
+/// A same-directory rename is atomic on every supported OS, so a concurrent
+/// `work`/daemon read observes either the old file or the new one — never a
+/// truncated or partial `config.json` — and a crash mid-write leaves the
+/// previous copy intact (the orphaned temp file is harmless and overwritten on
+/// the next write). The temp file is renamed away, never left behind: the
+/// contract test `state_writes_stay_under_home` asserts the exact set of files
+/// under the home, so nothing extra may persist.
+fn write_json_atomic(path: &std::path::Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut json = serde_json::to_string_pretty(value)?;
+    json.push('\n');
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("state path has no valid file name")?;
+    // Unique per (pid, nanos) so two processes never collide on the temp name.
+    let tmp_name = format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let write_result = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
+        // Flush user-space buffers and fsync so the bytes are durable before
+        // the rename publishes them.
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("renaming {} over {}", tmp_path.display(), path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Best-effort cleanup so a failed write never leaks a temp file under
+        // the home (the contract asserts the exact written-file set).
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
 fn write_config(cfg: &ConfigFile) -> Result<()> {
+    let path = config_path()?;
+    write_json_atomic(&path, cfg)
+}
+
+/// Run `mutate` against the current config while holding an exclusive
+/// interprocess lock, then commit the result atomically.
+///
+/// `hire`/`assign` are a read-modify-write over `config.json`; without
+/// serialization two concurrent commands each read the pre-image and the second
+/// commit silently overwrites the first's change. The lock lives on a dedicated
+/// `config.json.lock` file (advisory `flock`/`LockFileEx` via `fs2`), so the
+/// whole read→mutate→write cycle is serialized across processes. The lock file
+/// is removed after the commit so the home keeps only the documented file set
+/// (the contract test asserts it exactly). The lock is released on drop, so
+/// even an error path cannot leave the config locked.
+fn update_config<F>(mutate: F) -> Result<()>
+where
+    F: FnOnce(&mut ConfigFile) -> Result<()>,
+{
     let path = config_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut json = serde_json::to_string_pretty(cfg)?;
-    json.push('\n');
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
+    let lock_path = path.with_file_name("config.json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening lock {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+
+    // Critical section: read the latest config, mutate, commit atomically.
+    let result = (|| {
+        let mut cfg = read_config()?;
+        mutate(&mut cfg)?;
+        write_config(&cfg)
+    })();
+
+    // Unlock before removing so a waiting process that immediately re-locks and
+    // re-creates the file does not have its fresh lock file unlinked from under
+    // it (a locked-then-removed file would let a third process lock a *new*
+    // inode and enter concurrently).
+    let unlock_result = lock_file
+        .unlock()
+        .with_context(|| format!("unlocking {}", lock_path.display()));
+    let _ = std::fs::remove_file(&lock_path);
+
+    result.and(unlock_result)
 }
 
 /// An ISO-8601 UTC timestamp (`YYYY-MM-DDThh:mm:ss.sssZ`), matching the Node
@@ -308,9 +416,14 @@ pub fn hire(args: HireArgs) -> Result<()> {
         created_at: serde_json::Value::String(now_iso8601()),
     };
 
-    let mut cfg = read_config()?;
-    cfg.hires.insert(name.clone(), hire.clone());
-    write_config(&cfg)?;
+    // Serialize the read-modify-write against concurrent fleet commands and
+    // commit atomically (see `update_config`).
+    let name_for_insert = name.clone();
+    let hire_for_insert = hire.clone();
+    update_config(move |cfg| {
+        cfg.hires.insert(name_for_insert, hire_for_insert);
+        Ok(())
+    })?;
 
     let caps_display = if capabilities.is_empty() {
         "(none)".to_string()
@@ -358,17 +471,22 @@ fn hire_list(json: bool) -> Result<()> {
 // --- assign -----------------------------------------------------------------
 
 pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
-    let mut cfg = read_config()?;
-    let hire = cfg
-        .hires
-        .get_mut(profile)
-        .with_context(|| format!("no hire named \"{profile}\""))?;
     // `assign` SETS the capability list: starting from the old set would make a
     // stale capability impossible to remove, and the profile would keep
     // subscribing to its job types. Normalize the supplied list directly.
     let caps = normalize_capabilities(capabilities.split(',').map(|c| c.to_string()).collect());
-    hire.capabilities = caps.clone();
-    write_config(&cfg)?;
+    // Serialize the read-modify-write against concurrent fleet commands and
+    // commit atomically (see `update_config`).
+    let caps_for_set = caps.clone();
+    let profile_owned = profile.to_string();
+    update_config(move |cfg| {
+        let hire = cfg
+            .hires
+            .get_mut(profile_owned.as_str())
+            .with_context(|| format!("no hire named \"{profile_owned}\""))?;
+        hire.capabilities = caps_for_set;
+        Ok(())
+    })?;
     println!("Reassigned {profile} — capabilities: {}", caps.join(", "));
     Ok(())
 }
@@ -461,6 +579,14 @@ fn manifest_path(name: &str) -> Result<PathBuf> {
         )
     };
     let trimmed = name.trim();
+    // Reject surrounding whitespace rather than silently trimming: the path is
+    // derived from the trimmed name, but the manifest's stored `name`, status
+    // object, worker IDs, and output all use the original string — so
+    // `--name " default "` would alias `default.json` while persisting and
+    // reporting a *different* name. Rejecting it prevents the ambiguous alias.
+    if trimmed != name {
+        return Err(bad());
+    }
     // Reject both platforms' separators explicitly: on Unix a backslash is a
     // valid filename character, so the component check below passes `a\b`,
     // but the same manifest read on Windows would traverse into `b`.
@@ -490,13 +616,10 @@ fn read_manifest(name: &str) -> Result<Option<Manifest>> {
 
 fn write_manifest(m: &Manifest) -> Result<()> {
     let path = manifest_path(&m.name)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut json = serde_json::to_string_pretty(m)?;
-    json.push('\n');
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
+    // Same atomic commit as `config.json`: a concurrent `workforce status` /
+    // daemon read must never observe a truncated manifest, and a crash mid-write
+    // must not corrupt the only copy.
+    write_json_atomic(&path, m)
 }
 
 pub fn workforce_list(name: &str) -> Result<()> {
@@ -520,7 +643,12 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
         bail!("no hire named \"{profile}\"");
     }
     // A desired-zero worker entry is meaningless (the Node CLI floors instances
-    // at 1); clamp rather than persist an empty workers list.
+    // at 1); clamp rather than persist an empty workers list. An unbounded
+    // `u32`, on the other hand, lets `workforce status` allocate billions of
+    // worker slots, so reject anything above the supported ceiling outright.
+    if instances > MAX_WORKER_INSTANCES {
+        bail!("invalid --instances {instances}: supported maximum is {MAX_WORKER_INSTANCES}");
+    }
     let instances = instances.max(1);
     let mut manifest = read_manifest(name)?.unwrap_or(Manifest {
         version: 1,
@@ -589,6 +717,17 @@ pub fn workforce_status(name: &str, json: bool) -> Result<()> {
     let mut entries = Vec::new();
     if let Some(m) = &manifest {
         for w in &m.workers {
+            // A manifest on disk may predate the `workforce add` bound or have
+            // been hand-edited, so re-validate before expanding slots: an
+            // out-of-range `instances` must fail here rather than allocate
+            // billions of `StatusWorker` values.
+            if w.instances > MAX_WORKER_INSTANCES {
+                bail!(
+                    "workforce \"{name}\" worker \"{}\" declares {} instances, above the supported maximum of {MAX_WORKER_INSTANCES}",
+                    w.profile,
+                    w.instances
+                );
+            }
             let workers = (1..=w.instances)
                 .map(|i| StatusWorker {
                     name: format!("wf-{name}-{}-{i}", w.profile),
@@ -787,6 +926,104 @@ mod tests {
         assert!(
             !dir.join("other.json").exists(),
             "the internal name must not redirect the write to other.json"
+        );
+    }
+
+    /// A workforce name with surrounding whitespace must be rejected, not
+    /// trimmed for the path while persisted/reported untrimmed — otherwise
+    /// `--name " default "` aliases `default.json` under a different name.
+    #[test]
+    fn manifest_path_rejects_surrounding_whitespace() {
+        for bad in [
+            " default",
+            "default ",
+            " default ",
+            "\tdefault",
+            "default\n",
+        ] {
+            assert!(
+                manifest_path(bad).is_err(),
+                "name {bad:?} must be rejected, not aliased to a trimmed path"
+            );
+        }
+        // Interior whitespace is a single normal component and stays allowed.
+        assert!(manifest_path("my fleet").is_ok());
+    }
+
+    /// `workforce add` must reject an `instances` value above the supported
+    /// ceiling rather than persist a manifest whose status expansion would
+    /// exhaust memory.
+    #[test]
+    fn workforce_add_rejects_unbounded_instances() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        let err = workforce_add("default", "coder", u32::MAX, "auto")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supported maximum"), "{err}");
+        assert!(
+            read_manifest("default").unwrap().is_none(),
+            "an over-large instances value must not persist a manifest"
+        );
+        // The ceiling itself is accepted.
+        workforce_add("default", "coder", MAX_WORKER_INSTANCES, "auto").unwrap();
+        let m = read_manifest("default").unwrap().unwrap();
+        assert_eq!(m.workers[0].instances, MAX_WORKER_INSTANCES);
+    }
+
+    /// A manifest that already holds an out-of-range `instances` (hand-edited or
+    /// written before the bound existed) must make `workforce status` fail, not
+    /// allocate billions of worker slots.
+    #[test]
+    fn workforce_status_rejects_over_large_manifest() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        let dir = home_dir().unwrap().join("workforce");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("default.json"),
+            "{\"version\":1,\"name\":\"default\",\"workers\":[{\"profile\":\"coder\",\"instances\":4294967295,\"roles\":\"auto\"}]}",
+        )
+        .unwrap();
+        let err = workforce_status("default", false).unwrap_err().to_string();
+        assert!(err.contains("supported maximum"), "{err}");
+    }
+
+    /// `hire` must commit `config.json` atomically and leave no temp or lock
+    /// file behind: the home keeps exactly the documented file set.
+    #[test]
+    fn hire_writes_config_atomically_without_residue() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        let home = home_dir().unwrap();
+        assert!(home.join("config.json").is_file());
+        let mut leftover: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.json")
+            .collect();
+        leftover.sort();
+        assert!(
+            leftover.is_empty(),
+            "no temp/lock file may persist under the home, found: {leftover:?}"
+        );
+        // The committed config parses and holds the hire.
+        let cfg = read_config().unwrap();
+        assert!(cfg.hires.contains_key("coder"));
+    }
+
+    /// Two `update_config` mutations serialize: the second observes the first's
+    /// committed change rather than overwriting it from a stale pre-image.
+    #[test]
+    fn update_config_serializes_read_modify_write() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("a")).unwrap();
+        hire(hire_args("b")).unwrap();
+        let cfg = read_config().unwrap();
+        assert!(
+            cfg.hires.contains_key("a") && cfg.hires.contains_key("b"),
+            "both hires must survive; a lost update would drop one"
         );
     }
 
