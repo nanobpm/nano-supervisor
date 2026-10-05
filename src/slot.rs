@@ -3286,6 +3286,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&runs).unwrap();
+        // Canonicalize away any symlinked temp-dir ancestor (macOS `temp_dir()`
+        // is under the platform `/var` → `/private/var` symlink). The no-follow
+        // reap legitimately refuses a symlinked ancestor, so an unresolved
+        // `/var/...` runs root would be rejected (ENOTDIR) on macOS — mirror the
+        // `unique_tmp` helper and the canonical runs root production reaps under.
+        let runs = std::fs::canonicalize(&runs).unwrap();
         let run = runs.join("42");
         std::fs::create_dir_all(run.join("nested")).unwrap();
         std::fs::write(run.join("nested").join("result.json"), b"{}").unwrap();
