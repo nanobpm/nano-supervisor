@@ -2548,12 +2548,23 @@ pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> R
         {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&path)
                 .with_context(|| format!("creating {}", path.display()))?;
+            // `mode(0o600)` is filtered through the process umask, so a
+            // restrictive owner-bit umask (e.g. 0o777) would leave the seed
+            // `000` and the agent unable to read or update its own isolated
+            // c8ctl session. Re-assert the exact mode with `fchmod` on the
+            // open fd — immune to umask and re-resolving no path — mirroring
+            // the Linux pinned path's `write_new_child_file`.
+            if unsafe { libc::fchmod(f.as_raw_fd(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("chmod 0600 {}", path.display()));
+            }
             f.write_all(body.as_bytes())
                 .with_context(|| format!("writing {}", path.display()))?;
         }
@@ -2935,6 +2946,63 @@ mod tests {
             "the planted file must never be overwritten by the seed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #41, umask defence: `seed_c8ctl_dir`'s `mode(0o600)` is filtered
+    /// through the process umask, so under a restrictive owner-bit umask (e.g.
+    /// 0o777) the seeds would come out `000` and the agent could not read or
+    /// update its own isolated c8ctl session. The `fchmod` on the open fd must
+    /// re-assert the exact `0o600` regardless of the inherited umask.
+    ///
+    /// The umask is **process-global**, so tightening it in-process would race
+    /// with parallel tests that create files. Run the seed in a child process
+    /// (a re-invocation of this test binary, gated by an env var) so the parent
+    /// process's umask — and every sibling test — is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn seed_c8ctl_dir_files_are_0600_even_under_a_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ENV: &str = "NANO_SLOT_UMASK_SEED_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Child: running alone in its own process, so a restrictive umask is
+            // safe here. Seed under 0o777 and exit 0 only if both files are 0600.
+            let dir = std::env::temp_dir().join(format!(
+                "nano-slot-test-umask-child-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let profile = crate::profile::Profile {
+                name: "merlin".into(),
+                base_url: Some("http://engine:8080".into()),
+                ..Default::default()
+            };
+            unsafe { libc::umask(0o777) };
+            seed_c8ctl_dir(&dir, &profile).expect("seeding must succeed under a restrictive umask");
+            for name in ["session.json", "profiles.json"] {
+                let mode = std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "{name} must be exactly 0600, got {mode:o}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // Parent: re-run THIS test in a child process with the guard set, so the
+        // child's umask change cannot leak into the parent's parallel tests.
+        // `--exact` needs the full module path, or the child matches 0 tests and
+        // exits 0 without ever running the seed (a vacuous pass).
+        let exe = std::env::current_exe().expect("current test binary");
+        let status = std::process::Command::new(exe)
+            .arg("slot::tests::seed_c8ctl_dir_files_are_0600_even_under_a_restrictive_umask")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn umask-seed child");
+        assert!(status.success(), "the umask-seed child process must pass");
     }
 
     /// The profiled counterpart: a pinned profile seeds the isolated dir with
