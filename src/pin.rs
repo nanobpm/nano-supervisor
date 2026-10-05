@@ -217,11 +217,25 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         // the mutable ambient profile. fsync the parent dir so the rename is
         // durable before reporting success (Unix only; elsewhere the rename is
         // the best available guarantee).
+        //
+        // This directory fsync is BEST-EFFORT: the pin is already written and
+        // atomically renamed into place, so a failure here only weakens the
+        // crash-durability of that rename — it does not corrupt or lose the
+        // live file. Some platforms/filesystems reject `fsync` on a directory
+        // descriptor (e.g. macOS can return `EINVAL`/`ENOTSUP` depending on the
+        // filesystem), and propagating that would fail the whole pin write and
+        // break startup over a non-fatal durability nicety. So warn and carry
+        // on rather than failing closed on it.
         #[cfg(unix)]
         {
-            std::fs::File::open(dir)
-                .and_then(|d| d.sync_all())
-                .with_context(|| format!("syncing state directory {}", dir.display()))?;
+            if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+                log(&format!(
+                    "warning: could not fsync state directory {} ({e}); \
+                     the pin is written but its on-disk rename may be less \
+                     durable across a power loss",
+                    dir.display()
+                ));
+            }
         }
         Ok(())
     })();
@@ -768,6 +782,26 @@ mod tests {
     fn missing_state_file_reads_as_unpinned() {
         let home = temp_home("missing");
         assert!(read(&home).expect("missing reads ok").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn write_atomic_succeeds_on_every_unix_including_macos() {
+        // Regression (PR #46): the parent-directory fsync that follows the
+        // rename is only a best-effort durability nicety. Some platforms
+        // (notably macOS, depending on the filesystem) can reject `fsync` on a
+        // directory descriptor with `EINVAL`/`ENOTSUP`; that must NOT fail the
+        // pin write and break startup, since the file is already written and
+        // atomically renamed into place. Writing — and re-writing — a pin must
+        // succeed on the host running this test, macOS included.
+        let home = temp_home("write-atomic-durable");
+        let path = state_file(&home);
+        write_atomic(&path, b"{\"first\":true}\n").expect("first write must succeed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"first\":true}\n");
+        // A re-pin over the existing file must also succeed (exercises the same
+        // durability path a second time).
+        write_atomic(&path, b"{\"second\":true}\n").expect("re-write must succeed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"second\":true}\n");
         let _ = std::fs::remove_dir_all(&home);
     }
 
