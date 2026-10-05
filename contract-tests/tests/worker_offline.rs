@@ -22,7 +22,12 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
-use contract_tests::{require_engine_and_target, require_target, skip, Skip, Target, TempHome};
+use contract_tests::{require_target, skip, Skip, Target, TempHome};
+// `require_engine_and_target` is used only by the Linux-gated recovery test
+// below, so its import is gated too — otherwise the `-D warnings` macOS build
+// fails on an unused import.
+#[cfg(target_os = "linux")]
+use contract_tests::require_engine_and_target;
 // `bpmn` / `json!` are used only by the Linux-gated recovery test below, so the
 // imports are gated too — otherwise the `-D warnings` macOS build fails on them.
 #[cfg(target_os = "linux")]
