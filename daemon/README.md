@@ -43,8 +43,11 @@ handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
   started would `setsid` away and outlive the job as a phantom fleet that can
   lease real jobs; refusing to start closes that escape. The hermetic contract
   tests opt in with `--foreground-for-tests` (or `NANO_ALLOW_NESTED_SUPERVISOR=1`)
-  to run **attached** — no `setsid`, bound to the invoking process via
-  `PR_SET_PDEATHSIG` — so the job's teardown still kills it.
+  to run **attached** — no `setsid`, so the job's teardown still kills it: on
+  **Linux** the attached process is bound to the invoking process via
+  `PR_SET_PDEATHSIG` (and startup fails if that binding cannot be installed);
+  on **macOS** there is no `PR_SET_PDEATHSIG`, so containment relies on staying
+  in the invoking process group — the job's process-group kill takes it down.
 - **Lease-fenced settling**: a 404/409 on lock refresh is treated as a lost
   activation — the agent is stopped and the job is **not** settled, so no job is
   ever settled without its lease.

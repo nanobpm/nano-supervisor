@@ -2319,7 +2319,13 @@ mod tests {
             );
         }
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&cfg(), "1", &job, std::path::Path::new("/tmp/r.json"), std::path::Path::new("/tmp/run"));
+        let env = build_agent_env(
+            &cfg(),
+            "1",
+            &job,
+            std::path::Path::new("/tmp/r.json"),
+            std::path::Path::new("/tmp/run"),
+        );
         for (k, _) in &env {
             assert!(
                 !SENSITIVE_DAEMON_ENV.contains(&k.as_str()),
@@ -2333,7 +2339,13 @@ mod tests {
         let mut c = cfg();
         c.hire.env.insert("NANO_AGENTIC".into(), "on".into());
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, std::path::Path::new("/tmp/r.json"), std::path::Path::new("/tmp/run"));
+        let env = build_agent_env(
+            &c,
+            "1",
+            &job,
+            std::path::Path::new("/tmp/r.json"),
+            std::path::Path::new("/tmp/run"),
+        );
         // The reserved value is pushed AFTER the hire env, so it wins for any
         // consumer that reads the last occurrence (as a child process does).
         let last = env

@@ -239,15 +239,26 @@ fn nested_refusal(
 fn guard_nested_supervisor(command: &str, foreground_for_tests: bool) -> Result<()> {
     let run = std::env::var(AGENT_RUN_ENV).ok();
     let allow = std::env::var(ALLOW_NESTED_ENV).ok();
-    if let Some(msg) =
-        nested_refusal(command, run.as_deref(), foreground_for_tests, allow.as_deref())
-    {
+    if let Some(msg) = nested_refusal(
+        command,
+        run.as_deref(),
+        foreground_for_tests,
+        allow.as_deref(),
+    ) {
         anyhow::bail!(msg);
     }
     if run.as_deref().is_some_and(|r| !r.is_empty()) {
         // Opted in: run attached. Bind to the invoking agent's death so the job's
         // process-group kill (or the agent exiting) takes this process down too.
-        pdeath::bind_self_to_parent_death();
+        // Fail startup when the binding cannot be installed: running the opted-in
+        // supervisor without it would recreate the phantom the guard exists to
+        // prevent.
+        pdeath::bind_self_to_parent_death().map_err(|e| {
+            anyhow::anyhow!(
+                "could not bind this nested supervisor to the invoking agent's \
+                 death ({e}); refusing to run attached without teardown containment"
+            )
+        })?;
     }
     Ok(())
 }
