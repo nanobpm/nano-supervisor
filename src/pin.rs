@@ -327,7 +327,27 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         (None, Some(pin)) => (pin.profile.clone(), false),
         (None, None) => (active_profile.clone(), true),
     };
-    let resolved = profile::resolve(name.as_deref())?;
+    // An existing ENV-ONLY pin (`profile: None`) must stay env-only: `name` is
+    // `None` here, and if `CAMUNDA_REST_ADDRESS` was later removed,
+    // `profile::resolve(None)` would fall through to the session's active
+    // profile and silently retarget the fleet onto it — the exact incident the
+    // pin prevents (issue #41). Force the env fallback (never the session) and
+    // enforce the recorded baseUrl fingerprint over the (possibly drifted or
+    // absent) environment.
+    let existing_env_only = !created && matches!(&existing, Some(p) if p.profile.is_none());
+    let env_override: Option<String> = if existing_env_only {
+        existing
+            .as_ref()
+            .and_then(|p| p.base_url.clone())
+            .or_else(|| profile::resolved_base_url(None))
+    } else {
+        None
+    };
+    let resolved = if existing_env_only {
+        profile::resolve_with_base_override(None, env_override.as_deref())?
+    } else {
+        profile::resolve(name.as_deref())?
+    };
     let mut base_url = profile::resolved_base_url(resolved.as_ref());
     // The fingerprint recorded on disk by the pin this start followed (if any).
     // Tracked separately from `base_url` so the profile-URL drift check can
@@ -480,6 +500,11 @@ mod tests {
         fn set(key: &'static str, value: &str) -> EnvGuard {
             let saved = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            EnvGuard { key, saved }
+        }
+        fn unset(key: &'static str) -> EnvGuard {
+            let saved = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             EnvGuard { key, saved }
         }
     }
@@ -718,6 +743,50 @@ mod tests {
         // …and the on-disk pin is untouched either.
         let on_disk = read(&home).expect("read ok").expect("pin on disk");
         assert_eq!(on_disk.base_url.as_deref(), Some("http://engine-a:8080"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41, the env-only retarget gap: an existing env-only pin
+    /// (`profile: None`) must NOT fall through to the session's active profile
+    /// when `CAMUNDA_REST_ADDRESS` is later removed. `profile::resolve(None)`
+    /// would otherwise read `session.json` and silently retarget the fleet onto
+    /// the ambient profile — the exact incident the pin prevents. The pin must
+    /// keep enforcing its recorded baseUrl and stay profile-less.
+    #[test]
+    fn env_pin_is_not_retargeted_to_the_ambient_profile_when_env_is_removed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("envretarget");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        // Pin against an env-only connection (no profile)…
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
+        let first = resolve_or_pin(&home, None).expect("first start pins env-only");
+        assert!(first.created);
+        assert_eq!(first.pin.profile, None);
+        assert_eq!(first.pin.base_url.as_deref(), Some("http://engine-a:8080"));
+
+        // …then the env var is REMOVED and an ambient active profile appears.
+        // A naive `resolve(None)` would now fall through to the session and
+        // retarget onto "merlin" — the pin must not.
+        let _addr = EnvGuard::unset("CAMUNDA_REST_ADDRESS");
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-b:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+
+        let second = resolve_or_pin(&home, None).expect("second start follows the env pin");
+        assert!(!second.created);
+        // The pin stays env-only (no profile is picked up)…
+        assert_eq!(
+            second.pin.profile, None,
+            "an env-only pin must not be retargeted to the ambient active profile"
+        );
+        assert!(second.profile.is_none(), "no profile may be resolved");
+        // …and keeps enforcing the recorded engine-A fingerprint, not engine B.
+        assert_eq!(second.pin.base_url.as_deref(), Some("http://engine-a:8080"));
         let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -980,10 +980,45 @@ pub fn run_worker_job(
         worker_flags,
         extra_env,
         &[],
+        "junior",
     );
     // The outcome cloned the home's path (it borrows nothing from `home`), so
     // now that the `&home` borrow has ended, move the home into the outcome to
     // keep the temp dir alive for the outcome's lifetime.
+    outcome._home = Some(home);
+    outcome
+}
+
+/// [`run_worker_job`] with a caller-chosen hire rank. The sanity-guard test
+/// needs a TEST-LOOKING rank (`ct-worker`) so the worker's whole served matrix
+/// is `ct-*`/`probe-*` and the issue-#41 warning can actually fire — the default
+/// `junior` rank adds the production-looking `junior` job type, which
+/// disqualifies `all_test_looking`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_with_rank(
+    engine: &Engine,
+    target: &Target,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    rank: &str,
+) -> JobOutcome {
+    let home = TempHome::new();
+    let mut outcome = run_worker_job_with_home(
+        engine,
+        target,
+        &home,
+        None,
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+        &[],
+        rank,
+    );
     outcome._home = Some(home);
     outcome
 }
@@ -1018,6 +1053,7 @@ pub fn run_worker_job_in(
         worker_flags,
         extra_env,
         &[],
+        "junior",
     )
 }
 
@@ -1047,6 +1083,7 @@ pub fn run_worker_job_with(
         worker_flags,
         extra_env,
         custom_headers,
+        "junior",
     )
 }
 
@@ -1386,6 +1423,7 @@ fn run_worker_job_with_home(
     worker_flags: &[&str],
     extra_env: &[(&str, &str)],
     custom_headers: &[(&str, &str)],
+    rank: &str,
 ) -> JobOutcome {
     let job_type = engine.unique_type(test);
     let process_id = format!("p-{job_type}");
@@ -1421,7 +1459,7 @@ fn run_worker_job_with_home(
     // vocabulary, which the Rust `work` mirrors). The Rust worker additionally
     // takes `--max-jobs 1` so it exits once the job is handled.
     let profile = format!("ctfake{}", rand_suffix());
-    hire_profile(*target, home, &profile);
+    hire_profile_with_rank(*target, home, &profile, rank);
     let mut cmd = work_command(*target, &profile, &job_type, worker_flags);
     home.apply(&mut cmd);
     // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
@@ -1474,6 +1512,14 @@ fn run_worker_job_with_home(
 /// command yet, so the harness writes the same `config.json` entry the Node CLI
 /// writes (the Rust worker reads Node's state format).
 fn hire_profile(target: Target, home: &TempHome, profile: &str) {
+    hire_profile_with_rank(target, home, profile, "junior")
+}
+
+/// [`hire_profile`] with a caller-chosen rank. The sanity-guard test needs a
+/// TEST-LOOKING rank (`ct-worker`) so the worker's whole served matrix is
+/// `ct-*`/`probe-*` — a `junior` rank would add the production-looking `junior`
+/// type and disqualify `all_test_looking`, so the warning could never fire.
+fn hire_profile_with_rank(target: Target, home: &TempHome, profile: &str, rank: &str) {
     let agent = fake_agent_path();
     let agent = agent.to_string_lossy();
     match target {
@@ -1483,7 +1529,7 @@ fn hire_profile(target: Target, home: &TempHome, profile: &str) {
                 "--name",
                 profile,
                 "--rank",
-                "junior",
+                rank,
                 "--command",
                 &agent,
                 "--arg",
@@ -1505,7 +1551,7 @@ fn hire_profile(target: Target, home: &TempHome, profile: &str) {
             let config = serde_json::json!({
                 "hires": {
                     profile: {
-                        "rank": "junior",
+                        "rank": rank,
                         "command": agent,
                         "args": ["--acp"],
                         "protocol": "acp",

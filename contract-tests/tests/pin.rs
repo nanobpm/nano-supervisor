@@ -20,7 +20,8 @@
 mod common;
 
 use contract_tests::{
-    require_engine_and_target, require_target, run_worker_job, skip, Skip, Target, TempHome,
+    require_engine_and_target, require_target, run_worker_job_with_rank, skip, Skip, Target,
+    TempHome,
 };
 use serde_json::json;
 /// The two c8ctl profiles the acceptance scenario switches between: `alpha`
@@ -408,11 +409,17 @@ fn test_looking_job_types_still_start_and_banner() {
 }
 
 /// Proposal 4, end-to-end: a worker whose entire job-type matrix is
-/// test-looking (`run_worker_job` serves a single `ct-*` type) and that gets a
-/// LIVE job from the engine emits the issue-#41 sanity warning — exactly once —
-/// naming the engine. This is the retargeted-fleet alarm the incident lacked;
-/// the unit tests in `src/jobs.rs` cover the predicate, this proves it fires on
-/// a real activation. Engine-gated: skips without an engine + Rust target.
+/// test-looking and that gets a LIVE job from the engine emits the issue-#41
+/// sanity warning — exactly once — naming the engine. This is the
+/// retargeted-fleet alarm the incident lacked; the unit tests in `src/jobs.rs`
+/// cover the predicate, this proves it fires on a real activation.
+///
+/// The hire uses a TEST-LOOKING rank (`ct-worker`) via
+/// [`run_worker_job_with_rank`]: the default `junior` rank would add the
+/// production-looking `junior` job type to the served matrix, disqualifying
+/// `all_test_looking` so the warning could never fire. With a `ct-worker` rank
+/// the worker serves only `ct-worker` + the `ct-*` test type — every type
+/// test-looking. Engine-gated: skips without an engine + Rust target.
 #[test]
 fn live_job_on_a_test_looking_fleet_warns_once() {
     let (engine, target) = match require_engine_and_target() {
@@ -422,7 +429,7 @@ fn live_job_on_a_test_looking_fleet_warns_once() {
     if target != Target::Rust {
         skip!("the sanity guard is the Rust worker's issue-#41 instrumentation");
     }
-    let outcome = run_worker_job(
+    let outcome = run_worker_job_with_rank(
         &engine,
         &target,
         "sanity-warn",
@@ -433,6 +440,7 @@ fn live_job_on_a_test_looking_fleet_warns_once() {
         json!({ "prompt": "note your environment" }),
         &[],
         &[],
+        "ct-worker",
     );
     let stderr = outcome.stderr();
     let hits = stderr
