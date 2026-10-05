@@ -461,16 +461,41 @@ mod tests {
             // True server-side expiry in the monotonic frame is
             // `true_dispatch + window = (decoded_at - transit) + window`.
             let true_expiry = decoded_at + window - transit;
+            // Reconciliation pulls the anchor back by `transit - skew` (saturating
+            // at zero when `skew >= transit`), so the deadline overruns the true
+            // server-side expiry by EXACTLY `min(skew, transit)` — never the full
+            // `window`-scale skew. Asserting the exact residual (not just an upper
+            // bound the `anchor <= decoded_at` clamp already guarantees) makes this
+            // a real regression test: a no-op anchor that ignored reconciliation
+            // and returned `decoded_at` would overrun by the full `transit` even
+            // for `skew = 1s`, failing the `skew < transit` case below.
+            let tol = Duration::from_millis(50);
+            let expected_overrun = skew.min(transit);
+            let overrun = deadline.saturating_duration_since(true_expiry);
             assert!(
-                deadline <= true_expiry + transit + Duration::from_millis(50),
-                "positive skew {skew:?}: overrun exceeds the response transit"
+                overrun <= expected_overrun + tol,
+                "positive skew {skew:?}: overrun {overrun:?} exceeds the \
+                 reconciled residual {expected_overrun:?}"
             );
-            // The anchor must never rise above the decode instant, so the
-            // deadline never grants more than the decode-anchor bound.
             assert!(
-                deadline <= decoded_at + window + Duration::from_millis(50),
-                "positive skew {skew:?}: deadline exceeds the decode-anchor clamp"
+                overrun + tol >= expected_overrun,
+                "positive skew {skew:?}: overrun {overrun:?} falls short of the \
+                 reconciled residual {expected_overrun:?} — anchor was not pulled \
+                 back by reconciliation"
             );
+            // LOWER bound: when `skew < transit` the reconciliation pulls the
+            // anchor strictly earlier than the decode instant, so the deadline
+            // lands strictly before the naive decode-anchor bound. This fails
+            // against a no-op `return decoded_at`, proving the test exercises the
+            // wall-clock reconciliation rather than only the `anchor <= decoded_at`
+            // clamp.
+            if skew < transit {
+                assert!(
+                    deadline + tol < decoded_at + window,
+                    "positive skew {skew:?}: reconciliation should pull the \
+                     deadline strictly before the decode-anchor bound"
+                );
+            }
         }
     }
 }
