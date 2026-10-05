@@ -763,6 +763,73 @@ mod tests {
     }
 
     #[test]
+    fn initial_deadline_anchored_at_dispatch_fences_before_a_later_handle_top_anchor() {
+        // Regression (replaces an earlier tautological test): the refresher's
+        // initial lease deadline is `activated_at + window`, where `activated_at`
+        // is the DISPATCH/decode-time `Job::dispatched_at` captured in
+        // `Jobs::activate` — NOT a later `Instant::now()` taken when the slot's
+        // `handle` task begins. The engine starts the lease at dispatch, so a
+        // handle-top anchor over-grants the first window by the response-transit
+        // + validation/logging/spawn gap, letting the refresher (and the agent)
+        // keep running past the real server-side lease.
+        //
+        // Prove the safety property THROUGH the real `refresh_budget` rather than
+        // asserting a Duration identity: build both deadlines exactly as
+        // `refresh_loop` does (`anchor + window`), then evaluate them at the
+        // instant the TRUE (dispatch-anchored) lease has lapsed. The dispatch
+        // anchor must fence (`None` → final immediate attempt), while the
+        // over-granted handle-top anchor still hands out extend budget — the
+        // exact overrun the fix removes.
+        let window = Duration::from_secs(300);
+        let every = window / 3;
+        let reserve = REQUEST_MARGIN.min(window / 2);
+
+        // The engine dispatched (and started the lease) at `dispatched_at`, where
+        // the activation response is decoded. The old code captured its anchor a
+        // `gap` later, when `handle` ran. Pick a gap larger than the reserve so
+        // the over-grant is observable as live budget (not just a later fence).
+        let gap = reserve + Duration::from_secs(8);
+        let dispatched_at = Instant::now();
+        let handle_top = dispatched_at + gap;
+
+        // `refresh_loop` computes `deadline = activated_at + window`.
+        let dispatch_deadline = dispatched_at + window;
+        let handle_top_deadline = handle_top + window;
+        assert!(
+            dispatch_deadline < handle_top_deadline,
+            "anchoring at dispatch must never grant a later deadline than a handle-top capture"
+        );
+
+        // Evaluate both leases at the instant the TRUE (dispatch-anchored) lease
+        // is exactly up. The real lease ran `window` from dispatch, so this is
+        // the server-side expiry.
+        let now = dispatch_deadline;
+
+        // Dispatch anchor: at its deadline, `refresh_budget` yields the final
+        // immediate fence attempt (`None`) instead of more sleep budget.
+        assert_eq!(
+            refresh_budget(now, dispatch_deadline, every, window, 0),
+            None,
+            "at the true expiry the dispatch-anchored refresher must fence, not keep extending"
+        );
+
+        // Handle-top anchor (the reverted behaviour): the over-grant still
+        // reports live budget, so the refresher would fire another extend and the
+        // agent would keep running PAST the real lease.
+        let over_grant = refresh_budget(now, handle_top_deadline, every, window, 0)
+            .expect("the over-granted handle-top lease still has budget past the real expiry");
+        assert!(
+            now + over_grant > dispatch_deadline,
+            "the handle-top anchor schedules the next extend past the real lease — the overrun \
+             the dispatch anchor removes"
+        );
+        assert!(
+            now + over_grant < handle_top_deadline,
+            "that next extend still fires before the (wrongly later) handle-top deadline"
+        );
+    }
+
+    #[test]
     fn fence_status_comes_from_the_chain_not_bare_digits() {
         // Real fence responses flatten to an `HTTP 404 ` / `HTTP 409 ` marker
         // re-wrapped with the `/jobs/{key}` path context.
