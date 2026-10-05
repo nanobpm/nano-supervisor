@@ -536,8 +536,8 @@ pub fn warn_if_drifted(decision: &PinDecision) {
 fn drift_warnings(decision: &PinDecision) -> Vec<String> {
     let redact = |u: &str| crate::slot::redact_url(u);
     let mut out = Vec::new();
-    if let (Some(pinned), Some(active)) = (&decision.pin.profile, &decision.active_profile) {
-        if pinned != active {
+    match (&decision.pin.profile, &decision.active_profile) {
+        (Some(pinned), Some(active)) if pinned != active => {
             out.push(format!(
                 "WARNING: the pinned connection is profile {pinned:?} but c8ctl's active profile \
                  is now {active:?} — this supervisor keeps following the PIN; the active profile \
@@ -546,6 +546,25 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
                 state_file_display(decision)
             ));
         }
+        // A named pin whose session has NO active profile now (session.json was
+        // deleted or `activeProfile` cleared) is drift too — the classic
+        // retarget's sibling, symmetric with the env-only unset branch below —
+        // and must warn as loudly as a *changed* active profile rather than be
+        // silently swallowed by the `Some/Some`-only arm above. Only an
+        // *existing* pin being followed can drift: a freshly created pin
+        // (`created`) is being established from the current state now, so a
+        // first `--profile` start with no session must not warn here.
+        (Some(pinned), None) if !decision.created => {
+            out.push(format!(
+                "WARNING: the pinned connection is profile {pinned:?} but c8ctl now has NO active \
+                 profile (session.json was removed or its activeProfile cleared) — this supervisor \
+                 keeps following the PIN and connects to profile {pinned:?}; the unset session is \
+                 IGNORED (clearing the active profile cannot retarget this fleet). Restart with \
+                 --profile to re-pin, or edit {}",
+                state_file_display(decision)
+            ));
+        }
+        _ => {}
     }
     // The baseUrl drift check compares the fingerprint recorded on disk THEN
     // (`stored_base_url`) against what the connection resolves to NOW — never
@@ -1007,6 +1026,67 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// A named pin whose session becomes UNSET (session.json deleted or its
+    /// `activeProfile` cleared) is drift too: the `Some/None` sibling of the
+    /// active-profile retarget, and it must warn rather than be silently
+    /// swallowed by the `Some/Some`-only arm.
+    #[test]
+    fn named_pin_warns_when_active_profile_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("activeprofileunset");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        let first = resolve_or_pin(&home, None).expect("first start pins");
+        assert!(first.created);
+        // Clear the active profile: session.json removed entirely.
+        std::fs::remove_file(c8ctl.join("session.json")).unwrap();
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        assert!(second.active_profile.is_none());
+        let warnings = drift_warnings(&second);
+        assert!(
+            warnings.iter().any(|w| w.contains("NO active profile")),
+            "an unset active profile under a named pin must warn: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The sibling of the case above: a FRESH named pin created with an
+    /// explicit `--profile` while there is no session must NOT emit the
+    /// unset-active-profile drift warning — a pin being established now has
+    /// nothing to drift from.
+    #[test]
+    fn fresh_named_pin_without_session_does_not_warn_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("freshnamednosession");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+        )
+        .unwrap();
+        // No session.json at all: active_profile resolves to None.
+        let first = resolve_or_pin(&home, Some("merlin")).expect("explicit --profile pins");
+        assert!(first.created);
+        assert!(first.active_profile.is_none());
+        assert!(
+            !drift_warnings(&first)
+                .iter()
+                .any(|w| w.contains("NO active profile")),
+            "a freshly created pin must not warn about an unset active profile"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn env_pin_keeps_its_base_url_fingerprint_across_env_drift() {
         let _lock = ENV_LOCK.lock().unwrap();

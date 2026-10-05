@@ -45,8 +45,12 @@ naming the engine on its first live activation.
 
 Agents are quarantined from the operator's c8ctl session: every agent runs with
 `C8CTL_DATA_DIR` pointed at an isolated per-run dir (`<run dir>/c8ctl`) —
-created for **every** job, including an env-only pin (which has no profile to
-seed, so the dir stays empty) — so an agent's `c8 use profile` /
+created for **every** job and seeded with the pinned connection: a
+`session.json` whose `activeProfile` names the pinned profile and a
+`profiles.json` carrying only that profile's non-secret connection identity.
+An env-only pin (no c8ctl profile) is **synthesized** into a stable `pinned`
+profile from the recorded baseUrl, so the agent's `c8` still resolves exactly
+the pinned engine (the dir is never left empty). An agent's `c8 use profile` /
 `c8 profile add` writes stay inside its run and the operator's
 `~/.config/c8ctl/session.json` is never touched.
 

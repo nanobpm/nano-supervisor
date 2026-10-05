@@ -262,6 +262,15 @@ fn pinned_worker_dials_the_pinned_engine_not_the_moved_one() {
     let _ = run_work(&home, c8ctl.path(), &[]);
     set_active_profile(c8ctl.path(), "beta");
 
+    // The first pinning run shares the `alpha` listener and can race past its
+    // banner into an activation dial before `run_work` reaps it, leaving a stale
+    // "alpha" queued in `alpha_rx`. Drain BOTH receivers now (the first child is
+    // already reaped) so the assertions below observe only the worker under
+    // test's dials — otherwise a post-drift worker that never contacts alpha
+    // could still satisfy `recv_timeout` on that leftover event.
+    while alpha_rx.try_recv().is_ok() {}
+    while beta_rx.try_recv().is_ok() {}
+
     // Run the worker for real — past the banner, into the activation poll — so
     // its client genuinely connects. A short poll makes it dial promptly and
     // keep retrying; the unresponsive probe never lets it hang.

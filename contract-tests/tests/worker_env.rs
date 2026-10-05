@@ -322,34 +322,38 @@ fn worker_isolates_the_agents_c8ctl_session() {
         "the agent must be able to write inside its isolated c8ctl config dir"
     );
 
-    // The seed, when there is one, is exactly the pinned connection: the
-    // session's activeProfile and a profiles.json carrying only that profile,
-    // so the agent's own `c8` sees the job's engine and nothing else. (This
-    // engine-gated harness connects the worker via `CAMUNDA_REST_ADDRESS` — an
-    // env-only pin — so there is no profile to seed and the isolated dir holds
-    // only the agent's own write; the unit tests pin the seeded shape for a
-    // profiled connection.)
+    // The seed is exactly the pinned connection: the session's activeProfile
+    // and a profiles.json carrying only that profile, so the agent's own `c8`
+    // sees the job's engine and nothing else. This engine-gated harness
+    // connects the worker via `CAMUNDA_REST_ADDRESS` — an env-only pin — which
+    // no longer leaves the dir empty: the worker now SYNTHESIZES a `pinned`
+    // profile from the pinned base URL, so `session.json`/`profiles.json` are
+    // written unconditionally (the unit tests pin the exact seeded shape for a
+    // profiled connection). Assert the seed exists with no `if exists` guard,
+    // so a worker that failed to synthesize and seed it fails the test rather
+    // than silently passing.
     let session = dir_path.join("session.json");
-    if session.exists() {
-        let seeded: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&session).expect("read seeded session.json"),
-        )
-        .expect("seeded session.json is JSON");
-        assert!(
-            seeded["activeProfile"].is_string(),
-            "the seeded session names the pinned profile: {seeded}"
-        );
-        let profiles: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(session.with_file_name("profiles.json"))
-                .expect("read seeded profiles.json"),
-        )
-        .expect("seeded profiles.json is JSON");
-        assert_eq!(
-            profiles["profiles"].as_array().map(Vec::len),
-            Some(1),
-            "the agent's isolated config carries ONLY the pinned profile: {profiles}"
-        );
-    }
+    assert!(
+        session.exists(),
+        "the isolated c8ctl dir must carry a seeded session.json naming the pinned engine: {dir}"
+    );
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&session).expect("read seeded session.json"))
+            .expect("seeded session.json is JSON");
+    assert!(
+        seeded["activeProfile"].is_string(),
+        "the seeded session names the pinned profile: {seeded}"
+    );
+    let profiles: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(session.with_file_name("profiles.json"))
+            .expect("read seeded profiles.json"),
+    )
+    .expect("seeded profiles.json is JSON");
+    assert_eq!(
+        profiles["profiles"].as_array().map(Vec::len),
+        Some(1),
+        "the agent's isolated config carries ONLY the pinned profile: {profiles}"
+    );
     // The run is marked as agent-owned (the issue-#40 sibling marker).
     assert!(
         env.get("NANO_AGENT_RUN").is_some_and(|v| !v.is_empty()),
