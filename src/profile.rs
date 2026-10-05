@@ -169,14 +169,38 @@ pub fn resolve_with_base_override(
     }
 }
 
+/// Normalize an engine base URL the single, canonical way the supervisor both
+/// fingerprints and connects: trim surrounding whitespace, drop trailing
+/// slashes, strip the optional `/v2` suffix (c8ctl profiles may carry it; the
+/// SDK appends it itself), then drop any slashes the strip exposed. A URL that
+/// reduces to nothing (e.g. `/`, `/v2`, or whitespace) is not a usable address,
+/// so it yields `None`.
+///
+/// This is the ONE normalizer shared by the SDK config ([`sdk_settings`]) and
+/// the pin fingerprint ([`resolved_base_url`]): routing both through it is what
+/// guarantees a pin can never name one engine while the client is built for
+/// another (issue #41).
+pub fn normalize_base_url(raw: &str) -> Option<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let url = url.strip_suffix("/v2").unwrap_or(url).trim_end_matches('/');
+    (!url.is_empty()).then(|| url.to_string())
+}
+
 /// Map a c8ctl profile onto the SDK's `CAMUNDA_*` configuration keys.
 pub fn sdk_settings(p: &Profile) -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     if let Some(url) = &p.base_url {
-        // c8ctl profiles may carry the `/v2` suffix; the SDK appends it itself.
-        let url = url.trim_end_matches('/');
-        let url = url.strip_suffix("/v2").unwrap_or(url);
-        m.insert("CAMUNDA_REST_ADDRESS", url.to_string());
+        // An explicit profile `baseUrl` dictates the engine for the client; run
+        // it through the shared normalizer so the SDK target matches the pinned
+        // fingerprint ([`resolved_base_url`]) byte-for-byte. An explicit-but-
+        // unusable URL normalizes to `None`; set an EMPTY address so the client
+        // fails closed on this profile rather than silently falling through to
+        // the ambient `CAMUNDA_*` env — the same fail-closed stance
+        // `resolved_base_url` takes by returning `None` (issue #41).
+        m.insert(
+            "CAMUNDA_REST_ADDRESS",
+            normalize_base_url(url).unwrap_or_default(),
+        );
     }
     let oauth = p.client_id.is_some() && p.client_secret.is_some();
     let basic = p.username.is_some() && p.password.is_some();
@@ -235,39 +259,33 @@ pub fn client_with_base_override(
 }
 
 /// The engine base URL a connection resolved to, normalized the same way
-/// [`sdk_settings`] normalizes it for the SDK (trailing `/` and `/v2` stripped).
-/// Used as the connection *fingerprint* in the pinned state (issue #41): the
-/// supervisor records it next to the profile name so a later start can tell
-/// "same profile name, different engine" apart from "same engine". With no
-/// profile this is the ambient `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`.
+/// [`sdk_settings`] normalizes it for the SDK (both go through
+/// [`normalize_base_url`]). Used as the connection *fingerprint* in the pinned
+/// state (issue #41): the supervisor records it next to the profile name so a
+/// later start can tell "same profile name, different engine" apart from "same
+/// engine". With no profile this is the ambient
+/// `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`.
 pub fn resolved_base_url(profile: Option<&Profile>) -> Option<String> {
-    // A URL that normalizes to the empty string (e.g. a profile/env value of
-    // `/`, `/v2`, or whitespace) is NOT a usable fingerprint: returning
-    // `Some("")` here would let the pin persist a self-invalid connection the
-    // next start rejects. Collapse every empty-normalized result to `None` so a
-    // profile source falls through to the env and an empty env falls through to
-    // the next key (and ultimately `None`).
+    // An explicit profile `baseUrl` DICTATES the engine: normalize it the one
+    // shared way and return that result directly — including `None` for an
+    // unusable explicit URL (e.g. `/`, `/v2`, whitespace). Do NOT fall through
+    // to the ambient env in that case: the client ([`sdk_settings`]) is built
+    // for THIS profile's URL, so fingerprinting a different (env) engine would
+    // make the pin/banner name one engine while the client targets another
+    // (issue #41). A `None` here then fails the pin closed at creation.
+    //
+    // Only a profile that OMITS `baseUrl` (or no profile at all) consults the
+    // env; an empty env key falls through to the next key (ultimately `None`)
+    // so a self-invalid `Some("")` pin is never recorded.
     if let Some(p) = profile {
         if let Some(url) = &p.base_url {
-            let url = url.trim().trim_end_matches('/');
-            let url = url.strip_suffix("/v2").unwrap_or(url).trim_end_matches('/');
-            if !url.is_empty() {
-                return Some(url.to_string());
-            }
+            return normalize_base_url(url);
         }
     }
     for key in ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"] {
         if let Some(v) = std::env::var_os(key) {
-            let v = v.to_string_lossy().trim().trim_end_matches('/').to_string();
-            if !v.is_empty() {
-                let v = v
-                    .strip_suffix("/v2")
-                    .unwrap_or(&v)
-                    .trim_end_matches('/')
-                    .to_string();
-                if !v.is_empty() {
-                    return Some(v);
-                }
+            if let Some(normalized) = normalize_base_url(&v.to_string_lossy()) {
+                return Some(normalized);
             }
         }
     }
@@ -314,6 +332,55 @@ mod tests {
         let m = sdk_settings(&p);
         assert_eq!(m["CAMUNDA_REST_ADDRESS"], "http://192.168.0.21:8080");
         assert_eq!(m["CAMUNDA_AUTH_STRATEGY"], "NONE");
+    }
+
+    /// Issue #41 (review round 10): the SDK client config and the pin
+    /// fingerprint must normalize a profile URL identically — a whitespace-
+    /// padded (or `/v2`-suffixed) URL must not leave the client with stray
+    /// characters the pin stripped. Both now route through `normalize_base_url`.
+    #[test]
+    fn sdk_settings_and_fingerprint_normalize_url_identically() {
+        for (raw, want) in [
+            ("  http://host:8080/v2/  ", "http://host:8080"),
+            ("http://host:8080//", "http://host:8080"),
+            ("https://x.camunda.io/v2", "https://x.camunda.io"),
+        ] {
+            let p = profile(&format!(r#"{{"name":"m","baseUrl":"{raw}"}}"#));
+            assert_eq!(
+                sdk_settings(&p)["CAMUNDA_REST_ADDRESS"],
+                want,
+                "sdk_settings normalized {raw:?} unexpectedly"
+            );
+            assert_eq!(
+                resolved_base_url(Some(&p)).as_deref(),
+                Some(want),
+                "resolved_base_url normalized {raw:?} unexpectedly"
+            );
+        }
+    }
+
+    /// Issue #41 (review round 10): an explicit profile `baseUrl` that
+    /// normalizes to nothing (`/`, `/v2`, whitespace) must FAIL CLOSED, not fall
+    /// through to the ambient env differently in the two code paths. The pin
+    /// fingerprint (`resolved_base_url`) returns `None` for such a URL REGARDLESS
+    /// of any `CAMUNDA_*`/`ZEEBE_*` env (it never consults it for an explicit
+    /// profile URL), and `sdk_settings` agrees by setting an EMPTY address — so
+    /// the pin/banner can never name the env engine while the client is built
+    /// for a different one.
+    #[test]
+    fn explicit_unusable_profile_url_fails_closed_without_env_fallthrough() {
+        for degenerate in ["/", "/v2", "/v2/", "   ", "  /v2  "] {
+            let p = profile(&format!(r#"{{"name":"m","baseUrl":"{degenerate}"}}"#));
+            assert_eq!(
+                resolved_base_url(Some(&p)),
+                None,
+                "explicit baseUrl {degenerate:?} must fingerprint as None, not fall through to env"
+            );
+            assert_eq!(
+                sdk_settings(&p)["CAMUNDA_REST_ADDRESS"], "",
+                "explicit baseUrl {degenerate:?} must set an empty REST address, not inherit env"
+            );
+        }
     }
 
     /// Issue #41: the identity seeded into the agent's isolated c8ctl dir must

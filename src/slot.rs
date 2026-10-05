@@ -2231,6 +2231,19 @@ fn seed_agent_c8ctl_dir(cfg: &SlotConfig, result_file: &std::path::Path) -> Resu
         .connection_profile
         .as_ref()
         .map(crate::profile::Profile::connection_identity)
+        .map(|mut identity| {
+            // A named profile may omit `baseUrl`, in which case the worker
+            // resolved the engine from the ambient `CAMUNDA_*`/`ZEEBE_*` env and
+            // fingerprinted THAT URL (`resolved_base_url`). Seeding the bare
+            // identity would hand the agent a profile with no engine, so its
+            // `c8` could not reach the engine the worker is pinned to. Backfill
+            // the pinned connection URL (redacted like the env-only branch
+            // below) so the agent targets the SAME engine (issue #41).
+            if identity.base_url.is_none() {
+                identity.base_url = cfg.connection.base_url.as_deref().map(redact_url);
+            }
+            identity
+        })
         .or_else(|| {
             // No cached `Profile` object to clone: synthesize the non-secret
             // connection identity from the pinned `base_url` so the agent's
@@ -2810,7 +2823,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&run);
     }
 
-    /// Issue #41, credential leak: the profile seeded into the agent's isolated
+    /// Issue #41 (review round 10): a named profile may OMIT `baseUrl`, in which
+    /// case the worker resolved (and fingerprinted) the engine from the ambient
+    /// `CAMUNDA_*`/`ZEEBE_*` env. The `connection_identity` arm would otherwise
+    /// seed the agent a profile with NO engine, so its `c8` could not reach the
+    /// engine the worker is pinned to. The seed must backfill the pinned
+    /// connection URL (redacted) so the agent targets the SAME engine.
+    #[test]
+    fn profile_without_base_url_seeds_the_pinned_connection_url() {
+        let mut c = cfg();
+        // The pin's profile object carries no baseUrl…
+        c.connection_profile = Some(crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: None,
+            ..Default::default()
+        });
+        // …but the worker fingerprinted this engine from the env.
+        c.connection = crate::pin::ConnectionPin {
+            profile: Some("merlin".into()),
+            base_url: Some("http://env-engine:8080".into()),
+        };
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-nobaseurl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
+        let profiles: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(profiles["profiles"][0]["name"], serde_json::json!("merlin"));
+        assert_eq!(
+            profiles["profiles"][0]["baseUrl"],
+            serde_json::json!("http://env-engine:8080"),
+            "a baseUrl-less profile must seed the pinned connection URL so the agent sees the engine"
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// The round-10 backfill must honour the SAME credential boundary as the
+    /// env-only branch: when the pinned connection URL embeds HTTP(S) userinfo,
+    /// backfilling a baseUrl-less profile's address must strip it before it
+    /// lands in the agent-readable `profiles.json`.
+    #[test]
+    fn profile_without_base_url_strips_userinfo_when_backfilling() {
+        let mut c = cfg();
+        c.connection_profile = Some(crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: None,
+            ..Default::default()
+        });
+        let url = format!("http://{}:{}@env-engine:8080", "user", "SECRET");
+        c.connection = crate::pin::ConnectionPin {
+            profile: Some("merlin".into()),
+            base_url: Some(url),
+        };
+        let run = std::env::temp_dir().join(format!(
+            "nano-slot-test-nobaseurl-redact-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
+        let raw =
+            std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap();
+        assert!(
+            !raw.contains("SECRET") && !raw.contains("user@"),
+            "backfilled profiles.json leaked base_url userinfo: {raw}"
+        );
+        assert!(
+            raw.contains("http://env-engine:8080"),
+            "backfilled profiles.json must keep the engine location: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
     /// c8ctl dir is a CONNECTION IDENTITY only — the agent's own `c8` must reach
     /// the job's engine without ever being handed the operator's long-lived
     /// secrets. A seeded `profiles.json` must therefore carry no credential of
