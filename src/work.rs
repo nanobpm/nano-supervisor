@@ -171,16 +171,47 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         Ok(tail) => canon_anchor.join(tail),
         Err(_) => runs_dir,
     };
-    slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
-    std::fs::create_dir_all(&runs_dir)?;
-    // Re-validate NO-FOLLOW now that the tail exists on disk: a same-UID process
-    // could swap the freshly created leaf (or any tail ancestor) for a symlink
-    // between the create above and first use. Do NOT `canonicalize` here —
-    // `canonicalize` FOLLOWS such a swap to the attacker-chosen target and the
-    // checks would then pass against it. `reject_symlinked_ancestors_below`
-    // inspects every component below the (already canonical) anchor with
-    // `symlink_metadata` (no-follow) and REJECTS a swapped-in link.
-    slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+    // Materialise the worker-namespace root. On Unix this MUST be the
+    // component-wise pinned create (`open_or_create_root_nofollow`), never a
+    // path-based `create_dir_all` sandwiched between two no-follow checks:
+    // `create_dir_all` FOLLOWS a symlinked ancestor, so a same-UID actor
+    // swapping a writable tail ancestor (the state-home `agent-runs` dir, or the
+    // predictable `rust-worker-<pid>` leaf under the sticky `/tmp` fallback) for
+    // a symlink between the check and the create would have the namespace root
+    // materialised inside the attacker-chosen target — and the re-check only
+    // detects the swap AFTER the tree is already built outside the workspace.
+    // This is the same TOCTOU class `prepare_run_dir_pinned` closes for the
+    // per-job runs root; close it here too by creating each missing component
+    // relative to its already-pinned parent, so a swapped-in symlink is refused
+    // (ELOOP), never followed (#36).
+    #[cfg(unix)]
+    {
+        crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs_dir, 0o700).map_err(|e| {
+            match e {
+                crate::saferoot::PinError::Io(e) => anyhow::Error::new(e).context(format!(
+                    "creating worker-namespace runs root {}",
+                    runs_dir.display()
+                )),
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix fallback (no pinned-handle support — not a supported daemon
+        // host): best-effort check / create / re-check. This cannot close the
+        // TOCTOU window above; it only approximates it.
+        slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+        std::fs::create_dir_all(&runs_dir)?;
+        // Re-validate NO-FOLLOW now that the tail exists on disk: a same-UID
+        // process could swap the freshly created leaf (or any tail ancestor) for
+        // a symlink between the create above and first use. Do NOT
+        // `canonicalize` here — `canonicalize` FOLLOWS such a swap to the
+        // attacker-chosen target and the checks would then pass against it.
+        // `reject_symlinked_ancestors_below` inspects every component below the
+        // (already canonical) anchor with `symlink_metadata` (no-follow) and
+        // REJECTS a swapped-in link.
+        slot::reject_symlinked_ancestors_below(&runs_dir, &canon_anchor)?;
+    }
     // Sweep at the SHARED parent of this worker's namespace, not the namespace
     // itself: a crashed worker leaves `rust-worker-<old-pid>` as a sibling of
     // the next launch's root, so sweeping only `runs_dir` could never discover

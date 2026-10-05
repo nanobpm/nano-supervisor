@@ -498,6 +498,11 @@ pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
 /// `anchor` must be an ancestor of `dir` (or equal to it); components at or
 /// above `anchor` are trusted and skipped. A non-existent component is skipped:
 /// `create_dir_all` materialises it as a fresh real directory, not a link.
+/// Only the non-Unix fallback (and the tests exercising the rejection) use this
+/// now: on Unix the worker-namespace bootstrap materialises the root via the
+/// component-wise pinned `open_or_create_root_nofollow` instead, which closes
+/// the check→create race rather than merely re-checking after it.
+#[cfg(any(not(unix), test))]
 pub(crate) fn reject_symlinked_ancestors_below(dir: &Path, anchor: &Path) -> Result<()> {
     // Walk dir's ancestors from the leaf up to (but not past) `anchor`, stopping
     // before the anchor's own (trusted) ancestors. The anchor itself is trusted:
@@ -3422,6 +3427,20 @@ mod tests {
         // `runs_dir` = `<link>/runs`, where `link` -> `outside`. The old code
         // would create `<outside>/runs`; the fix must refuse the symlinked
         // `link` and create nothing outside.
+        //
+        // NOTE (adversarial-review caveat): this plants the symlink BEFORE the
+        // call, so it is NOT red-before — the pre-fix `reject_symlinked_ancestors`
+        // pre-check already bails on the static `link` ancestor, so these
+        // assertions also pass against the old code. It pins the "refuse a
+        // pre-existing symlinked ancestor, create nothing outside" guarantee the
+        // fix must preserve, but it does NOT exercise the check→create race
+        // window itself. A deterministic red-before race test would require a
+        // test-only pause hook inside the pre-fix `create_dir_all`→`open_root`
+        // window; the pre-fix `open_root_nofollow` resolves the whole path in one
+        // atomic `openat2`, so there is no shared per-component seam to hook and
+        // such a test is not feasible here. The race is instead closed by
+        // construction: the fix creates each component relative to its pinned
+        // parent, so a swapped-in symlink is refused by the no-follow open.
         let link = base.join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         let runs = link.join("runs");
