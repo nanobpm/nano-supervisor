@@ -1218,6 +1218,18 @@ mod tests {
     /// process cwd (racy under parallel tests) by computing a relative path from
     /// the *actual* current dir to the source repo and passing that — exactly
     /// what `provision` re-anchors via `std::env::current_dir()`.
+    ///
+    /// The red-before guard is the **persisted origin**, not merely that the
+    /// clone produced a checkout: `relativize(cwd, temp_src)` can climb to `/`
+    /// when the cwd is deeper than the temp base, and such an all-`..` path
+    /// resolves to the *same* absolute location whether git anchors it at the
+    /// run dir (the bug) or the supervisor cwd (the fix) — so a checkout-only
+    /// assertion passes against the broken code too (it did, from a deep cwd).
+    /// We therefore assert the stored `remote.origin.url` is the re-anchored
+    /// **absolute** path: the fix persists `supervisor_cwd.join(url)` (absolute),
+    /// whereas the pre-fix code would persist the raw **relative** input. That
+    /// distinction is independent of cwd depth, so the test is reliably red
+    /// before the fix wherever the test binary runs.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn provision_resolves_a_relative_local_source_from_supervisor_cwd() {
@@ -1263,7 +1275,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let workdir = CwdHandle::open(&run).unwrap();
 
-        let checkout = provision(&repo_envelope(rel_url), &workdir, Duration::from_secs(60))
+        let checkout = provision(&repo_envelope(rel_url.clone()), &workdir, Duration::from_secs(60))
             .await
             .expect("provision must resolve a relative local source from the supervisor cwd");
 
@@ -1271,6 +1283,34 @@ mod tests {
         assert!(
             landed.join("f.txt").exists(),
             "the relative-source clone must land a real checkout in the run dir"
+        );
+
+        // The real red-before guard (see the doc comment): the persisted origin
+        // must be the re-anchored ABSOLUTE path, not the raw relative input. The
+        // fix stores `supervisor_cwd.join(url)`; the pre-fix code would store the
+        // relative string verbatim. This distinction holds regardless of how
+        // deep the test binary's cwd is, so it catches a reintroduction of the
+        // bug even when an all-`..` relative path happens to clone successfully.
+        let origin = {
+            let out = std::process::Command::new("git")
+                .args(["config", "--get", "remote.origin.url"])
+                .current_dir(landed)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "reading remote.origin.url failed");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let origin_path = Path::new(&origin);
+        assert!(
+            origin_path.is_absolute(),
+            "persisted origin must be the re-anchored ABSOLUTE path, not the \
+             relative input {rel_url:?}; got {origin:?}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(origin_path).unwrap(),
+            std::fs::canonicalize(&src).unwrap(),
+            "the re-anchored origin must resolve to the real source repo"
         );
         std::fs::remove_dir_all(&base).ok();
     }
