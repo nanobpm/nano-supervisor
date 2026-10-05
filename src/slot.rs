@@ -1670,7 +1670,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // "commits" signal from a pre/post `rev-parse` of this HEAD (any advance =
     // a commit) and reports no push. `None` for a non-git run dir (no
     // repository) or when HEAD can't be read — treated as "no commits".
-    let start_head = git_head_blocking(agent_cwd.clone()).await;
+    // Dup the pinned handle FALLIBLY: this probe is best-effort (a failure is
+    // already `None` = "HEAD unreadable"), so a dup failure (descriptor
+    // exhaustion, EMFILE) must yield `None` here, never a worker-crashing
+    // panic from `Clone` — the same class as the launch-cwd dup above.
+    let start_head = match agent_cwd.try_clone() {
+        Ok(cwd) => git_head_blocking(cwd).await,
+        Err(_) => None,
+    };
 
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
@@ -1787,11 +1794,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // AND gates reaping (a provisioned checkout that advanced HEAD holds commits
     // that, absent a push stage, exist ONLY in the run dir).
     let provisioned = env.repository.is_some();
-    let has_commits = detect_commits(
-        start_head.as_deref(),
-        git_head_blocking(agent_cwd.clone()).await.as_deref(),
-        provisioned,
-    );
+    // The post-run HEAD probe is best-effort too: dup the pinned handle
+    // fallibly so a dup failure (EMFILE) reads as `None` ("HEAD unreadable"),
+    // not a `Clone` panic — mirroring `start_head` above.
+    let end_head = match agent_cwd.try_clone() {
+        Ok(cwd) => git_head_blocking(cwd).await,
+        Err(_) => None,
+    };
+    let has_commits = detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned);
 
     let settle = if !run.ok {
         let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {

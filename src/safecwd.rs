@@ -904,6 +904,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `try_clone` must be genuinely fallible: under descriptor exhaustion
+    /// (`EMFILE`) it returns `Err` instead of panicking, so a best-effort
+    /// caller (the `execute()` HEAD probes, which degrade a failed probe to
+    /// `None` = "HEAD unreadable") can propagate/degrade rather than crash the
+    /// worker the way `Clone`'s `expect` would. This is the invariant the
+    /// `slot.rs` HEAD-probe fix relies on: `try_clone().ok()`-style degradation
+    /// only works if `try_clone` actually yields `Err` on `EMFILE`.
+    ///
+    /// Simulates exhaustion by capping `RLIMIT_NOFILE` just above the current
+    /// open-fd count, so the very next `F_DUPFD_CLOEXEC` fails with `EMFILE`.
+    /// Runs in its own process (a `#[test]` is a thread of the test binary, but
+    /// the rlimit is restored before returning, so sibling tests are
+    /// unaffected); skipped if the rlimit cannot be tightened.
+    #[cfg(unix)]
+    #[test]
+    fn try_clone_is_fallible_under_descriptor_exhaustion() {
+        let dir = scratch("try-clone-emfile");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+
+        // Tighten RLIMIT_NOFILE to the number of fds currently open, so the
+        // next dup exceeds the soft limit and fails with EMFILE.
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            std::fs::remove_dir_all(&dir).ok();
+            return; // cannot read the limit; skip rather than fail spuriously
+        }
+        let saved = lim;
+        // Empirically find the highest soft limit at which a fresh open already
+        // fails with EMFILE. Start from a high-water count of the open fds and
+        // walk DOWN, probing with a real `open`: each success means the cap
+        // still leaves a free slot, so close that fd and lower the cap by one;
+        // the first EMFILE means the table is exactly full — which is precisely
+        // the state in which the very next `try_clone` dup must fail. (A pure
+        // `/proc/self/fd` count is unreliable here: the read_dir fd closes
+        // before the probe, so the arithmetic is off by one and the dup can
+        // still succeed.)
+        let mut cap: libc::rlim_t = std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count() as libc::rlim_t)
+            .unwrap_or(256)
+            + 1;
+        let mut armed = false;
+        while cap > 0 {
+            lim.rlim_cur = cap;
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+                break; // cannot tighten further; give up and skip below
+            }
+            let probe = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY) };
+            if probe < 0 {
+                // EMFILE (or any failure) at this cap: the table is full.
+                armed = true;
+                break;
+            }
+            unsafe { libc::close(probe) };
+            cap -= 1;
+        }
+
+        let result = if armed { Some(handle.try_clone()) } else { None };
+
+        // Restore the limit before asserting/cleanup so a failure here does not
+        // wedge the rest of the test binary.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) };
+        std::fs::remove_dir_all(&dir).ok();
+
+        let Some(result) = result else {
+            return; // could not reach a full fd table on this host; skip
+        };
+        assert!(
+            result.is_err(),
+            "try_clone must return Err(EMFILE) under descriptor exhaustion, not panic or succeed"
+        );
+    }
+
     #[test]
     fn dup_fd_never_occupies_a_standard_descriptor() {
         // The dup moved into a child's `pre_exec` must be allocated at
