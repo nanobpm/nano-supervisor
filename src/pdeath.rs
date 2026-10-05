@@ -137,14 +137,32 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// [`PgidGuard::still_ours`] for the policy and its residual recycle window.
 ///
 /// **Scope of the guarantee.** The recycled-PGID race is closed for every case
-/// except one narrow residual window: the group empties *entirely*, the pgid is
-/// recycled by an unrelated group, *and* that recycled group's own leader is
-/// reaped too — all inside a single poll interval — so the re-read yields `None`
-/// and the fail-open policy signals the unrelated group. That window is accepted
-/// (it requires a full recycle plus a second leader reap inside one poll); the
-/// in-process paths close it entirely by holding the leader unreaped until after
-/// the SIGKILL. Everywhere else — a live recycled leader, or any group whose
-/// leader is still readable — the identity check refuses the signal.
+/// except two accepted residual windows:
+///
+/// 1. *Nested recycle.* The group empties *entirely*, the pgid is recycled by an
+///    unrelated group, *and* that recycled group's own leader is reaped too — all
+///    inside a single poll interval — so the re-read yields `None` and the
+///    fail-open policy signals the unrelated group. (Requires a full recycle plus
+///    a second leader reap inside one poll.)
+///
+/// 2. *Check-to-signal TOCTOU (watchdog only).* The identity check and the
+///    `kill(2)` are separate syscalls. In the watchdog's fail-open branch — where
+///    the leader is already *gone* and the group is held only by orphaned
+///    descendants — the last descendant can exit and the pgid be recycled in the
+///    window *between* [`PgidGuard::still_ours`]/`group_identity_matches`
+///    returning true and `sigkill_group` running, so the SIGKILL can land on an
+///    unrelated group *without* the recycled leader needing to be reaped. This is
+///    broader than window 1.
+///
+/// Both are accepted as the price of not leaking `TERM`-resistant orphans. The
+/// in-process paths close *both* by holding the leader unreaped until after the
+/// SIGKILL — the zombie keeps the pgid un-recyclable across the whole
+/// check→signal window — so only the detached watchdog, which cannot hold the
+/// leader unreaped, retains them. Shrinking the watchdog window by detecting
+/// whether any non-zombie member still remains (so clean exits finish without
+/// waiting out the grace, and the signal window closes) is tracked in #50.
+/// Everywhere else — a live recycled leader, or any group whose leader is still
+/// readable — the identity check refuses the signal.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GroupIdentity {
@@ -263,13 +281,16 @@ impl PgidGuard {
     ///   descendants — so fail **open** and signal. This is the case the earlier
     ///   strict-equality check got wrong: it returned `false` here and *skipped*
     ///   the SIGKILL, leaking the very `TERM`-resistant descendants the cleanup
-    ///   exists to kill. The residual risk is the nested recycle: the group
-    ///   emptied entirely, the pgid was recycled, *and* the recycled group's own
-    ///   leader was reaped too, all before this probe — then we signal an
-    ///   unrelated group. That window is accepted (it requires a full recycle
-    ///   plus a second leader reap inside one poll interval); it is the price of
-    ///   not leaking orphans, and the in-process paths close it entirely by
-    ///   holding the leader unreaped until after the SIGKILL.
+    ///   exists to kill. Two residual windows remain: (a) the nested recycle —
+    ///   the group emptied entirely, the pgid was recycled, *and* the recycled
+    ///   group's own leader was reaped too, all before this probe; and (b) a
+    ///   check-to-signal TOCTOU — because this predicate and the `kill(2)` that
+    ///   follows it are separate syscalls, a gone-leader group's last member can
+    ///   exit and the pgid be recycled *between* this returning true and the
+    ///   signal. Both are accepted (the price of not leaking orphans). The
+    ///   in-process paths close both by holding the leader unreaped until after
+    ///   the SIGKILL; only the detached watchdog, which cannot, retains them
+    ///   (shrinking that window is tracked in #50).
     pub(crate) fn still_ours(&self) -> bool {
         if !group_alive(self.pgid) {
             return false;
@@ -347,6 +368,11 @@ pub(crate) async fn terminate_group_and_reap(
                 // The cost is that `group_alive` stays true on the zombie, so a
                 // clean shutdown waits out the full grace period rather than
                 // breaking early; correctness is preferred over that latency.
+                // This grace runs after every ACP job (`acp::shutdown`), so the
+                // accepted cost is ~`grace` per clean ACP shutdown. Detecting
+                // whether any non-zombie member still remains (so a clean exit
+                // breaks early while the zombie stays as the identity anchor) is
+                // tracked in #50.
                 if !guard.still_ours() {
                     // The group is gone (every member exited). Don't re-signal.
                     break;
@@ -657,6 +683,14 @@ pub fn reap_watchdog(
         // parent may have exited while the agent's group already went away,
         // freeing the pid to be recycled by an unrelated group. The identity
         // check gates the kill so a recycled pgid is never signalled (issue #27).
+        //
+        // Residual check-to-signal TOCTOU: this predicate and `sigkill_group`
+        // are separate syscalls, so in the fail-open (gone-leader) branch the
+        // last orphaned descendant can exit and the pgid be recycled in between,
+        // broader than the nested-recycle poll-interval window. The detached
+        // watchdog cannot hold the leader unreaped to close this gap (unlike the
+        // in-process paths); it is accepted to avoid leaking orphans. Shrinking
+        // it is tracked in #50.
         if wait_parent_or_group_gone(parent_pid, pgid, expected_start)
             && group_identity_matches(pgid, expected_group)
         {
@@ -677,9 +711,14 @@ pub fn reap_watchdog(
 /// kept the pgid reserved — almost certainly our own orphans — so fail **open**
 /// and reap them. Failing closed there (the earlier strict-equality behaviour)
 /// skipped the SIGKILL and leaked the very orphaned descendants the watchdog
-/// exists to kill. The residual nested-recycle window (group emptied, pgid
-/// recycled, recycled leader also reaped, all inside one poll interval) is
-/// accepted; see [`PgidGuard::still_ours`].
+/// exists to kill. Two residual windows are accepted here: the nested-recycle
+/// window (group emptied, pgid recycled, recycled leader also reaped, all inside
+/// one poll interval) and — because this check and the caller's `sigkill_group`
+/// are separate syscalls — a check-to-signal TOCTOU, where a gone-leader group's
+/// last member exits and the pgid is recycled between this returning true and the
+/// signal. The detached watchdog cannot hold the leader unreaped to close them
+/// (unlike the in-process paths); shrinking the window is tracked in #50. See
+/// [`PgidGuard::still_ours`].
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn group_identity_matches(pgid: u32, expected: Option<GroupIdentity>) -> bool {
     if !group_alive(pgid) {
