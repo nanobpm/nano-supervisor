@@ -1,11 +1,18 @@
-//! #27 — recycled-PGID race: a cleanup `SIGKILL` must never hit an unrelated
+//! #27 — recycled-PGID race: a cleanup `SIGKILL` must not hit an unrelated
 //! process group that recycled the agent's pgid.
 //!
 //! The daemon arms a parent-death watchdog (`__reap-watchdog`) for every agent
 //! and passes it the agent group's **identity** (the leader's start time + real
 //! uid, captured at spawn) via `--pgid-start`/`--pgid-uid`. Before the watchdog
 //! `SIGKILL`s the group it re-verifies that identity, so a pgid that was freed
-//! and recycled by an unrelated group is never signalled.
+//! and recycled by an unrelated group is not signalled — **with one accepted
+//! residual window**: if the group empties entirely, the pgid is recycled, *and*
+//! the recycled group's own leader is reaped too (all inside one poll interval),
+//! the leader's identity source reads `None` and the watchdog fails *open* to
+//! avoid leaking orphaned descendants. That nested-recycle window is the
+//! documented, maintainer-accepted limit of the guarantee; everywhere else (a
+//! live recycled leader, or any still-readable leader) the identity check
+//! refuses the signal. These tests pin the fail-closed live-leader case.
 //!
 //! These tests are **engine-free** and drive the real binary's hidden
 //! `__reap-watchdog` subcommand directly. They are **Linux-only** (the identity

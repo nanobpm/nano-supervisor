@@ -753,13 +753,17 @@ async fn git(
             // (`child.wait()` reaped only the direct git leader). Tear the whole
             // group down before disarming the guard — mirroring the ACP and pipe
             // paths — so a lingering helper can't keep mutating the run directory
-            // after provisioning "succeeds". `terminate_group_and_reap` gates on
-            // `group_alive`, so this is a no-op when git left nothing behind and
-            // never re-signals a pid that may have been recycled.
+            // after provisioning "succeeds". The spawn-time `group_guard` (not a
+            // fresh capture) verifies the group's identity, so this is a no-op
+            // when git left nothing behind and never re-signals a recycled pgid.
             #[cfg(unix)]
             {
-                crate::pdeath::terminate_group_and_reap(&mut child, gpid, Duration::from_secs(3))
-                    .await;
+                crate::pdeath::terminate_group_and_reap(
+                    &mut child,
+                    group_guard.guard(),
+                    Duration::from_secs(3),
+                )
+                .await;
                 group_guard.disarm();
             }
             res

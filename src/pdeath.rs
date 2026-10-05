@@ -135,6 +135,16 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// (b) treat a *gone* leader (re-read `None`) as fail-**open** while treating a
 /// *live* leader with a *different* identity as fail-**closed**. See
 /// [`PgidGuard::still_ours`] for the policy and its residual recycle window.
+///
+/// **Scope of the guarantee.** The recycled-PGID race is closed for every case
+/// except one narrow residual window: the group empties *entirely*, the pgid is
+/// recycled by an unrelated group, *and* that recycled group's own leader is
+/// reaped too — all inside a single poll interval — so the re-read yields `None`
+/// and the fail-open policy signals the unrelated group. That window is accepted
+/// (it requires a full recycle plus a second leader reap inside one poll); the
+/// in-process paths close it entirely by holding the leader unreaped until after
+/// the SIGKILL. Everywhere else — a live recycled leader, or any group whose
+/// leader is still readable — the identity check refuses the signal.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GroupIdentity {
@@ -280,34 +290,39 @@ impl PgidGuard {
 }
 
 /// Gracefully tear down an agent's whole process group and reap the leader:
-/// `SIGTERM` the group, poll up to `grace` for it to exit (reaping the leader as
-/// soon as it does), then `SIGKILL` the group to catch any `TERM`-resistant
-/// descendant, and finally reap the leader. Killing the group — not just
-/// `start_kill`ing the direct leader — is what prevents a tool the agent started
-/// from surviving a timeout / lease-loss cancellation and overlapping the
-/// redelivered job. Safe to call when the group is already gone.
+/// `SIGTERM` the group, poll up to `grace` for it to exit (holding the leader
+/// **unreaped** through the grace loop so its identity stays verifiable — see
+/// below), then `SIGKILL` the group to catch any `TERM`-resistant descendant,
+/// and finally reap the leader. Killing the group — not just `start_kill`ing
+/// the direct leader — is what prevents a tool the agent started from surviving
+/// a timeout / lease-loss cancellation and overlapping the redelivered job.
+/// Safe to call when the group is already gone.
 ///
-/// `pgid` is the *preserved* process-group id (the leader's pid captured at
-/// spawn), passed in rather than read from `child.id()`: a caller may already
-/// have reaped the leader (the pipe EOF path and ACP request path call
-/// `child.wait()`), which drops `child.id()` to `None`; keying the group kill off
-/// that would silently skip it and leak descendants.
+/// `guard` is the [`PgidGuard`] captured at **spawn** (the same one the
+/// caller's [`GroupGuard`] holds), passed in rather than re-captured here: a
+/// caller may already have reaped the leader (the pipe EOF path and ACP request
+/// path call `child.wait()`), so a fresh capture at cleanup time would read
+/// whatever group *currently* holds the pgid — blessing and signalling an
+/// unrelated group if the number was recycled in between (issue #27). The
+/// spawn-time identity held by `guard` instead fails the check on a recycled
+/// pgid. `None` (a platform or spawn where no guard exists) skips the group
+/// signals and only reaps.
 ///
 /// Every group signal is gated on [`PgidGuard::still_ours`]: the guard
 /// re-verifies the group's identity immediately before each SIGTERM/SIGKILL, so
 /// a pgid that was freed and recycled by an unrelated group in the window since
-/// the last check is never signalled (issue #27). The leader is held **unreaped**
-/// through the grace loop so that identity stays positively readable (and the
-/// pgid un-recyclable) until the final SIGKILL decision; it is reaped only by the
-/// `child.wait()` at the end.
+/// the last check is never signalled (issue #27). The leader is held
+/// **unreaped** through the grace loop so that identity stays positively
+/// readable (and the pgid un-recyclable) until the final SIGKILL decision; it
+/// is reaped only by the `child.wait()` at the end.
 #[cfg(unix)]
 pub(crate) async fn terminate_group_and_reap(
     child: &mut tokio::process::Child,
-    pgid: Option<u32>,
+    guard: Option<PgidGuard>,
     grace: std::time::Duration,
 ) {
-    if let Some(pgid) = pgid {
-        let guard = PgidGuard::capture(pgid);
+    if let Some(guard) = guard {
+        let pgid = guard.pgid();
         // Only signal the pgid while it still names *our* group. If the leader
         // was already reaped and no descendant remains, the pid is no longer
         // reserved and could have been recycled — signalling it would risk
@@ -361,7 +376,7 @@ pub(crate) async fn terminate_group_and_reap(
 #[cfg(not(unix))]
 pub(crate) async fn terminate_group_and_reap(
     child: &mut tokio::process::Child,
-    _pgid: Option<u32>,
+    _guard: Option<PgidGuard>,
     _grace: std::time::Duration,
 ) {
     let _ = child.start_kill();
@@ -399,6 +414,16 @@ impl GroupGuard {
             let _ = pid;
             Self(None)
         }
+    }
+
+    /// The spawn-time [`PgidGuard`] this cancellation guard holds, for passing
+    /// to [`terminate_group_and_reap`]: that routine must verify against the
+    /// identity captured at *spawn*, never a fresh cleanup-time capture (a
+    /// caller may already have reaped the leader, and a fresh capture would
+    /// read — and bless — whatever group currently holds a recycled pgid).
+    /// `None` on non-Unix platforms or when no pgid was captured.
+    pub(crate) fn guard(&self) -> Option<PgidGuard> {
+        self.0
     }
 
     /// SIGKILL the captured group now, gated on the identity captured at
@@ -923,7 +948,10 @@ mod tests {
         // returned false here and leaked the descendant.)
         let (mut leader, pgid) = spawn_group_leader();
         let guard = PgidGuard::capture(pgid);
-        assert!(guard.identity.is_some(), "identity captured for live leader");
+        assert!(
+            guard.identity.is_some(),
+            "identity captured for live leader"
+        );
         let mut member = spawn_group_member(pgid);
 
         // Kill and reap the leader; the descendant keeps the group alive.
@@ -971,6 +999,51 @@ mod tests {
         assert!(
             !stale.still_ours(),
             "a live leader with a mismatched identity must fail closed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn spawn_time_guard_beats_cleanup_time_recapture() {
+        // The cleanup-time-recapture bug (review finding): a guard captured at
+        // *cleanup* reads whatever group currently holds the pgid, so if the
+        // leader was reaped and the pgid recycled, it blesses the unrelated
+        // group. A guard captured at *spawn* still holds the original identity
+        // and refuses the recycled group. This pins why `terminate_group_and_reap`
+        // takes the spawn-time guard rather than capturing one itself.
+        let (mut child, pgid) = spawn_group_leader();
+        let spawn_guard = PgidGuard::capture(pgid);
+        let spawn_identity = spawn_guard.identity.expect("identity captured at spawn");
+
+        // A cleanup-time capture reads the *current* leader's identity. While
+        // the group is un-recycled that equals the spawn identity…
+        let cleanup_capture = PgidGuard::capture(pgid);
+        assert_eq!(
+            cleanup_capture.identity,
+            Some(spawn_identity),
+            "before any recycle, a cleanup-time capture matches the spawn capture"
+        );
+
+        // …but once the pgid is recycled the current leader presents a *new*
+        // identity, which a cleanup-time capture would record and then match —
+        // blessing the unrelated group. The spawn-time guard still holds the
+        // original identity and refuses. Model the recycle as a leader whose
+        // start time differs from the spawn capture (what a reused pgid shows):
+        let recycled = GroupIdentity {
+            start: spawn_identity.start.wrapping_add(1),
+            uid: spawn_identity.uid,
+        };
+        assert!(
+            !group_identity_matches(pgid, Some(recycled)),
+            "the spawn-time identity must refuse a recycled group even while it is alive"
+        );
+        // Had we instead recaptured at cleanup we would hold `recycled` and the
+        // same check would have passed — the bug. The spawn-time guard is the
+        // only capture that stays pinned to the original group.
+        assert!(
+            group_identity_matches(pgid, spawn_guard.identity),
+            "the spawn-time guard still matches its own (un-recycled) group"
         );
         let _ = child.kill();
         let _ = child.wait();
