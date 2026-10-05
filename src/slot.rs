@@ -464,6 +464,12 @@ pub(crate) fn reject_symlink(dir: &Path) -> Result<()> {
 /// is skipped: `create_dir_all` will materialise it as a fresh real directory,
 /// not follow a link. Paired with the leaf [`reject_symlink`] and re-run after
 /// the non-atomic create, this closes the whole chain to symlink redirection.
+///
+/// On Unix the runs root is now materialised no-follow component-by-component
+/// ([`crate::saferoot::DirHandle::open_or_create_root_nofollow`]), so this
+/// path-based whole-chain check is only reached by the non-Unix fallback (and
+/// the tests exercising the rejection) — exactly like [`reject_symlink`].
+#[cfg(any(not(unix), test))]
 pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
     for ancestor in dir.ancestors() {
         if std::fs::symlink_metadata(ancestor)
@@ -647,20 +653,18 @@ fn prepare_run_dir_pinned(
             format!("run dir {} has no final component", run_dir.display()),
         ))
     })?;
-    // Bootstrap: the runs root must exist before it can be opened no-follow. A
-    // symlinked component is still caught the instant we open it (the no-follow
-    // open refuses it), so this only ever materialises real directories under
-    // an honest root; a planted symlink ancestor fails the open rather than
-    // being silently followed. But `create_dir_all` itself *follows* symlinks,
-    // so an attacker-planted symlinked ancestor could make the bootstrap
-    // materialise the root through it (in an attacker-chosen target) *before*
-    // the no-follow open ever runs. Reject a symlinked existing ancestor first
-    // so the create cannot be redirected out of the workspace.
-    if let Err(e) = reject_symlinked_ancestors(runs_dir) {
-        return Err(PinError::Io(std::io::Error::other(e.to_string())));
-    }
-    std::fs::create_dir_all(runs_dir).map_err(PinError::Io)?;
-    let root = DirHandle::open_root_nofollow(runs_dir)?;
+    // Bootstrap: the runs root must exist before it can be opened no-follow.
+    // Materialise it by walking and creating each missing component RELATIVE to
+    // its already-pinned parent (`open_or_create_root_nofollow`), never via a
+    // path-based `create_dir_all`: a path-based create *follows* a symlinked
+    // ancestor, so a same-UID actor swapping a writable ancestor for a symlink
+    // between a no-follow check and the create could redirect the materialised
+    // root into an attacker-chosen target — building the run dir outside the
+    // workspace before the no-follow open ever ran. The component-wise
+    // create+pin closes that window: each step is anchored on the previous
+    // step's pinned inode, and an existing or swapped-in symlinked component is
+    // refused by the no-follow open rather than followed.
+    let root = DirHandle::open_or_create_root_nofollow(runs_dir, 0o700)?;
     let child = root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
     // Carry the EXACT pinned child inode preparation just created and secured
     // into the launch — never reopen `run_dir` by path, which a same-UID actor
@@ -3395,6 +3399,66 @@ mod tests {
             "a symlinked root must not be followed to create the job dir in the target"
         );
         let _ = err;
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_pinned_does_not_materialise_root_through_a_symlinked_ancestor() {
+        // Regression for the runs-root creation race (#36, review r4181639033):
+        // the bootstrap used to no-follow-check the ancestors and then call the
+        // path-based `create_dir_all(runs_dir)`. Between that check and the
+        // create a same-UID actor could swap a writable ancestor for a symlink,
+        // and `create_dir_all` would FOLLOW it — materialising the missing
+        // runs-root suffix inside the attacker's target before the no-follow
+        // open ever ran. The fix creates each missing component relative to its
+        // pinned parent, so a symlinked component is refused, never followed.
+        let base = unique_tmp("prep-root-race");
+        let outside = base.join("attacker-target");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // A missing runs root whose PARENT is a symlink to the attacker target:
+        // `runs_dir` = `<link>/runs`, where `link` -> `outside`. The old code
+        // would create `<outside>/runs`; the fix must refuse the symlinked
+        // `link` and create nothing outside.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let runs = link.join("runs");
+        let run = runs.join("42");
+
+        let err = prepare_run_dir(&runs, &run).unwrap_err();
+        let _ = err;
+        assert!(
+            !outside.join("runs").exists(),
+            "a symlinked ancestor must not be followed to materialise the runs root in the target"
+        );
+        assert!(
+            !run.exists() && !outside.join("runs/42").exists(),
+            "no run dir may be created through the symlinked ancestor"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_pinned_creates_missing_root_components_owner_only() {
+        // The handle-relative bootstrap must still materialise a multi-level
+        // MISSING runs root (the common first-run case), locking each created
+        // component to 0700 — now without any path-based create.
+        use std::os::unix::fs::PermissionsExt;
+        let base = unique_tmp("prep-root-missing");
+        let runs = base.join("a/b/runs");
+        let run = runs.join("7");
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "run dir must exist after prepare");
+        for dir in [&runs, &run] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be owner-only 0700", dir.display());
+        }
 
         std::fs::remove_dir_all(&base).ok();
     }

@@ -514,6 +514,98 @@ impl DirHandle {
     pub(crate) fn into_fd(self) -> OwnedFd {
         self.fd
     }
+
+    /// Ensure a direct child directory `name` exists under this pinned handle,
+    /// creating it (mode `mode`, umask-subject) when missing, and return it
+    /// pinned no-follow. Every step is relative to this handle's fd, so the
+    /// create and the open are anchored on the *pinned parent inode* — a
+    /// same-UID actor that swaps `name` (or races the create) cannot redirect
+    /// the result outside this directory: a pre-existing symlinked `name`
+    /// fails the no-follow open, and a freshly created real directory is what
+    /// gets pinned. This is the handle-relative building block that lets the
+    /// runs root be materialised component-by-component without any
+    /// path-based `create_dir_all` that would follow a swapped ancestor (#36).
+    pub(crate) fn ensure_child_dir(&self, name: &OsStr, mode: u32) -> io::Result<DirHandle> {
+        let c = cstr(name)?;
+        if unsafe { libc::mkdirat(self.fd.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) } != 0 {
+            let e = io::Error::last_os_error();
+            // Already existing is fine — we pin whatever is there no-follow
+            // below. Any other error (permissions, a non-dir in the way, ...)
+            // is real and surfaced.
+            if e.kind() != ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
+        // Open no-follow, beneath us: if `name` is a symlink (planted before or
+        // swapped in after the mkdirat), this open refuses it (ELOOP) rather
+        // than following it to an attacker-chosen target.
+        self.open_child_dir(name)
+    }
+
+    /// Resolve `path` from the current working directory like
+    /// [`DirHandle::open_root_nofollow`], but **create any missing directory
+    /// component along the way** — each one created and opened relative to its
+    /// already-pinned parent, never via a path-based `create_dir_all`. That is
+    /// the whole point: a path-based create *follows* a symlinked ancestor, so
+    /// a same-UID actor swapping a writable ancestor for a symlink between a
+    /// no-follow check and the create could redirect the materialised root into
+    /// an attacker-chosen target (the run dir would then be built outside the
+    /// workspace before any no-follow open ran). Walking and creating
+    /// component-by-component relative to the pinned parent closes that window:
+    /// each step is anchored on the previous step's inode, an existing symlinked
+    /// component is refused by the no-follow open, and a swapped-in symlink is
+    /// refused the same way. `path` may be absolute; the anchor (`/` / `.`) is
+    /// opened as-is (trusted, never a symlink).
+    pub(crate) fn open_or_create_root_nofollow(path: &Path, mode: u32) -> Result<DirHandle, PinError> {
+        let mut cur: Option<DirHandle> = None;
+        for comp in path.components() {
+            match comp {
+                // The anchor (`/` or a leading `.`) is structural and never a
+                // symlink; open it directly to seed the walk.
+                Component::RootDir => {
+                    cur = Some(DirHandle::open_root_nofollow(Path::new("/"))?);
+                }
+                Component::CurDir => {
+                    if cur.is_none() {
+                        cur = Some(DirHandle::open_root_nofollow(Path::new("."))?);
+                    }
+                }
+                Component::Normal(name) => {
+                    // A relative path with no explicit `.` anchors at the cwd.
+                    let parent = match cur {
+                        Some(ref p) => p,
+                        None => {
+                            cur = Some(DirHandle::open_root_nofollow(Path::new("."))?);
+                            cur.as_ref().unwrap()
+                        }
+                    };
+                    cur = Some(parent.ensure_child_dir(name, mode)?);
+                }
+                // `..` cannot be created through, and resolving it against the
+                // pinned parent would still leave the *named* components under it
+                // to be created — but a `..` in a would-be-created path means the
+                // target escapes the frame we just pinned, which a path-based
+                // `create_dir_all` would have followed (possibly through a
+                // symlinked ancestor). Run paths reaching here are validated by
+                // `normalize_run_path`, which refuses an interior `..`, so this
+                // only ever sees a leading `..` a caller built by hand; refuse it
+                // rather than silently create outside the pinned frame.
+                Component::ParentDir => {
+                    return Err(PinError::Io(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "runs root with a `..` component cannot be created no-follow",
+                    )));
+                }
+                Component::Prefix(_) => {
+                    return Err(PinError::Io(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "unexpected path prefix",
+                    )));
+                }
+            }
+        }
+        cur.ok_or_else(|| PinError::Io(io::Error::new(ErrorKind::InvalidInput, "empty directory path")))
+    }
 }
 
 #[cfg(test)]
