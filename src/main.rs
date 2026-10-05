@@ -233,6 +233,17 @@ fn nested_refusal(
     ))
 }
 
+/// Presence-preserving decode of an environment marker.
+///
+/// Returns `Some` whenever the variable is **present**, even when its value is
+/// not valid UTF-8 — decoding lossily for display rather than discarding the
+/// value the way `std::env::var().ok()` does (it maps a present non-UTF-8 value
+/// to `None`). The `#40` guard keys on presence, so losing a present non-UTF-8
+/// marker would silently reopen the nested-fleet bypass it exists to prevent.
+fn marker_presence(value: Option<std::ffi::OsString>) -> Option<String> {
+    value.map(|v| v.to_string_lossy().into_owned())
+}
+
 /// Refuse to start a long-lived supervisor/worker inside an agent run (#40).
 ///
 /// The worker marks every agent's environment with `NANO_AGENT_RUN`. Left
@@ -244,7 +255,15 @@ fn nested_refusal(
 /// run **attached**: staying in the invoking process group, and bound to the
 /// invoking process so the job's teardown still takes it down.
 fn guard_nested_supervisor(command: &str, foreground_for_tests: bool) -> Result<()> {
-    let run = std::env::var(AGENT_RUN_ENV).ok();
+    // Presence-preserving read: the guard is presence-based, so a present but
+    // non-UTF-8 `NANO_AGENT_RUN` must still count as "inside a run". Reading it
+    // with `std::env::var().ok()` would drop a non-UTF-8 value to `None` and let
+    // a present marker bypass both the refusal and the parent-death binding;
+    // `var_os` keeps presence and we decode lossily only for the diagnostic.
+    let run = marker_presence(std::env::var_os(AGENT_RUN_ENV));
+    // `allow` is matched by value against the exact opt-in `"1"`, not by
+    // presence: a non-UTF-8 value can never equal `"1"`, so dropping it to
+    // `None` fails closed (stays refused) and needs no presence preservation.
     let allow = std::env::var(ALLOW_NESTED_ENV).ok();
     if let Some(msg) = nested_refusal(
         command,
@@ -570,12 +589,39 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_recovery_window, daemon_leases, nested_refusal, normalize_runs_dir,
+        clamp_recovery_window, daemon_leases, marker_presence, nested_refusal, normalize_runs_dir,
         normalize_runs_dir_impl, Cli, Cmd, MIN_RECOVERY_WINDOW,
     };
     use clap::Parser;
     use std::path::{Component, Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn marker_presence_preserves_a_present_value_including_non_utf8() {
+        // A present marker is kept even when its value is not valid UTF-8, so a
+        // present-but-non-UTF-8 `NANO_AGENT_RUN` still reads as "inside a run".
+        // `std::env::var().ok()` would drop it to `None` and silently reopen the
+        // nested-fleet bypass the #40 guard exists to close.
+        use std::ffi::OsString;
+        assert_eq!(marker_presence(None), None);
+        assert_eq!(
+            marker_presence(Some(OsString::from("214829"))),
+            Some("214829".to_string())
+        );
+        // An empty-but-present value stays `Some` (presence, not non-emptiness).
+        assert_eq!(marker_presence(Some(OsString::new())), Some(String::new()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // Invalid UTF-8 (a lone 0xFF byte) must remain `Some` — presence is
+            // preserved, decoded lossily only for display.
+            let non_utf8 = OsString::from_vec(vec![0xff]);
+            assert!(
+                marker_presence(Some(non_utf8)).is_some(),
+                "a present non-UTF-8 marker must still count as present"
+            );
+        }
+    }
 
     #[test]
     fn nested_refusal_blocks_an_agent_run_without_opt_in() {
