@@ -976,12 +976,47 @@ static REMOVE_IF_INACTIVE_PAUSE: Mutex<Option<(std::path::PathBuf, RemovePauseHo
     Mutex::new(None);
 
 /// Process-local monotonically increasing sequence folded into the per-activation
-/// fallback-branch suffix (`nano/agent-work/<base>-<pid>-<nanos>-<seq>`). All
-/// slots share the worker PID and can observe the same wall-clock tick, so the
-/// timestamp alone is not unique; this counter guarantees two activations in one
-/// process never mint the same suffix. `Relaxed` ordering suffices — only the
+/// fallback-branch suffix (`nano/agent-work/<base>-<rand>-<pid>-<nanos>-<seq>`).
+/// All slots share the worker PID and can observe the same wall-clock tick, so
+/// the timestamp alone is not unique; this counter guarantees two activations in
+/// one process never mint the same suffix. `Relaxed` ordering suffices — only the
 /// fetch_add's atomicity/uniqueness matters, not any happens-before edge.
 static ACTIVATION_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A per-process random token folded into every fallback-branch suffix so the
+/// suffix is unique ACROSS worker processes, not merely across slots in one
+/// process. `pid`+`nanos`+`seq` is only process-local: two *separate* workers
+/// can share a PID (PID 1 is common in containers), both start `ACTIVATION_SEQ`
+/// at 0, and observe the same wall-clock tick — then they cut the identical
+/// fallback ref and one activation's push is rejected non-fast-forward. The
+/// fallback contract requires uniqueness per activation across the whole fleet,
+/// so we mix in a token drawn once from the OS CSPRNG (matching the mirrored
+/// worker's per-run UUID). Generated lazily and cached for the process's life.
+fn process_rand_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut buf = [0u8; 8];
+        // Prefer the OS CSPRNG. Never panic if it is unavailable — a weaker
+        // token still beats cutting no branch at all, so fall back to stirring
+        // together pid, a high-res timestamp, and a live stack address (ASLR).
+        let have_os_entropy = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| {
+                use std::io::Read;
+                f.read_exact(&mut buf)
+            })
+            .is_ok();
+        if !have_os_entropy {
+            let seed = (std::process::id() as u128)
+                ^ ((&buf as *const _ as usize) as u128)
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+            buf = (seed as u64).to_le_bytes();
+        }
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
 
 /// Atomically check `path` against [`active_runs`] and, when it is not
 /// registered, remove it — all while holding the active-runs mutex. This closes
@@ -1778,9 +1813,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // the SAME clock tick (or the clock can move backward), recreating
             // the very collision the suffix exists to prevent. Fold in a
             // process-local monotonically increasing sequence so two activations
-            // can never mint the same suffix even on an identical timestamp.
+            // can never mint the same suffix even on an identical timestamp, AND
+            // a per-process random token (`process_rand_token`) so the suffix is
+            // unique across SEPARATE workers too — they can share a PID (PID 1 in
+            // containers), both start the sequence at 0, and observe the same
+            // tick, which `pid`+`nanos`+`seq` alone would not disambiguate.
             let activation = format!(
-                "{}-{}-{}",
+                "{}-{}-{}-{}",
+                process_rand_token(),
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2430,6 +2470,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_rand_token_is_stable_hex_and_feeds_the_suffix() {
+        // Regression for the cross-worker fallback-branch collision class: the
+        // token must be stable within a process (so a retry inside ONE process
+        // is driven by the sequence/time, not a re-roll) yet high-entropy hex so
+        // SEPARATE workers sharing a PID + clock tick + seq=0 still mint
+        // distinct suffixes.
+        let a = process_rand_token();
+        let b = process_rand_token();
+        assert_eq!(a, b, "token must be cached for the life of the process");
+        assert_eq!(a.len(), 16, "8 random bytes rendered as hex");
+        assert!(
+            a.bytes().all(|c| c.is_ascii_hexdigit()),
+            "token must be ref-safe hex, got {a:?}"
+        );
+    }
 
     fn hire() -> Hire {
         Hire {

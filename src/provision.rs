@@ -828,12 +828,14 @@ pub struct GitResult {
 ///
 /// A git ref is stored loose as a file per component, so each component must
 /// fit the filesystem's `NAME_MAX` (255 on ext4/overlayfs/APFS). The composed
-/// fallback is `nano/agent-work/<base>-<uniq>`: `agent-work` is 10 chars and
-/// the per-activation `<uniq>` (`<pid>-<nanos>`) is ~25, so capping the
-/// job-controlled `<base>` segment here keeps every component — and the whole
-/// ref — comfortably inside the limit. Mirrors the plugin's
+/// fallback is `nano/agent-work/<base>-<uniq>`, whose last component is
+/// `<base>-<uniq>`. The per-activation `<uniq>` is `<rand>-<pid>-<nanos>-<seq>`,
+/// whose worst case stays under ~70 chars (16 hex + a `u32` pid + `u128` nanos +
+/// a `usize` seq + separators), so capping the job-controlled `<base>` segment
+/// at 180 keeps that component (`180 + 1 + ~70 ≈ 251`) — and the whole ref —
+/// comfortably inside the 255 limit even at the extremes. Mirrors the plugin's
 /// `sanitizeBranchSegment`, which likewise bounds its segment.
-const MAX_FALLBACK_SEGMENT: usize = 200;
+const MAX_FALLBACK_SEGMENT: usize = 180;
 
 /// Keep only ref-safe characters in a branch segment and trim leading/trailing
 /// separators so the composed `nano/agent-work/<base>-<uniq>` is always a valid
