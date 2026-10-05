@@ -188,7 +188,19 @@ fn refresh_budget(
     if window > REQUEST_MARGIN {
         None
     } else {
-        Some(wait)
+        // The cadence fallback must still NOT outlive the lease. `wait` is sized
+        // from the FULL window, so on a short lease near its deadline it can
+        // exceed the time actually left — e.g. a 10s window whose first extend
+        // fails at t=9s has only ~1s left, but a 3.3–6.6s jittered cadence would
+        // push the retry (and the `failures >= 2` `lost` fence) several seconds
+        // past expiry, leaving the job running unfenced on a dead activation.
+        // Avoiding a zero sleep does not require the full cadence: cap the
+        // fallback to the lease time REMAINING so the retry starts before the
+        // deadline and the fence publishes at or before it. Floor at 1ms so a
+        // lease with a sliver of time left still yields (never a zero-length
+        // busy-spin); the attempt itself is bounded by `extend_timeout`, which
+        // clamps to the same remaining lease.
+        Some(wait.min(left).max(Duration::from_millis(1)))
     }
 }
 
@@ -584,6 +596,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refresh_budget_sub_reserve_fallback_is_capped_by_the_remaining_lease() {
+        // Regression: the sub-reserve cadence fallback must NOT outlive the
+        // lease. `wait` is sized from the FULL window, so on a short lease near
+        // its deadline it exceeds the time actually left. With a 10s window
+        // (`every` = 3.3s) whose first extend fails at t=9s, only ~1s remains;
+        // the uncapped 3.3–6.6s cadence would push the retry — and the
+        // `failures >= 2` `lost` fence — several seconds past expiry, leaving
+        // the job running unfenced on a dead activation. The fallback must cap
+        // to the remaining lease so the retry starts before the deadline and
+        // the fence publishes at or before it.
+        let window = Duration::from_secs(10);
+        assert!(window <= REQUEST_MARGIN, "test premise: sub-reserve window");
+        let every = (window / 3).max(Duration::from_millis(1));
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1); // ~1s left, as at t=9s
+        for failures in [0u32, 1, 2, 5] {
+            let w = refresh_budget(now, deadline, every, window, failures)
+                .expect("a sub-reserve window still yields a (capped) sleep, not None");
+            assert!(
+                now + w <= deadline,
+                "the sub-reserve fallback {w:?} (failures={failures}) must not sleep past the \
+                 lease deadline — the retry and lost fence must land before expiry"
+            );
+        }
+
+        // A sliver of time left still yields (never a zero-length busy-spin):
+        // the 1ms floor keeps the loop from spinning while staying inside the lease.
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(1);
+        let w = refresh_budget(now, deadline, every, window, 1)
+            .expect("a sub-reserve window with a sliver left must still yield, not spin");
+        assert!(!w.is_zero(), "a sliver of lease left must not busy-spin");
+        assert!(now + w <= deadline, "the floor must stay within the lease");
     }
 
     #[test]

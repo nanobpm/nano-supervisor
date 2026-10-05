@@ -294,6 +294,14 @@ fn worker_recovers_and_picks_up_jobs_when_the_engine_returns() {
     if target != Target::Rust {
         skip!("recovery is asserted on the Rust worker (#23); the Node plugin's own retry loop is not this contract");
     }
+    // The forced reconnect below uses `ss -K` (kernel `SO_DESTROY`), which needs
+    // `CAP_NET_ADMIN`. CI runs this suite as the ordinary unprivileged runner
+    // user, so the reset would fail — or silently leave the long-poll intact and
+    // pass without ever exercising the reconnect. Skip cleanly when the
+    // capability is absent rather than fail or pass a contract never exercised.
+    if !can_destroy_sockets() {
+        skip!("forcing a reconnect needs CAP_NET_ADMIN for `ss -K` (SO_DESTROY); this runner is unprivileged");
+    }
 
     {
         // Deploy the job to the LIVE engine first so it is WAITING while the worker
@@ -549,6 +557,41 @@ fn kill_worker_engine_connections(engine: &contract_tests::Engine) {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Whether this process may destroy sockets via `ss -K` (kernel `SO_DESTROY`),
+/// which requires `CAP_NET_ADMIN`. The recovery test uses `ss -K` to force the
+/// worker's stalled long-poll to reset; the CI job runs the suite as the
+/// ordinary (unprivileged) runner user, so without a preflight the reset would
+/// fail — failing the suite, or worse silently leaving the connection intact so
+/// the test passes without ever exercising the forced reconnect. The caller
+/// **skips** the test when this returns false rather than failing or passing a
+/// contract it never exercised.
+///
+/// Detection prefers `capsh --print` (parses the current process's effective
+/// capability set for `cap_net_admin`). `capsh` is not on every minimal image,
+/// so when it is absent/unparseable this falls back to whether a
+/// `CAP_NET_ADMIN`-gated sysctl (`/proc/sys/net/ipv4/tcp_tw_reuse`) is writable
+/// — a conservative proxy: read-only means the process almost certainly lacks
+/// the capability. When neither check is available it errs on the side of
+/// *attempting* the reset, so a mis-detection fails loudly (the `ss -K` assert
+/// above) rather than silently skipping a runnable test.
+#[cfg(target_os = "linux")]
+fn can_destroy_sockets() -> bool {
+    // Preferred: parse the effective capability set for cap_net_admin.
+    if let Ok(out) = std::process::Command::new("capsh").arg("--print").output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = stdout.lines().find(|l| l.starts_with("Current:")) {
+                return line.contains("cap_net_admin");
+            }
+        }
+    }
+    // Fallback: a CAP_NET_ADMIN-gated sysctl is writable only with the capability.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/proc/sys/net/ipv4/tcp_tw_reuse")
+        .is_ok()
 }
 
 /// PIDs of processes listening on loopback TCP `port` (via `lsof`, then `fuser`).
