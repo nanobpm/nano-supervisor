@@ -20,8 +20,8 @@
 mod common;
 
 use contract_tests::{
-    require_engine_and_target, require_target, run_worker_job_with_rank, skip, Skip, Target,
-    TempHome,
+    Skip, Target, TempHome, require_engine_and_target, require_target, run_worker_job_with_rank,
+    skip,
 };
 use serde_json::json;
 /// The two c8ctl profiles the acceptance scenario switches between: `alpha`
@@ -325,6 +325,59 @@ fn env_pin_enforces_its_base_url_fingerprint_across_env_drift() {
     assert_eq!(
         state["connection"]["baseUrl"],
         serde_json::json!("http://engine-a.invalid:8080")
+    );
+}
+
+/// Issue #41, the env-REMOVED drift signal: removing `CAMUNDA_REST_ADDRESS`
+/// after an env-only pin is just as much connection drift as pointing it
+/// elsewhere — the deployment environment was cleared — yet the worker still
+/// connects to the PINNED engine. The drift warning must fire for the unset
+/// case too (rendering the cleared value explicitly), not only when a current
+/// URL exists to compare.
+#[test]
+fn env_pin_warns_when_the_env_is_removed_after_pinning() {
+    let target = Target::from_env();
+    require_target!(target);
+    if target == Target::Node {
+        contract_tests::note_skip(module_path!(), "Rust target only (issue #41)");
+        return;
+    }
+    let home = TempHome::with_target(target);
+    hire(&home);
+    let c8ctl = tempfile::tempdir().expect("c8ctl dir");
+
+    // First start pins the env connection (engine A).
+    let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
+    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+        .env("CAMUNDA_REST_ADDRESS", "http://engine-a.invalid:8080");
+    let out = run_to_banner(cmd);
+    assert!(
+        out.stderr
+            .contains("engine: CAMUNDA_* env (http://engine-a.invalid:8080)"),
+        "first start must pin and banner the env engine; stderr was:\n{}",
+        out.stderr
+    );
+
+    // The environment is CLEARED (the export removed from the unit). The next
+    // start must keep following the PIN (engine A) AND warn that the env is now
+    // unset — a silently-ignored removal is exactly the drift the pin exists to
+    // surface.
+    let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
+    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+        .env_remove("CAMUNDA_REST_ADDRESS");
+    let out = run_to_banner(cmd);
+    assert!(
+        out.stderr
+            .contains("engine: CAMUNDA_* env (http://engine-a.invalid:8080)"),
+        "the worker must keep following the PIN (engine A) with the env unset; stderr was:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("WARNING")
+            && out.stderr.contains("UNSET")
+            && out.stderr.contains("engine-a.invalid:8080"),
+        "the drift warning must fire for the REMOVED env and name the pinned engine; stderr was:\n{}",
+        out.stderr
     );
 }
 

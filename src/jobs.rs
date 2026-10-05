@@ -51,7 +51,9 @@ pub struct Jobs {
     /// certainly pointed at a test cluster, so the first activation logs a
     /// prominent warning naming the engine.
     test_type_prefixes: Vec<String>,
-    /// Fires the sanity-guard warning at most once per worker process.
+    /// Fires the sanity-guard warning at most once per worker process. Kept for
+    /// backwards compatibility with [`Jobs::with_identity`]; the daemon instead
+    /// latches PER SLOT via [`Jobs::for_slot`] (see [`Jobs::activate_for`]).
     sanity_warned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -146,6 +148,25 @@ impl Jobs {
         }
     }
 
+    /// Derive a PER-SLOT view of this shared client for the issue-#41 sanity
+    /// guard (issue #41, proposal 4). The daemon shares one `Jobs` across every
+    /// slot, but the "every served type looks test-ish" judgement must be made
+    /// against the SLOT's own job-type matrix — not the aggregate of every hire
+    /// — or a daemon mixing a normal hire with a `ct-*`-only hire would see the
+    /// normal type in the aggregate, make `all_test_looking` false, and never
+    /// warn for the slot that is actually serving only test jobs. This view
+    /// carries the slot's own matrix and a FRESH one-shot latch, so the warning
+    /// fires once per slot. The underlying client (and its HTTP pool) is still
+    /// shared — only the guard identity/latch are per-slot.
+    pub fn for_slot(&self, slot_job_types: Vec<String>) -> Self {
+        Jobs {
+            client: self.client.clone(),
+            engine_desc: self.engine_desc.clone(),
+            test_type_prefixes: slot_job_types,
+            sanity_warned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
     /// True when every served job type looks like a throwaway test type — the
     /// exact shape of the issue-#41 incident, where a retargeted fleet served a
     /// stray engine's `probe-*`/`ct-*` jobs. A production hire's matrix
@@ -166,7 +187,10 @@ impl Jobs {
         warn_sanity_decision(got_jobs, self.looks_like_test_engine(), &self.sanity_warned)
     }
 
-    pub async fn activate(
+    /// Activate against this view's own sanity-guard identity. This is the body
+    /// of [`Jobs::activate`]; a slot calls it via [`Jobs::for_slot`] so the
+    /// guard judges the slot's own matrix and latches per slot.
+    pub async fn activate_for(
         &self,
         job_type: &str,
         worker: &str,
@@ -206,6 +230,18 @@ impl Jobs {
                 Job { job: j, lease }
             })
             .collect())
+    }
+
+    pub async fn activate(
+        &self,
+        job_type: &str,
+        worker: &str,
+        timeout: Duration,
+        poll: Duration,
+        with_lease: bool,
+    ) -> Result<Vec<Job>> {
+        self.activate_for(job_type, worker, timeout, poll, with_lease)
+            .await
     }
 
     /// Extend the activation timeout (the lease refresh).
@@ -302,6 +338,58 @@ mod tests {
         assert!(warn_sanity_decision(true, true, &latch));
         assert!(!warn_sanity_decision(true, true, &latch));
         assert!(!warn_sanity_decision(true, true, &latch));
+    }
+
+    /// Issue #41, the mixed-hire gap: the sanity guard must judge each SLOT's
+    /// own job-type matrix, not the daemon-wide aggregate. A daemon running one
+    /// normal hire and one `ct-*`-only hire has a non-test-looking AGGREGATE,
+    /// but the slot serving only `ct-*` must still warn. `for_slot` gives each
+    /// slot its own matrix and warn-once latch while sharing the client.
+    #[test]
+    fn for_slot_judges_the_slots_own_matrix_with_a_fresh_latch() {
+        let client = camunda_orchestration_sdk::CamundaClient::new(
+            camunda_orchestration_sdk::CamundaOptions::new(),
+        )
+        .expect("a default client builds");
+        // The shared daemon client carries the AGGREGATE matrix: a normal type
+        // plus a test type, so the aggregate is NOT all-test-looking.
+        let shared = super::Jobs::new(client).with_identity(
+            "engine: test (http://engine:8080)".to_string(),
+            vec!["senior".into(), "ct-smoke".into()],
+        );
+        assert!(
+            !shared.looks_like_test_engine(),
+            "the aggregate matrix (senior + ct-*) is not all-test-looking"
+        );
+
+        // Deriving the ct-*-only slot's view judges THAT slot's matrix…
+        let ct_slot = shared.for_slot(vec!["ct-smoke".into()]);
+        assert!(
+            ct_slot.looks_like_test_engine(),
+            "the ct-*-only slot must be judged test-looking on its own matrix"
+        );
+        // …with a FRESH latch, independent of the shared one and of a sibling
+        // slot's latch.
+        let normal_slot = shared.for_slot(vec!["senior".into()]);
+        assert!(!normal_slot.looks_like_test_engine());
+        assert!(
+            ct_slot.should_warn_sanity(true),
+            "first live activation warns"
+        );
+        assert!(
+            !ct_slot.should_warn_sanity(true),
+            "the ct slot's latch is one-shot"
+        );
+        assert!(
+            !shared
+                .sanity_warned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the shared latch is untouched by the slot's latch"
+        );
+        assert!(
+            !normal_slot.should_warn_sanity(true),
+            "the normal slot never warns (its matrix is not test-looking)"
+        );
     }
 
     #[test]

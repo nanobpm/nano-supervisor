@@ -156,8 +156,14 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 connection: decision.pin.clone(),
                 connection_profile: decision.profile.clone(),
             });
+            // Issue #41 sanity guard: judge each SLOT's own job-type matrix, not
+            // the daemon-wide aggregate `all_types` the shared `jobs` was built
+            // with. A daemon mixing a normal hire with a `ct-*`-only hire would
+            // otherwise see the normal type in the aggregate and never warn for
+            // the slot serving only test jobs. `for_slot` shares the client (and
+            // its HTTP pool) but gives the slot its own matrix + warn-once latch.
             handles.push(tokio::spawn(slot::run(
-                jobs.clone(),
+                jobs.for_slot(job_types.clone()),
                 cfg,
                 shutdown_rx.clone(),
                 shutdown_tx.clone(),

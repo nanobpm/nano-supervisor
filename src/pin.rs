@@ -130,7 +130,17 @@ fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
 /// wedge every later worker start until manual repair. The rename is atomic, so
 /// a concurrent reader sees either the old pin or the new one, never a torn
 /// half-write. Permission-setting failures are propagated, not ignored.
-fn write(state_home: &Path, pin: &ConnectionPin) -> Result<()> {
+///
+/// The whole read-modify-write runs under `lock` (the home's [`PinLock`]). The
+/// pin is merged into the file's other fields — the Node supervisor's own
+/// `socket`/`pid` — so the merge must be serialized against every other Rust
+/// pin writer on the home: without it, two processes could each read the file,
+/// merge their pin into their own stale copy of the foreign fields, and the
+/// last rename would clobber the other's update. (The lock is advisory and
+/// Rust-only, so it cannot serialize the EXTERNAL Node supervisor's own writes
+/// to those fields — that coordination is out of scope here — but holding it
+/// across the merge removes the Rust-side read-modify-write race.)
+fn write(state_home: &Path, pin: &ConnectionPin, lock: &PinLock) -> Result<()> {
     std::fs::create_dir_all(state_home)
         .with_context(|| format!("creating state home {}", state_home.display()))?;
     #[cfg(unix)]
@@ -143,7 +153,9 @@ fn write(state_home: &Path, pin: &ConnectionPin) -> Result<()> {
     // Preserve the Node supervisor's own fields on rewrite — but fail closed on
     // a corrupt existing file rather than silently discarding it (which would
     // drop those fields AND any pin). `read_state` already turned a `NotFound`
-    // into `Ok(None)`, so a fresh home starts from the default.
+    // into `Ok(None)`, so a fresh home starts from the default. This read and
+    // the `write_atomic` below are one critical section under `lock`.
+    let _ = lock; // held by the caller across this whole read-modify-write
     let mut state: SupervisorState = read_state(state_home)?.unwrap_or_default();
     state.connection = Some(pin.clone());
     let json = serde_json::to_string_pretty(&state).context("serializing supervisor.json")?;
@@ -191,9 +203,22 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         f.sync_all()
             .with_context(|| format!("syncing temporary state file {}", tmp.display()))?;
         drop(f);
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!("renaming {} over {}", tmp.display(), path.display())
-        })?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} over {}", tmp.display(), path.display()))?;
+        // Durability (issue #41): syncing the temp file makes its CONTENT
+        // durable, but the rename itself only updates the containing
+        // directory's entry — and that update can still be lost on a power
+        // loss unless the DIRECTORY is fsynced too. On a first pin that could
+        // make `supervisor.json` vanish and the next start would re-resolve
+        // the mutable ambient profile. fsync the parent dir so the rename is
+        // durable before reporting success (Unix only; elsewhere the rename is
+        // the best available guarantee).
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("syncing state directory {}", dir.display()))?;
+        }
         Ok(())
     })();
     if write_result.is_err() {
@@ -379,7 +404,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         base_url,
     };
     if created {
-        write(state_home, &pin)?;
+        write(state_home, &pin, &_pin_lock)?;
     }
     Ok(PinDecision {
         pin,
@@ -450,25 +475,41 @@ pub fn warn_if_drifted(decision: &PinDecision) {
         }
         // Env-only pin: the recorded fingerprint is compared against the
         // CURRENT environment, and the client build keeps following the PIN
-        // (see `engine::connect`'s `pinned_base_url`).
-        (None, Some(then)) => {
-            if let Some(now) = profile::resolved_base_url(None) {
-                if then != now {
-                    log(&format!(
-                        "WARNING: the CAMUNDA_* environment now points at {} but this \
-                         supervisor's connection was pinned against {} — the env drifted \
-                         after pinning; this supervisor keeps connecting to the PINNED engine \
-                         {}. To re-pin an env-only connection, delete the pin in {} and restart \
-                         with the intended CAMUNDA_* environment (an explicit --profile would \
-                         select a named c8ctl profile instead of the changed environment)",
-                        redact(&now),
-                        redact(then),
-                        redact(then),
-                        state_file_display(decision)
-                    ));
-                }
+        // (see `engine::connect`'s `pinned_base_url`). A REMOVED
+        // `CAMUNDA_REST_ADDRESS` is drift too — the deployment environment was
+        // cleared after pinning — so an unset current value warns as loudly as
+        // a changed one (the worker still connects to the pinned URL either
+        // way).
+        (None, Some(then)) => match profile::resolved_base_url(None) {
+            Some(now) if now == then => {}
+            Some(now) => {
+                log(&format!(
+                    "WARNING: the CAMUNDA_* environment now points at {} but this \
+                     supervisor's connection was pinned against {} — the env drifted \
+                     after pinning; this supervisor keeps connecting to the PINNED engine \
+                     {}. To re-pin an env-only connection, delete the pin in {} and restart \
+                     with the intended CAMUNDA_* environment (an explicit --profile would \
+                     select a named c8ctl profile instead of the changed environment)",
+                    redact(&now),
+                    redact(then),
+                    redact(then),
+                    state_file_display(decision)
+                ));
             }
-        }
+            None => {
+                log(&format!(
+                    "WARNING: the CAMUNDA_* environment is now UNSET (CAMUNDA_REST_ADDRESS was \
+                     removed) but this supervisor's connection was pinned against {} — the env \
+                     drifted after pinning; this supervisor keeps connecting to the PINNED \
+                     engine {}. To re-pin an env-only connection, delete the pin in {} and \
+                     restart with the intended CAMUNDA_* environment (an explicit --profile \
+                     would select a named c8ctl profile instead of the changed environment)",
+                    redact(then),
+                    redact(then),
+                    state_file_display(decision)
+                ));
+            }
+        },
         _ => {}
     }
 }
@@ -537,12 +578,14 @@ mod tests {
         assert_eq!(pin.profile.as_deref(), Some("merlin"));
         assert_eq!(pin.base_url.as_deref(), Some("http://m:8080"));
         // Rewriting the pin must not drop the Node supervisor's own fields.
+        let lock = PinLock::acquire(&home).unwrap();
         write(
             &home,
             &ConnectionPin {
                 profile: Some("local".into()),
                 base_url: Some("http://localhost:8080".into()),
             },
+            &lock,
         )
         .unwrap();
         let raw: serde_json::Value =
@@ -633,12 +676,14 @@ mod tests {
     #[test]
     fn write_is_atomic_and_leaves_no_temp_file() {
         let home = temp_home("atomic");
+        let lock = PinLock::acquire(&home).unwrap();
         write(
             &home,
             &ConnectionPin {
                 profile: Some("local".into()),
                 base_url: Some("http://localhost:8080".into()),
             },
+            &lock,
         )
         .unwrap();
         // The state file is valid JSON with the pin…
