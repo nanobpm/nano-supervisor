@@ -239,6 +239,18 @@ impl Agent {
         // preparation cannot make the agent resolve a requested workspace that
         // now points at the attacker's tree (#35). The value sent is the
         // pinned inode's current path — the directory the agent is running in.
+        //
+        // DESIGN DECISION (maintainer, #36): we deliberately send the
+        // fd-recovered ABSOLUTE path here, not `.` or an omitted field. ACP's
+        // `session/new` takes a `cwd` STRING and offers no fd/capability
+        // handoff, so a path string is the strongest binding the protocol
+        // allows. The real protection is not this string: the agent process is
+        // already launched with its cwd `fchdir`-pinned to the validated
+        // checkout inode (via `CwdHandle::apply` in `pre_exec`), so it operates
+        // inside the pinned inode regardless. Recovering the name through the
+        // pinned fd (rather than reusing the stale provisioning path) keeps the
+        // string naming that same inode, so it is informational and consistent
+        // with the launch — the correct, ACP-compatible handoff.
         let session_cwd = cwd
             .path()
             .context("recovering the pinned session workspace path")?;

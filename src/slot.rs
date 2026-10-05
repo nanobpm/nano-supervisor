@@ -1584,17 +1584,19 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // *before* joining it to a path (a malformed `../` key must never make
     // `remove_dir_all` / `create_dir_all` operate outside `runs_dir`).
     crate::jobs::validate_job_key(&key)?;
-    // Absolute AND lexically normalized, so the agent (whose cwd is inside
+    // Absolute AND lexically resolved, so the agent (whose cwd is inside
     // `run_dir`) and the worker resolve `AGENT_RESULT_FILE` identically, and so
-    // every launch backend resolves the same path: `std::path::absolute` (and a
-    // parent-relative `--runs-dir ../runs`) preserves interior `..`, which the
-    // Linux `openat2` no-follow open accepts but the portable `O_NOFOLLOW`
-    // chain resolves fd-relative — NOT path resolution — so a renamed ancestor
-    // would silently redirect the descent. Normalizing at this input boundary
+    // every launch backend resolves the same path. `normalize_run_path`
+    // resolves only a LEADING `..` (e.g. a parent-relative `--runs-dir ../runs`)
+    // against the trusted cwd and REFUSES any interior `..`: a lexical collapse
+    // of an interior `..` is unsafe across a symlinked component (the Linux
+    // `openat2` open would accept it while the portable `O_NOFOLLOW` chain
+    // resolves it fd-relative — NOT path resolution — so a renamed ancestor
+    // could silently redirect the descent). Resolving at this input boundary
     // (trusted prefix only; the not-yet-created job-dir tail stays literal)
-    // gives both backends one identical, parent-free path (#35). Purely lexical
-    // — the symlink hardening in `prepare_run_dir` still inspects the real
-    // on-disk structure.
+    // gives both backends one identical, parent-free path (#35/#36). Purely
+    // lexical — the symlink hardening in `prepare_run_dir` still inspects the
+    // real on-disk structure.
     let run_dir =
         crate::safecwd::normalize_run_path(&cfg.runs_dir.join(&key)).with_context(|| {
             format!(
