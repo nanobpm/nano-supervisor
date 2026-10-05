@@ -225,8 +225,8 @@ fn nested_refusal(
     Some(format!(
         "refusing to start `nano-supervisor {command}` inside an agent run \
          ({AGENT_RUN_ENV}={run_display}). A supervisor or worker started by an agent \
-         escapes the job's teardown and becomes a phantom that can lease real \
-         jobs and misreport the fleet. Agents must never start a real supervisor \
+         would run as an unintended nested fleet that leases real jobs outside the \
+         job's lifecycle and misreports the fleet. Agents must never start a real supervisor \
          or daemon outside the hermetic test harness. If this IS a contract test, \
          opt in with `--foreground-for-tests` or `{ALLOW_NESTED_ENV}=1` to run \
          attached (bound to the invoking process)."
@@ -235,14 +235,14 @@ fn nested_refusal(
 
 /// Refuse to start a long-lived supervisor/worker inside an agent run (#40).
 ///
-/// The worker marks every agent's environment with `NANO_AGENT_RUN`. A
-/// supervisor an agent starts daemonises (`setsid`, new session) and so escapes
-/// the job's process-group teardown, becoming a phantom that can lease real jobs
-/// and misreport the fleet. So when `NANO_AGENT_RUN` is set we refuse, unless the
+/// The worker marks every agent's environment with `NANO_AGENT_RUN`. Left
+/// unguarded, an agent could start its own supervisor/worker and build an
+/// unintended nested fleet that leases real jobs outside the job's lifecycle and
+/// misreports the fleet. So when `NANO_AGENT_RUN` is set we refuse, unless the
 /// caller explicitly opts in — `--foreground-for-tests` or
 /// `NANO_ALLOW_NESTED_SUPERVISOR=1` — which the hermetic contract tests use to
-/// run **attached**: no `setsid`, and bound to the invoking process so the job's
-/// teardown still takes it down.
+/// run **attached**: staying in the invoking process group, and bound to the
+/// invoking process so the job's teardown still takes it down.
 fn guard_nested_supervisor(command: &str, foreground_for_tests: bool) -> Result<()> {
     let run = std::env::var(AGENT_RUN_ENV).ok();
     let allow = std::env::var(ALLOW_NESTED_ENV).ok();

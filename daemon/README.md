@@ -39,11 +39,13 @@ handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
 - **Refuses to nest inside an agent run** (#40): the worker stamps
   `NANO_AGENT_RUN=<job key>` (and `NANO_AGENT_RUN_DIR`) on every agent's
   environment, and `nano-supervisor daemon` / `work` refuse to start when that
-  variable is set — exiting non-zero with an explanation. A supervisor an agent
-  started would `setsid` away and outlive the job as a phantom fleet that can
-  lease real jobs; refusing to start closes that escape. The hermetic contract
+  variable is set — exiting non-zero with an explanation. Left unguarded, an
+  agent could start its own supervisor/worker and build an unintended nested
+  fleet that leases real jobs outside the job's lifecycle; refusing to start
+  closes that hole. The hermetic contract
   tests opt in with `--foreground-for-tests` (or `NANO_ALLOW_NESTED_SUPERVISOR=1`)
-  to run **attached** — no `setsid`, so the job's teardown still kills it: on
+  to run **attached** — staying in the invoking process group, so the job's
+  teardown still kills it: on
   **Linux** the attached process is bound to the invoking process via
   `PR_SET_PDEATHSIG` (and startup fails if that binding cannot be installed);
   on **macOS** there is no `PR_SET_PDEATHSIG`, so containment relies on staying
