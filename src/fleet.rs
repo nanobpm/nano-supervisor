@@ -571,8 +571,9 @@ fn normalized_identity(path: &Path) -> PathBuf {
 ///
 /// The lock file lives in an **owner-private per-user directory**
 /// (`<base>/c8ctl-nano-fleet-<uid>/`, where `<base>` is the single stable
-/// `$HOME/.local/state/c8ctl-nano` anchor — see `lock_base_dir` for why it is
-/// *not* an environment-dependent precedence chain), keyed by a hash of the
+/// per-user anchor derived from the UID's passwd home — see `lock_base_dir` for
+/// why it is derived from the UID, *not* from `$HOME` or an environment-dependent
+/// precedence chain), keyed by a hash of the
 /// guarded path — *not* under the state home, so it
 /// leaves no residue there: the contract test `state_writes_stay_under_home`
 /// asserts the home's file set exhaustively. Preferring a user-private base
@@ -605,29 +606,78 @@ fn fleet_lock_dir() -> Result<PathBuf> {
 
 /// Base directory under which the owner-private lock directory is created.
 ///
-/// This is a **single stable per-user anchor** — `$HOME/.local/state/c8ctl-nano`
-/// — deliberately *not* an environment-dependent precedence chain. The lock's
-/// job is to serialize the read-modify-write of one guarded state file across
-/// *every* process that targets it; that only works if those processes all
-/// derive the *same* lock path. An earlier design preferred
-/// `$XDG_RUNTIME_DIR` / `$XDG_STATE_HOME` before `$HOME`, but those vary
-/// independently of the guarded path: an interactive shell commonly has
-/// `$XDG_RUNTIME_DIR` set while a service (cron, systemd with a reduced
-/// environment) does not, so two processes targeting the *same*
-/// `C8CTL_NANO_HOME` would pick *different* lock files and never serialize —
-/// a silent mutual-exclusion break. `$HOME` is the canonical per-user location
-/// both inherit, so it keeps the lock path stable across that split while
-/// remaining user-private (no other local user can pre-create entries under our
-/// home, so the pre-creation DoS the owner/mode checks guard against cannot even
-/// be staged). Only when no home is known at all do we fall back to the shared
-/// system temp dir, where `fleet_lock_dir_in`'s ownership/permission
-/// verification still fails closed on a foreign pre-created directory.
+/// This is a **single stable per-user anchor**, derived purely from the process
+/// UID via the system account database (`getpwuid`) — deliberately *not* read
+/// from the environment at all. The lock's job is to serialize the
+/// read-modify-write of one guarded state file across *every* process that
+/// targets it; that only works if those processes all derive the *same* lock
+/// path. Environment variables cannot provide that guarantee: an earlier design
+/// preferred `$XDG_RUNTIME_DIR` / `$XDG_STATE_HOME` before `$HOME`, but those
+/// vary independently of the guarded path, and even `$HOME` alone is not safe —
+/// a service (cron, systemd with a reduced environment) frequently runs with
+/// `$HOME` *unset*, while an interactive shell for the same user has it set, so
+/// two processes targeting the *same* `C8CTL_NANO_HOME` would resolve
+/// *different* lock files and never serialize — a silent mutual-exclusion break.
+///
+/// Keying the anchor on the UID's passwd home (`<pw_dir>/.local/state/c8ctl-nano`)
+/// removes the environment from the equation entirely: the same user resolves
+/// the same home regardless of `$HOME`/XDG state, and the location stays
+/// user-private (no other local user can pre-create entries under our home, so
+/// the pre-creation DoS the owner/mode checks guard against cannot even be
+/// staged). Only when the UID has *no* account entry at all (e.g. an anonymous
+/// container UID) do we fall back to the shared system temp dir — and even then
+/// the fallback is UID-only, so two such processes still converge on the same
+/// path, where `fleet_lock_dir_in`'s ownership/permission verification still
+/// fails closed on a foreign pre-created directory.
 #[cfg(unix)]
 fn lock_base_dir() -> PathBuf {
-    if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(h).join(".local/state/c8ctl-nano");
+    if let Some(home) = passwd_home_dir() {
+        return home.join(".local/state/c8ctl-nano");
     }
     std::env::temp_dir()
+}
+
+/// The current user's home directory as recorded in the system account database
+/// (`getpwuid_r`), resolved from the UID alone and therefore **independent of
+/// the `$HOME` environment variable**. This is the stable per-user anchor the
+/// lock base needs so that processes with differing environments (e.g. a login
+/// shell vs. a reduced-environment service) still agree on one lock path.
+/// Returns `None` only when the UID has no account entry, or that entry records
+/// no home directory — a degenerate case the caller handles with a UID-only
+/// temp-dir fallback.
+#[cfg(unix)]
+fn passwd_home_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let uid = unsafe { libc::getuid() };
+    let mut bufsize = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n > 0 => n as usize,
+        _ => 1024,
+    };
+    loop {
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0 as libc::c_char; bufsize];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pwd`, `buf` and `result` all outlive the call; `buf` is
+        // `bufsize` bytes long. On success `result` is either null ("no entry
+        // for this UID") or points at `pwd`, whose `pw_dir` borrows from `buf`
+        // — we copy it out before `buf` is dropped.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), bufsize, &mut result) };
+        if rc == libc::ERANGE && bufsize < (1usize << 20) {
+            // Entry larger than the buffer; grow (bounded) and retry.
+            bufsize *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is a valid NUL-terminated C string inside `buf`.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())));
+    }
 }
 
 #[cfg(unix)]
@@ -2570,19 +2620,22 @@ mod tests {
     }
 
     /// Regression (finding `r4182128486`): the lock base must be a single
-    /// stable per-user anchor, invariant to `XDG_RUNTIME_DIR` / `XDG_STATE_HOME`.
+    /// stable per-user anchor, invariant to the *entire* environment —
+    /// `XDG_RUNTIME_DIR` / `XDG_STATE_HOME` **and** `HOME` (present or absent).
     /// Two processes targeting the SAME guarded file but running with different
-    /// environments — an interactive shell with `XDG_RUNTIME_DIR` set vs. a
-    /// service with a reduced environment that has neither XDG var — must derive
-    /// the SAME lock base, or the `flock` lands on different files and silently
-    /// fails to serialize them (a mutual-exclusion break). Asserts on the pure
-    /// `lock_base_dir()` (no filesystem, no `HOME` mutation) so it neither races
-    /// the `HOME`-reading sibling tests nor leaves a lock dir behind.
+    /// environments — an interactive shell (HOME + XDG set) vs. a service with a
+    /// reduced environment that has neither (the very scenario `lock_base_dir`
+    /// cites) — must derive the SAME lock base, or the `flock` lands on different
+    /// files and silently fails to serialize them (a mutual-exclusion break).
+    /// Because the base is keyed on the UID's passwd home, it is invariant to
+    /// all of these by construction. Asserts on the pure `lock_base_dir()` (no
+    /// filesystem writes) so it neither races sibling tests nor leaves a lock
+    /// dir behind.
     #[cfg(unix)]
     #[test]
-    fn lock_base_is_invariant_to_xdg_environment() {
+    fn lock_base_is_invariant_to_environment() {
         // Restores the perturbed env on any exit (including a panicking assert),
-        // so this test never leaks a stale XDG var into the next one.
+        // so this test never leaks a stale var into the next one.
         struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for EnvRestore {
             fn drop(&mut self) {
@@ -2597,35 +2650,39 @@ mod tests {
 
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = EnvRestore(
-            ["XDG_RUNTIME_DIR", "XDG_STATE_HOME"]
+            ["XDG_RUNTIME_DIR", "XDG_STATE_HOME", "HOME"]
                 .iter()
                 .map(|k| (*k, std::env::var_os(k)))
                 .collect(),
         );
 
-        // "Interactive shell": both XDG vars set.
+        // "Interactive shell": HOME and both XDG vars set.
+        std::env::set_var("HOME", "/home/interactive-shell");
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/31415");
         std::env::set_var("XDG_STATE_HOME", "/some/xdg/state");
-        let with_xdg = lock_base_dir();
+        let interactive = lock_base_dir();
 
-        // "Service with a reduced environment": neither XDG var present.
+        // "Service with a reduced environment": a *different* HOME and neither
+        // XDG var — the exact split that silently broke serialization before.
+        std::env::set_var("HOME", "/home/some-other-value");
         std::env::remove_var("XDG_RUNTIME_DIR");
         std::env::remove_var("XDG_STATE_HOME");
-        let without_xdg = lock_base_dir();
+        let other_home = lock_base_dir();
+
+        // "Service with no HOME at all": the cited cron/systemd reduced env.
+        std::env::remove_var("HOME");
+        let no_home = lock_base_dir();
 
         assert_eq!(
-            with_xdg, without_xdg,
-            "lock base must not vary with XDG_RUNTIME_DIR/XDG_STATE_HOME, or \
-             same-home processes with different environments fail to serialize"
+            interactive, other_home,
+            "lock base must not vary with HOME/XDG, or same-home processes with \
+             different environments fail to serialize"
         );
-        // It must be the stable HOME anchor, never an XDG path.
-        if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-            assert_eq!(
-                with_xdg,
-                PathBuf::from(h).join(".local/state/c8ctl-nano"),
-                "lock base must be the stable $HOME anchor, not an XDG location"
-            );
-        }
+        assert_eq!(
+            interactive, no_home,
+            "lock base must be identical whether HOME is set or absent, or a \
+             reduced-environment service fails to serialize with a login shell"
+        );
     }
 
     /// Two `update_config` mutations running on *concurrent* threads both
