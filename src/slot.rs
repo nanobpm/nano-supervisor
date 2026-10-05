@@ -2272,10 +2272,6 @@ fn build_agent_env(
     ));
     // MVP: the agentic visibility channel is off (host sandbox only).
     env.push(("NANO_AGENTIC".into(), "off".into()));
-    // Issue #40's marker: this process tree is an agent run, so a supervisor an
-    // agent tries to start can refuse to daemonise (and a sweep can tell an
-    // agent-owned subtree from the operator's fleet).
-    env.push(("NANO_AGENT_RUN".into(), key.to_string()));
     env.push((
         "AGENT_RESULT_FILE".into(),
         result_file.to_string_lossy().into_owned(),

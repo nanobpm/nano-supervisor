@@ -579,7 +579,8 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
 ///   fingerprint — the profile itself was re-pointed under the same name (the
 ///   worker connects to the profile's CURRENT baseUrl and warns);
 /// * an env-only pin's recorded baseUrl differs from the CURRENT
-///   `CAMUNDA_REST_ADDRESS` — the env drifted after pinning; the worker keeps
+///   `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS` — the env drifted after
+///   pinning; the worker keeps
 ///   connecting to the PINNED baseUrl (the fingerprint is enforced, not just
 ///   recorded) and warns.
 pub fn warn_if_drifted(decision: &PinDecision) {
@@ -681,12 +682,13 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
             Some(now) if now == then => {}
             Some(now) => {
                 out.push(format!(
-                    "WARNING: the CAMUNDA_* environment now points at {} but this \
-                     supervisor's connection was pinned against {} — the env drifted \
-                     after pinning; this supervisor keeps connecting to the PINNED engine \
-                     {}. To re-pin an env-only connection, delete the pin in {} and restart \
-                     with the intended CAMUNDA_* environment (an explicit --profile would \
-                     select a named c8ctl profile instead of the changed environment)",
+                    "WARNING: the CAMUNDA_REST_ADDRESS/ZEEBE_REST_ADDRESS environment now \
+                     points at {} but this supervisor's connection was pinned against {} — the \
+                     env drifted after pinning; this supervisor keeps connecting to the PINNED \
+                     engine {}. To re-pin an env-only connection, delete the pin in {} and \
+                     restart with the intended CAMUNDA_REST_ADDRESS/ZEEBE_REST_ADDRESS \
+                     environment (an explicit --profile would select a named c8ctl profile \
+                     instead of the changed environment)",
                     redact(&now),
                     redact(then),
                     redact(then),
@@ -695,12 +697,14 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
             }
             None => {
                 out.push(format!(
-                    "WARNING: the CAMUNDA_* environment is now UNSET (CAMUNDA_REST_ADDRESS was \
-                     removed) but this supervisor's connection was pinned against {} — the env \
-                     drifted after pinning; this supervisor keeps connecting to the PINNED \
-                     engine {}. To re-pin an env-only connection, delete the pin in {} and \
-                     restart with the intended CAMUNDA_* environment (an explicit --profile \
-                     would select a named c8ctl profile instead of the changed environment)",
+                    "WARNING: the CAMUNDA_REST_ADDRESS/ZEEBE_REST_ADDRESS environment is now \
+                     UNSET (the engine address was removed) but this supervisor's connection \
+                     was pinned against {} — the env drifted after pinning; this supervisor \
+                     keeps connecting to the PINNED engine {}. To re-pin an env-only \
+                     connection, delete the pin in {} and restart with the intended \
+                     CAMUNDA_REST_ADDRESS/ZEEBE_REST_ADDRESS environment (an explicit \
+                     --profile would select a named c8ctl profile instead of the changed \
+                     environment)",
                     redact(then),
                     redact(then),
                     state_file_display(decision)
@@ -1422,6 +1426,44 @@ mod tests {
         assert!(
             read(&home).expect("read ok").is_none(),
             "a rejected profile pin must not write any state"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41, env-drift warning wording: the drifted address may come from
+    /// `ZEEBE_REST_ADDRESS` (not only `CAMUNDA_REST_ADDRESS`), so the warning must
+    /// name BOTH variables — a `CAMUNDA_*`-only message misleads a ZEEBE-only
+    /// deployment. This pins the drift-via-ZEEBE path and the message wording.
+    #[test]
+    fn env_drift_via_zeebe_address_warns_and_names_both_variables() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("zeebedrift");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        // Pin against an env-only connection via CAMUNDA_REST_ADDRESS…
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
+        let _zaddr = EnvGuard::unset("ZEEBE_REST_ADDRESS");
+        let first = resolve_or_pin(&home, None).expect("first start pins env-only");
+        assert!(first.created);
+        assert_eq!(first.pin.base_url.as_deref(), Some("http://engine-a:8080"));
+
+        // …then the drift arrives via ZEEBE_REST_ADDRESS only (CAMUNDA_ removed).
+        let _addr = EnvGuard::unset("CAMUNDA_REST_ADDRESS");
+        let _zaddr = EnvGuard::set("ZEEBE_REST_ADDRESS", "http://engine-b:8080");
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        let warnings = drift_warnings(&second);
+        assert!(
+            warnings.iter().any(|w| w.contains("points at")),
+            "drift via ZEEBE_REST_ADDRESS must warn: {warnings:?}"
+        );
+        // The warning must name BOTH candidate source variables, not mislead a
+        // ZEEBE-only deployment with a CAMUNDA_*-only message.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("CAMUNDA_REST_ADDRESS") && w.contains("ZEEBE_REST_ADDRESS")),
+            "the env-drift warning must name both CAMUNDA_REST_ADDRESS and ZEEBE_REST_ADDRESS: {warnings:?}"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
