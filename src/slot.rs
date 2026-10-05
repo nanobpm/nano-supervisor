@@ -2179,10 +2179,7 @@ fn build_agent_env(
     // on the operator's global session — the exact write this prevents — so a
     // best-effort skip here would silently reopen the incident.
     let dir = seed_agent_c8ctl_dir(cfg, result_file)?;
-    env.push((
-        "C8CTL_CONFIG_DIR".into(),
-        dir.to_string_lossy().into_owned(),
-    ));
+    env.push(("C8CTL_DATA_DIR".into(), dir.to_string_lossy().into_owned()));
     Ok(env)
 }
 
@@ -2190,10 +2187,10 @@ fn build_agent_env(
 /// and seed it from the worker's pinned connection: a `session.json` whose
 /// `activeProfile` is the pinned profile and a `profiles.json` carrying only
 /// that profile's **non-secret connection identity**, both written `0600`.
-/// Returns the dir to export as `C8CTL_CONFIG_DIR`.
+/// Returns the dir to export as `C8CTL_DATA_DIR`.
 ///
 /// The dir is created for EVERY job — including a `CAMUNDA_*`-env pin, which
-/// has no profile files to seed: an agent without `C8CTL_CONFIG_DIR` inherits
+/// has no profile files to seed: an agent without `C8CTL_DATA_DIR` inherits
 /// the operator's ambient c8ctl session, and its `c8 use profile X` then
 /// rewrites the operator's global `~/.config/c8ctl/session.json` — the exact
 /// write that retargeted the fleet in the issue-#41 incident. With the env var
@@ -2571,7 +2568,7 @@ mod tests {
 
     /// Issue #41, the env-only gap: a worker pinned to the `CAMUNDA_*`
     /// environment (no c8ctl profile) must STILL hand every agent an isolated
-    /// per-run `C8CTL_CONFIG_DIR` — otherwise the agent inherits the operator's
+    /// per-run `C8CTL_DATA_DIR` — otherwise the agent inherits the operator's
     /// ambient c8ctl session and its `c8 use profile X` rewrites the operator's
     /// global `~/.config/c8ctl/session.json` (the incident's write). The dir is
     /// created but NOT seeded (there is no profile to seed).
@@ -2592,9 +2589,9 @@ mod tests {
         let env = build_agent_env(&c, "1", &job, &rf).unwrap();
         let dir = env
             .iter()
-            .find(|(k, _)| k == "C8CTL_CONFIG_DIR")
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
             .map(|(_, v)| v.clone())
-            .expect("an env-only pin must still export C8CTL_CONFIG_DIR");
+            .expect("an env-only pin must still export C8CTL_DATA_DIR");
         assert_eq!(dir, run.join("c8ctl").to_string_lossy());
         // The dir exists, is owner-only, and carries NO seed files — the
         // agent's c8ctl starts empty inside the run.
@@ -2622,9 +2619,9 @@ mod tests {
         let env = build_agent_env(&cfg(), "1", &job, &rf).unwrap();
         let dir = env
             .iter()
-            .find(|(k, _)| k == "C8CTL_CONFIG_DIR")
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
             .map(|(_, v)| v.clone())
-            .expect("a profiled pin exports C8CTL_CONFIG_DIR");
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
         let session: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(std::path::Path::new(&dir).join("session.json")).unwrap(),
         )
@@ -2661,9 +2658,9 @@ mod tests {
         let env = build_agent_env(&c, "1", &job, &rf).unwrap();
         let dir = env
             .iter()
-            .find(|(k, _)| k == "C8CTL_CONFIG_DIR")
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
             .map(|(_, v)| v.clone())
-            .expect("a profiled pin exports C8CTL_CONFIG_DIR");
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
         let raw =
             std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap();
         for secret in ["SECRET", "PASSWORD"] {

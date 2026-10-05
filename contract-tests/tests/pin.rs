@@ -20,13 +20,13 @@
 mod common;
 
 use contract_tests::{
-    Skip, Target, TempHome, require_engine_and_target, require_target, run_worker_job_with_rank,
-    skip,
+    require_engine_and_target, require_target, run_worker_job_with_rank, skip, Skip, Target,
+    TempHome,
 };
 use serde_json::json;
 /// The two c8ctl profiles the acceptance scenario switches between: `alpha`
 /// (the fleet's engine) and `beta` (the engine an agent's `c8 use profile`
-/// would select). Written into an isolated `C8CTL_CONFIG_DIR` per test.
+/// would select). Written into an isolated `C8CTL_DATA_DIR` per test.
 fn write_c8ctl_profiles(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).expect("create c8ctl config dir");
     std::fs::write(
@@ -83,7 +83,7 @@ fn run_work(
     let mut args: Vec<&str> = vec!["work", "coder", "--poll-timeout", "200"];
     args.extend_from_slice(extra);
     let mut cmd = home.cmd(&args);
-    cmd.env("C8CTL_CONFIG_DIR", c8ctl_dir);
+    cmd.env("C8CTL_DATA_DIR", c8ctl_dir);
     // Never let a stray activation hang the test: the pin and banner are the
     // contract here, and both are logged BEFORE the first activation attempt —
     // so as soon as the banner line appears on stderr the worker has done
@@ -280,7 +280,7 @@ fn env_pin_enforces_its_base_url_fingerprint_across_env_drift() {
 
     // First start pins the env connection (engine A).
     let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
-    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+    cmd.env("C8CTL_DATA_DIR", c8ctl.path())
         .env("CAMUNDA_REST_ADDRESS", "http://engine-a.invalid:8080");
     let out = run_to_banner(cmd);
     assert!(
@@ -300,7 +300,7 @@ fn env_pin_enforces_its_base_url_fingerprint_across_env_drift() {
     // next start must NOT follow it: the banner still names the PINNED engine
     // A and a loud warning names the drift.
     let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
-    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+    cmd.env("C8CTL_DATA_DIR", c8ctl.path())
         .env("CAMUNDA_REST_ADDRESS", "http://engine-b.invalid:8080");
     let out = run_to_banner(cmd);
     assert!(
@@ -348,7 +348,7 @@ fn env_pin_warns_when_the_env_is_removed_after_pinning() {
 
     // First start pins the env connection (engine A).
     let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
-    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+    cmd.env("C8CTL_DATA_DIR", c8ctl.path())
         .env("CAMUNDA_REST_ADDRESS", "http://engine-a.invalid:8080");
     let out = run_to_banner(cmd);
     assert!(
@@ -363,7 +363,7 @@ fn env_pin_warns_when_the_env_is_removed_after_pinning() {
     // unset — a silently-ignored removal is exactly the drift the pin exists to
     // surface.
     let mut cmd = home.cmd(&["work", "coder", "--poll-timeout", "200"]);
-    cmd.env("C8CTL_CONFIG_DIR", c8ctl.path())
+    cmd.env("C8CTL_DATA_DIR", c8ctl.path())
         .env_remove("CAMUNDA_REST_ADDRESS");
     let out = run_to_banner(cmd);
     assert!(

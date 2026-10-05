@@ -1,9 +1,13 @@
 //! Resolve a c8ctl connection profile and turn it into SDK configuration.
 //!
-//! c8ctl keeps profiles in `<config>/c8ctl/profiles.json` (`{"profiles": [...]}`)
-//! and the active profile in `<config>/c8ctl/session.json` (`activeProfile`).
-//! `<config>` is `$XDG_CONFIG_HOME` or `~/.config` on Linux, and
-//! `~/Library/Application Support` on macOS.
+//! c8ctl keeps profiles in `<datadir>/profiles.json` (`{"profiles": [...]}`)
+//! and the active profile in `<datadir>/session.json` (`activeProfile`).
+//! `<datadir>` mirrors c8ctl's own `getUserDataDir()`: `$C8CTL_DATA_DIR`
+//! verbatim when set, else `$XDG_CONFIG_HOME/c8ctl` or `~/.config/c8ctl` on
+//! Linux and `~/Library/Application Support/c8ctl` on macOS. The supervisor
+//! MUST read the same `C8CTL_DATA_DIR` the `c8` CLI honours (c8ctl ignores
+//! `C8CTL_CONFIG_DIR`), or it would isolate a different directory than the
+//! agents it is trying to quarantine (issue #41).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -52,10 +56,7 @@ impl Profile {
     pub fn connection_identity(&self) -> Profile {
         Profile {
             name: self.name.clone(),
-            base_url: self
-                .base_url
-                .as_deref()
-                .map(crate::slot::redact_url),
+            base_url: self.base_url.as_deref().map(crate::slot::redact_url),
             default_tenant_id: self.default_tenant_id.clone(),
             ..Default::default()
         }
@@ -74,13 +75,13 @@ struct SessionFile {
     active_profile: Option<String>,
 }
 
-pub fn c8ctl_config_dir() -> Option<PathBuf> {
+pub fn c8ctl_data_dir() -> Option<PathBuf> {
     // Issue #41: an explicit override wins first. The worker seeds every agent
-    // with an isolated per-run `C8CTL_CONFIG_DIR` so an agent's
+    // with an isolated per-run `C8CTL_DATA_DIR` so an agent's
     // `c8 use profile` / `c8 profile add` lands inside its own run directory
     // and can never rewrite the operator's global c8ctl session — which every
     // supervisor/worker on the host would otherwise follow on its next start.
-    if let Some(dir) = std::env::var_os("C8CTL_CONFIG_DIR") {
+    if let Some(dir) = std::env::var_os("C8CTL_DATA_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
         }
@@ -101,7 +102,7 @@ pub fn c8ctl_config_dir() -> Option<PathBuf> {
 /// agent's `c8 use profile` rewrites exactly this, so a mismatch after the
 /// fact is the observable signal that the ambient session moved.
 pub fn active_profile_name() -> Option<String> {
-    let dir = c8ctl_config_dir()?;
+    let dir = c8ctl_data_dir()?;
     std::fs::read(dir.join("session.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
@@ -125,7 +126,7 @@ pub fn resolve_with_base_override(
     wanted: Option<&str>,
     base_url_override: Option<&str>,
 ) -> Result<Option<Profile>> {
-    let Some(dir) = c8ctl_config_dir() else {
+    let Some(dir) = c8ctl_data_dir() else {
         return Ok(None);
     };
     // An explicit engine address in the environment beats c8ctl's remembered

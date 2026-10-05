@@ -44,7 +44,7 @@ job types are all test-looking (`probe-*`/`ct-*`) logs a prominent warning
 naming the engine on its first live activation.
 
 Agents are quarantined from the operator's c8ctl session: every agent runs with
-`C8CTL_CONFIG_DIR` pointed at an isolated per-run dir (`<run dir>/c8ctl`) —
+`C8CTL_DATA_DIR` pointed at an isolated per-run dir (`<run dir>/c8ctl`) —
 created for **every** job, including an env-only pin (which has no profile to
 seed, so the dir stays empty) — so an agent's `c8 use profile` /
 `c8 profile add` writes stay inside its run and the operator's

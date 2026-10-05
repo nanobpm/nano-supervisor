@@ -258,7 +258,7 @@ fn worker_provisions_the_repository_into_the_run_dir() {
 /// #41, acceptance: an agent job runs with an ISOLATED c8ctl config dir, so an
 /// agent's `c8 use profile X` can never rewrite the operator's
 /// `~/.config/c8ctl/session.json` (the write that retargeted the production
-/// fleet). The worker hands the agent a per-run `C8CTL_CONFIG_DIR` seeded with
+/// fleet). The worker hands the agent a per-run `C8CTL_DATA_DIR` seeded with
 /// exactly the pinned connection, and marks the run with `NANO_AGENT_RUN`.
 #[test]
 fn worker_isolates_the_agents_c8ctl_session() {
@@ -282,7 +282,7 @@ fn worker_isolates_the_agents_c8ctl_session() {
         "c8ctl-isolation",
         &[
             json!({ "emit": "ok" }),
-            json!({ "shell": "printf 'agent-was-here' > \"$C8CTL_CONFIG_DIR/agent-write.txt\"" }),
+            json!({ "shell": "printf 'agent-was-here' > \"$C8CTL_DATA_DIR/agent-write.txt\"" }),
             json!({ "write_result": { "ok": true } }),
         ],
         json!({ "prompt": "note your environment" }),
@@ -295,9 +295,9 @@ fn worker_isolates_the_agents_c8ctl_session() {
     // The agent's c8ctl is pointed INSIDE its own run dir — never at the
     // operator's global config — so its `c8 use profile` writes stay in the
     // run and the operator's session.json is untouched.
-    let dir = env.get("C8CTL_CONFIG_DIR").unwrap_or_else(|| {
-        panic!("worker must set C8CTL_CONFIG_DIR for the agent; env was {env:?}")
-    });
+    let dir = env
+        .get("C8CTL_DATA_DIR")
+        .unwrap_or_else(|| panic!("worker must set C8CTL_DATA_DIR for the agent; env was {env:?}"));
     assert!(
         dir.contains("agent-runs"),
         "the agent's c8ctl config dir must live under the per-run tree, not the operator's ~/.config; got {dir}"
@@ -316,7 +316,8 @@ fn worker_isolates_the_agents_c8ctl_session() {
     // onto the operator's config).
     let agent_write = dir_path.join("agent-write.txt");
     assert_eq!(
-        std::fs::read_to_string(&agent_write).expect("the agent's write must exist in its isolated c8ctl dir"),
+        std::fs::read_to_string(&agent_write)
+            .expect("the agent's write must exist in its isolated c8ctl dir"),
         "agent-was-here",
         "the agent must be able to write inside its isolated c8ctl config dir"
     );

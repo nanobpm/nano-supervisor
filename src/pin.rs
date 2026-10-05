@@ -168,7 +168,9 @@ fn write(state_home: &Path, pin: &ConnectionPin, lock: &PinLock) -> Result<()> {
 /// `*.tmp` beside the state file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let dir = path.parent().context("state file has no parent directory")?;
+    let dir = path
+        .parent()
+        .context("state file has no parent directory")?;
     // A unique temp name: pid + a process-local counter disambiguate concurrent
     // writers and repeated writes within one process (the cross-process pin
     // lock serializes pin writers anyway, but the state file is also rewritten
@@ -179,7 +181,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(
         ".{}.{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("supervisor.json"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("supervisor.json"),
         std::process::id(),
         seq
     ));
@@ -274,7 +278,10 @@ impl PinLock {
                 .truncate(false)
                 .open(state_home.join(".pin.lock"))
                 .with_context(|| {
-                    format!("opening the connection-pin lock in {}", state_home.display())
+                    format!(
+                        "opening the connection-pin lock in {}",
+                        state_home.display()
+                    )
                 })?;
             // LOCK_EX blocks until every other holder releases; the fd's Drop
             // (or process exit) releases it, so a crash can never wedge the
@@ -427,7 +434,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         if let Some(wanted) = &name {
             anyhow::bail!(
                 "cannot resolve c8ctl profile {wanted:?}: no c8ctl config directory \
-                 was found (set HOME/XDG_CONFIG_HOME, or C8CTL_CONFIG_DIR). Refusing \
+                 was found (set HOME/XDG_CONFIG_HOME, or C8CTL_DATA_DIR). Refusing \
                  to start with an ambient connection masquerading as this profile \
                  (issue #41)."
             );
@@ -495,12 +502,21 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
 ///   connecting to the PINNED baseUrl (the fingerprint is enforced, not just
 ///   recorded) and warns.
 pub fn warn_if_drifted(decision: &PinDecision) {
-    // Every URL interpolated into a warning is redacted first: an engine URL
-    // may embed HTTP(S) userinfo, and these lines land on stdout/journald.
+    for warning in drift_warnings(decision) {
+        log(&warning);
+    }
+}
+
+/// The pure core of [`warn_if_drifted`]: compute the drift warnings for this
+/// start without emitting them, so every branch is unit-testable. Every URL
+/// interpolated into a warning is redacted first: an engine URL may embed
+/// HTTP(S) userinfo, and these lines land on stdout/journald.
+fn drift_warnings(decision: &PinDecision) -> Vec<String> {
     let redact = |u: &str| crate::slot::redact_url(u);
+    let mut out = Vec::new();
     if let (Some(pinned), Some(active)) = (&decision.pin.profile, &decision.active_profile) {
         if pinned != active {
-            log(&format!(
+            out.push(format!(
                 "WARNING: the pinned connection is profile {pinned:?} but c8ctl's active profile \
                  is now {active:?} — this supervisor keeps following the PIN; the active profile \
                  is IGNORED (an agent's `c8 use profile` cannot retarget this fleet). Restart with \
@@ -524,21 +540,36 @@ pub fn warn_if_drifted(decision: &PinDecision) {
     match (&decision.pin.profile, then) {
         // Profile pin: the recorded fingerprint is compared against what the
         // pinned profile resolves to NOW (the client connects to the profile's
-        // CURRENT baseUrl and warns).
-        (Some(_), Some(then)) => {
-            if let Some(now) = profile::resolved_base_url(decision.profile.as_ref()) {
-                if then != now {
-                    log(&format!(
-                        "WARNING: the pinned profile resolves to {} but the pin was taken \
-                         against {} — the profile's baseUrl changed under the same name; \
-                         this supervisor connects to {}",
-                        redact(&now),
-                        redact(then),
-                        redact(&now)
-                    ));
-                }
+        // CURRENT baseUrl and warns). A REMOVED baseUrl is drift too — the
+        // profile dropped its address under the same name — and is the more
+        // dangerous case: with no explicit address the client falls back to the
+        // ambient/SDK-default endpoint, so an unset current value warns as
+        // loudly as a changed one (symmetric with the env-only branch below).
+        (Some(_), Some(then)) => match profile::resolved_base_url(decision.profile.as_ref()) {
+            Some(now) if now == then => {}
+            Some(now) => {
+                out.push(format!(
+                    "WARNING: the pinned profile resolves to {} but the pin was taken \
+                     against {} — the profile's baseUrl changed under the same name; \
+                     this supervisor connects to {}",
+                    redact(&now),
+                    redact(then),
+                    redact(&now)
+                ));
             }
-        }
+            None => {
+                out.push(format!(
+                    "WARNING: the pinned profile no longer resolves a baseUrl (it was \
+                     removed under the same name) but the pin was taken against {} — \
+                     with no explicit engine address the client falls back to the \
+                     ambient/SDK-default endpoint, NOT the pinned engine. Restore the \
+                     profile's baseUrl, or re-pin with --profile / an explicit \
+                     CAMUNDA_REST_ADDRESS, or delete the pin in {}",
+                    redact(then),
+                    state_file_display(decision)
+                ));
+            }
+        },
         // Env-only pin: the recorded fingerprint is compared against the
         // CURRENT environment, and the client build keeps following the PIN
         // (see `engine::connect`'s `pinned_base_url`). A REMOVED
@@ -549,7 +580,7 @@ pub fn warn_if_drifted(decision: &PinDecision) {
         (None, Some(then)) => match profile::resolved_base_url(None) {
             Some(now) if now == then => {}
             Some(now) => {
-                log(&format!(
+                out.push(format!(
                     "WARNING: the CAMUNDA_* environment now points at {} but this \
                      supervisor's connection was pinned against {} — the env drifted \
                      after pinning; this supervisor keeps connecting to the PINNED engine \
@@ -563,7 +594,7 @@ pub fn warn_if_drifted(decision: &PinDecision) {
                 ));
             }
             None => {
-                log(&format!(
+                out.push(format!(
                     "WARNING: the CAMUNDA_* environment is now UNSET (CAMUNDA_REST_ADDRESS was \
                      removed) but this supervisor's connection was pinned against {} — the env \
                      drifted after pinning; this supervisor keeps connecting to the PINNED \
@@ -578,6 +609,7 @@ pub fn warn_if_drifted(decision: &PinDecision) {
         },
         _ => {}
     }
+    out
 }
 
 /// Display path for the state file in warnings (the decision does not carry
@@ -768,7 +800,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(state_file(&home)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(state_file(&home))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "supervisor.json must be 0600");
         }
         let _ = std::fs::remove_dir_all(&home);
@@ -786,7 +821,7 @@ mod tests {
         let home = temp_home("profiledrift");
         let c8ctl = home.join("c8ctl-config");
         std::fs::create_dir_all(&c8ctl).unwrap();
-        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
         // A profile that initially points at engine A…
         std::fs::write(
             c8ctl.join("profiles.json"),
@@ -797,7 +832,10 @@ mod tests {
         let first = resolve_or_pin(&home, None).expect("first start pins");
         assert!(first.created);
         assert_eq!(first.pin.base_url.as_deref(), Some("http://engine-a:8080"));
-        assert_eq!(first.stored_base_url, None, "a fresh pin has no prior fingerprint");
+        assert_eq!(
+            first.stored_base_url, None,
+            "a fresh pin has no prior fingerprint"
+        );
 
         // …then the profile is re-pointed at engine B under the SAME name.
         std::fs::write(
@@ -819,11 +857,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Issue #41, the env-only gap: an env pin's baseUrl fingerprint must
-    /// survive a restart whose `CAMUNDA_REST_ADDRESS` drifted. Re-resolving the
-    /// current env would silently rewrite the pin to the drifted engine and the
-    /// drift warning could never fire — the pin would ratify the very retarget
-    /// it exists to catch.
+    /// Issue #41, the profile-URL-REMOVAL drift gap (review round 6): when a
+    /// pinned profile drops its `baseUrl` under the same name, the profile
+    /// still resolves (so the created-time fail-closed guard never fires) but
+    /// `resolved_base_url(Some(profile))` is now `None` and the client falls
+    /// back to the ambient/SDK-default endpoint. The symmetric env-only branch
+    /// already warned on a removed address; the profile branch must too, rather
+    /// than silently skipping the `None` case.
+    #[test]
+    fn profile_pin_warns_when_its_base_url_is_removed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("profileurlremoved");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        // Ensure no ambient CAMUNDA_* address masks the removed profile URL —
+        // otherwise `resolved_base_url(Some(profile))` would fall through to it
+        // and the removal would read as a plain URL *change* instead.
+        let _addr = EnvGuard::unset("CAMUNDA_REST_ADDRESS");
+        let _zaddr = EnvGuard::unset("ZEEBE_REST_ADDRESS");
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        let first = resolve_or_pin(&home, None).expect("first start pins");
+        assert!(first.created);
+        // No drift warning on the creating start.
+        assert!(
+            drift_warnings(&first).is_empty(),
+            "a freshly created pin has nothing to drift from"
+        );
+
+        // The profile drops its baseUrl under the SAME name.
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin"}]}"#,
+        )
+        .unwrap();
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        assert!(!second.created);
+        assert_eq!(
+            second.stored_base_url.as_deref(),
+            Some("http://engine-a:8080"),
+            "the recorded fingerprint must survive so removal is detectable"
+        );
+        let warnings = drift_warnings(&second);
+        assert!(
+            warnings.iter().any(|w| w.contains("no longer resolves a baseUrl")),
+            "a removed profile baseUrl must warn about drift, not be silently skipped: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A changed profile baseUrl (engine A → B under one name) warns, and the
+    /// warning names the drift — the sibling of the removal case above.
+    #[test]
+    fn profile_pin_warns_when_its_base_url_changes() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("profileurlchanged");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        let first = resolve_or_pin(&home, None).expect("first start pins");
+        assert!(first.created);
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-b:8080"}]}"#,
+        )
+        .unwrap();
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        let warnings = drift_warnings(&second);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("baseUrl changed under the same name")),
+            "a changed profile baseUrl must warn: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
     #[test]
     fn env_pin_keeps_its_base_url_fingerprint_across_env_drift() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -833,7 +952,7 @@ mod tests {
         // about the profile-LESS (env) path.
         let c8ctl = home.join("c8ctl-config");
         std::fs::create_dir_all(&c8ctl).unwrap();
-        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
         let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
         let first = resolve_or_pin(&home, None).expect("first start pins");
         assert!(first.created);
@@ -869,7 +988,7 @@ mod tests {
         let home = temp_home("envretarget");
         let c8ctl = home.join("c8ctl-config");
         std::fs::create_dir_all(&c8ctl).unwrap();
-        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
         // Pin against an env-only connection (no profile)…
         let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
         let first = resolve_or_pin(&home, None).expect("first start pins env-only");
@@ -924,7 +1043,7 @@ mod tests {
         let home = temp_home("userinfo");
         let c8ctl = home.join("c8ctl-config");
         std::fs::create_dir_all(&c8ctl).unwrap();
-        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
         let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://admin:s3cr3t@engine:8080");
         let err = match resolve_or_pin(&home, None) {
             Ok(_) => panic!("userinfo URL must be rejected"),
@@ -952,7 +1071,7 @@ mod tests {
         let home = temp_home("nobaseurl");
         let c8ctl = home.join("c8ctl-config");
         std::fs::create_dir_all(&c8ctl).unwrap();
-        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
         let _a = EnvGuard::unset("CAMUNDA_REST_ADDRESS");
         let _z = EnvGuard::unset("ZEEBE_REST_ADDRESS");
         let err = match resolve_or_pin(&home, None) {
@@ -979,8 +1098,8 @@ mod tests {
     fn explicit_profile_that_cannot_be_resolved_is_rejected() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = temp_home("ghostprofile");
-        // Make `c8ctl_config_dir()` return None: no override and no HOME/XDG.
-        let _cfg = EnvGuard::unset("C8CTL_CONFIG_DIR");
+        // Make `c8ctl_data_dir()` return None: no override and no HOME/XDG.
+        let _cfg = EnvGuard::unset("C8CTL_DATA_DIR");
         let _home_env = EnvGuard::unset("HOME");
         let _xdg = EnvGuard::unset("XDG_CONFIG_HOME");
         let err = match resolve_or_pin(&home, Some("ghost")) {
