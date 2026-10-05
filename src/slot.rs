@@ -1641,7 +1641,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let start_head = git_head_blocking(agent_cwd.clone()).await;
 
     let result_file = run_dir.join("result.json");
-    let agent_env = build_agent_env(&cfg, &key, &job, &result_file);
+    let agent_env = build_agent_env(&cfg, &key, &job, &result_file, &run_dir);
     let payload = build_agent_payload(&cfg, &job, &env);
     let acp = cfg.hire.protocol == Protocol::Acp;
 
@@ -2119,6 +2119,7 @@ fn build_agent_env(
     key: &str,
     job: &ActivatedJobResult,
     result_file: &std::path::Path,
+    run_dir: &std::path::Path,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     // #283: a headless agent has no interactive terminal, so any git command that
@@ -2142,6 +2143,17 @@ fn build_agent_env(
     }
     env.push(("NANO_JOB_KEY".into(), key.to_string()));
     env.push(("NANO_AGENT_NAME".into(), cfg.worker_name.clone()));
+    // #40: mark this process tree as an agent run. A supervisor/worker that an
+    // agent tries to start reads these and refuses to daemonise (see
+    // `main::guard_nested_supervisor`), so a job can never spawn a phantom fleet
+    // that escapes its teardown. `NANO_AGENT_RUN` is the run identity (the job
+    // key); `NANO_AGENT_RUN_DIR` is its working-directory root, so a host sweep
+    // can also find descendants by cwd.
+    env.push(("NANO_AGENT_RUN".into(), key.to_string()));
+    env.push((
+        "NANO_AGENT_RUN_DIR".into(),
+        run_dir.to_string_lossy().into_owned(),
+    ));
     // MVP: the agentic visibility channel is off (host sandbox only).
     env.push(("NANO_AGENTIC".into(), "off".into()));
     env.push((
@@ -2207,7 +2219,7 @@ mod tests {
             ..Default::default()
         };
         let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&cfg(), "42", &job, rf);
+        let env = build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/run"));
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("NANO_AGENTIC"), Some("off"));
         assert_eq!(get("NANO_JOB_KEY"), Some("42"));
@@ -2217,13 +2229,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_env_marks_the_agent_run() {
+        // #40: every agent is told which run it belongs to so a supervisor/worker
+        // it tries to start can refuse to daemonise and a host sweep can find its
+        // descendants by cwd.
+        let job = ActivatedJobResult::default();
+        let rf = std::path::Path::new("/tmp/r.json");
+        let env = build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/runs/42"));
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("NANO_AGENT_RUN"), Some("42"));
+        assert_eq!(get("NANO_AGENT_RUN_DIR"), Some("/tmp/runs/42"));
+    }
+
+    #[test]
     fn agent_env_sets_headless_editor_noops() {
         let job = ActivatedJobResult {
             r#type: "senior:pr-review".into(),
             ..Default::default()
         };
         let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&cfg(), "42", &job, rf);
+        let env = build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/run"));
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         // #283: every editor git might spawn points at the `:` no-op so a headless
         // agent's `git commit`/`rebase -i` can never block on an interactive editor.
@@ -2244,7 +2269,7 @@ mod tests {
             ..Default::default()
         };
         let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&c, "1", &job, rf);
+        let env = build_agent_env(&c, "1", &job, rf, std::path::Path::new("/tmp/run"));
         // `.envs()` is last-wins, so the LAST entry for a key is the effective value.
         let last = |k: &str| {
             env.iter()
@@ -2294,7 +2319,13 @@ mod tests {
             );
         }
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&cfg(), "1", &job, std::path::Path::new("/tmp/r.json"));
+        let env = build_agent_env(
+            &cfg(),
+            "1",
+            &job,
+            std::path::Path::new("/tmp/r.json"),
+            std::path::Path::new("/tmp/run"),
+        );
         for (k, _) in &env {
             assert!(
                 !SENSITIVE_DAEMON_ENV.contains(&k.as_str()),
@@ -2308,7 +2339,13 @@ mod tests {
         let mut c = cfg();
         c.hire.env.insert("NANO_AGENTIC".into(), "on".into());
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, std::path::Path::new("/tmp/r.json"));
+        let env = build_agent_env(
+            &c,
+            "1",
+            &job,
+            std::path::Path::new("/tmp/r.json"),
+            std::path::Path::new("/tmp/run"),
+        );
         // The reserved value is pushed AFTER the hire env, so it wins for any
         // consumer that reads the last occurrence (as a child process does).
         let last = env

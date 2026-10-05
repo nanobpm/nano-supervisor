@@ -53,6 +53,53 @@ pub fn arm(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn arm(_cmd: &mut Command) {}
 
+/// Bind the CURRENT process to die when its parent does. Used when a supervisor
+/// is allowed to run *attached* inside an agent run (#40): arming
+/// `PR_SET_PDEATHSIG` on ourselves means that if the invoking agent dies — or the
+/// job's process-group kill reaps it — this supervisor is SIGKILLed too, instead
+/// of lingering as a phantom. On non-Linux targets it is a no-op: those callers
+/// stay in the invoking process group (no `setsid`), so the group kill already
+/// takes them down.
+///
+/// Returns an error when the binding could not be installed — a rejected `prctl`
+/// (e.g. under a seccomp policy) — or when the invoking parent already exited
+/// before we armed (the getppid re-check mirrors [`arm`]'s fork race fix: an
+/// already-dead parent never fires PDEATHSIG, so the attached supervisor would
+/// linger exactly as if unbound). Callers must fail startup rather than run the
+/// opted-in supervisor without the promised parent-death binding.
+#[cfg(target_os = "linux")]
+pub fn bind_self_to_parent_death() -> std::io::Result<()> {
+    let parent = unsafe { libc::getppid() };
+    // SAFETY: a single async-signal-safe libc call that only arms a signal
+    // disposition for this process; it touches no Rust allocator state.
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Close the race: if the invoking agent already died before we armed,
+    // PR_SET_PDEATHSIG will never fire, so refuse the attachment rather than
+    // linger as the phantom this binding exists to prevent.
+    if unsafe { libc::getppid() } != parent {
+        return Err(std::io::Error::other(
+            "invoking parent exited before the parent-death binding was armed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn bind_self_to_parent_death() -> std::io::Result<()> {
+    Ok(())
+}
+
 /// `SIGKILL` a process group by its leader pid (the pid is also the pgid, since
 /// agents are spawned with `process_group(0)`). Used by the ACP/pipe cancellation
 /// guards so that dropping an in-flight agent — e.g. when a slot aborts its
@@ -482,5 +529,26 @@ mod tests {
         // A pid that cannot exist yields a false (unreadable /proc) — the
         // caller's `kill(_, 0)` probe is the authority for a truly-gone pid.
         assert!(!parent_is_dead_or_zombie(u32::MAX));
+    }
+
+    #[test]
+    fn bind_self_to_parent_death_arms_for_a_live_parent() {
+        // The attached-mode binding must install cleanly for a live invoking
+        // parent (the prctl succeeds and the getppid re-check passes), and the
+        // disposition must actually be queryable afterwards.
+        bind_self_to_parent_death().expect("binding must arm for a live parent");
+        // SAFETY: PR_GET_PDEATHSIG only reads this process's disposition.
+        let mut sig: libc::c_int = 0;
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_GET_PDEATHSIG,
+                &mut sig as *mut libc::c_int as libc::c_ulong,
+                0,
+                0,
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "PR_GET_PDEATHSIG failed");
+        assert_eq!(sig, libc::SIGKILL, "the binding must arm SIGKILL");
     }
 }

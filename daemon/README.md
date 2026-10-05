@@ -36,6 +36,20 @@ handling: prompt assembly, repo clone, ACP **and** pipe protocols, result-file /
 - Agents run in **their own process group** and **die with the daemon**:
   `PR_SET_PDEATHSIG` on Linux, a kqueue watchdog on macOS — so a `kill -9` of the
   daemon leaves **no orphaned agent processes**.
+- **Refuses to nest inside an agent run** (#40): the worker stamps
+  `NANO_AGENT_RUN=<job key>` (and `NANO_AGENT_RUN_DIR`) on every agent's
+  environment, and `nano-supervisor daemon` / `work` refuse to start when that
+  variable is set — exiting non-zero with an explanation. Left unguarded, an
+  agent could start its own supervisor/worker and build an unintended nested
+  fleet that leases real jobs outside the job's lifecycle; refusing to start
+  closes that hole. The hermetic contract
+  tests opt in with `--foreground-for-tests` (or `NANO_ALLOW_NESTED_SUPERVISOR=1`)
+  to run **attached** — staying in the invoking process group, so the job's
+  teardown still kills it: on
+  **Linux** the attached process is bound to the invoking process via
+  `PR_SET_PDEATHSIG` (and startup fails if that binding cannot be installed);
+  on **macOS** there is no `PR_SET_PDEATHSIG`, so containment relies on staying
+  in the invoking process group — the job's process-group kill takes it down.
 - **Lease-fenced settling**: a 404/409 on lock refresh is treated as a lost
   activation — the agent is stopped and the job is **not** settled, so no job is
   ever settled without its lease.
