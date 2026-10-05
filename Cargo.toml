@@ -42,11 +42,10 @@ sha1 = "0.10"
 # ECMAScript way. Already serde_json's own transitive dep, so no new code is
 # pulled in.
 ryu = "1"
-# Cross-platform advisory file locking (`FileExt::lock_exclusive`/`unlock`) used
-# to serialize `config.json` read-modify-write cycles (fleet hire/assign) so
-# concurrent fleet commands cannot silently overwrite each other, and so the
-# atomic temp+rename commit below is observed whole. Small, std-only, no unsafe.
-fs2 = "0.4"
+# (Cross-process serialization of `config.json` / workforce-manifest
+# read-modify-write cycles is done with an atomic `create_new` lock marker in
+# `fleet::StateLock` — no external locking crate, so the flock unlink race is
+# avoided by construction and no lock file persists under the home.)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).

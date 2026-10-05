@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{job_type_matrix, normalize_capabilities, state_home};
@@ -178,17 +177,101 @@ fn write_config(cfg: &ConfigFile) -> Result<()> {
     write_json_atomic(&path, cfg)
 }
 
+/// A mutual-exclusion guard for a state file's read-modify-write cycle.
+///
+/// The guard is an atomically-created `<file>.lock` marker: acquisition uses
+/// `OpenOptions::create_new` (`O_CREAT|O_EXCL`), which creates the file only if
+/// it does not already exist, so exactly one contender wins the path — there is
+/// no flock-style "unlink a locked inode, a third process locks a fresh inode
+/// and enters concurrently" race, because the lock *is* the path's existence,
+/// not an inode. The holder removes the file on release, so the home keeps
+/// exactly the documented file set (the contract test asserts it exhaustively).
+///
+/// A process that crashes or is killed while holding the guard leaves the
+/// marker behind; the next contender's acquisition then spins forever on a lock
+/// no one holds. To fail closed rather than hang, a marker older than
+/// `LOCK_STALE_MS` is treated as abandoned and reclaimed (removed, then
+/// retried): a holder that takes that long is either dead or pathological, and
+/// a falsely-reclaimed lock degrades to the previous unsynchronized behaviour
+/// rather than wedging every future command.
+struct StateLock {
+    path: PathBuf,
+}
+
+/// Age after which an unreleased lock marker is assumed abandoned (its holder
+/// crashed) and is reclaimed. Generous enough that no real critical section —
+/// a few filesystem reads and one atomic write — ever approaches it.
+const LOCK_STALE_MS: u128 = 30_000;
+
+impl StateLock {
+    /// Acquire the exclusive lock guarding `path`'s sibling `<file>.lock`,
+    /// spinning briefly until the current holder releases it. `path` is the
+    /// guarded state file (e.g. `config.json`); the marker is derived from it.
+    fn acquire(path: &std::path::Path) -> Result<StateLock> {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("state path has no valid file name")?;
+        let lock_path = path.with_file_name(format!("{file_name}.lock"));
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(StateLock { path: lock_path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Held by another process. Reclaim it if abandoned;
+                    // otherwise wait for the holder to finish and retry.
+                    Self::reclaim_if_stale(&lock_path);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("opening lock {}", lock_path.display()))
+                }
+            }
+        }
+    }
+
+    /// If the marker is older than the stale threshold, remove it so a fresh
+    /// acquisition can proceed. Best-effort: a removal error just means the
+    /// next loop iteration retries.
+    fn reclaim_if_stale(lock_path: &std::path::Path) {
+        let stale = std::fs::metadata(lock_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|age| age.as_millis() > LOCK_STALE_MS)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(lock_path);
+        }
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // Release by removing the marker. Because acquisition is the atomic
+        // create-new, a contender only proceeds once the path is gone, and it
+        // then creates a *fresh* marker it owns — no unlinked-inode window.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Run `mutate` against the current config while holding an exclusive
 /// interprocess lock, then commit the result atomically.
 ///
 /// `hire`/`assign` are a read-modify-write over `config.json`; without
 /// serialization two concurrent commands each read the pre-image and the second
-/// commit silently overwrites the first's change. The lock lives on a dedicated
-/// `config.json.lock` file (advisory `flock`/`LockFileEx` via `fs2`), so the
-/// whole read→mutate→write cycle is serialized across processes. The lock file
-/// is removed after the commit so the home keeps only the documented file set
-/// (the contract test asserts it exactly). The lock is released on drop, so
-/// even an error path cannot leave the config locked.
+/// commit silently overwrites the first's change. A `StateLock` on
+/// `config.json.lock` serializes the whole read→mutate→write cycle across
+/// processes, and the marker is removed on release (even on the error path, via
+/// `Drop`) so the home keeps only the documented file set.
 fn update_config<F>(mutate: F) -> Result<()>
 where
     F: FnOnce(&mut ConfigFile) -> Result<()>,
@@ -198,34 +281,12 @@ where
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let lock_path = path.with_file_name("config.json.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening lock {}", lock_path.display()))?;
-    lock_file
-        .lock_exclusive()
-        .with_context(|| format!("locking {}", lock_path.display()))?;
+    let _guard = StateLock::acquire(&path)?;
 
     // Critical section: read the latest config, mutate, commit atomically.
-    let result = (|| {
-        let mut cfg = read_config()?;
-        mutate(&mut cfg)?;
-        write_config(&cfg)
-    })();
-
-    // Unlock before removing so a waiting process that immediately re-locks and
-    // re-creates the file does not have its fresh lock file unlinked from under
-    // it (a locked-then-removed file would let a third process lock a *new*
-    // inode and enter concurrently).
-    let unlock_result = lock_file
-        .unlock()
-        .with_context(|| format!("unlocking {}", lock_path.display()));
-    let _ = std::fs::remove_file(&lock_path);
-
-    result.and(unlock_result)
+    let mut cfg = read_config()?;
+    mutate(&mut cfg)?;
+    write_config(&cfg)
 }
 
 /// An ISO-8601 UTC timestamp (`YYYY-MM-DDThh:mm:ss.sssZ`), matching the Node
@@ -650,6 +711,14 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
         bail!("invalid --instances {instances}: supported maximum is {MAX_WORKER_INSTANCES}");
     }
     let instances = instances.max(1);
+    // The read-modify-write below is the same lost-update class as `config.json`:
+    // two concurrent `workforce add <name> <a>` / `<b>` on the *same* manifest
+    // each read the pre-image and the second atomic rename silently drops the
+    // first's worker. `write_manifest` is atomic (a reader never sees a partial
+    // file) but atomicity alone does not serialize the mutate, so guard the whole
+    // read→mutate→write behind a per-manifest lock, exactly like `update_config`.
+    let manifest_file = manifest_path(name)?;
+    let _guard = StateLock::acquire(&manifest_file)?;
     let mut manifest = read_manifest(name)?.unwrap_or(Manifest {
         version: 1,
         name: name.to_string(),
@@ -671,6 +740,12 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
             roles: roles.to_string(),
         }),
     }
+    // Test-only: widen the read→write window so the concurrency test reliably
+    // overlaps two critical sections. With the lock this just serializes them
+    // (green); without it the second read observes the pre-image and its rename
+    // drops the first's worker (red). Compiled out of non-test builds.
+    #[cfg(test)]
+    std::thread::sleep(std::time::Duration::from_millis(30));
     write_manifest(&manifest)?;
     println!("Added {profile} × {instances} to workforce \"{name}\"");
     Ok(())
@@ -990,7 +1065,9 @@ mod tests {
     }
 
     /// `hire` must commit `config.json` atomically and leave no temp or lock
-    /// file behind: the home keeps exactly the documented file set.
+    /// file behind: the home keeps exactly the documented file set. The
+    /// `StateLock` marker (`config.json.lock`) is removed on release, so after
+    /// the command returns nothing but `config.json` may remain.
     #[test]
     fn hire_writes_config_atomically_without_residue() {
         let _cfg = TempCfg::new();
@@ -1013,17 +1090,66 @@ mod tests {
         assert!(cfg.hires.contains_key("coder"));
     }
 
-    /// Two `update_config` mutations serialize: the second observes the first's
-    /// committed change rather than overwriting it from a stale pre-image.
+    /// Two `update_config` mutations running on *concurrent* threads both
+    /// survive: the lock serializes them, so the second observes the first's
+    /// committed change rather than overwriting it from a stale pre-image. A
+    /// sequential pair would pass even against the old unlocked code, so this
+    /// spawns real threads (red before the lock, green after).
     #[test]
     fn update_config_serializes_read_modify_write() {
         let _cfg = TempCfg::new();
-        hire(hire_args("a")).unwrap();
-        hire(hire_args("b")).unwrap();
+        // Release both hires together so their read-modify-write cycles overlap
+        // as much as the scheduler allows; without the lock one is lost.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for name in ["a", "b"] {
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                hire(hire_args(name))
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
         let cfg = read_config().unwrap();
         assert!(
             cfg.hires.contains_key("a") && cfg.hires.contains_key("b"),
-            "both hires must survive; a lost update would drop one"
+            "both concurrent hires must survive; a lost update would drop one"
+        );
+    }
+
+    /// Concurrent `workforce add` of *different* profiles onto the *same*
+    /// manifest both survive: the per-manifest lock serializes the
+    /// read-modify-write, so the second add observes the first's committed
+    /// worker instead of renaming over it. This is the manifest half of the
+    /// lost-update class (Copilot's "also appears on line 499"); a sequential
+    /// pair would not exercise the lock, so this spawns real threads.
+    #[test]
+    fn workforce_add_serializes_concurrent_manifest_updates() {
+        let _cfg = TempCfg::new();
+        // Both profiles must exist so `workforce_add` passes its hire check.
+        hire(hire_args("a")).unwrap();
+        hire(hire_args("b")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for profile in ["a", "b"] {
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                workforce_add("default", profile, 1, "auto")
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let manifest = read_manifest("default").unwrap().unwrap();
+        let mut profiles: Vec<_> = manifest.workers.iter().map(|w| w.profile.as_str()).collect();
+        profiles.sort();
+        assert_eq!(
+            profiles,
+            vec!["a", "b"],
+            "both concurrent adds must survive; a lost update would drop one worker"
         );
     }
 
