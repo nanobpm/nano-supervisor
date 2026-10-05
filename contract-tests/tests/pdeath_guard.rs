@@ -8,20 +8,24 @@
 //! and recycled by an unrelated group is never signalled.
 //!
 //! These tests are **engine-free** and drive the real binary's hidden
-//! `__reap-watchdog` subcommand directly, so they run in any environment. They
-//! are **Rust-pinned**: the identity token and its verification are the Rust
-//! port's hardening (the Node plugin's cleanup is the predecessor this guards),
-//! so they skip on the Node target and the rest of the suite keeps both targets
-//! green.
+//! `__reap-watchdog` subcommand directly. They are **Linux-only** (the identity
+//! token is read from `/proc`) and **Rust-pinned**: the identity token and its
+//! verification are the Rust port's hardening (the Node plugin's cleanup is the
+//! predecessor this guards), so they skip on the Node target and the rest of the
+//! suite keeps both targets green.
 
 mod common;
 
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use contract_tests::{skip, Target};
 
 /// The Rust binary under test (`$NS_BIN`, default `target/debug/nano-supervisor`).
+#[cfg(target_os = "linux")]
 fn bin() -> String {
     std::env::var("NS_BIN").unwrap_or_else(|_| "target/debug/nano-supervisor".to_string())
 }
@@ -46,6 +50,7 @@ fn proc_identity(pid: u32) -> Option<(u64, u32)> {
 
 /// Spawn a `sleep` in its own process group (pid == pgid), like an agent.
 /// Returns (child, pgid). The child is killed+reaped on drop of the guard.
+#[cfg(target_os = "linux")]
 fn spawn_group() -> (std::process::Child, u32) {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("sleep");
@@ -60,12 +65,13 @@ fn spawn_group() -> (std::process::Child, u32) {
 }
 
 /// True while a process group with this pgid has a live member.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn group_alive(pgid: u32) -> bool {
     unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
 }
 
 /// Wait up to `timeout` for `cond` to become true, polling every 25ms.
+#[cfg(target_os = "linux")]
 fn eventually<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

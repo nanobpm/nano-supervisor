@@ -31,8 +31,9 @@ shlex = "1"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json", "redactions", "filters"] }
-# Process-group liveness probes (`kill(-pgid, 0)`) in the pdeath_guard tests.
-[target.'cfg(unix)'.dev-dependencies]
+# Process-group liveness probes (`kill(-pgid, 0)`) in the Linux-only
+# pdeath_guard tests.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 
 # The scripted stand-in for Copilot/nano-coder. Issue #4 owns it; #3 and #5 use it.
