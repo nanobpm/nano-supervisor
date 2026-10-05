@@ -857,6 +857,14 @@ struct ManifestWorker {
     instances: u32,
     #[serde(default)]
     roles: Roles,
+    /// Unmodelled per-worker fields, preserved verbatim across a rewrite — the
+    /// same preservation `StoredHire` gives a hire. `workforce add` is a
+    /// read-modify-write of the whole manifest, so without this a mutation of
+    /// one worker would silently drop a sibling worker's fields a future plugin
+    /// version added. Empty for a freshly created worker, so the golden
+    /// manifest shape (exactly the modelled fields) is unchanged.
+    #[serde(flatten)]
+    other: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -865,6 +873,12 @@ struct Manifest {
     name: String,
     #[serde(default)]
     workers: Vec<ManifestWorker>,
+    /// Unmodelled top-level manifest fields, preserved verbatim across a
+    /// rewrite — mirrors `ConfigFile`. The `version` field signals schema
+    /// evolution, so a newer manifest may carry keys this struct does not
+    /// model; `workforce add` must not drop them when it rewrites the file.
+    #[serde(flatten)]
+    other: BTreeMap<String, serde_json::Value>,
 }
 
 fn manifest_path(name: &str) -> Result<PathBuf> {
@@ -973,6 +987,7 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
         version: 1,
         name: name.to_string(),
         workers: Vec::new(),
+        other: BTreeMap::new(),
     });
     // The write destination comes from the requested (validated) name, so bind
     // the loaded manifest to it: a manifest file whose internal `name` disagrees
@@ -988,6 +1003,7 @@ pub fn workforce_add(name: &str, profile: &str, instances: u32, roles: &str) -> 
             profile: profile.to_string(),
             instances,
             roles: roles_value,
+            other: BTreeMap::new(),
         }),
     }
     // Test-only: widen the read→write window so the concurrency test reliably
@@ -1352,6 +1368,85 @@ mod tests {
             !dir.join("other.json").exists(),
             "the internal name must not redirect the write to other.json"
         );
+    }
+
+    /// A Node-written manifest may carry top-level keys and per-worker fields
+    /// this struct does not model (schema evolution — the `version` field
+    /// signals exactly that). `workforce add` is a read-modify-write of the
+    /// whole manifest, so rewriting it must PRESERVE those fields — the same
+    /// unknown-field preservation `config.json` gives a hire, not drop them off
+    /// the manifest or a sibling worker.
+    #[test]
+    fn workforce_add_preserves_unknown_manifest_fields() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        hire(hire_args("other")).unwrap();
+        let dir = home_dir().unwrap().join("workforce");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Seed a manifest with an unmodelled top-level key and an unmodelled
+        // field on an existing (sibling) worker that the add won't touch.
+        std::fs::write(
+            dir.join("default.json"),
+            r#"{"version":1,"name":"default","generation":7,"workers":[{"profile":"other","instances":2,"roles":"auto","lastSeen":"2026-01-01T00:00:00.000Z"}]}"#,
+        )
+        .unwrap();
+        // Add a different worker — a read-modify-write of the whole manifest.
+        workforce_add("default", "coder", 1, "auto").unwrap();
+        let raw = std::fs::read_to_string(dir.join("default.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            value["generation"],
+            serde_json::json!(7),
+            "an unmodelled top-level manifest field must survive a rewrite"
+        );
+        let sibling = value["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["profile"] == serde_json::json!("other"))
+            .expect("the untouched sibling worker must still be present");
+        assert_eq!(
+            sibling["lastSeen"],
+            serde_json::json!("2026-01-01T00:00:00.000Z"),
+            "an unmodelled field on a sibling worker must survive a rewrite"
+        );
+    }
+
+    /// A freshly created manifest/worker writes exactly the modelled fields (no
+    /// stray `other` keys), so the golden manifest shape is unchanged.
+    #[test]
+    fn fresh_workforce_add_writes_only_modelled_fields() {
+        let _cfg = TempCfg::new();
+        hire(hire_args("coder")).unwrap();
+        workforce_add("default", "coder", 1, "auto").unwrap();
+        let raw =
+            std::fs::read_to_string(home_dir().unwrap().join("workforce").join("default.json"))
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let top: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        for k in &top {
+            assert!(
+                matches!(*k, "version" | "name" | "workers"),
+                "fresh manifest leaked an unmodelled top-level key: {k}"
+            );
+        }
+        let worker: Vec<&str> = value["workers"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        for k in &worker {
+            assert!(
+                matches!(*k, "profile" | "instances" | "roles"),
+                "fresh worker leaked an unmodelled key: {k}"
+            );
+        }
     }
 
     /// A workforce name with surrounding whitespace must be rejected, not
