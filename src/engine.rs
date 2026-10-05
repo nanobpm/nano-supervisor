@@ -37,7 +37,10 @@ pub fn connect(
         Some(p) => crate::runtime::log(&format!(
             "using c8ctl profile {:?} ({})",
             p.name,
-            p.base_url.as_deref().unwrap_or("no baseUrl")
+            // Redact any embedded HTTP(S) userinfo before logging: the profile's
+            // baseUrl may carry an engine credential, and this line lands on
+            // stdout/journald. The un-redacted URL still drives the client.
+            crate::slot::redact_url(p.base_url.as_deref().unwrap_or("no baseUrl"))
         )),
         None => crate::runtime::log("no c8ctl profile; using CAMUNDA_* environment"),
     }

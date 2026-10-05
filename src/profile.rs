@@ -42,10 +42,20 @@ impl Profile {
     /// *which engine* the job is pinned to, so only the connection identity is
     /// seeded; authenticated `c8` access, if ever required, must come from a
     /// deliberately scoped agent credential, never the daemon's.
+    ///
+    /// The `baseUrl` itself can carry a credential: an operator may embed
+    /// HTTP(S) userinfo (`https://user:secret@host`) directly in the address
+    /// (the same secret `SENSITIVE_DAEMON_ENV` strips from `*_REST_ADDRESS`).
+    /// Copying it verbatim into the agent-readable seed would leak it, so the
+    /// userinfo is stripped here too — the agent needs the engine's *location*,
+    /// never the credential embedded in its URL.
     pub fn connection_identity(&self) -> Profile {
         Profile {
             name: self.name.clone(),
-            base_url: self.base_url.clone(),
+            base_url: self
+                .base_url
+                .as_deref()
+                .map(crate::slot::redact_url),
             default_tenant_id: self.default_tenant_id.clone(),
             ..Default::default()
         }
@@ -306,5 +316,23 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         assert!(!json.contains("SECRET"), "clientSecret leaked: {json}");
         assert!(!json.contains("PASSWORD"), "password leaked: {json}");
+    }
+
+    /// Issue #41: the `baseUrl` itself can carry a credential — HTTP(S)
+    /// userinfo (`https://user:secret@host`). The seeded identity must strip it
+    /// so the agent-readable `profiles.json` never leaks the embedded secret.
+    #[test]
+    fn connection_identity_strips_url_userinfo() {
+        let p = profile(
+            r#"{"name":"saas","baseUrl":"https://user:secret@host.example:8443/v2","clientId":"id","clientSecret":"SECRET"}"#,
+        );
+        let id = p.connection_identity();
+        assert_eq!(
+            id.base_url.as_deref(),
+            Some("https://host.example:8443/v2"),
+            "the URL userinfo credential must be stripped from the seeded identity"
+        );
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(!json.contains("secret"), "URL userinfo leaked: {json}");
     }
 }

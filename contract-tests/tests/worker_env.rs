@@ -269,16 +269,24 @@ fn worker_isolates_the_agents_c8ctl_session() {
     if target != Target::Rust {
         skip!("the isolated agent c8ctl session is the Rust worker's fix for issue #41");
     }
+    // Run with `--keep-runs` so the run directory (and the agent's isolated
+    // c8ctl config inside it) SURVIVES the successful run — otherwise the
+    // worker reaps it before the assertions below and `session.exists()` is
+    // vacuously false, so the test would pass even if the isolated dir was
+    // never created or seeded. The agent also exercises a real write into the
+    // isolated dir (via the `shell` step, which runs in the per-run cwd) to
+    // prove it is a writable, agent-owned config root.
     let outcome = run_worker_job(
         &engine,
         &target,
         "c8ctl-isolation",
         &[
             json!({ "emit": "ok" }),
+            json!({ "shell": "printf 'agent-was-here' > \"$C8CTL_CONFIG_DIR/agent-write.txt\"" }),
             json!({ "write_result": { "ok": true } }),
         ],
         json!({ "prompt": "note your environment" }),
-        &[],
+        &["--keep-runs"],
         &[],
     );
     let record = outcome.record();
@@ -294,15 +302,33 @@ fn worker_isolates_the_agents_c8ctl_session() {
         dir.contains("agent-runs"),
         "the agent's c8ctl config dir must live under the per-run tree, not the operator's ~/.config; got {dir}"
     );
+
+    // Under `--keep-runs` the isolated dir MUST exist after the run — assert it
+    // unconditionally (no `if exists`), so a worker that failed to create or
+    // seed it fails the test rather than silently passing.
+    let dir_path = std::path::Path::new(dir);
+    assert!(
+        dir_path.is_dir(),
+        "the isolated c8ctl config dir must exist after a --keep-runs run: {dir}"
+    );
+    // The agent's own write landed inside the isolated dir, proving it is a
+    // writable, agent-owned config root (not a read-only mount or a symlink
+    // onto the operator's config).
+    let agent_write = dir_path.join("agent-write.txt");
+    assert_eq!(
+        std::fs::read_to_string(&agent_write).expect("the agent's write must exist in its isolated c8ctl dir"),
+        "agent-was-here",
+        "the agent must be able to write inside its isolated c8ctl config dir"
+    );
+
     // The seed, when there is one, is exactly the pinned connection: the
     // session's activeProfile and a profiles.json carrying only that profile,
     // so the agent's own `c8` sees the job's engine and nothing else. (This
     // engine-gated harness connects the worker via `CAMUNDA_REST_ADDRESS` — an
-    // env-only pin — so there is no profile to seed and the isolated dir stays
-    // EMPTY; the unit tests pin the seeded shape for a profiled connection.
-    // The run dir also outlives the job only when it failed, so read the seed
-    // only when it exists.)
-    let session = std::path::Path::new(dir).join("session.json");
+    // env-only pin — so there is no profile to seed and the isolated dir holds
+    // only the agent's own write; the unit tests pin the seeded shape for a
+    // profiled connection.)
+    let session = dir_path.join("session.json");
     if session.exists() {
         let seeded: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&session).expect("read seeded session.json"),

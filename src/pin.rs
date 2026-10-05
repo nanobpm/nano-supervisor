@@ -43,11 +43,19 @@ pub struct ConnectionPin {
 
 impl ConnectionPin {
     /// `engine: <profile> (<baseUrl>)` for banners and status output.
+    ///
+    /// The baseUrl is run through [`crate::slot::redact_url`] first: an engine
+    /// URL may embed HTTP(S) userinfo (`https://user:secret@host`), and this
+    /// string is interpolated into startup banners and drift warnings that land
+    /// on stdout/journald — logging it verbatim would leak the credential. The
+    /// redaction is display-only; the un-redacted URL is retained in the pin
+    /// for connection setup.
     pub fn describe(&self) -> String {
+        let url = |u: &String| crate::slot::redact_url(u);
         match (&self.profile, &self.base_url) {
-            (Some(p), Some(u)) => format!("{p} ({u})"),
+            (Some(p), Some(u)) => format!("{p} ({})", url(u)),
             (Some(p), None) => format!("{p} (no baseUrl recorded)"),
-            (None, Some(u)) => format!("CAMUNDA_* env ({u})"),
+            (None, Some(u)) => format!("CAMUNDA_* env ({})", url(u)),
             (None, None) => "CAMUNDA_* env (no baseUrl recorded)".to_string(),
         }
     }
@@ -113,13 +121,23 @@ fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
 /// Persist the pin, preserving any other fields already in the file. The state
 /// home is created owner-only if needed; the file is written `0600` because it
 /// names the engine the fleet talks to.
+///
+/// The write is **atomic**: the new state goes to a `0600` temporary file in the
+/// same directory, is flushed + `fsync`ed, then `rename(2)`d over
+/// `supervisor.json`. A plain `std::fs::write` truncates the live file in place,
+/// so a crash, cancellation, or short write could leave malformed JSON behind —
+/// and because a corrupt pin deliberately fails closed (issue #41), that would
+/// wedge every later worker start until manual repair. The rename is atomic, so
+/// a concurrent reader sees either the old pin or the new one, never a torn
+/// half-write. Permission-setting failures are propagated, not ignored.
 fn write(state_home: &Path, pin: &ConnectionPin) -> Result<()> {
     std::fs::create_dir_all(state_home)
         .with_context(|| format!("creating state home {}", state_home.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(state_home, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(state_home, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting state home {}", state_home.display()))?;
     }
     let path = state_file(state_home);
     // Preserve the Node supervisor's own fields on rewrite — but fail closed on
@@ -129,19 +147,139 @@ fn write(state_home: &Path, pin: &ConnectionPin) -> Result<()> {
     let mut state: SupervisorState = read_state(state_home)?.unwrap_or_default();
     state.connection = Some(pin.clone());
     let json = serde_json::to_string_pretty(&state).context("serializing supervisor.json")?;
-    std::fs::write(&path, format!("{json}\n"))
-        .with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(&path, format!("{json}\n").as_bytes())
+}
+
+/// Write `bytes` to `path` atomically and owner-only: create a `0600` temp file
+/// in the same directory, flush + `fsync` it, then `rename` it over `path`. The
+/// temp file is unlinked on any failure so a crash never leaves a stray
+/// `*.tmp` beside the state file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let dir = path.parent().context("state file has no parent directory")?;
+    // A unique temp name: pid + a process-local counter disambiguate concurrent
+    // writers and repeated writes within one process (the cross-process pin
+    // lock serializes pin writers anyway, but the state file is also rewritten
+    // outside that lock by the Node supervisor's own updates, so never collide
+    // on a fixed name). `create_new` would otherwise fail a second write that
+    // reused a name a prior crash left behind.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("supervisor.json"),
+        std::process::id(),
+        seq
+    ));
+    // Remove any stale temp file of this exact name (e.g. left by a killed
+    // process that got the same pid) so `create_new` below cannot trip on it.
+    let _ = std::fs::remove_file(&tmp);
+    let write_result = (|| -> Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating temporary state file {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing temporary state file {}", tmp.display()))?;
+        // Flush + fsync so the renamed file is durable, not a torn page.
+        f.sync_all()
+            .with_context(|| format!("syncing temporary state file {}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!("renaming {} over {}", tmp.display(), path.display())
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Never leave a stray temp file behind on failure.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result?;
+    // `create_new` + `mode(0o600)` already made the temp file owner-only, and
+    // the rename preserves that. Re-assert it so a pre-existing `path` with
+    // looser permissions (left by an older version) is tightened too — and
+    // propagate a failure rather than ignoring it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
     }
     Ok(())
 }
 
+/// An interprocess (advisory `flock`) lock serializing the pin's
+/// read/resolve/write across every `work`/`daemon` process that shares a state
+/// home. Without it, two concurrent first starts on a fresh home could both
+/// read "no pin", resolve different profiles, and overwrite each other's
+/// `supervisor.json` — then keep running connected to different engines, the
+/// exact split-fleet condition the pin exists to prevent (issue #41). The lock
+/// is held from the first read to the final write, so exactly one process pins
+/// and the rest follow the pin they read while holding it.
+///
+/// Unix-only: on non-Unix hosts there is no `flock`, so this is a best-effort
+/// no-op (the race window remains, as it did before this hardening). The lock
+/// file itself is never deleted — it is a stable inode every process agrees on;
+/// the lock is released simply by dropping the file handle.
+struct PinLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl PinLock {
+    fn acquire(state_home: &Path) -> Result<PinLock> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            std::fs::create_dir_all(state_home)
+                .with_context(|| format!("creating state home {}", state_home.display()))?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                // The lock file is a pure lock token — its content is never
+                // read or written, only the flock on its inode matters. State
+                // the truncation intent explicitly (clippy::suspicious_open_options).
+                .truncate(false)
+                .open(state_home.join(".pin.lock"))
+                .with_context(|| {
+                    format!("opening the connection-pin lock in {}", state_home.display())
+                })?;
+            // LOCK_EX blocks until every other holder releases; the fd's Drop
+            // (or process exit) releases it, so a crash can never wedge the
+            // home. This is an advisory lock — it serializes only the processes
+            // that take it, which is every supervisor/worker start on the home.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "locking the connection-pin lock in {}",
+                        state_home.display()
+                    )
+                });
+            }
+            Ok(PinLock { _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = state_home;
+            Ok(PinLock {})
+        }
+    }
+}
+
 /// The outcome of resolving the connection for this start.
 pub struct PinDecision {
-    /// The pin this start will run with (read from disk or just written).
+    /// The pin this start will run with (read from disk or just written). Its
+    /// `base_url` is the URL the client actually connects to: for an existing
+    /// env-only pin it is the *stored* fingerprint (enforced), and for a
+    /// profile pin / fresh pin it is the currently resolved URL.
     pub pin: ConnectionPin,
     /// The fully resolved profile for the pin, when it names one — already
     /// loaded once, so the caller does not re-resolve it.
@@ -151,6 +289,15 @@ pub struct PinDecision {
     /// The session's current active profile at resolve time, for drift
     /// warnings. `None` when no session names one.
     pub active_profile: Option<String>,
+    /// The baseUrl fingerprint **stored on disk** in the pre-existing pin, when
+    /// this start followed one (`created == false`). Kept separate from
+    /// `pin.base_url` so the profile-URL drift check compares the *recorded*
+    /// fingerprint against what the pinned profile resolves to NOW — for a
+    /// profile pin `pin.base_url` is rebuilt from the profile's current value,
+    /// so without this the check would compare the current URL with itself and
+    /// a re-pointed profile (engine A → B under the same name) would warn about
+    /// nothing.
+    pub stored_base_url: Option<String>,
 }
 
 /// Resolve the connection for this start, honouring and maintaining the pin:
@@ -163,6 +310,14 @@ pub struct PinDecision {
 /// * With no pin and no explicit flag, the active profile (or `CAMUNDA_*` env)
 ///   is resolved once and pinned for every later start.
 pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDecision> {
+    // Serialize the whole read/resolve/write across every `work`/`daemon`
+    // process sharing this state home. Two concurrent first starts on a fresh
+    // home could both observe "no pin", resolve different profiles, and
+    // overwrite each other's state — then keep running connected to different
+    // engines, precisely the split-fleet condition the pin exists to prevent
+    // (issue #41). Hold an interprocess lock from the first read to the final
+    // write so exactly one process pins and the rest follow the pin they read.
+    let _pin_lock = PinLock::acquire(state_home)?;
     let active_profile = profile::active_profile_name();
     let existing = read(state_home)?;
 
@@ -174,17 +329,29 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
     };
     let resolved = profile::resolve(name.as_deref())?;
     let mut base_url = profile::resolved_base_url(resolved.as_ref());
+    // The fingerprint recorded on disk by the pin this start followed (if any).
+    // Tracked separately from `base_url` so the profile-URL drift check can
+    // compare "what the pin recorded THEN" against "what the profile resolves
+    // to NOW" (see `PinDecision::stored_base_url`).
+    let mut stored_base_url: Option<String> = None;
     if !created {
-        // An env-only pin has no profile to re-resolve, so its baseUrl
-        // fingerprint is the RECORDED one: keep it stable across restarts.
-        // Re-reading the current `CAMUNDA_REST_ADDRESS` here would rewrite the
-        // pin to wherever the env drifted and the drift check below could
-        // never fire — the pin would ratify the very retarget it exists to
-        // catch.
-        if let (Some(pin), None) = (&existing, &resolved) {
-            if pin.base_url.is_some() {
-                base_url = pin.base_url.clone();
+        if let Some(pin) = &existing {
+            stored_base_url = pin.base_url.clone();
+            if resolved.is_none() {
+                // An env-only pin has no profile to re-resolve, so its baseUrl
+                // fingerprint is the RECORDED one: keep it stable across
+                // restarts (and ENFORCE it as the connection URL). Re-reading
+                // the current `CAMUNDA_REST_ADDRESS` here would rewrite the pin
+                // to wherever the env drifted and the drift check below could
+                // never fire — the pin would ratify the very retarget it exists
+                // to catch.
+                if pin.base_url.is_some() {
+                    base_url = pin.base_url.clone();
+                }
             }
+            // A profile pin leaves `base_url` as the profile's CURRENT resolved
+            // URL (the client connects there); the recorded fingerprint stays
+            // in `stored_base_url` purely for the drift comparison.
         }
     }
     let pin = ConnectionPin {
@@ -199,6 +366,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         profile: resolved,
         created,
         active_profile,
+        stored_base_url,
     })
 }
 
@@ -216,6 +384,9 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
 ///   connecting to the PINNED baseUrl (the fingerprint is enforced, not just
 ///   recorded) and warns.
 pub fn warn_if_drifted(decision: &PinDecision) {
+    // Every URL interpolated into a warning is redacted first: an engine URL
+    // may embed HTTP(S) userinfo, and these lines land on stdout/journald.
+    let redact = |u: &str| crate::slot::redact_url(u);
     if let (Some(pinned), Some(active)) = (&decision.pin.profile, &decision.active_profile) {
         if pinned != active {
             log(&format!(
@@ -227,32 +398,52 @@ pub fn warn_if_drifted(decision: &PinDecision) {
             ));
         }
     }
-    match (&decision.pin.profile, &decision.pin.base_url) {
-        // Profile pin: the fingerprint is compared against what the pinned
-        // profile resolves to NOW.
+    // The baseUrl drift check compares the fingerprint recorded on disk THEN
+    // (`stored_base_url`) against what the connection resolves to NOW — never
+    // `pin.base_url` against itself. For a profile pin `pin.base_url` was
+    // rebuilt from the profile's current value, so comparing it to `now` would
+    // always be equal and a re-pointed profile (engine A → B under one name)
+    // would warn about nothing; the stored fingerprint is the honest "then".
+    let then = if decision.created {
+        // A freshly created pin has no prior fingerprint to drift from.
+        None
+    } else {
+        decision.stored_base_url.as_deref()
+    };
+    match (&decision.pin.profile, then) {
+        // Profile pin: the recorded fingerprint is compared against what the
+        // pinned profile resolves to NOW (the client connects to the profile's
+        // CURRENT baseUrl and warns).
         (Some(_), Some(then)) => {
             if let Some(now) = profile::resolved_base_url(decision.profile.as_ref()) {
-                if *then != now {
+                if then != now {
                     log(&format!(
-                        "WARNING: the pinned profile resolves to {now} but the pin was taken \
-                         against {then} — the profile's baseUrl changed under the same name; \
-                         this supervisor connects to {now}"
+                        "WARNING: the pinned profile resolves to {} but the pin was taken \
+                         against {} — the profile's baseUrl changed under the same name; \
+                         this supervisor connects to {}",
+                        redact(&now),
+                        redact(then),
+                        redact(&now)
                     ));
                 }
             }
         }
-        // Env-only pin: the fingerprint is compared against the CURRENT
-        // environment, and the client build keeps following the PIN (see
-        // `engine::connect`'s `pinned_base_url`).
+        // Env-only pin: the recorded fingerprint is compared against the
+        // CURRENT environment, and the client build keeps following the PIN
+        // (see `engine::connect`'s `pinned_base_url`).
         (None, Some(then)) => {
             if let Some(now) = profile::resolved_base_url(None) {
-                if *then != now {
+                if then != now {
                     log(&format!(
-                        "WARNING: the CAMUNDA_* environment now points at {now} but this \
-                         supervisor's connection was pinned against {then} — the env drifted \
+                        "WARNING: the CAMUNDA_* environment now points at {} but this \
+                         supervisor's connection was pinned against {} — the env drifted \
                          after pinning; this supervisor keeps connecting to the PINNED engine \
-                         {then} (restart with a changed environment AND --profile, or delete \
-                         the pin in {}, to re-pin)",
+                         {}. To re-pin an env-only connection, delete the pin in {} and restart \
+                         with the intended CAMUNDA_* environment (an explicit --profile would \
+                         select a named c8ctl profile instead of the changed environment)",
+                        redact(&now),
+                        redact(then),
+                        redact(then),
                         state_file_display(decision)
                     ));
                 }
@@ -387,6 +578,109 @@ mod tests {
             .describe(),
             "CAMUNDA_* env (http://localhost:8080)"
         );
+    }
+
+    /// Issue #41: `describe()` feeds startup banners and drift warnings that
+    /// land on stdout/journald, so a baseUrl carrying HTTP(S) userinfo
+    /// (`https://user:secret@host`) must be redacted — never logged verbatim.
+    #[test]
+    fn describe_redacts_url_userinfo() {
+        let d = ConnectionPin {
+            profile: Some("merlin".into()),
+            base_url: Some("https://user:secret@m.example:8443".into()),
+        }
+        .describe();
+        assert_eq!(d, "merlin (https://m.example:8443)");
+        assert!(!d.contains("secret"), "describe leaked a credential: {d}");
+        // …and the env-only form redacts too.
+        let d = ConnectionPin {
+            profile: None,
+            base_url: Some("https://user:secret@m.example:8443".into()),
+        }
+        .describe();
+        assert_eq!(d, "CAMUNDA_* env (https://m.example:8443)");
+    }
+
+    /// Issue #41: the pin is persisted atomically — a crash mid-write must never
+    /// leave a torn `supervisor.json` (which would then fail closed on every
+    /// later start). The write goes through a temp file + rename, and the temp
+    /// file is cleaned up.
+    #[test]
+    fn write_is_atomic_and_leaves_no_temp_file() {
+        let home = temp_home("atomic");
+        write(
+            &home,
+            &ConnectionPin {
+                profile: Some("local".into()),
+                base_url: Some("http://localhost:8080".into()),
+            },
+        )
+        .unwrap();
+        // The state file is valid JSON with the pin…
+        let pin = read(&home).expect("read ok").expect("pin present");
+        assert_eq!(pin.profile.as_deref(), Some("local"));
+        // …and no stray temp file is left beside it.
+        let entries: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().all(|n| !n.ends_with(".tmp")),
+            "no temp file may survive the atomic write: {entries:?}"
+        );
+        // …and on Unix the state file is owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(state_file(&home)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "supervisor.json must be 0600");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41: for an existing PROFILE pin, the drift check must compare the
+    /// fingerprint recorded on disk THEN against what the profile resolves to
+    /// NOW. `pin.base_url` is rebuilt from the profile's current value, so the
+    /// recorded fingerprint is carried separately in `stored_base_url` —
+    /// otherwise a re-pointed profile (engine A → B under one name) would warn
+    /// about nothing.
+    #[test]
+    fn profile_pin_preserves_stored_fingerprint_for_drift() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("profiledrift");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_CONFIG_DIR", &c8ctl.to_string_lossy());
+        // A profile that initially points at engine A…
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        let first = resolve_or_pin(&home, None).expect("first start pins");
+        assert!(first.created);
+        assert_eq!(first.pin.base_url.as_deref(), Some("http://engine-a:8080"));
+        assert_eq!(first.stored_base_url, None, "a fresh pin has no prior fingerprint");
+
+        // …then the profile is re-pointed at engine B under the SAME name.
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-b:8080"}]}"#,
+        )
+        .unwrap();
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        assert!(!second.created);
+        // The client connects to the profile's CURRENT URL (engine B)…
+        assert_eq!(second.pin.base_url.as_deref(), Some("http://engine-b:8080"));
+        // …but the recorded fingerprint (engine A) is preserved separately so
+        // `warn_if_drifted` can compare A-vs-B instead of B-vs-B.
+        assert_eq!(
+            second.stored_base_url.as_deref(),
+            Some("http://engine-a:8080"),
+            "the stored fingerprint must survive so profile-URL drift is detectable"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Issue #41, the env-only gap: an env pin's baseUrl fingerprint must
