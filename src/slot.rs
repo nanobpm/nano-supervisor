@@ -550,11 +550,17 @@ pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
 /// `anchor` must be an ancestor of `dir` (or equal to it); components at or
 /// above `anchor` are trusted and skipped. A non-existent component is skipped:
 /// `create_dir_all` materialises it as a fresh real directory, not a link.
-/// Only the non-Unix fallback (and the tests exercising the rejection) use this
-/// now: on Unix the worker-namespace bootstrap materialises the root via the
-/// component-wise pinned `open_or_create_root_nofollow` instead, which closes
-/// the check→create race rather than merely re-checking after it.
-#[cfg(any(not(unix), test))]
+/// Two path-based fallbacks use this (and the tests exercising the rejection):
+/// the non-Unix run-dir bootstrap, and the non-Linux agent-`c8ctl`-seed
+/// fallback ([`create_agent_c8ctl_dir_path_based`], reached on macOS where the
+/// strict whole-chain no-follow open would reject legitimate platform symlinks
+/// like `/var` → `/private/var`). On Linux the worker-namespace bootstrap and
+/// the seed both materialise/pin no-follow (`open_or_create_root_nofollow` /
+/// `open_root_nofollow`) instead, closing the check→create race rather than
+/// merely re-checking after it — so this path-based check is compiled off there
+/// (outside tests). Gated `not(target_os = "linux")` (not `not(unix)`) so the
+/// macOS seed fallback can anchor its ancestor check at the trusted runs root.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn reject_symlinked_ancestors_below(dir: &Path, anchor: &Path) -> Result<()> {
     // Walk dir's ancestors from the leaf up to (but not past) `anchor`, stopping
     // before the anchor's own (trusted) ancestors. The anchor itself is trusted:
@@ -2429,7 +2435,7 @@ fn create_agent_c8ctl_dir(
     // path-based fallback, which still fails closed on a symlinked `c8ctl` leaf.
     #[cfg(not(target_os = "linux"))]
     {
-        create_agent_c8ctl_dir_path_based(&dir, profile)?;
+        create_agent_c8ctl_dir_path_based(run_dir, &dir, profile)?;
         Ok(dir)
     }
 }
@@ -2471,11 +2477,30 @@ fn create_agent_c8ctl_dir_pinned(
 /// the seed files. This cannot fully close the TOCTOU window — hence the pinned
 /// path above — but is the best available guarantee where `openat2` is
 /// unavailable, and still fails closed on a symlinked `c8ctl` leaf.
+///
+/// Also rejects a symlinked **ancestor** below the trusted runs root (the run
+/// dir itself): `reject_symlink(dir)` only inspects the final `c8ctl` leaf after
+/// the OS has already resolved its ancestors, so a same-UID sibling that swaps
+/// the prepared `run_dir` for a symlink to (e.g.) the parent of the operator's
+/// real `c8ctl` config would have `dir` resolve onto that config — and the
+/// `remove_dir_all(dir)` below would then delete/reseed it, the exact write this
+/// quarantine exists to prevent. `run_dir` is the no-follow-prepared,
+/// 0700-owned anchor; its parent (the runs root) and above — including macOS
+/// platform links like `/var` — stay trusted, so we only reject links in the
+/// operator-plantable tail beneath the runs root. Mirrors the
+/// before-*and*-after-the-non-atomic-mutation re-check in
+/// [`prepare_run_dir_path_based`].
 #[cfg(any(not(target_os = "linux"), test))]
 fn create_agent_c8ctl_dir_path_based(
+    run_dir: &Path,
     dir: &Path,
     profile: Option<&crate::profile::Profile>,
 ) -> Result<()> {
+    // The runs root (run_dir's parent) and above are trusted; validate the tail
+    // beneath it so a swapped run-dir ancestor cannot redirect the wipe/create.
+    let runs_root = run_dir.parent().unwrap_or(run_dir);
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors_below(dir, runs_root)?;
     reject_symlink(dir)?;
     // Wipe any pre-existing `c8ctl` entry before (re)creating it, so a planted
     // child — e.g. a `session.json` symlink left inside an existing regular
@@ -2501,6 +2526,11 @@ fn create_agent_c8ctl_dir_path_based(
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating the agent's c8ctl config dir {}", dir.display()))?;
+    // Re-validate the whole tail after the non-atomic remove+create: a sibling
+    // could have swapped the run dir (or the fresh leaf) for a symlink in the
+    // window between the checks above and the create.
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors_below(dir, runs_root)?;
     reject_symlink(dir)?;
     #[cfg(unix)]
     {
@@ -2917,13 +2947,55 @@ mod tests {
         // A stale/planted child from a previous (or hostile) occupant.
         std::fs::write(dir.join("session.json"), "{\"activeProfile\":\"operator\"}").unwrap();
         // No profile: the fallback must still clear the directory.
-        create_agent_c8ctl_dir_path_based(&dir, None).unwrap();
+        create_agent_c8ctl_dir_path_based(&run, &dir, None).unwrap();
         assert!(
             !dir.join("session.json").exists(),
             "the path-based fallback must wipe a planted session.json even with no profile"
         );
         assert!(dir.is_dir(), "the c8ctl dir must be recreated");
         let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, swapped-ancestor defence (review 5422432257): the path-based
+    /// fallback's `reject_symlink(dir)` inspects only the final `c8ctl` leaf —
+    /// *after* the OS has resolved its ancestors. A same-UID sibling that swaps
+    /// the prepared run dir for a symlink to the parent of the operator's real
+    /// `c8ctl` config makes `dir` resolve onto that config, and the fallback's
+    /// `remove_dir_all(dir)` would then delete it — the exact write this
+    /// quarantine prevents. The ancestor check anchored at the trusted runs root
+    /// must FAIL CLOSED on the symlinked run dir and leave the operator's config
+    /// untouched.
+    #[cfg(unix)]
+    #[test]
+    fn path_based_seed_fails_closed_on_a_symlinked_run_dir_ancestor() {
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-ancestor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let runs_root = base.join("runs");
+        std::fs::create_dir_all(&runs_root).unwrap();
+        // The operator's real c8ctl config, with a sentinel the seed must not
+        // delete. `operator` stands in for the parent the attacker links at.
+        let operator = base.join("operator");
+        let operator_c8ctl = operator.join("c8ctl");
+        std::fs::create_dir_all(&operator_c8ctl).unwrap();
+        std::fs::write(operator_c8ctl.join("session.json"), "OPERATOR").unwrap();
+        // Attacker swaps the prepared run dir for a symlink to `operator`, so
+        // `run_dir/c8ctl` resolves onto the operator's real config dir.
+        let run_dir = runs_root.join("job-1");
+        std::os::unix::fs::symlink(&operator, &run_dir).unwrap();
+        let dir = run_dir.join("c8ctl");
+        let err = create_agent_c8ctl_dir_path_based(&run_dir, &dir, None)
+            .expect_err("a symlinked run-dir ancestor must be refused, not followed");
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected a symlink rejection, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(operator_c8ctl.join("session.json")).unwrap(),
+            "OPERATOR",
+            "the operator's real c8ctl config must never be deleted/reseeded"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Issue #41, hard-link defence: `seed_c8ctl_dir` creates each seed file
