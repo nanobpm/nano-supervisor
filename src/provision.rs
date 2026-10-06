@@ -822,6 +822,18 @@ pub struct GitResult {
     /// as "empty" and its retry would wipe the only copy. Feeds the caller's
     /// `has_commits`/empty detection.
     pub work_found: bool,
+    /// Set when finalize proved the repository is still in the UNBORN/no-ref
+    /// state it was provisioned in (`start_sha` was `None` and HEAD still
+    /// resolves to no commit): the agent created no commit anywhere, so the
+    /// run dir holds NO agent work. Distinct from `retain` (an incomplete or
+    /// stranded scan): the empty-scan retain that accompanies this state is
+    /// only the fail-closed "cannot prove completeness" guard for a repo with
+    /// no anchor — NOT evidence a commit exists — so the caller must NOT let
+    /// it count as `has_commits` for the empty-result check (a quiet no-op
+    /// agent on an unborn base would otherwise bypass the empty-result failure
+    /// contract). Reaping is unaffected: `retain` still keeps the dir, and the
+    /// stale-run sweep ages it out.
+    pub unborn_no_ref: bool,
 }
 
 /// Longest segment `sanitize_branch_segment` leaves in a composed fallback ref.
@@ -1251,6 +1263,7 @@ pub async fn finalize_git(
         pr: None,
         retain: false,
         work_found: false,
+        unborn_no_ref: false,
     };
 
     // Commit discovery is anchored to the PREPARED work branch, not to wherever
@@ -1478,7 +1491,29 @@ pub async fn finalize_git(
                          the empty list",
                     );
                     out.retain = true;
-                    return out;
+                    // An unborn/empty base LEGITIMATELY has no `refs/heads/`
+                    // branches (a symbolic HEAD with no commit creates none),
+                    // so the empty parse is the expected no-ref state there,
+                    // not an inconclusive scan. The detached-HEAD reflog and
+                    // non-head-ref nets below still run (they catch any commit
+                    // the agent DID make off-branch), but the push block is
+                    // unreachable — `branch_tip` is `None` on an unborn base,
+                    // so `commits` is empty and the push is refused under
+                    // `retain` regardless. Return early only when the nets also
+                    // prove the repo is still unborn (no commit anywhere);
+                    // otherwise fall through so the nets can flag stranded work.
+                    if prep.start_sha.is_none() && !out.work_found && out.commits.is_empty() {
+                        mark_unborn_no_ref(&mut out, prep, workspace, timeout).await;
+                        if out.unborn_no_ref {
+                            return out;
+                        }
+                        // Not provably unborn (HEAD now resolves, or the probe
+                        // failed): fall through so the reflog/non-head nets can
+                        // classify whatever appeared.
+                        out.retain = false;
+                    } else {
+                        return out;
+                    }
                 }
                 // Bound the per-branch reachability scan even when the listing
                 // IS complete: each branch costs serial `rev-parse`/`rev-list`
@@ -1709,22 +1744,35 @@ pub async fn finalize_git(
         .await
         {
             Ok(entries) => {
+                // De-duplicate with a HashSet and stop as soon as the distinct
+                // count EXCEEDS the scan cap: the reflog is agent-controlled,
+                // so a linear `Vec` membership probe per line is quadratic in
+                // the reflog length and would burn CPU for the whole capture
+                // before the `MAX_REFLOG_SCAN` guard ever fired — defeating the
+                // CPU bound the cap exists to enforce. Iterating the positions
+                // in their original (newest-first) order preserves the scan
+                // order the loop below had when `distinct` was a Vec.
+                let mut seen = std::collections::HashSet::new();
                 let mut distinct: Vec<String> = Vec::new();
+                let mut unbounded = false;
                 for h in entries.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    if !distinct.iter().any(|t| t == h) {
+                    if seen.insert(h.to_string()) {
                         distinct.push(h.to_string());
+                        if distinct.len() > MAX_REFLOG_SCAN {
+                            unbounded = true;
+                            break;
+                        }
                     }
                 }
-                if distinct.len() > MAX_REFLOG_SCAN {
+                if unbounded {
                     log(&format!(
-                        "finalize: HEAD reflog has {} distinct positions (> {MAX_REFLOG_SCAN}); \
-                         treating the detached-commit scan as unbounded and retaining the run dir \
-                         rather than sweeping an agent-controlled reflog",
-                        distinct.len()
+                        "finalize: HEAD reflog has more than {MAX_REFLOG_SCAN} distinct \
+                         positions; treating the detached-commit scan as unbounded and retaining \
+                         the run dir rather than sweeping an agent-controlled reflog"
                     ));
                     out.retain = true;
                 } else if let Some(start) = &prep.start_sha {
-                    if !distinct.iter().any(|h| h == start) {
+                    if !seen.contains(start.as_str()) {
                         log(&format!(
                             "finalize: HEAD reflog no longer contains the provision-time HEAD \
                              {start} (expired/rewritten); treating the detached-commit scan as \
@@ -1832,6 +1880,12 @@ pub async fn finalize_git(
         // works on older git too. `git_untruncated` fails closed if the listing
         // overflows the capture cap.
         let mut candidates: Vec<String> = Vec::new();
+        // HashSet membership for the candidate de-dup below: the ref set is
+        // agent-controlled, so a linear `Vec` probe per line is quadratic in
+        // the ref count and would burn CPU for the whole capture before the
+        // `MAX_REFLOG_SCAN` guard ever fired. `candidates` keeps insertion
+        // order for the classification loop; `seen` makes membership O(1).
+        let mut seen_candidates = std::collections::HashSet::new();
         match git_untruncated(
             &[
                 "for-each-ref".into(),
@@ -1856,7 +1910,7 @@ pub async fn finalize_git(
                     let direct = parts.next().unwrap_or("");
                     let peeled = parts.next().unwrap_or("");
                     let sha = if !peeled.is_empty() { peeled } else { direct };
-                    if !sha.is_empty() && !candidates.iter().any(|c| c == sha) {
+                    if !sha.is_empty() && seen_candidates.insert(sha.to_string()) {
                         candidates.push(sha.to_string());
                     }
                 }
@@ -1903,7 +1957,10 @@ pub async fn finalize_git(
                 {
                     Ok(list) => {
                         for h in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                            if !candidates.iter().any(|c| c == h) {
+                            // Same O(1)-membership guard as the `for-each-ref`
+                            // dedup above: the stash reflog is agent-controlled,
+                            // so a linear `Vec` probe per entry is quadratic.
+                            if seen_candidates.insert(h.to_string()) {
                                 candidates.push(h.to_string());
                             }
                         }
@@ -2128,7 +2185,163 @@ pub async fn finalize_git(
             }
         }
     }
+
+    // UNBORN/NO-REF verdict (see the helper): a proven-still-unborn run's
+    // `retain` is only the fail-closed guard of a repo with no anchor, not
+    // evidence a commit exists — mark it so the caller's empty-result check
+    // does not read that retain as `has_commits`.
+    mark_unborn_no_ref(&mut out, prep, workspace, timeout).await;
     out
+}
+
+/// Set [`GitResult::unborn_no_ref`] when finalize PROVED the repository is
+/// still in the unborn/no-ref state it was provisioned in: the base was empty
+/// (`start_sha` is `None`), every scan found nothing (`commits` empty,
+/// `work_found` clear), and HEAD STILL resolves to no commit. Every
+/// commit-carrying path in `finalize_git` (work branch, side branch, detached
+/// HEAD, stash/tag/remote-ref) sets `commits` or `work_found` when it finds
+/// one, so all three conditions together prove the agent created no commit
+/// anywhere. The `retain` such a run carries comes only from the fail-closed
+/// empty-scan guards (an unborn repo has no anchor, so the nets cannot PROVE
+/// completeness) — it is not evidence a commit exists. The caller must not let
+/// that retain count as `has_commits` for the empty-result check (a quiet
+/// no-op agent on an unborn base would otherwise bypass the empty-result
+/// failure contract).
+///
+/// The probe uses `--verify --quiet`: a bare `rev-parse --verify HEAD` exits
+/// 128 on an unborn HEAD, which `git()` surfaces as Err — indistinguishable
+/// from a real scan failure. `--quiet` downgrades "no such ref" to exit 1 with
+/// no stderr, so `Ok("")` is the definitive no-ref answer and `Err` is a
+/// genuine failure. A read failure leaves `unborn_no_ref` false (the
+/// conservative "may hold work" default).
+async fn mark_unborn_no_ref(
+    out: &mut GitResult,
+    prep: &GitPrep,
+    workspace: &CwdHandle,
+    timeout: Duration,
+) {
+    if !(prep.start_sha.is_none() && !out.work_found && out.commits.is_empty()) {
+        return;
+    }
+    // `git rev-parse --verify --quiet HEAD` exits 0 with the SHA when HEAD
+    // resolves, 1 with empty stdout on an unborn HEAD (the expected no-ref
+    // state), and 128 on a real error. `git()` maps ALL nonzero exits to Err,
+    // which would conflate the legitimate unborn state (1) with a scan failure
+    // (128), so read the RAW exit status: only the definitive `1` + empty
+    // stdout proves "no commit anywhere". `0` (a commit exists) and any other
+    // outcome leave `unborn_no_ref` false — the conservative "may hold work"
+    // default.
+    let status = git_raw_status(
+        &[
+            "rev-parse".into(),
+            "--verify".into(),
+            "--quiet".into(),
+            "HEAD".into(),
+        ],
+        Some(workspace),
+        timeout,
+    )
+    .await;
+    if status == Some(1) {
+        log(
+            "finalize: repository is still unborn (no commit on any ref) — the run made no \
+             commits; the retained run dir holds no agent work",
+        );
+        out.unborn_no_ref = true;
+    }
+}
+
+/// Run git and return its RAW exit code (`Some(0)`/`Some(1)`/…), or `None` on
+/// a spawn/wait/timeout failure. Unlike [`git`], a nonzero exit is NOT an
+/// error — needed by probes like `rev-parse --verify --quiet`, whose exit `1`
+/// is the definitive "no such ref" answer, not a failure. Stdout/stderr are
+/// drained (bounded) so the child never blocks, but discarded: the caller
+/// wants only the status. Same cwd-pinning, env-scrubbing, timeout, and
+/// process-group cleanup as [`git_with_env_capture`].
+async fn git_raw_status(
+    args: &[String],
+    cwd: Option<&CwdHandle>,
+    timeout: Duration,
+) -> Option<i32> {
+    use std::process::Stdio;
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    cmd.kill_on_drop(true);
+    if let Some(dir) = cwd {
+        dir.apply(&mut cmd).ok()?;
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    for k in crate::slot::SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+    for k in GIT_CONFIG_INJECTION_ENV {
+        cmd.env_remove(k);
+    }
+    for (k, _) in std::env::vars_os() {
+        if k.to_str()
+            .is_some_and(|s| s.starts_with("GIT_CONFIG_KEY_") || s.starts_with("GIT_CONFIG_VALUE_"))
+        {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(unix)]
+    crate::pdeath::arm(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    #[cfg(unix)]
+    let gpid = child.id();
+    #[cfg(unix)]
+    if let Some(pid) = gpid {
+        crate::pdeath::watch(pid);
+    }
+    #[cfg(unix)]
+    let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let wait = async {
+        let drain_err = async {
+            match stderr {
+                Some(e) => drain_capped(e, GIT_STDERR_TAIL).await.0,
+                None => Vec::new(),
+            }
+        };
+        let drain_out = async {
+            match stdout {
+                Some(o) => drain_capped(o, GIT_STDOUT_TAIL).await,
+                None => (Vec::new(), false),
+            }
+        };
+        let (status, _err, _out) = tokio::join!(child.wait(), drain_err, drain_out);
+        status
+    };
+    let status = match tokio::time::timeout(timeout, wait).await {
+        Ok(res) => {
+            #[cfg(unix)]
+            {
+                crate::pdeath::terminate_group_and_reap(&mut child, gpid, Duration::from_secs(3))
+                    .await;
+                group_guard.disarm();
+            }
+            res.ok()?.code()
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = gpid {
+                if crate::pdeath::group_alive(pid) {
+                    crate::pdeath::sigkill_group(pid);
+                }
+            }
+            #[cfg(unix)]
+            group_guard.disarm();
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            None
+        }
+    };
+    status
 }
 
 /// A clean, self-contained git administrative context for the credentialed
@@ -5133,6 +5346,191 @@ mod tests {
         assert!(
             res.retain,
             "a stranded detached-HEAD commit on an empty base must flag retain via the reflog net"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_marks_still_unborn_repo_no_ref() {
+        // Regression for the slot-side empty-result bypass: on an unborn base
+        // where the agent made NO commit, the empty-scan guards retain
+        // (fail closed — they cannot prove completeness with no anchor), but
+        // finalize must ALSO mark the proven-unborn verdict so the caller does
+        // not read that retain as evidence a commit exists (which would let a
+        // quiet no-op agent bypass the empty-result failure contract).
+        let dir = empty_base_workspace("unborn-noop").await;
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        assert!(
+            res.unborn_no_ref,
+            "a no-op run on an unborn base must be marked unborn_no_ref (retain={}, work_found={}, commits={:?})",
+            res.retain,
+            res.work_found,
+            res.commits
+        );
+        assert!(
+            !res.work_found && res.commits.is_empty(),
+            "a no-op run reports no work and no commits (work_found={}, commits={:?})",
+            res.work_found,
+            res.commits
+        );
+        assert!(
+            !res.pushed,
+            "nothing was created, so nothing can have been pushed"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_mark_unborn_no_ref_when_agent_committed() {
+        // Companion: on an unborn base where the agent DID commit on the work
+        // branch, the verdict must stay clear — the run holds real work.
+        let dir = empty_base_workspace("unborn-commit").await;
+        git(
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "first work").await;
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        assert!(
+            !res.unborn_no_ref,
+            "a committing run on an unborn base must NOT be marked unborn_no_ref"
+        );
+        assert_eq!(res.commits.len(), 1, "the first commit is enumerated");
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_mark_unborn_no_ref_for_stranded_work_on_empty_base() {
+        // Companion: a stranded side-branch commit on an unborn base sets
+        // `work_found` (and `retain`), so the proven-unborn verdict must stay
+        // clear — the run dir holds the only copy of real work.
+        let dir = empty_base_workspace("unborn-side").await;
+        git(
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "work commit").await;
+        git(
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/side".into(),
+                "--".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "stranded side commit").await;
+        git(
+            &["checkout".into(), "feat/work".into(), "--".into()],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        assert!(
+            res.retain && res.work_found,
+            "stranded side-branch work flags retain+work_found (retain={}, work_found={})",
+            res.retain,
+            res.work_found
+        );
+        assert!(
+            !res.unborn_no_ref,
+            "stranded work must NOT be marked unborn_no_ref (the dir holds the only copy)"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_reflog_scan_breaks_at_cap_without_quadratic_dedup() {
+        // Regression for the quadratic de-dup: the HEAD-reflog net must stop
+        // de-duplicating as soon as the distinct count exceeds
+        // `MAX_REFLOG_SCAN` (O(1) HashSet membership, early break), failing
+        // closed as unbounded — not linear-probe a `Vec` for every one of an
+        // agent-controlled reflog's lines before the cap guard fires.
+        let dir = git_workspace("reflog-cap").await; // checkout on `main`, one commit
+        let start = git(
+            &["rev-parse".into(), "HEAD".into()],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        // Inflate the HEAD reflog past the cap with distinct positions. Each
+        // `--allow-empty` commit + reset pair appends two DISTINCT SHAs, so
+        // MAX_REFLOG_SCAN/2 iterations already overflow it.
+        for i in 0..(MAX_REFLOG_SCAN / 2 + 4) {
+            commit(&dir, &format!("churn {i}")).await;
+            git(
+                &["reset".into(), "--hard".into(), start.clone()],
+                Some(&dir),
+                Duration::from_secs(30),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let prep = GitPrep {
+            working_branch: Some("main".into()),
+            want_push: false,
+            start_sha: Some(start.clone()),
+            provision_tips: Some(std::collections::BTreeMap::from([(
+                "main".to_string(),
+                start.clone(),
+            )])),
+            provision_shas: Some(std::collections::BTreeSet::from([start])),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(60)).await;
+        assert!(
+            res.retain,
+            "a HEAD reflog past the distinct-position cap must fail closed as unbounded"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }

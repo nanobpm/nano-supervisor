@@ -1811,11 +1811,25 @@ fn detect_commits(before: Option<&str>, after: Option<&str>, provisioned: bool) 
 /// destroying the very work `retain`/`work_found` was protecting (e.g. finalize
 /// returns `retain=true, commits=[], work_found=false` after an inconclusive
 /// branch/reflog scan).
+///
+/// EXCEPTION — `unborn_no_ref`: finalize PROVED the repository is still in the
+/// unborn/no-ref state it was provisioned in (no commit on any ref), so the
+/// run dir holds no agent work and the `retain` it carries is only the
+/// fail-closed "cannot prove completeness" guard of a repo with no anchor —
+/// not evidence a commit exists. Letting that retain count as commits would
+/// turn a quiet no-op agent on an empty base into `has_commits = true` and
+/// bypass the empty-result failure contract, so the unborn verdict disregards
+/// `retain` here. Reaping is unaffected (`retain` still keeps the dir; the
+/// stale-run sweep ages it out).
 fn retained_result_counts_as_commits(
     retain: bool,
     work_found: bool,
+    unborn_no_ref: bool,
     head_has_commits: bool,
 ) -> bool {
+    if unborn_no_ref {
+        return head_has_commits;
+    }
     retain || work_found || head_has_commits
 }
 
@@ -2147,6 +2161,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // the empty-job detector would fail the run as "empty", its retry wiping the
     // job-keyed dir that holds the only copy. Treat `work_found` as commits.
     let work_found = git_result.as_ref().is_some_and(|g| g.work_found);
+    // Finalize's PROVEN-unborn verdict: the repo is still in the empty/no-ref
+    // state it was provisioned in, so the run dir holds no agent work and the
+    // `retain` accompanying it is only the fail-closed "cannot prove
+    // completeness" guard of a repo with no anchor — not evidence a commit
+    // exists. The empty-result check must disregard that retain (a quiet no-op
+    // agent on an unborn base must still fail as empty); reaping still honours
+    // `retain` itself below.
+    let unborn_no_ref = git_result.as_ref().is_some_and(|g| g.unborn_no_ref);
     // The post-run HEAD probe is best-effort too: dup the pinned handle
     // fallibly so a dup failure (EMFILE) reads as `None` ("HEAD unreadable"),
     // not a `Clone` panic — mirroring `start_head` above.
@@ -2165,10 +2187,13 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // failing it there would retry the job, and the retry wipes the
             // job-keyed run dir — destroying the very work `retain` was protecting
             // (e.g. finalize returns `retain=true, commits=[], work_found=false`
-            // after a branch/reflog scan failed inconclusively).
+            // after a branch/reflog scan failed inconclusively). The exception is
+            // `unborn_no_ref`: finalize PROVED the repo still has no commit
+            // anywhere, so its retain is no evidence of work (see the helper).
             retained_result_counts_as_commits(
                 retain,
                 work_found,
+                unborn_no_ref,
                 detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned),
             )
         }
@@ -4425,13 +4450,32 @@ mod tests {
         // mean the run dir may hold the ONLY copy of agent work. Either flag alone
         // MUST make the run count as having commits so it is never failed as empty
         // and retried (the retry wipes the job-keyed run dir).
-        assert!(retained_result_counts_as_commits(true, false, false));
-        assert!(retained_result_counts_as_commits(false, true, false));
+        assert!(retained_result_counts_as_commits(true, false, false, false));
+        assert!(retained_result_counts_as_commits(false, true, false, false));
         // A genuinely empty run — no retain, no stranded work, HEAD unmoved — is
         // still correctly "no commits" so the empty detector can fail it.
-        assert!(!retained_result_counts_as_commits(false, false, false));
+        assert!(!retained_result_counts_as_commits(
+            false, false, false, false
+        ));
         // A moved HEAD counts regardless of the finalize flags.
-        assert!(retained_result_counts_as_commits(false, false, true));
+        assert!(retained_result_counts_as_commits(false, false, false, true));
+    }
+
+    #[test]
+    fn unborn_no_ref_retain_does_not_count_as_commits() {
+        // Regression for the unborn-repo bypass: on an empty/unborn base the
+        // empty-scan guards set `retain` (fail closed — they cannot PROVE
+        // completeness with no anchor), but finalize also PROVED no commit
+        // exists anywhere (`unborn_no_ref`). That retain is not evidence of
+        // work, so a quiet no-op agent must NOT count as having commits — it
+        // would otherwise bypass the empty-result failure contract.
+        assert!(!retained_result_counts_as_commits(true, false, true, false));
+        // The unborn verdict disregards only `retain`: a moved HEAD (the agent
+        // DID commit) still counts.
+        assert!(retained_result_counts_as_commits(true, false, true, true));
+        // Without the unborn verdict the same retain still counts (the scan was
+        // merely inconclusive, so the dir may hold the only copy of work).
+        assert!(retained_result_counts_as_commits(true, false, false, false));
     }
 
     #[test]
