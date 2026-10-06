@@ -108,6 +108,11 @@ pub fn state_file(state_home: &Path) -> PathBuf {
 /// profile and recreate the exact fleet-retargeting incident this pin exists to
 /// prevent (issue #41). The operator must repair or deliberately delete the
 /// file to re-pin.
+///
+/// Production code goes through [`resolve_or_pin`] (which reads [`read_state`]
+/// directly so it can tell a present-but-pinless file from an absent one); this
+/// thin accessor is retained for tests that only care about the pin value.
+#[cfg(test)]
 pub fn read(state_home: &Path) -> Result<Option<ConnectionPin>> {
     Ok(read_state(state_home)?.and_then(|s| s.connection))
 }
@@ -221,6 +226,23 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut f = opts
             .open(&tmp)
             .with_context(|| format!("creating temporary state file {}", tmp.display()))?;
+        // `OpenOptionsExt::mode(0o600)` above is filtered through the process
+        // umask, so a umask that strips the owner bits (e.g. 0o077/0o700) can
+        // create the temp file — and thus, after the rename, the live
+        // `connection.json` — as `000`. An unreadable pin fails closed (issue
+        // #41) and permanently wedges startup. `fchmod` the OPEN fd here, before
+        // writing/syncing/renaming: it is immune to umask, re-resolves no path
+        // (unlike a later path-based chmod, which TOCTOUs and only runs after
+        // the rename has already published the wrong mode), and the rename
+        // carries this exact mode onto `path` — mirroring the seed-file writer.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if unsafe { libc::fchmod(f.as_raw_fd(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("chmod 0600 temporary state file {}", tmp.display()));
+            }
+        }
         f.write_all(bytes)
             .with_context(|| format!("writing temporary state file {}", tmp.display()))?;
         // Flush + fsync so the renamed file is durable, not a torn page.
@@ -257,16 +279,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     write_result?;
-    // `create_new` + `mode(0o600)` already made the temp file owner-only, and
-    // the rename preserves that. Re-assert it so a pre-existing `path` with
-    // looser permissions (left by an older version) is tightened too — and
-    // propagate a failure rather than ignoring it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting {}", path.display()))?;
-    }
+    // The temp file was `fchmod`ed to 0600 on its open fd before the rename, and
+    // `rename(2)` carries that inode (mode included) onto `path`, replacing any
+    // pre-existing entry — so the live `connection.json` is already owner-only
+    // with no post-rename, path-based chmod window to leave it briefly readable
+    // or briefly `000`.
     Ok(())
 }
 
@@ -440,7 +457,34 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
     // write so exactly one process pins and the rest follow the pin they read.
     let _pin_lock = PinLock::acquire(state_home)?;
     let active_profile = profile::active_profile_name();
-    let existing = read(state_home)?;
+    // Read the raw state so we can tell "file absent" (genuinely unpinned) from
+    // "file present but carries no usable connection pin". `read` collapses both
+    // to `None` via `and_then(|s| s.connection)`, which is the fail-open hole
+    // below.
+    let state = read_state(state_home)?;
+    let file_present = state.is_some();
+    let existing = state.and_then(|s| s.connection);
+
+    // Fail CLOSED on a `connection.json` that EXISTS but yields no connection
+    // pin — a missing or null `connection` field (`{}`, `{"connection":null}`,
+    // or a file holding only forward-compat keys). `read`'s `and_then` collapses
+    // that to `None`, indistinguishable from a genuinely ABSENT file, so the
+    // `(None, None)` arm below would treat the home as a FIRST start, re-resolve
+    // the mutable ambient profile, and overwrite the file — the exact fail-open
+    // retargeting this feature exists to prevent (issue #41). This is the
+    // sibling of the fingerprint-less check just after the match (a present
+    // `connection` whose `baseUrl` is absent): together they make EVERY present
+    // state file that cannot produce an enforceable pin fail closed. An explicit
+    // `--profile` is the operator deliberately re-pinning, so it still repairs a
+    // present-but-empty file rather than being blocked.
+    if file_present && existing.is_none() && explicit.is_none() {
+        anyhow::bail!(
+            "connection.json exists but carries no connection pin (its `connection` \
+             field is missing or null), so it cannot be enforced and would fall back \
+             to resolving the mutable ambient profile — silently retargetable. \
+             Repair the pin in connection.json, or re-pin with --profile (issue #41)."
+        );
+    }
 
     // Choose the profile NAME this start connects with, then resolve it once.
     let (name, created) = match (explicit, &existing) {
@@ -872,6 +916,97 @@ mod tests {
     fn missing_state_file_reads_as_unpinned() {
         let home = temp_home("missing");
         assert!(read(&home).expect("missing reads ok").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Red-first regression (PR #46): a `connection.json` that EXISTS but whose
+    /// `connection` field is missing or null must FAIL CLOSED, never be treated
+    /// as a first start. `read` collapses "present but empty" to the same `None`
+    /// as a genuinely absent file, so without the explicit presence check the
+    /// `(None, None)` arm would re-resolve the mutable ambient profile and
+    /// overwrite the file — the fail-open retargeting the pin exists to prevent.
+    /// An explicit `--profile` is still allowed to repair the present-but-empty
+    /// file. Covers both the missing-field (`{}`) and explicit-null variants.
+    #[test]
+    fn present_but_pinless_state_file_fails_closed_but_explicit_repairs() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for pinless in [r#"{}"#, r#"{"connection":null}"#, r#"{"someFutureKey":1}"#] {
+            let home = temp_home("pinless");
+            let c8ctl = home.join("c8ctl-config");
+            std::fs::create_dir_all(&c8ctl).unwrap();
+            let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+            std::fs::write(
+                c8ctl.join("profiles.json"),
+                r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"}]}"#,
+            )
+            .unwrap();
+            // A present-but-pinless file, plus an ambient address it must NOT
+            // silently adopt by treating the home as freshly unpinned.
+            std::fs::write(state_file(&home), pinless).unwrap();
+            let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://ambient:8080");
+
+            let err = resolve_or_pin(&home, None).err().unwrap_or_else(|| {
+                panic!("present-but-pinless {pinless:?} must fail closed, never adopt the ambient env")
+            });
+            assert!(
+                format!("{err:#}").contains("no connection pin"),
+                "{pinless:?}: unexpected error: {err:#}"
+            );
+
+            // The operator's explicit --profile repairs it and records a pin.
+            let repaired =
+                resolve_or_pin(&home, Some("merlin")).expect("explicit --profile repairs");
+            assert!(repaired.created);
+            assert_eq!(repaired.pin.profile.as_deref(), Some("merlin"));
+            assert_eq!(
+                repaired.pin.base_url.as_deref(),
+                Some("http://engine-a:8080")
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    /// Red-first regression (PR #46): `OpenOptionsExt::mode(0o600)` on the temp
+    /// file is filtered through the process umask, so a umask that strips the
+    /// owner bits (here 0o700) would create the temp — and, after the rename,
+    /// the live `connection.json` — as `000`. An unreadable pin fails closed
+    /// (issue #41) and permanently wedges startup. `write_atomic` must
+    /// `fchmod(0600)` the open fd so the persisted file is owner-rw regardless
+    /// of umask, with no post-rename chmod window. Serialized under `ENV_LOCK`
+    /// because `umask` is process-global.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_is_0600_even_under_an_owner_stripping_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Create the home dir FIRST, under the normal umask, so the hostile
+        // umask applies only to the temp file `write_atomic` creates — not to
+        // the containing directory (a 0o700 umask on `create_dir_all` would
+        // leave the dir itself inaccessible and fail the write for an unrelated
+        // reason).
+        let home = temp_home("hostile-umask");
+        let path = state_file(&home);
+        // Strip ALL owner bits via the umask; without the `fchmod` the temp
+        // file (and the renamed pin) would land `000`.
+        let prev = unsafe { libc::umask(0o700) };
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _umask = UmaskGuard(prev);
+
+        write_atomic(&path, b"{\"pinned\":true}\n").expect("write must succeed under a hostile umask");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "connection.json must be 0600 regardless of the process umask, got {:o}",
+            mode & 0o777
+        );
+        // And it is genuinely readable back.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"pinned\":true}\n");
         let _ = std::fs::remove_dir_all(&home);
     }
 
