@@ -852,7 +852,9 @@ async fn git(
             // paths — so a lingering helper can't keep mutating the run directory
             // after provisioning "succeeds". The spawn-time `group_guard` (not a
             // fresh capture) verifies the group's identity, so this is a no-op
-            // when git left nothing behind and never re-signals a recycled pgid.
+            // when git left nothing behind and does not re-signal a recycled
+            // pgid outside the accepted residual windows (see
+            // `pdeath::GroupIdentity`).
             #[cfg(unix)]
             {
                 crate::pdeath::terminate_group_and_reap(

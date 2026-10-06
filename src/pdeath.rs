@@ -255,29 +255,63 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GroupIdentity {
     /// Leader start time: Linux `/proc/<pid>/stat` field 22 (clock ticks since
-    /// boot), macOS `sysctl(KERN_PROC)` `kp_proc.p_starttime` in microseconds.
+    /// boot), macOS `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_start_tvsec`/
+    /// `pbi_start_tvusec` folded to microseconds.
     start: u64,
     /// The leader's real uid at capture.
     uid: u32,
 }
 
 #[cfg(target_os = "linux")]
-fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
+fn read_start_tick(pgid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).ok()?;
     // `comm` (field 2) may itself contain spaces and parentheses, so parse from
     // just past the final ')'. After it, field 3 (state) is the first token, so
     // starttime (field 22) is the 20th token — 0-based index 19.
     let after = &stat[stat.rfind(')')? + 1..];
-    let start: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_uid(pgid: u32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pgid}/status")).ok()?;
-    let uid = status
+    status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))?
         .split_whitespace()
         .next()?
         .parse()
-        .ok()?;
+        .ok()
+}
+
+/// Assemble the `(start, uid)` token from two independent reads, rejecting any
+/// snapshot that straddles a reap+recycle. The Linux identity is read from two
+/// separate `/proc/<pid>` files (`stat` for the start tick, `status` for the
+/// uid), so a plain read-one-then-the-other is **not** atomic: if the leader is
+/// reaped and its pid/pgid recycled by a *same-uid* replacement in the gap, the
+/// start tick comes from the original incarnation and the uid from the
+/// replacement — a mixed token that still matches the captured identity and
+/// green-lights signalling the unrelated group. Bracketing the uid read between
+/// two start-tick reads and rejecting the snapshot when the tick moved closes
+/// that window: a reap+recycle changes the start tick, so the only residual is a
+/// same-tick *and* same-uid recycle (window 3 on [`GroupIdentity`], already
+/// accepted). Every returned field is thus read from one stable incarnation.
+#[cfg(target_os = "linux")]
+fn assemble_identity(
+    mut read_start: impl FnMut() -> Option<u64>,
+    read_uid: impl FnOnce() -> Option<u32>,
+) -> Option<GroupIdentity> {
+    let start = read_start()?;
+    let uid = read_uid()?;
+    if read_start()? != start {
+        return None;
+    }
     Some(GroupIdentity { start, uid })
+}
+
+#[cfg(target_os = "linux")]
+fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
+    assemble_identity(|| read_start_tick(pgid), || read_uid(pgid))
 }
 
 #[cfg(target_os = "macos")]
@@ -526,8 +560,8 @@ pub(crate) struct PgidGuard;
 ///
 /// The guard captures the group's identity at construction ([`PgidGuard`]) and
 /// re-verifies it immediately before the drop-time SIGKILL, so a pgid that was
-/// freed and recycled by an unrelated group in the drop window is never
-/// signalled (issue #27).
+/// freed and recycled by an unrelated group in the drop window is not signalled
+/// outside the accepted residual windows (see [`GroupIdentity`]) (issue #27).
 pub(crate) struct GroupGuard(Option<PgidGuard>);
 
 impl GroupGuard {
@@ -990,6 +1024,45 @@ mod tests {
     #[test]
     fn leader_identity_none_for_nonexistent_pid() {
         assert!(leader_identity(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assemble_identity_rejects_recycle_straddling_snapshot() {
+        use std::cell::Cell;
+        // A reap+recycle between the two `/proc` reads moves the start tick, so
+        // the second start read disagrees with the first: the mixed
+        // (original-start, replacement-uid) token must be rejected rather than
+        // returned as a false match that would signal the unrelated group (#27).
+        let reads = Cell::new(0u32);
+        let straddled = assemble_identity(
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                // First read: original incarnation's tick; second: recycled tick.
+                Some(if n == 0 { 100 } else { 200 })
+            },
+            || Some(1000),
+        );
+        assert!(straddled.is_none(), "straddled snapshot must be rejected");
+
+        // A start tick that is stable across both reads yields the assembled
+        // token — the common, non-racing case.
+        let stable = assemble_identity(|| Some(100), || Some(7));
+        assert_eq!(stable, Some(GroupIdentity { start: 100, uid: 7 }));
+
+        // An unreadable second start read (leader gone, no recycle) also rejects
+        // rather than returning a half-token.
+        let reads2 = Cell::new(0u32);
+        let vanished = assemble_identity(
+            || {
+                let n = reads2.get();
+                reads2.set(n + 1);
+                if n == 0 { Some(100) } else { None }
+            },
+            || Some(7),
+        );
+        assert!(vanished.is_none(), "unreadable re-read must be rejected");
     }
 
     /// Spawn a child in its own process group that sleeps, return (child, pgid).
