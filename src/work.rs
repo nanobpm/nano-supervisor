@@ -271,7 +271,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // that re-resolved c8ctl's *mutable* active profile on every start is the
     // incident's vector: one agent's `c8 use profile` moved the session, and
     // the next-started workers silently followed it onto a stray test engine.
-    // The pin in `supervisor.json` makes the connection a recorded decision —
+    // The pin in `connection.json` makes the connection a recorded decision —
     // an explicit `--profile` (re)pins; otherwise the existing pin wins over
     // the ambient session; a first start pins what it resolved.
     let state_home = state::state_home().unwrap_or_else(|| {

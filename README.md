@@ -30,8 +30,12 @@ The two workers differ only in what they do when the engine issues **no** token:
 The supervisor never follows c8ctl's **mutable active profile** more than once.
 On its first start, `daemon`/`work` resolves the connection — an explicit
 `--profile`, else the active profile, else the `CAMUNDA_*` env — and records it
-in `<state home>/supervisor.json` as `connection: {profile, baseUrl}` (the
-baseUrl is the fingerprint). Every later start of the same state home reuses
+in `<state home>/connection.json` as `connection: {profile, baseUrl}` (the
+baseUrl is the fingerprint). This is a **dedicated, Rust-owned file**, kept
+separate from the shared `supervisor.json` that the external Node supervisor
+(`c8ctl-plugin-nano`) rewrites on every worker persist and deletes on stop — so
+the pin's durability never depends on the Node side's state lifecycle. Every
+later start of the same state home reuses
 the **pinned** profile, so an agent's (or anyone's) `c8 use profile` cannot
 retarget the fleet on its next restart; an explicit `--profile` re-pins. Both
 processes lead their startup output with `engine: <profile> (<baseUrl>)` and

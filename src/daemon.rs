@@ -72,7 +72,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     // Issue #41: pin the connection. Resolve the profile ONCE (explicit
     // `--profile`, else the pin this state home recorded, else the current
-    // active profile) and persist the choice in `supervisor.json`, so a later
+    // active profile) and persist the choice in `connection.json`, so a later
     // `c8 use profile` — by an agent or an operator — can never silently
     // retarget this daemon's fleet on its next start.
     let state_home = state::state_home().ok_or_else(|| {

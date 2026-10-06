@@ -1,4 +1,4 @@
-//! Pin the supervisor's engine connection in `supervisor.json` (issue #41).
+//! Pin the supervisor's engine connection in `connection.json` (issue #41).
 //!
 //! The failure this guards against: the supervisor and its workers used to
 //! resolve their connection from c8ctl's **mutable active profile at the moment
@@ -11,11 +11,24 @@
 //! The fix has the supervisor resolve its connection **once** — from an
 //! explicit `--profile`, else the active profile at that moment — and record
 //! the choice (profile name plus the resolved baseUrl as a fingerprint) in
-//! `<state home>/supervisor.json`. Every later start of the same state home
+//! `<state home>/connection.json`. Every later start of the same state home
 //! reuses the pinned profile instead of re-reading the ambient session, so a
 //! moved `activeProfile` can never silently retarget the fleet. A drift between
 //! the pin and the current session is surfaced loudly on every startup banner
 //! instead of being obeyed.
+//!
+//! The pin has its **own dedicated file**, `connection.json`, owned solely by
+//! this Rust supervisor — deliberately NOT the shared `supervisor.json` the
+//! external Node supervisor (`c8ctl-plugin-nano`) rewrites on every worker
+//! persist and deletes on stop. That Node writer does not merge foreign keys,
+//! so a pin kept in `supervisor.json` would be clobbered on the next Node
+//! persist and erased on the next Node stop — re-exposing the exact ambient
+//! re-resolution incident this pin exists to prevent (issue #41). A private
+//! file the Node supervisor never touches makes the pin durable regardless of
+//! the Node side's state lifecycle, with no cross-repo coordination required.
+//! `connection.json` is new to this feature, so there is no legacy pin in
+//! `supervisor.json` to migrate: a home that has never pinned simply pins on
+//! its next start.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::profile::{self, Profile};
 use crate::runtime::log;
 
-/// The pinned connection, persisted in `supervisor.json`.
+/// The pinned connection, persisted in `connection.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionPin {
@@ -61,12 +74,16 @@ impl ConnectionPin {
     }
 }
 
-/// The on-disk shape of `<state home>/supervisor.json`. Only the connection
-/// pin is modeled here; the file is otherwise free-form so the Node
-/// supervisor's own fields (socket path, pid, …) survive a round-trip.
+/// The on-disk shape of `<state home>/connection.json`. Only the connection
+/// pin is modeled explicitly; any other keys are preserved verbatim on rewrite
+/// so a field written by a NEWER supervisor binary is not dropped when an older
+/// one on the same state home does a read-modify-write (forward compatibility).
+/// This file is owned solely by this Rust supervisor — the external Node
+/// supervisor never reads or writes it — so the preserved keys are future Rust
+/// fields, not another process's state.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SupervisorState {
+struct PinState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     connection: Option<ConnectionPin>,
     /// Everything else the file carries, preserved verbatim on rewrite.
@@ -74,18 +91,20 @@ struct SupervisorState {
     rest: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Where the pin lives: `supervisor.json` directly under the c8ctl-nano state
-/// home — the same file the Node supervisor records its socket path in, so
-/// there is exactly one supervisor state file per home.
+/// Where the pin lives: `connection.json` directly under the c8ctl-nano state
+/// home. This is a dedicated, Rust-owned file — deliberately separate from the
+/// shared `supervisor.json` the external Node supervisor rewrites and deletes —
+/// so the pin's durability never depends on the Node side's state lifecycle
+/// (issue #41).
 pub fn state_file(state_home: &Path) -> PathBuf {
-    state_home.join("supervisor.json")
+    state_home.join("connection.json")
 }
 
-/// Read the pinned connection. `Ok(None)` means `supervisor.json` does not
+/// Read the pinned connection. `Ok(None)` means `connection.json` does not
 /// exist — genuinely unpinned, so the next start resolves and pins. A file that
 /// exists but is unreadable or malformed is a HARD ERROR ([`Err`]), never
 /// silently treated as unpinned: a truncated or externally corrupted
-/// `supervisor.json` would otherwise fall back to resolving the mutable ambient
+/// `connection.json` would otherwise fall back to resolving the mutable ambient
 /// profile and recreate the exact fleet-retargeting incident this pin exists to
 /// prevent (issue #41). The operator must repair or deliberately delete the
 /// file to re-pin.
@@ -93,11 +112,11 @@ pub fn read(state_home: &Path) -> Result<Option<ConnectionPin>> {
     Ok(read_state(state_home)?.and_then(|s| s.connection))
 }
 
-/// Read and parse `supervisor.json`, distinguishing "absent" (`Ok(None)`) from
+/// Read and parse `connection.json`, distinguishing "absent" (`Ok(None)`) from
 /// "present but corrupt" ([`Err`]). Only a `NotFound` means unpinned; every
 /// other read error and every parse error fails closed, so no corrupt state can
 /// be mistaken for a clean, unpinned home.
-fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
+fn read_state(state_home: &Path) -> Result<Option<PinState>> {
     let path = state_file(state_home);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -106,9 +125,9 @@ fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
             return Err(e).with_context(|| format!("reading {}", path.display()));
         }
     };
-    let state = serde_json::from_slice::<SupervisorState>(&bytes).with_context(|| {
+    let state = serde_json::from_slice::<PinState>(&bytes).with_context(|| {
         format!(
-            "{} exists but is not valid supervisor state JSON; refusing to start with a corrupt \
+            "{} exists but is not valid connection-pin JSON; refusing to start with a corrupt \
              connection pin (an unpinned fallback would re-resolve the mutable ambient profile \
              and could silently retarget the fleet — issue #41). Repair the file, or delete it \
              to deliberately re-pin",
@@ -124,7 +143,7 @@ fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
 ///
 /// The write is **atomic**: the new state goes to a `0600` temporary file in the
 /// same directory, is flushed + `fsync`ed, then `rename(2)`d over
-/// `supervisor.json`. A plain `std::fs::write` truncates the live file in place,
+/// `connection.json`. A plain `std::fs::write` truncates the live file in place,
 /// so a crash, cancellation, or short write could leave malformed JSON behind —
 /// and because a corrupt pin deliberately fails closed (issue #41), that would
 /// wedge every later worker start until manual repair. The rename is atomic, so
@@ -132,14 +151,15 @@ fn read_state(state_home: &Path) -> Result<Option<SupervisorState>> {
 /// half-write. Permission-setting failures are propagated, not ignored.
 ///
 /// The whole read-modify-write runs under `lock` (the home's [`PinLock`]). The
-/// pin is merged into the file's other fields — the Node supervisor's own
-/// `socket`/`pid` — so the merge must be serialized against every other Rust
-/// pin writer on the home: without it, two processes could each read the file,
-/// merge their pin into their own stale copy of the foreign fields, and the
-/// last rename would clobber the other's update. (The lock is advisory and
-/// Rust-only, so it cannot serialize the EXTERNAL Node supervisor's own writes
-/// to those fields — that coordination is out of scope here — but holding it
-/// across the merge removes the Rust-side read-modify-write race.)
+/// pin is merged into the file's other (forward-compat) keys, so the merge must
+/// be serialized against every other pin writer on the home: without it, two
+/// processes could each read the file, merge their pin into their own stale
+/// copy, and the last rename would clobber the other's update. Because
+/// `connection.json` is owned solely by this Rust supervisor — the external
+/// Node supervisor never writes it — this advisory Rust-only lock serializes
+/// EVERY writer of the file, so it fully removes the read-modify-write race
+/// (unlike the old shared `supervisor.json`, which the Node side could still
+/// rewrite outside any lock we hold).
 fn write(state_home: &Path, pin: &ConnectionPin, lock: &PinLock) -> Result<()> {
     std::fs::create_dir_all(state_home)
         .with_context(|| format!("creating state home {}", state_home.display()))?;
@@ -150,15 +170,15 @@ fn write(state_home: &Path, pin: &ConnectionPin, lock: &PinLock) -> Result<()> {
             .with_context(|| format!("restricting state home {}", state_home.display()))?;
     }
     let path = state_file(state_home);
-    // Preserve the Node supervisor's own fields on rewrite — but fail closed on
-    // a corrupt existing file rather than silently discarding it (which would
-    // drop those fields AND any pin). `read_state` already turned a `NotFound`
-    // into `Ok(None)`, so a fresh home starts from the default. This read and
-    // the `write_atomic` below are one critical section under `lock`.
+    // Preserve any forward-compat keys on rewrite — but fail closed on a corrupt
+    // existing file rather than silently discarding it (which would drop those
+    // keys AND any pin). `read_state` already turned a `NotFound` into
+    // `Ok(None)`, so a fresh home starts from the default. This read and the
+    // `write_atomic` below are one critical section under `lock`.
     let _ = lock; // held by the caller across this whole read-modify-write
-    let mut state: SupervisorState = read_state(state_home)?.unwrap_or_default();
+    let mut state: PinState = read_state(state_home)?.unwrap_or_default();
     state.connection = Some(pin.clone());
-    let json = serde_json::to_string_pretty(&state).context("serializing supervisor.json")?;
+    let json = serde_json::to_string_pretty(&state).context("serializing connection.json")?;
     write_atomic(&path, format!("{json}\n").as_bytes())
 }
 
@@ -173,17 +193,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .context("state file has no parent directory")?;
     // A unique temp name: pid + a process-local counter disambiguate concurrent
     // writers and repeated writes within one process (the cross-process pin
-    // lock serializes pin writers anyway, but the state file is also rewritten
-    // outside that lock by the Node supervisor's own updates, so never collide
-    // on a fixed name). `create_new` would otherwise fail a second write that
-    // reused a name a prior crash left behind.
+    // lock serializes pin writers, but use a unique name anyway so a stale temp
+    // left by a crashed process can never make `create_new` trip on a fixed
+    // name). `create_new` would otherwise fail a second write that reused a
+    // name a prior crash left behind.
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(
         ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("supervisor.json"),
+            .unwrap_or("connection.json"),
         std::process::id(),
         seq
     ));
@@ -213,7 +233,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         // durable, but the rename itself only updates the containing
         // directory's entry — and that update can still be lost on a power
         // loss unless the DIRECTORY is fsynced too. On a first pin that could
-        // make `supervisor.json` vanish and the next start would re-resolve
+        // make `connection.json` vanish and the next start would re-resolve
         // the mutable ambient profile. fsync the parent dir so the rename is
         // durable before reporting success (Unix only; elsewhere the rename is
         // the best available guarantee).
@@ -302,7 +322,7 @@ thread_local! {
 /// read/resolve/write across every `work`/`daemon` process that shares a state
 /// home. Without it, two concurrent first starts on a fresh home could both
 /// read "no pin", resolve different profiles, and overwrite each other's
-/// `supervisor.json` — then keep running connected to different engines, the
+/// `connection.json` — then keep running connected to different engines, the
 /// exact split-fleet condition the pin exists to prevent (issue #41). The lock
 /// is held from the first read to the final write, so exactly one process pins
 /// and the rest follow the pin they read while holding it.
@@ -443,12 +463,12 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
             .is_some_and(|u| !u.trim().is_empty());
         if !has_fingerprint {
             anyhow::bail!(
-                "the pinned connection in supervisor.json has no recorded engine \
+                "the pinned connection in connection.json has no recorded engine \
                  baseUrl fingerprint, so it cannot be enforced and would fall back \
                  to the ambient connection — silently retargetable. Setting an \
                  engine address alone will NOT repair this pin (this check runs \
                  before the environment is consulted): delete/reset the pin in \
-                 supervisor.json first, or re-pin with --profile (issue #41)."
+                 connection.json first, or re-pin with --profile (issue #41)."
             );
         }
     }
@@ -520,7 +540,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         }
     }
     // 2. An engine URL that embeds HTTP(S) userinfo (`user:pass@host`) would be
-    //    persisted into `<state home>/supervisor.json` in cleartext. The agent
+    //    persisted into `<state home>/connection.json` in cleartext. The agent
     //    runs as the same OS user and inherits the state-home context, so
     //    `0600`/`0700` does not stop it reading that secret, and display/seed
     //    redaction happens too late. Reject it and require dedicated auth
@@ -529,7 +549,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         if base_url_has_userinfo(u) {
             anyhow::bail!(
                 "engine base URL embeds userinfo credentials, which would be \
-                 persisted to supervisor.json in cleartext and readable by \
+                 persisted to connection.json in cleartext and readable by \
                  same-user agents. Remove the `user:pass@` from the engine URL \
                  and supply authentication via a c8ctl profile or the \
                  CAMUNDA_* auth environment instead (issue #41)."
@@ -721,7 +741,7 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
 fn state_file_display(_decision: &PinDecision) -> String {
     match crate::state::state_home() {
         Some(h) => state_file(&h).display().to_string(),
-        None => "supervisor.json".to_string(),
+        None => "connection.json".to_string(),
     }
 }
 
@@ -769,17 +789,22 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_foreign_fields() {
+    fn round_trip_preserves_unknown_forward_compat_fields() {
+        // `connection.json` is Rust-owned, but a rewrite must still preserve any
+        // keys it does not model — e.g. a field written by a NEWER supervisor
+        // binary — so an older binary on the same home does not drop it. (This
+        // file is NOT shared with the Node supervisor; the preserved keys are
+        // future Rust fields, not another process's state.)
         let home = temp_home("roundtrip");
         std::fs::write(
             state_file(&home),
-            r#"{"socket":"/tmp/x.sock","pid":1234,"connection":{"profile":"merlin","baseUrl":"http://m:8080"}}"#,
+            r#"{"futureField":"keep-me","schemaVersion":2,"connection":{"profile":"merlin","baseUrl":"http://m:8080"}}"#,
         )
         .unwrap();
         let pin = read(&home).expect("pin read ok").expect("pin present");
         assert_eq!(pin.profile.as_deref(), Some("merlin"));
         assert_eq!(pin.base_url.as_deref(), Some("http://m:8080"));
-        // Rewriting the pin must not drop the Node supervisor's own fields.
+        // Rewriting the pin must not drop the unmodeled forward-compat fields.
         let lock = PinLock::acquire(&home).unwrap();
         write(
             &home,
@@ -792,15 +817,15 @@ mod tests {
         .unwrap();
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(state_file(&home)).unwrap()).unwrap();
-        assert_eq!(raw["socket"], serde_json::json!("/tmp/x.sock"));
-        assert_eq!(raw["pid"], serde_json::json!(1234));
+        assert_eq!(raw["futureField"], serde_json::json!("keep-me"));
+        assert_eq!(raw["schemaVersion"], serde_json::json!(2));
         assert_eq!(raw["connection"]["profile"], serde_json::json!("local"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn malformed_state_file_is_a_hard_error_not_unpinned() {
-        // Issue #41: a corrupt `supervisor.json` must FAIL CLOSED. Treating it
+        // Issue #41: a corrupt `connection.json` must FAIL CLOSED. Treating it
         // as unpinned would re-resolve the mutable ambient profile on the next
         // start and could silently retarget the fleet — the very incident the
         // pin prevents. Only a MISSING file means unpinned.
@@ -940,7 +965,7 @@ mod tests {
     }
 
     /// Issue #41: the pin is persisted atomically — a crash mid-write must never
-    /// leave a torn `supervisor.json` (which would then fail closed on every
+    /// leave a torn `connection.json` (which would then fail closed on every
     /// later start). The write goes through a temp file + rename, and the temp
     /// file is cleaned up.
     #[test]
@@ -976,7 +1001,7 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o600, "supervisor.json must be 0600");
+            assert_eq!(mode & 0o777, 0o600, "connection.json must be 0600");
         }
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1346,7 +1371,7 @@ mod tests {
     }
 
     /// Issue #41, credential-in-pin: an engine URL that embeds `user:pass@host`
-    /// must NOT be persisted to `supervisor.json`, where a same-user agent could
+    /// must NOT be persisted to `connection.json`, where a same-user agent could
     /// read it. The pin fails closed and tells the operator to use dedicated
     /// auth settings instead.
     #[test]

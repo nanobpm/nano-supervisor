@@ -1,4 +1,4 @@
-//! #41 — the supervisor pins its engine connection in `supervisor.json` and
+//! #41 — the supervisor pins its engine connection in `connection.json` and
 //! never follows c8ctl's mutable active profile again.
 //!
 //! The incident: an agent ran `c8 use profile local`, which rewrote the
@@ -9,7 +9,7 @@
 //!
 //! These tests pin the fix's observable surface, with no engine needed:
 //!   * `work` records `connection{profile,baseUrl}` in
-//!     `<C8CTL_NANO_HOME>/supervisor.json` on first start, and its startup
+//!     `<C8CTL_NANO_HOME>/connection.json` on first start, and its startup
 //!     banner names the engine;
 //!   * after `activeProfile` moves to another profile, the next `work` start
 //!     still connects to the PINNED profile and warns loudly about the drift —
@@ -131,7 +131,7 @@ fn run_work(
 }
 
 /// Acceptance, first half: starting under profile A pins the connection in
-/// `supervisor.json` and the startup banner shows the engine.
+/// `connection.json` and the startup banner shows the engine.
 #[test]
 fn first_start_pins_the_connection_and_banners_the_engine() {
     let target = Target::from_env();
@@ -151,19 +151,19 @@ fn first_start_pins_the_connection_and_banners_the_engine() {
 
     let out = run_work(&home, c8ctl.path(), &[]);
 
-    // The pin landed in supervisor.json with the resolved baseUrl fingerprint.
+    // The pin landed in connection.json with the resolved baseUrl fingerprint.
     let state = home
-        .read_json("supervisor.json")
-        .expect("supervisor.json written on first start");
+        .read_json("connection.json")
+        .expect("connection.json written on first start");
     assert_eq!(
         state["connection"]["profile"],
         serde_json::json!("alpha"),
-        "supervisor.json must pin the profile resolved at first start: {state}"
+        "connection.json must pin the profile resolved at first start: {state}"
     );
     assert_eq!(
         state["connection"]["baseUrl"],
         serde_json::json!("http://alpha.invalid:8080"),
-        "supervisor.json must record the baseUrl fingerprint: {state}"
+        "connection.json must record the baseUrl fingerprint: {state}"
     );
     // The banner names the engine loudly (the incident's clue was buried in a
     // job-type line; now the engine leads the startup output).
@@ -220,12 +220,12 @@ fn moved_active_profile_does_not_retarget_a_pinned_worker() {
         out.stderr
     );
     // The pin itself is untouched by the drift.
-    let state = home.read_json("supervisor.json").expect("supervisor.json");
+    let state = home.read_json("connection.json").expect("connection.json");
     assert_eq!(state["connection"]["profile"], serde_json::json!("alpha"));
 }
 
 /// Issue #41, client-target verification (not just the banner): the banner and
-/// `supervisor.json` are both derived from the pin *decision*, so asserting
+/// `connection.json` are both derived from the pin *decision*, so asserting
 /// them proves the decision, not that the worker's constructed client actually
 /// dials the pinned engine. This test closes that gap with distinguishable
 /// LIVE local endpoints: after the active profile moves from alpha to beta, the
@@ -338,12 +338,12 @@ fn explicit_profile_re_pins() {
 
     set_active_profile(c8ctl.path(), "alpha");
     let _ = run_work(&home, c8ctl.path(), &[]);
-    let state = home.read_json("supervisor.json").expect("pinned");
+    let state = home.read_json("connection.json").expect("pinned");
     assert_eq!(state["connection"]["profile"], serde_json::json!("alpha"));
 
     // The operator deliberately restarts on beta: the pin moves.
     let out = run_work(&home, c8ctl.path(), &["--profile", "beta"]);
-    let state = home.read_json("supervisor.json").expect("re-pinned");
+    let state = home.read_json("connection.json").expect("re-pinned");
     assert_eq!(
         state["connection"]["profile"],
         serde_json::json!("beta"),
@@ -386,7 +386,7 @@ fn env_pin_enforces_its_base_url_fingerprint_across_env_drift() {
         "first start must pin and banner the env engine; stderr was:\n{}",
         out.stderr
     );
-    let state = home.read_json("supervisor.json").expect("pinned");
+    let state = home.read_json("connection.json").expect("pinned");
     assert_eq!(
         state["connection"]["baseUrl"],
         serde_json::json!("http://engine-a.invalid:8080")
@@ -418,7 +418,7 @@ fn env_pin_enforces_its_base_url_fingerprint_across_env_drift() {
         out.stderr
     );
     // The pin on disk is untouched by the drift.
-    let state = home.read_json("supervisor.json").expect("supervisor.json");
+    let state = home.read_json("connection.json").expect("connection.json");
     assert_eq!(
         state["connection"]["baseUrl"],
         serde_json::json!("http://engine-a.invalid:8080")

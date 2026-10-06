@@ -292,7 +292,7 @@ impl Jobs {
                 "WARNING: worker {worker} is connected to {} but every job type it serves is \
                  test-looking ({:?}); if this is not a throwaway test engine, the worker was \
                  likely re-pointed by a changed c8ctl active profile — check the pinned \
-                 connection in supervisor.json (issue #41)",
+                 connection in connection.json (issue #41)",
                 self.engine_desc.as_deref().unwrap_or("the engine"),
                 self.test_type_prefixes
             ));
