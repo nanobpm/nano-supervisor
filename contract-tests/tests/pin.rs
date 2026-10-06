@@ -155,6 +155,40 @@ fn run_to_banner(mut cmd: std::process::Command) -> contract_tests::CmdOutput {
     }
 }
 
+/// Start `daemon` with the given c8ctl config dir and extra args, wait for its
+/// startup banner (and any drift WARNING right behind it), then reap it. The
+/// daemon process manager resolves/banners/enforces the pin through the SAME
+/// `pin::resolve_or_pin` → `engine:` banner → `warn_if_drifted` path as `work`,
+/// and all of it runs BEFORE the daemon reads hires or opens the engine
+/// connection, so the contract surface lands on stderr first — exactly like
+/// [`run_work`]. A throwaway `--runs-dir` keeps the daemon off any shared path.
+fn run_daemon(
+    home: &TempHome,
+    c8ctl_dir: &std::path::Path,
+    extra: &[&str],
+) -> contract_tests::CmdOutput {
+    let runs = tempfile::tempdir().expect("daemon runs dir");
+    let runs_path = runs.path().to_str().expect("utf8 runs dir").to_string();
+    let mut args: Vec<&str> = vec![
+        "daemon",
+        "--poll-timeout",
+        "200",
+        "--runs-dir",
+        &runs_path,
+        // The hermetic env already clears `NANO_AGENT_RUN`, but pass the
+        // documented contract-test opt-in explicitly so this never trips the
+        // nested-supervisor refusal if the suite is ever run from inside an
+        // agent run.
+        "--foreground-for-tests",
+    ];
+    args.extend_from_slice(extra);
+    let mut cmd = home.cmd(&args);
+    cmd.env("C8CTL_DATA_DIR", c8ctl_dir);
+    // `run_to_banner` spawns, captures through the banner + a short quiet
+    // window, then reaps — so the daemon is dead before `runs` is dropped here.
+    run_to_banner(cmd)
+}
+
 /// Acceptance, first half: starting under profile A pins the connection in
 /// `connection.json` and the startup banner shows the engine.
 #[test]
@@ -249,6 +283,75 @@ fn moved_active_profile_does_not_retarget_a_pinned_worker() {
     assert_eq!(state["connection"]["profile"], serde_json::json!("alpha"));
 }
 
+/// Issue #41, daemon path: the `daemon` process manager resolves, banners, and
+/// enforces the pin through the SAME code as `work` (`pin::resolve_or_pin` →
+/// the `engine:` banner → `warn_if_drifted`), yet no contract exercised it end
+/// to end — the black-box pin suite drove only `work`. A regression in the
+/// daemon's own startup wiring (it independently resolves the pin and threads
+/// that snapshot into its shared client and every slot) could therefore
+/// silently retarget a whole fleet while every `work` pin contract stayed
+/// green. This closes that gap: pin A via the daemon, move the active profile
+/// to B, restart the daemon, and assert it STILL banners A (never B) and warns
+/// that the active profile drifted.
+#[test]
+fn daemon_keeps_pinned_engine_after_active_profile_drift() {
+    let target = Target::from_env();
+    require_target!(target);
+    if target == Target::Node {
+        contract_tests::note_skip(
+            module_path!(),
+            "the Node plugin has no daemon connection pinning (that is issue #41); Rust target only",
+        );
+        return;
+    }
+    let home = TempHome::with_target(target);
+    hire(&home);
+    let c8ctl = tempfile::tempdir().expect("c8ctl dir");
+    write_c8ctl_profiles(c8ctl.path());
+
+    // Start the daemon under A so it pins the connection…
+    set_active_profile(c8ctl.path(), "alpha");
+    let first = run_daemon(&home, c8ctl.path(), &[]);
+    assert!(
+        first
+            .stderr
+            .contains("engine: alpha (http://alpha.invalid:8080)"),
+        "the daemon's first start must banner the pinned engine; stderr was:\n{}",
+        first.stderr
+    );
+    // The daemon wrote the pin before it ever read hires or dialed the engine.
+    let pinned = home
+        .read_json("connection.json")
+        .expect("daemon must pin connection.json on first start");
+    assert_eq!(pinned["connection"]["profile"], serde_json::json!("alpha"));
+
+    // …then an agent (or anyone) runs `c8 use profile B`.
+    set_active_profile(c8ctl.path(), "beta");
+
+    // The next daemon start must still serve A — and say so, with a warning
+    // naming the drifted active profile.
+    let out = run_daemon(&home, c8ctl.path(), &[]);
+    assert!(
+        out.stderr
+            .contains("engine: alpha (http://alpha.invalid:8080)"),
+        "the daemon must keep following the PIN (alpha), not the moved session; stderr was:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("engine: beta"),
+        "the daemon must NOT follow the moved active profile; stderr was:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("WARNING") && out.stderr.contains("beta"),
+        "the drift warning must name the now-active profile; stderr was:\n{}",
+        out.stderr
+    );
+    // The pin itself is untouched by the drift.
+    let state = home.read_json("connection.json").expect("connection.json");
+    assert_eq!(state["connection"]["profile"], serde_json::json!("alpha"));
+}
+
 /// Issue #41, client-target verification (not just the banner): the banner and
 /// `connection.json` are both derived from the pin *decision*, so asserting
 /// them proves the decision, not that the worker's constructed client actually
@@ -282,19 +385,24 @@ fn pinned_worker_dials_the_pinned_engine_not_the_moved_one() {
     )
     .expect("write profiles.json");
 
-    // Pin under alpha (the banner lands before any dial), then move to beta.
-    set_active_profile(c8ctl.path(), "alpha");
-    let _ = run_work(&home, c8ctl.path(), &[]);
+    // Pin alpha by writing `connection.json` directly, then move the active
+    // profile to beta. Crucially, NO live `work` run happens under alpha: a real
+    // first run would share the alpha listener and could race past its banner
+    // into an activation dial before being reaped, leaving a stale "alpha"
+    // connection queued in the listener's accept backlog. Draining `alpha_rx`
+    // only empties the channel, not that kernel backlog, so a late-accepted
+    // stale event could still satisfy the post-drift worker's `recv_timeout` and
+    // pass the assertion without the worker ever dialing alpha. Eliminating the
+    // first-run alpha connection removes that false-positive class entirely:
+    // after this, the ONLY dialer of the alpha probe is the worker under test.
+    // The pinned baseUrl is the live alpha probe URL (already normalized: no
+    // trailing `/`, no `/v2`) so the enforced pin dials exactly this listener.
+    std::fs::write(
+        home.path().join("connection.json"),
+        format!(r#"{{"connection":{{"profile":"alpha","baseUrl":"{alpha_url}"}}}}"#),
+    )
+    .expect("write connection.json pin");
     set_active_profile(c8ctl.path(), "beta");
-
-    // The first pinning run shares the `alpha` listener and can race past its
-    // banner into an activation dial before `run_work` reaps it, leaving a stale
-    // "alpha" queued in `alpha_rx`. Drain BOTH receivers now (the first child is
-    // already reaped) so the assertions below observe only the worker under
-    // test's dials — otherwise a post-drift worker that never contacts alpha
-    // could still satisfy `recv_timeout` on that leftover event.
-    while alpha_rx.try_recv().is_ok() {}
-    while beta_rx.try_recv().is_ok() {}
 
     // Run the worker for real — past the banner, into the activation poll — so
     // its client genuinely connects. A short poll makes it dial promptly and
