@@ -39,7 +39,17 @@ use crate::profile::{self, Profile};
 use crate::runtime::log;
 
 /// The pinned connection, persisted in `connection.json`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Forward compatibility is two-level: [`PinState`] preserves unknown
+/// *top-level* keys, and this struct preserves unknown keys *inside* the
+/// `connection` object via [`ConnectionPin::rest`]. Without the nested capture,
+/// a field a NEWER binary wrote inside `connection` would be dropped the moment
+/// an older binary deserialized the pin, and the next re-pin (which replaces the
+/// whole `connection` object) would persist the lossy version — silently
+/// discarding the newer binary's state. This file is owned solely by this Rust
+/// supervisor, so the preserved keys are future Rust fields, not another
+/// process's state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionPin {
     /// The c8ctl profile every worker of this supervisor connects with. `None`
@@ -52,6 +62,12 @@ pub struct ConnectionPin {
     /// pinned profile to a *different* baseUrl warns loudly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Every other key carried inside the `connection` object, preserved
+    /// verbatim on rewrite so a nested field written by a NEWER supervisor
+    /// binary survives an older binary's read-modify-write (forward
+    /// compatibility — the nested sibling of [`PinState::rest`]).
+    #[serde(flatten)]
+    pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ConnectionPin {
@@ -627,6 +643,14 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
     let pin = ConnectionPin {
         profile: resolved.as_ref().map(|p| p.name.clone()).or(name),
         base_url,
+        // Preserve any unknown fields a newer binary wrote inside the existing
+        // `connection` object across this re-pin (forward compatibility): a
+        // re-pin replaces the whole object, so without carrying `rest` forward
+        // an older binary's rewrite would silently drop them (issue #41).
+        rest: existing
+            .as_ref()
+            .map(|e| e.rest.clone())
+            .unwrap_or_default(),
     };
     if created {
         write(state_home, &pin, &_pin_lock)?;
@@ -882,6 +906,7 @@ mod tests {
             &ConnectionPin {
                 profile: Some("local".into()),
                 base_url: Some("http://localhost:8080".into()),
+                rest: Default::default(),
             },
             &lock,
         )
@@ -891,6 +916,134 @@ mod tests {
         assert_eq!(raw["futureField"], serde_json::json!("keep-me"));
         assert_eq!(raw["schemaVersion"], serde_json::json!(2));
         assert_eq!(raw["connection"]["profile"], serde_json::json!("local"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn round_trip_preserves_unknown_nested_connection_fields() {
+        // Forward compatibility is two-level: `PinState` preserves unknown
+        // TOP-LEVEL keys, and `ConnectionPin` must preserve unknown keys NESTED
+        // inside the `connection` object. A field a newer binary wrote inside
+        // `connection` must survive an older binary's read-modify-write re-pin;
+        // without `ConnectionPin::rest` it would be silently dropped the moment
+        // the pin is deserialized, and the next re-pin would persist the lossy
+        // object (issue #41).
+        let home = temp_home("nestedroundtrip");
+        std::fs::write(
+            state_file(&home),
+            r#"{"connection":{"profile":"merlin","baseUrl":"http://m:8080","futureConnField":{"nested":true},"schemaVersion":3}}"#,
+        )
+        .unwrap();
+        let pin = read(&home).expect("pin read ok").expect("pin present");
+        assert_eq!(pin.profile.as_deref(), Some("merlin"));
+        assert_eq!(pin.base_url.as_deref(), Some("http://m:8080"));
+        // The unknown nested fields are captured, not discarded.
+        assert_eq!(
+            pin.rest["futureConnField"],
+            serde_json::json!({"nested": true})
+        );
+        assert_eq!(pin.rest["schemaVersion"], serde_json::json!(3));
+        // A re-pin (which replaces the whole `connection` object) must carry the
+        // unknown nested fields forward rather than dropping them.
+        let lock = PinLock::acquire(&home).unwrap();
+        write(
+            &home,
+            &ConnectionPin {
+                profile: Some("local".into()),
+                base_url: Some("http://localhost:8080".into()),
+                rest: pin.rest.clone(),
+            },
+            &lock,
+        )
+        .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_file(&home)).unwrap()).unwrap();
+        assert_eq!(raw["connection"]["profile"], serde_json::json!("local"));
+        assert_eq!(
+            raw["connection"]["baseUrl"],
+            serde_json::json!("http://localhost:8080")
+        );
+        assert_eq!(
+            raw["connection"]["futureConnField"],
+            serde_json::json!({"nested": true}),
+            "a re-pin must preserve unknown fields nested inside `connection`"
+        );
+        assert_eq!(raw["connection"]["schemaVersion"], serde_json::json!(3));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41: a `resolve_or_pin` re-pin (e.g. an explicit `--profile` on a
+    /// home that already has unknown nested `connection` fields) must preserve
+    /// those nested fields, not just a hand-built `write`. This exercises the
+    /// production construction path end to end.
+    #[test]
+    fn resolve_or_pin_preserves_unknown_nested_connection_fields() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("nestedrepin");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://m:8080"}]}"#,
+        )
+        .unwrap();
+        // A newer binary left an unknown nested field inside `connection`.
+        std::fs::write(
+            state_file(&home),
+            r#"{"connection":{"profile":"merlin","baseUrl":"http://m:8080","futureConnField":42}}"#,
+        )
+        .unwrap();
+        // An explicit --profile re-pins (created = true) and rewrites the file.
+        let decision = resolve_or_pin(&home, Some("merlin")).expect("explicit re-pin");
+        assert!(decision.created);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_file(&home)).unwrap()).unwrap();
+        assert_eq!(
+            raw["connection"]["futureConnField"],
+            serde_json::json!(42),
+            "resolve_or_pin re-pin must preserve unknown nested `connection` fields"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Issue #41: the documented resolution order is `--profile`, then c8ctl's
+    /// active profile, then the engine environment. A RAW `CAMUNDA_REST_ADDRESS`
+    /// in the environment must NOT suppress the active profile — only an
+    /// existing env pin (passed as `base_url_override`) does. This guards the
+    /// `resolve_with_base_override` precedence against regressing to the old
+    /// "any env address wins" behaviour, which silently pinned the ambient env
+    /// target over the active profile on a first start with both configured.
+    #[test]
+    fn raw_env_address_does_not_suppress_active_profile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("envvsprofile");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://m:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        // Both the env address AND an active profile are configured.
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://env-engine:8080");
+        // The active profile wins over the raw env address…
+        let resolved = profile::resolve(None).expect("resolve ok");
+        assert_eq!(
+            resolved.as_ref().map(|p| p.name.as_str()),
+            Some("merlin"),
+            "a raw CAMUNDA_REST_ADDRESS must not suppress the active profile"
+        );
+        // …but an existing env pin (a base_url_override) still keeps the env-only
+        // fallback (no profile), so the pin remains the recorded decision.
+        let overridden =
+            profile::resolve_with_base_override(None, Some("http://pinned:8080")).expect("ok");
+        assert!(
+            overridden.is_none(),
+            "an existing env pin's base_url_override must still beat the active profile"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1114,6 +1267,7 @@ mod tests {
             ConnectionPin {
                 profile: Some("merlin".into()),
                 base_url: Some("http://m:8080".into()),
+                rest: Default::default(),
             }
             .describe(),
             "merlin (http://m:8080)"
@@ -1122,6 +1276,7 @@ mod tests {
             ConnectionPin {
                 profile: None,
                 base_url: Some("http://localhost:8080".into()),
+                rest: Default::default(),
             }
             .describe(),
             "CAMUNDA_* env (http://localhost:8080)"
@@ -1136,6 +1291,7 @@ mod tests {
         let d = ConnectionPin {
             profile: Some("merlin".into()),
             base_url: Some("https://user:secret@m.example:8443".into()),
+            rest: Default::default(),
         }
         .describe();
         assert_eq!(d, "merlin (https://m.example:8443)");
@@ -1144,6 +1300,7 @@ mod tests {
         let d = ConnectionPin {
             profile: None,
             base_url: Some("https://user:secret@m.example:8443".into()),
+            rest: Default::default(),
         }
         .describe();
         assert_eq!(d, "CAMUNDA_* env (https://m.example:8443)");
@@ -1162,6 +1319,7 @@ mod tests {
             &ConnectionPin {
                 profile: Some("local".into()),
                 base_url: Some("http://localhost:8080".into()),
+                rest: Default::default(),
             },
             &lock,
         )

@@ -2729,6 +2729,7 @@ mod tests {
             connection: crate::pin::ConnectionPin {
                 profile: Some("merlin".into()),
                 base_url: Some("http://merlin:8080".into()),
+                rest: Default::default(),
             },
             connection_profile: Some(crate::profile::Profile {
                 name: "merlin".into(),
@@ -2919,6 +2920,7 @@ mod tests {
         c.connection = crate::pin::ConnectionPin {
             profile: None,
             base_url: Some("http://env-engine:8080".into()),
+            rest: Default::default(),
         };
         c.connection_profile = None;
         let run =
@@ -2972,6 +2974,7 @@ mod tests {
         c.connection = crate::pin::ConnectionPin {
             profile: None,
             base_url: Some(url),
+            rest: Default::default(),
         };
         c.connection_profile = None;
         let run = std::env::temp_dir().join(format!(
@@ -3235,6 +3238,7 @@ mod tests {
         c.connection = crate::pin::ConnectionPin {
             profile: Some("merlin".into()),
             base_url: Some("http://env-engine:8080".into()),
+            rest: Default::default(),
         };
         let run =
             std::env::temp_dir().join(format!("nano-slot-test-nobaseurl-{}", std::process::id()));
@@ -3277,6 +3281,7 @@ mod tests {
         c.connection = crate::pin::ConnectionPin {
             profile: Some("merlin".into()),
             base_url: Some(url),
+            rest: Default::default(),
         };
         let run = std::env::temp_dir().join(format!(
             "nano-slot-test-nobaseurl-redact-{}",

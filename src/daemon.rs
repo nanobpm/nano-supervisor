@@ -53,6 +53,33 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             anyhow::anyhow!("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
         })?,
     };
+
+    // Issue #41: resolve & pin the connection BEFORE reading hires so the
+    // daemon's VERY FIRST startup line names the engine it is about to serve
+    // (the incident's only clue was buried in per-worker logs). Resolve the
+    // profile ONCE (explicit `--profile`, else the pin this state home
+    // recorded, else the current active profile) and persist the choice in
+    // `connection.json`, so a later `c8 use profile` — by an agent or an
+    // operator — can never silently retarget this daemon's fleet on its next
+    // start.
+    let state_home = state::state_home().ok_or_else(|| {
+        anyhow::anyhow!("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
+    })?;
+    let decision = pin::resolve_or_pin(&state_home, opts.profile.as_deref())?;
+    let engine_desc = decision.pin.describe();
+    // The console header leads daemon startup output with the engine it is
+    // about to serve: the incident's only clue was buried in per-worker logs,
+    // so this banner must precede every other startup line (including the
+    // config-path log below).
+    log(&format!("engine: {engine_desc}"));
+    if decision.created {
+        log(&format!(
+            "pinned the connection in {}: engine: {engine_desc}",
+            pin::state_file(&state_home).display()
+        ));
+    }
+    pin::warn_if_drifted(&decision);
+
     log(&format!("reading hires from {}", config_path.display()));
     let all = state::read_hires_from(&config_path)?;
     if all.is_empty() {
@@ -69,28 +96,6 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     if selected.is_empty() {
         bail!("no hires matched --hire {:?}", opts.only);
     }
-
-    // Issue #41: pin the connection. Resolve the profile ONCE (explicit
-    // `--profile`, else the pin this state home recorded, else the current
-    // active profile) and persist the choice in `connection.json`, so a later
-    // `c8 use profile` — by an agent or an operator — can never silently
-    // retarget this daemon's fleet on its next start.
-    let state_home = state::state_home().ok_or_else(|| {
-        anyhow::anyhow!("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
-    })?;
-    let decision = pin::resolve_or_pin(&state_home, opts.profile.as_deref())?;
-    let engine_desc = decision.pin.describe();
-    if decision.created {
-        log(&format!(
-            "pinned the connection in {}: engine: {engine_desc}",
-            pin::state_file(&state_home).display()
-        ));
-    }
-    pin::warn_if_drifted(&decision);
-    // The console header names the engine loudly: the incident's only clue was
-    // buried in per-worker logs, so the daemon's own startup output now leads
-    // with the engine it is about to serve.
-    log(&format!("engine: {engine_desc}"));
 
     // Normalize the runs root to the SAME absolute, parent-free lexical form
     // `slot::execute` registers in `active_runs` (via

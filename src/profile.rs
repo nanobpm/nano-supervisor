@@ -143,16 +143,19 @@ pub fn resolve_with_base_override(
     let Some(dir) = c8ctl_data_dir() else {
         return Ok(None);
     };
-    // An explicit engine address in the environment beats c8ctl's remembered
-    // active profile (but not an explicit --profile). A pinned baseUrl counts
-    // as such an address: the pin IS the recorded connection decision.
-    let env_address = base_url_override.is_some()
-        || ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"]
-            .iter()
-            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    // The documented resolution order is `--profile`, then c8ctl's active
+    // profile, then the engine environment (issue #41). Only an existing env
+    // pin — passed here as `base_url_override`, the recorded connection
+    // decision — beats the active profile; a RAW `CAMUNDA_REST_ADDRESS` /
+    // `ZEEBE_REST_ADDRESS` in the environment must NOT suppress `activeProfile`
+    // (otherwise a first start with both configured would silently pin the
+    // ambient env target instead of the active profile, with no drift warning).
+    // So: `--profile` wins; else an existing env pin keeps the env-only
+    // fallback; else consult the session, falling back to the environment only
+    // when no profile is active.
     let name = match wanted {
         Some(n) => Some(n.to_string()),
-        None if env_address => None,
+        None if base_url_override.is_some() => None,
         None => std::fs::read(dir.join("session.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
