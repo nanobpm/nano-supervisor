@@ -1499,17 +1499,26 @@ pub async fn finalize_git(
                     // the agent DID make off-branch), but the push block is
                     // unreachable — `branch_tip` is `None` on an unborn base,
                     // so `commits` is empty and the push is refused under
-                    // `retain` regardless. Return early only when the nets also
-                    // prove the repo is still unborn (no commit anywhere);
-                    // otherwise fall through so the nets can flag stranded work.
+                    // `retain` regardless.
+                    //
+                    // `unborn_no_ref` is NOT decided here: the HEAD probe alone
+                    // only proves HEAD resolves to no commit — it says nothing
+                    // about a commit the agent stranded and then orphaned (e.g.
+                    // commit on the only branch, then `update-ref -d` it: HEAD
+                    // is unborn again and `refs/heads/` is empty, yet the
+                    // commit still dangles in the HEAD reflog). Marking here
+                    // would return before those nets run and let the caller
+                    // fail the run as empty — and its retry wipes the run dir
+                    // holding the only copy. Fall through so the nets classify
+                    // whatever appeared; the end-of-function `mark_unborn_no_ref`
+                    // marks the verdict only when they found nothing.
                     if prep.start_sha.is_none() && !out.work_found && out.commits.is_empty() {
-                        mark_unborn_no_ref(&mut out, prep, workspace, timeout).await;
-                        if out.unborn_no_ref {
-                            return out;
-                        }
-                        // Not provably unborn (HEAD now resolves, or the probe
-                        // failed): fall through so the reflog/non-head nets can
-                        // classify whatever appeared.
+                        // The empty-scan `retain` is only the fail-closed
+                        // "cannot prove completeness" guard of a repo with no
+                        // anchor, not evidence of work — clear it so the nets
+                        // below run their classification loops (they skip while
+                        // `retain` is set) and re-set it on any inconclusive
+                        // step or stranded find.
                         out.retain = false;
                     } else {
                         return out;
@@ -2208,6 +2217,15 @@ pub async fn finalize_git(
 /// no-op agent on an unborn base would otherwise bypass the empty-result
 /// failure contract).
 ///
+/// The still-unborn HEAD probe alone is not sufficient: an agent that committed
+/// on the only branch and then deleted it leaves HEAD unborn with the commit
+/// dangling in the HEAD reflog, and on an unborn HEAD the reflog net above
+/// fails closed (it cannot enumerate the log). So the verdict additionally
+/// requires the HEAD reflog to be ABSENT (see `head_reflog_is_absent`) — the
+/// state of a genuine no-op. A present-but-unreadable reflog (the orphaned-
+/// commit shape) keeps `unborn_no_ref` clear so the caller does not fail the
+/// run as empty and wipe the run dir holding the only copy.
+///
 /// The probe uses `--verify --quiet`: a bare `rev-parse --verify HEAD` exits
 /// 128 on an unborn HEAD, which `git()` surfaces as Err — indistinguishable
 /// from a real scan failure. `--quiet` downgrades "no such ref" to exit 1 with
@@ -2242,6 +2260,23 @@ async fn mark_unborn_no_ref(
         timeout,
     )
     .await;
+    // A still-unborn HEAD is necessary but NOT sufficient: the agent may have
+    // committed and then orphaned the commit (deleted the only branch), leaving
+    // HEAD unborn again with the commit dangling in the HEAD reflog. On an
+    // unborn HEAD `git reflog show HEAD` exits 128, so the reflog net above
+    // failed closed and set `retain` — which here means "a commit may dangle",
+    // not "no work". Distinguish the genuine no-op (no HEAD reflog was ever
+    // written) from an orphaned commit (a reflog exists but is unreadable on
+    // the unborn HEAD): only the former proves the agent created no commit.
+    //
+    // Read `.git/logs/HEAD` through the pinned checkout handle (fd-relative,
+    // no-follow) so a same-UID actor swapping a path component cannot redirect
+    // the probe outside the validated tree. Any open/read error — missing git
+    // dir, a symlinked component, I/O failure — is the conservative "may hold
+    // work" default and leaves `unborn_no_ref` false.
+    if !head_reflog_is_absent(workspace) {
+        return;
+    }
     if status == Some(1) {
         log(
             "finalize: repository is still unborn (no commit on any ref) — the run made no \
@@ -2249,6 +2284,49 @@ async fn mark_unborn_no_ref(
         );
         out.unborn_no_ref = true;
     }
+}
+
+/// Probe whether the checkout's HEAD reflog (`.git/logs/HEAD`) is ABSENT —
+/// the state of a genuine no-op on an unborn base (no commit was ever made, so
+/// no reflog entry exists). Returns `true` only when the file is definitively
+/// not there; `false` when it exists (a commit was written, then possibly
+/// orphaned) or cannot be read (the conservative "may hold work" answer).
+///
+/// The walk is fd-relative and no-follow through the pinned checkout handle:
+/// `.git` and `logs` are opened as directories with `O_NOFOLLOW`, and the leaf
+/// `HEAD` is matched by name from `logs`'s own `getdents` — so a symlinked
+/// component or a swapped ancestor yields an open/read error (→ `false`),
+/// never a redirect outside the validated tree.
+fn head_reflog_is_absent(workspace: &CwdHandle) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // `.git` must exist in a provisioned checkout; a missing/unopenable `.git`
+    // is anomalous, so fail closed (false — "may hold work").
+    let git = match workspace.open_child(std::ffi::OsStr::new(".git")) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    // A missing `logs/` directory is the genuine no-op: git creates it lazily on
+    // the first reflog write, so no `logs/` means no commit was ever recorded.
+    // Any OTHER open error (a symlinked component, I/O failure) fails closed.
+    let logs = match git.open_child(std::ffi::OsStr::new("logs")) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let logs_path = match logs.path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let entries = match std::fs::read_dir(&logs_path) {
+        Ok(rd) => rd,
+        Err(_) => return false,
+    };
+    for e in entries.flatten() {
+        if e.file_name().as_bytes() == b"HEAD" {
+            return false; // a reflog exists — a commit was written
+        }
+    }
+    true
 }
 
 /// Run git and return its RAW exit code (`Some(0)`/`Some(1)`/…), or `None` on
@@ -5481,6 +5559,70 @@ mod tests {
         assert!(
             !res.unborn_no_ref,
             "stranded work must NOT be marked unborn_no_ref (the dir holds the only copy)"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_mark_unborn_no_ref_for_orphaned_branch_commit() {
+        // Regression for the unborn early-return: an agent that commits on the
+        // ONLY branch and then deletes it (`update-ref -d`) leaves HEAD unborn
+        // and `refs/heads/` empty, but the commit still dangles in the HEAD
+        // reflog. Finalize must NOT mark `unborn_no_ref` from the HEAD probe
+        // alone and return before the nets — the slot would fail the run as
+        // empty and the retry would wipe the run dir holding the only copy.
+        // The nets run first (fail closed: the reflog net cannot enumerate an
+        // unborn HEAD's log, so it retains), and the end-of-function verdict
+        // stays clear.
+        let dir = empty_base_workspace("unborn-orphan").await;
+        git(
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "work commit").await;
+        // Delete the only branch: HEAD is unborn again, the commit dangles.
+        git(
+            &[
+                "update-ref".into(),
+                "-d".into(),
+                "refs/heads/feat/work".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        assert!(
+            !res.unborn_no_ref,
+            "an orphaned commit on an unborn base must NOT be marked unborn_no_ref \
+             (the dir holds the only copy; retain={}, work_found={}, commits={:?})",
+            res.retain, res.work_found, res.commits
+        );
+        assert!(
+            res.retain,
+            "the nets fail closed on the orphaned commit (retain keeps the run dir)"
+        );
+        assert!(
+            !res.pushed,
+            "nothing publishable: the only branch was deleted"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
