@@ -715,11 +715,83 @@ fn prepare_run_dir_pinned(
     // step's pinned inode, and an existing or swapped-in symlinked component is
     // refused by the no-follow open rather than followed.
     let root = DirHandle::open_or_create_root_nofollow(runs_dir, 0o700)?;
+    // DEFER THE WIPE for a retained checkout. `prepare_child_dir` below wipes
+    // `<name>` unconditionally — correct for an ordinary retry, but WRONG when
+    // the prior attempt was RETAINED (a completed run whose unpushed commits
+    // live only in `<name>`) and then redelivered after a failed/fenced
+    // `jobs.complete`: that wipe would destroy the only copy of the work. When
+    // `<name>/<RETENTION_MARKER>` is present, set the retained dir aside
+    // (rename it to a unique quarantine sibling) instead of wiping it, so the
+    // redelivery gets a fresh `<name>` while the retained work survives for
+    // recovery / the `sweep_stale_runs` cadence. See [`RETENTION_MARKER`].
+    quarantine_retained_run_dir(&root, name)?;
     let child = root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
     // Carry the EXACT pinned child inode preparation just created and secured
     // into the launch — never reopen `run_dir` by path, which a same-UID actor
     // could have swapped for an ordinary (unwiped, unsecured) tree in between.
     Ok(crate::safecwd::CwdHandle::from_fd(child.into_fd()))
+}
+
+/// Defer the wipe of a RETAINED run dir on redelivery. When `<name>` carries a
+/// [`RETENTION_MARKER`] file, the prior attempt was a completed-but-unpushed run
+/// whose only copy of the agent's work lives in `<name>`; wiping it (the
+/// `prepare_child_dir` the caller is about to do) would destroy that work if
+/// this activation is a redelivery after a failed/fenced `jobs.complete`. Set
+/// the retained dir aside — rename `<name>` to a unique quarantine sibling —
+/// so the caller can prepare a fresh `<name>` while the retained work survives
+/// for recovery and the `sweep_stale_runs` cadence.
+///
+/// Everything is relative to the pinned `root` handle (`renameat`/`fstatat`),
+/// so a same-UID actor swapping an ancestor cannot redirect the check or the
+/// rename outside the runs root. Best-effort: a dir that has no marker, or
+/// whose marker read fails, is left for the caller's normal wipe — the marker
+/// is a durability hint, never a reason to fail preparing a new attempt. A
+/// symlinked `<name>` is left untouched (the rename would target the link, not
+/// a retained checkout) and handed to the caller's no-follow wipe as usual.
+#[cfg(unix)]
+fn quarantine_retained_run_dir(
+    root: &crate::saferoot::DirHandle,
+    name: &std::ffi::OsStr,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::PinError;
+    // Does `<name>/<RETENTION_MARKER>` exist? Open the child dir no-follow and
+    // stat the marker within it. Any error (no such dir, no marker, a symlinked
+    // `<name>` refused with ELOOP) means "not a retained checkout" — leave it
+    // to the caller's normal wipe.
+    let marker_present = match root.open_child_dir(name, false) {
+        Ok(child) => child
+            .symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER))
+            .map(|m| !m.is_dir || m.is_symlink) // a regular file / symlink marker
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if !marker_present {
+        return Ok(());
+    }
+    // Rename `<name>` aside to a unique quarantine sibling. The suffix mirrors
+    // the per-activation fallback-branch uniqueness (`process_rand_token` +
+    // pid + clock + a process-local sequence), so concurrent redeliveries can
+    // never collide on the quarantine name. The renamed dir keeps its mtime
+    // and is aged out by `sweep_stale_runs` like any retained run.
+    let quarantine = std::ffi::OsString::from(format!(
+        "{}.retained-{}-{}-{}-{}",
+        name.to_string_lossy(),
+        process_rand_token(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    root.rename_child(name, &quarantine).map_err(PinError::Io)?;
+    log(&format!(
+        "run dir {} carries a retention marker — setting it aside as {} instead of wiping, so a \
+         settlement-failure redelivery cannot destroy the retained (unpushed) work",
+        name.to_string_lossy(),
+        quarantine.to_string_lossy()
+    ));
+    Ok(())
 }
 
 /// Path-based `prepare_run_dir`: the non-Unix fallback (no `openat`/`fchmod`
@@ -816,6 +888,27 @@ pub(crate) async fn reap_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf, k
 /// daemon that retention is otherwise unbounded, so leftover failed runs are
 /// deleted once they age past this window (3 days).
 pub(crate) const FAILED_RUN_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Name of the retention marker file written into a run dir when [`execute`]
+/// decides to RETAIN it (a completed run whose provisioned commits were not
+/// pushed, or that finalize flagged for stranded/incomplete work). The marker
+/// makes that retention decision durable across a settlement failure: `execute`
+/// returns `Settle::Complete` and the caller sends `jobs.complete` *afterward*,
+/// so if that completion fails or is fenced the engine redelivers the SAME job
+/// key and the next `execute` would otherwise `prepare_run_dir` → wipe the
+/// retained checkout, destroying the only copy of the unpushed work. While the
+/// marker is present, [`prepare_run_dir`] defers the wipe — it sets the retained
+/// dir aside (quarantine) instead of removing it — so a redelivery cannot
+/// destroy retained work before settlement durability is confirmed. The
+/// quarantined dir is aged out by `sweep_stale_runs` like any retained run.
+///
+/// The marker is a durability HINT, not a security boundary: it is written after
+/// the agent has finished, inside the `0700` run dir. A same-UID agent could
+/// plant or remove it, but that only ever steers the wipe in the *conservative*
+/// direction (preserve rather than delete) or reverts to the pre-marker
+/// behaviour — it can never cause work to be deleted that would otherwise be
+/// kept, nor keep a dir the sweep would not already retain.
+pub(crate) const RETENTION_MARKER: &str = ".nano-retain-unpushed";
 
 /// Process-global set of run directories currently being serviced by a slot.
 ///
@@ -2099,6 +2192,24 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         if may_reap_completed_run(provisioned, has_commits, pushed, retain) {
             reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
         } else {
+            // Make the retention durable BEFORE returning: `execute` hands
+            // `Settle::Complete` back and the caller sends `jobs.complete`
+            // *afterward*, so if that completion fails or is fenced the engine
+            // redelivers the SAME job key and the next `execute` would
+            // `prepare_run_dir` → wipe this retained checkout, destroying the
+            // only copy of the unpushed work. Drop a retention marker so that
+            // redelivery's prepare defers the wipe (sets the dir aside) instead
+            // of removing it — see [`RETENTION_MARKER`]. Best-effort: a write
+            // failure only loses the cross-redelivery guard, not this run's
+            // in-memory retention, so it is logged and not fatal.
+            if let Err(e) = std::fs::write(run_dir.join(RETENTION_MARKER), b"retained\n") {
+                log(&format!(
+                    "job {key}: could not write the retention marker to {} ({e}); the retained \
+                     checkout is preserved this run but is not guarded against a settlement-failure \
+                     redelivery wipe",
+                    run_dir.display()
+                ));
+            }
             log(&format!(
                 "job {key}: retaining run dir {} — provisioned checkout holds commits that were \
                  not pushed (or finalize flagged stranded/incomplete work), so they are not \
@@ -3672,6 +3783,92 @@ mod tests {
         assert_eq!(
             root_mode, 0o700,
             "runs root must be locked to owner-only 0700"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_defers_the_wipe_for_a_retained_checkout() {
+        // Regression for the retention-vs-settlement finding (HIGH): a run dir
+        // RETAINED because its provisioned commits were not pushed carries a
+        // RETENTION_MARKER. When the SAME job key is redelivered (a failed /
+        // fenced `jobs.complete`), `prepare_run_dir` must NOT wipe that
+        // retained checkout — it must set it aside (quarantine) and prepare a
+        // fresh run dir, so the only copy of the unpushed work survives.
+        let runs = unique_tmp("prep-retained");
+        let run = runs.join("42");
+
+        // The prior attempt's retained checkout: a marker plus the only copy of
+        // the work (a stand-in file).
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RETENTION_MARKER), b"retained\n").unwrap();
+        std::fs::write(run.join("unpushed-work.txt"), b"the only copy").unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        // A fresh run dir is prepared at <key>, and it must NOT contain the
+        // retained work (the redelivery starts from a clean slate).
+        assert!(run.is_dir(), "a fresh run dir must be prepared");
+        assert!(
+            !run.join("unpushed-work.txt").exists(),
+            "the fresh run dir must not contain the prior attempt's files"
+        );
+        // The retained checkout must SURVIVE as a quarantine sibling, still
+        // holding the only copy of the work and its marker.
+        let quarantined: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("42.retained-")
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the retained checkout must be set aside as exactly one quarantine sibling"
+        );
+        let qpath = quarantined[0].path();
+        assert!(
+            qpath.join("unpushed-work.txt").exists(),
+            "the quarantined dir must still hold the retained (unpushed) work"
+        );
+        assert!(
+            qpath.join(RETENTION_MARKER).exists(),
+            "the quarantined dir must still carry its retention marker"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_wipes_an_unmarked_prior_attempt() {
+        // The ordinary retry path is unchanged: a prior attempt with NO
+        // retention marker is wiped (not quarantined), so a normal retry starts
+        // from a clean slate and no quarantine sibling is left behind.
+        let runs = unique_tmp("prep-unmarked");
+        let run = runs.join("7");
+
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("stale.json"), b"old").unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "run dir must exist after prepare");
+        assert!(
+            !run.join("stale.json").exists(),
+            "an unmarked prior attempt must be wiped"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("7.retained-"))
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "an unmarked prior attempt must NOT be quarantined"
         );
 
         std::fs::remove_dir_all(&runs).ok();

@@ -2137,11 +2137,22 @@ pub async fn finalize_git(
 ///
 /// The context lives INSIDE the per-job run directory (a sibling of the
 /// agent's checkout), not the shared system temp dir: the run dir is prepared
-/// mode `0700` under a `0700` runs root and pinned no-follow, so a same-UID
-/// agent — whose own cwd is a *child* of the run dir and which cannot traverse
-/// upward into it — cannot reopen or mutate the context after construction
-/// (closing the post-creation tamper window a world-writable temp dir would
-/// leave open). Dropping it removes the directory.
+/// mode `0700` under a `0700` runs root and pinned no-follow, so it is not
+/// readable or writable by *other* UIDs and a world-writable temp dir's
+/// post-creation tamper window is closed. Dropping it removes the directory.
+///
+/// RESIDUAL RISK (accepted, see nano-supervisor#45): the daemon's documented
+/// model is "host sandbox only" — the agent runs as the SAME UID as the daemon
+/// (no setuid / namespace / chroot; only process-group + pdeath containment).
+/// `0700` excludes only *other* UIDs, so a same-UID agent is NOT barred from
+/// the run dir: it can traverse upward from its checkout (`cd ..`), watch for
+/// the `.nano-finalize-push-*` context dir, and reopen/mutate its `config`,
+/// refs, or `objects/info/alternates` before `git push` reads them. The clean
+/// context removes the agent-writable *config search path* (the scrub-then-use
+/// race), but it does NOT provide OS-level isolation of the context from a
+/// same-UID agent. Real isolation (a different UID / sandbox / an unlinked
+/// capability) is a deliberate, out-of-scope architectural change; do not read
+/// this comment as asserting it exists.
 struct FinalizePushContext {
     /// The context git-dir's absolute path (inside the run dir). The push and
     /// verification reference it via `--git-dir=<dir>`; `Drop` removes it.
@@ -2177,8 +2188,9 @@ impl Drop for FinalizePushContext {
 ///
 /// The context is created as a direct child of the run dir (the workspace's
 /// parent), never the shared temp dir, so it inherits the run dir's `0700`
-/// no-follow protection and a same-UID agent cannot reopen or mutate it after
-/// construction. `workspace` is the pinned checkout handle; its parent is the
+/// no-follow protection against *other* UIDs. It does NOT isolate the context
+/// from a same-UID agent (see the `FinalizePushContext` docs for the accepted
+/// residual risk). `workspace` is the pinned checkout handle; its parent is the
 /// pinned run dir.
 async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<FinalizePushContext> {
     // Resolve the work-branch tip from the workspace's refs. This is the only
@@ -2231,10 +2243,12 @@ async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<Fi
     // Fresh, supervisor-owned context git-dir created as a direct child of the
     // run dir (the workspace's parent), never the shared system temp dir. The
     // run dir is prepared mode `0700` under a `0700` runs root and pinned
-    // no-follow, and the agent's cwd is a *child* of it (the checkout), so a
-    // same-UID agent cannot traverse upward into the run dir to reopen or
-    // mutate this context after construction — closing the post-creation
-    // tamper window a world-writable temp dir would leave open. The name is a
+    // no-follow, so the context is protected from *other* UIDs — closing the
+    // post-creation tamper window a world-writable temp dir would leave open.
+    // It is NOT isolated from a same-UID agent (which can traverse upward from
+    // its checkout into the run dir); that residual risk is accepted under the
+    // daemon's "host sandbox only" model — see the `FinalizePushContext` docs.
+    // The name is a
     // single component carrying a process/clock-unique suffix (no agent
     // influence); the uniqueness also keeps the tests — which place their
     // workspace directly under the shared temp dir — from colliding on a fixed
@@ -4484,11 +4498,13 @@ mod tests {
     async fn finalize_push_context_lives_inside_the_run_dir() {
         // Regression for the writable-temp-context finding (HIGH): the clean
         // push context must NOT be created under the shared, world-writable
-        // system temp dir (where a same-UID agent could watch for it and mutate
-        // its config/refs/alternates after construction). It must live inside
-        // the per-job run dir — the workspace's parent — which is prepared mode
-        // 0700 under a 0700 runs root, so the agent (whose cwd is the checkout,
-        // a child of the run dir) cannot traverse into it.
+        // system temp dir (where ANY process — including one of another UID —
+        // could watch for it and mutate its config/refs/alternates after
+        // construction). It must live inside the per-job run dir — the
+        // workspace's parent — which is prepared mode 0700 under a 0700 runs
+        // root, so it is protected from other UIDs. (It is not isolated from a
+        // same-UID agent; that residual risk is accepted — see the
+        // `FinalizePushContext` docs.)
         let dir = git_workspace("fin-ctxloc").await;
         git(
             &["checkout".into(), "-B".into(), "feat/work".into(), "--".into()],

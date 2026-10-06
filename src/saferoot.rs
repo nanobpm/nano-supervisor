@@ -651,6 +651,30 @@ impl DirHandle {
         Ok(())
     }
 
+    /// Rename a direct child `from` to `to`, both relative to this handle, via
+    /// `renameat`. Both names stay under the pinned parent inode, so a same-UID
+    /// actor swapping an ancestor cannot redirect either side outside the
+    /// workspace. `renameat` does not follow a symlink at the *source* leaf (it
+    /// renames the link itself), and `to`/`from` are single components, so the
+    /// operation is anchored on the pinned fd exactly like `remove_tree`. Used
+    /// to set a retained run dir aside (quarantine) instead of wiping it.
+    pub(crate) fn rename_child(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let from_c = cstr(from)?;
+        let to_c = cstr(to)?;
+        let r = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                from_c.as_ptr(),
+                self.fd.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Restrict this directory to `mode` via `fchmod` on the pinned fd (no path
     /// re-resolution, so no swapped component can redirect the chmod).
     pub(crate) fn restrict_mode(&self, mode: u32) -> io::Result<()> {
