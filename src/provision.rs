@@ -2133,10 +2133,18 @@ pub async fn finalize_git(
 /// `.git/config` / `config.worktree` / `include` chain is in the push's config
 /// search path. This removes the scrub-then-use race outright: there is no
 /// mutable local config for a detached agent helper to rewrite between a scrub
-/// and the spawn. Dropping it removes the temporary directory.
+/// and the spawn.
+///
+/// The context lives INSIDE the per-job run directory (a sibling of the
+/// agent's checkout), not the shared system temp dir: the run dir is prepared
+/// mode `0700` under a `0700` runs root and pinned no-follow, so a same-UID
+/// agent — whose own cwd is a *child* of the run dir and which cannot traverse
+/// upward into it — cannot reopen or mutate the context after construction
+/// (closing the post-creation tamper window a world-writable temp dir would
+/// leave open). Dropping it removes the directory.
 struct FinalizePushContext {
-    /// The temporary git-dir; kept so the directory lives until the push and
-    /// any verification are done. `Drop` removes it.
+    /// The context git-dir's absolute path (inside the run dir). The push and
+    /// verification reference it via `--git-dir=<dir>`; `Drop` removes it.
     dir: PathBuf,
     /// The work-branch tip SHA pinned at build time (the trusted local state).
     branch_tip: String,
@@ -2166,6 +2174,12 @@ impl Drop for FinalizePushContext {
 /// workspace's refs/objects are trusted repo state; only its *config* is
 /// agent-mutable). Any failure fails CLOSED: the caller skips the push and
 /// retains the run dir rather than risk a redirect.
+///
+/// The context is created as a direct child of the run dir (the workspace's
+/// parent), never the shared temp dir, so it inherits the run dir's `0700`
+/// no-follow protection and a same-UID agent cannot reopen or mutate it after
+/// construction. `workspace` is the pinned checkout handle; its parent is the
+/// pinned run dir.
 async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<FinalizePushContext> {
     // Resolve the work-branch tip from the workspace's refs. This is the only
     // workspace read the push depends on; it carries no config influence.
@@ -2214,16 +2228,34 @@ async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<Fi
         );
     }
 
-    // Fresh, supervisor-owned temporary git-dir. No component is agent-influenced.
+    // Fresh, supervisor-owned context git-dir created as a direct child of the
+    // run dir (the workspace's parent), never the shared system temp dir. The
+    // run dir is prepared mode `0700` under a `0700` runs root and pinned
+    // no-follow, and the agent's cwd is a *child* of it (the checkout), so a
+    // same-UID agent cannot traverse upward into the run dir to reopen or
+    // mutate this context after construction — closing the post-creation
+    // tamper window a world-writable temp dir would leave open. The name is a
+    // single component carrying a process/clock-unique suffix (no agent
+    // influence); the uniqueness also keeps the tests — which place their
+    // workspace directly under the shared temp dir — from colliding on a fixed
+    // name.
+    let run_dir_path = workspace
+        .path()
+        .context("recovering the pinned checkout path")?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("the checkout has no parent run dir"))?
+        .to_path_buf();
     let uniq = format!(
-        "nano-finalize-push-{}-{}",
+        ".nano-finalize-push-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let dir = std::env::temp_dir().join(uniq);
+    let dir = run_dir_path.join(uniq);
+    std::fs::create_dir(&dir)
+        .with_context(|| format!("creating the clean push context {}", dir.display()))?;
     let info = dir.join("objects").join("info");
     std::fs::create_dir_all(&info)
         .with_context(|| format!("creating the clean push context {}", info.display()))?;
@@ -2314,19 +2346,18 @@ async fn remote_contains_branch_tip(
     fetch.push(fetch_url.to_string());
     fetch.push(format!("refs/heads/{branch}"));
     git_isolated(&fetch, None, timeout, cred).await.ok()?;
-    let landed = git_isolated(
-        &[
-            "merge-base".into(),
-            "--is-ancestor".into(),
-            local_tip,
-            remote_tip,
-        ],
-        None,
-        timeout,
-        None,
-    )
-    .await
-    .is_ok();
+    // `merge-base` must run against the SAME clean context the fetch wrote
+    // into: without `cfg`'s `--git-dir` prefix (and with `cwd=None`) git cannot
+    // find a repository at all and exits "not a git repository", which
+    // `.is_ok()` would misread as "not an ancestor" — reporting a landed,
+    // fast-forwarded push as unconfirmed (`pushed = false`, retained). Prefix
+    // the command with `cfg` exactly like the `ls-remote`/`fetch` above.
+    let mut mb = cfg.to_vec();
+    mb.push("merge-base".into());
+    mb.push("--is-ancestor".into());
+    mb.push(local_tip);
+    mb.push(remote_tip);
+    let landed = git_isolated(&mb, None, timeout, None).await.is_ok();
     Some(landed)
 }
 
@@ -3516,6 +3547,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
+    #[tokio::test]
+    async fn remote_contains_branch_tip_confirms_a_fast_forwarded_remote() {
+        // Regression for the descendant-confirmation finding: when the push's
+        // response is lost AND the remote branch is then fast-forwarded on top
+        // of our tip, the remote tip differs from the local tip, so finalize
+        // must fetch it and run `merge-base --is-ancestor` against the SAME
+        // clean context (`--git-dir`). Without that prefix the command cannot
+        // find a repository and `.is_ok()` misreads the failure as "not an
+        // ancestor", reporting a durable push as unconfirmed.
+        let dir = git_workspace("verify-push-ff").await;
+        let t = Duration::from_secs(30);
+        git(
+            &["checkout".into(), "-B".into(), "feat/work".into(), "--".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "durable work").await;
+        let bare = std::env::temp_dir().join(format!(
+            "nano-bare-verifyff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        git(
+            &[
+                "init".into(),
+                "--bare".into(),
+                "--".into(),
+                bare.to_string_lossy().into_owned(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        let url = format!("file://{}", bare.display());
+        // The verification context is built over the workspace's object store +
+        // branch tip; `cfg` carries its `--git-dir` prefix, exactly as the real
+        // finalize caller passes it.
+        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        let cfg: Vec<String> = vec![
+            format!("--git-dir={}", ctx.dir.display()),
+            "-c".into(),
+            "core.hooksPath=/dev/null".into(),
+        ];
+        // Publish our tip, then fast-forward the remote with a descendant commit
+        // (someone built on top before our lost response was retried).
+        git(
+            &[
+                "push".into(),
+                "--".into(),
+                url.clone(),
+                "refs/heads/feat/work:refs/heads/feat/work".into(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "someone else fast-forwards").await;
+        git(
+            &[
+                "push".into(),
+                "--".into(),
+                url.clone(),
+                "refs/heads/feat/work:refs/heads/feat/work".into(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
+        // The remote tip is now a DESCENDANT of the context's pinned tip: the
+        // push must be confirmed durable, not reported unconfirmed.
+        assert_eq!(
+            remote_contains_branch_tip(&ctx, &cfg, &url, "feat/work", None, t).await,
+            Some(true),
+            "a remote tip that is a descendant of ours must confirm the push landed"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
     /// Init a fresh local bare repo and return a `test_repo()` whose `url` points
     /// at it, so the finalize push actually SUCCEEDS. Scan/retain tests use this
     /// to isolate the scan's `retain` decision from the push outcome: an
@@ -4356,6 +4478,37 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[tokio::test]
+    async fn finalize_push_context_lives_inside_the_run_dir() {
+        // Regression for the writable-temp-context finding (HIGH): the clean
+        // push context must NOT be created under the shared, world-writable
+        // system temp dir (where a same-UID agent could watch for it and mutate
+        // its config/refs/alternates after construction). It must live inside
+        // the per-job run dir — the workspace's parent — which is prepared mode
+        // 0700 under a 0700 runs root, so the agent (whose cwd is the checkout,
+        // a child of the run dir) cannot traverse into it.
+        let dir = git_workspace("fin-ctxloc").await;
+        git(
+            &["checkout".into(), "-B".into(), "feat/work".into(), "--".into()],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "work").await;
+        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        let workspace = dir_path(&dir);
+        let run_dir = workspace.parent().expect("the checkout has a parent run dir");
+        assert_eq!(
+            ctx.dir.parent(),
+            Some(run_dir),
+            "the push context must be a direct child of the run dir (which production prepares \
+             mode 0700 under a 0700 runs root), not a sibling of the checkout in a shared temp dir"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
 
     #[tokio::test]
