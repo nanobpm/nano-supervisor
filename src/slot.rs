@@ -2319,6 +2319,21 @@ fn build_agent_env(
     // dir into this fail-closed no-follow root. Isolating session/profiles
     // without relocating the plugins dir is tracked in #51.
     let dir = seed_agent_c8ctl_dir(cfg, result_file, run_dir_handle)?;
+    // RESIDUAL RISK (#46, accepted): the seed WRITE is pinned to the run-dir
+    // inode (via `run_dir_handle`, no-follow), but `C8CTL_DATA_DIR` is still
+    // exported as the nominal PATH (`<run dir>/c8ctl`), which the agent's `c8`
+    // re-resolves by name at read time. A same-UID sibling could therefore swap
+    // `run_dir` for a different directory between seed and the agent's later `c8`
+    // invocation, redirecting those reads/writes. We accept this read-side
+    // TOCTOU rather than binding the export to the inode: the only robust fixes
+    // are a cwd-relative export (fragile — the external agent may `chdir` before
+    // calling `c8`) or an inherited non-CLOEXEC dir fd exported as
+    // `/proc/self/fd/N` (Linux-only, and depends on the external `c8` binary
+    // accepting a procfs path as its data dir, which we cannot verify). Neither
+    // is warranted under this PR's same-UID threat model: an actor who can swap
+    // `run_dir` already shares the UID and can edit the `0600` seed files — or
+    // the operator's global config — directly, so the export adds no new
+    // boundary here. This mirrors the accepted plugins-dir tradeoff in #51.
     env.push(("C8CTL_DATA_DIR".into(), dir.to_string_lossy().into_owned()));
     Ok(env)
 }
