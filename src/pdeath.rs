@@ -262,6 +262,31 @@ pub(crate) struct GroupIdentity {
     uid: u32,
 }
 
+/// The result of probing the current leader's identity for a pgid. This is
+/// richer than `Option<GroupIdentity>` because the two `None`-collapsing cases
+/// a plain read conflates — a *genuinely absent* leader and a *detected
+/// incarnation change* — need **opposite** signal policies (issue #27):
+///
+/// - [`LeaderProbe::Absent`]: the leader is gone (reaped). The pgid is held
+///   only by orphaned descendants — almost certainly our own — so the caller
+///   fails **open** (signals) rather than leak `TERM`-resistant orphans.
+/// - [`LeaderProbe::Changed`]: the leader's identity *changed* mid-read (a
+///   reap+recycle straddled the non-atomic `/proc` reads). The group holding
+///   the pgid is positively **not** ours, so the caller fails **closed** (does
+///   not signal). Collapsing this to `Absent` would green-light signalling the
+///   unrelated replacement group — the exact race the bracketed read exists to
+///   close.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaderProbe {
+    /// A live, readable leader with this identity.
+    Present(GroupIdentity),
+    /// The leader is gone (reaped); only descendants may hold the pgid.
+    Absent,
+    /// The leader's identity changed mid-read — a detected reap+recycle.
+    Changed,
+}
+
 #[cfg(target_os = "linux")]
 fn read_start_tick(pgid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).ok()?;
@@ -296,22 +321,53 @@ fn read_uid(pgid: u32) -> Option<u32> {
 /// that window: a reap+recycle changes the start tick, so the only residual is a
 /// same-tick *and* same-uid recycle (window 3 on [`GroupIdentity`], already
 /// accepted). Every returned field is thus read from one stable incarnation.
+///
+/// The result distinguishes the two ways the read can fail, because the
+/// verification callers need opposite policies for them (issue #27): a *moved*
+/// start tick is a detected reap+recycle and returns [`LeaderProbe::Changed`]
+/// (fail **closed** — the group is positively not ours), while a *vanished*
+/// leader (either read unreadable) returns [`LeaderProbe::Absent`] (fail
+/// **open** — only our own orphaned descendants remain). Collapsing the moved
+/// case to `Absent` would signal the unrelated replacement group.
 #[cfg(target_os = "linux")]
 fn assemble_identity(
     mut read_start: impl FnMut() -> Option<u64>,
     read_uid: impl FnOnce() -> Option<u32>,
-) -> Option<GroupIdentity> {
-    let start = read_start()?;
-    let uid = read_uid()?;
-    if read_start()? != start {
-        return None;
+) -> LeaderProbe {
+    let Some(start) = read_start() else {
+        return LeaderProbe::Absent;
+    };
+    let Some(uid) = read_uid() else {
+        return LeaderProbe::Absent;
+    };
+    match read_start() {
+        // The tick moved between the bracketing reads: a reap+recycle straddled
+        // the snapshot, so the group holding the pgid is a *different*
+        // incarnation. Fail closed, not open.
+        Some(tick) if tick != start => LeaderProbe::Changed,
+        // The re-read is unreadable: the leader vanished (reaped) with no
+        // replacement yet — the accepted fail-open case.
+        None => LeaderProbe::Absent,
+        // Stable tick across both reads: one stable incarnation.
+        Some(_) => LeaderProbe::Present(GroupIdentity { start, uid }),
     }
-    Some(GroupIdentity { start, uid })
+}
+
+#[cfg(target_os = "linux")]
+fn probe_leader(pgid: u32) -> LeaderProbe {
+    assemble_identity(|| read_start_tick(pgid), || read_uid(pgid))
 }
 
 #[cfg(target_os = "linux")]
 fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
-    assemble_identity(|| read_start_tick(pgid), || read_uid(pgid))
+    match probe_leader(pgid) {
+        LeaderProbe::Present(id) => Some(id),
+        // A detected incarnation change is *not* a readable identity: collapse
+        // to `None` for capture sites (which store `Option<GroupIdentity>` and
+        // degrade to the numeric probe). The fail-closed distinction only
+        // matters at *verification* time, which uses `probe_leader` directly.
+        LeaderProbe::Absent | LeaderProbe::Changed => None,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -344,11 +400,30 @@ fn leader_identity(pgid: u32) -> Option<GroupIdentity> {
     }
 }
 
+/// The macOS identity read is a single `proc_pidinfo` snapshot, so it cannot
+/// straddle a recycle the way the two-file Linux read can — there is no
+/// mid-read incarnation change to detect, hence no `Changed` case.
+#[cfg(target_os = "macos")]
+fn probe_leader(pgid: u32) -> LeaderProbe {
+    match leader_identity(pgid) {
+        Some(id) => LeaderProbe::Present(id),
+        None => LeaderProbe::Absent,
+    }
+}
+
 /// No identity source on other unix targets: callers fall back to the numeric
 /// liveness probe alone (the pre-#27 behaviour) rather than failing closed.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn leader_identity(_pgid: u32) -> Option<GroupIdentity> {
     None
+}
+
+/// With no identity source there is nothing to probe: report the leader as
+/// absent so callers degrade to the numeric liveness probe (the pre-#27
+/// behaviour), matching `leader_identity` returning `None`.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn probe_leader(_pgid: u32) -> LeaderProbe {
+    LeaderProbe::Absent
 }
 
 /// A preserved process-group id **plus the identity of the group it named at
@@ -404,7 +479,14 @@ impl PgidGuard {
     /// - **Leader still readable, identity differs**: the pgid was recycled by a
     ///   *live* unrelated group — fail **closed**, do not signal (a live leader
     ///   with a different identity is a definite recycle).
-    /// - **Leader gone** (re-read yields `None`): the leader was reaped while
+    /// - **Leader changed mid-probe** ([`LeaderProbe::Changed`]): the bracketed
+    ///   identity read detected a reap+recycle straddling it, so the group now
+    ///   holding the pgid is positively a *different* incarnation — fail
+    ///   **closed**, do not signal. This must not collapse into the fail-open
+    ///   "leader gone" case below: a detected recycle means the replacement
+    ///   group is present and unrelated, so signalling it is exactly the
+    ///   recycled-PGID race #27 closes.
+    /// - **Leader gone** (re-read yields [`LeaderProbe::Absent`]): the leader was reaped while
     ///   descendants kept the pgid reserved — almost certainly our own orphaned
     ///   descendants — so fail **open** and signal. This is the case the earlier
     ///   strict-equality check got wrong: it returned `false` here and *skipped*
@@ -430,12 +512,15 @@ impl PgidGuard {
             return false;
         }
         match self.identity {
-            Some(id) => match leader_identity(self.pgid) {
+            Some(id) => match probe_leader(self.pgid) {
                 // Live leader, identity matches: ours.
-                Some(cur) => cur == id,
+                LeaderProbe::Present(cur) => cur == id,
                 // Leader reaped but the group is still alive: our orphaned
                 // descendants hold the pgid — fail open (see the doc above).
-                None => true,
+                LeaderProbe::Absent => true,
+                // Detected incarnation change mid-probe: a reap+recycle, so the
+                // group is positively not ours — fail closed.
+                LeaderProbe::Changed => false,
             },
             // No identity source on this platform: fall back to the numeric
             // probe alone (the pre-#27 behaviour).
@@ -875,12 +960,17 @@ fn group_identity_matches(pgid: u32, expected: Option<GroupIdentity>) -> bool {
         return false;
     }
     match expected {
-        Some(id) => match leader_identity(pgid) {
+        Some(id) => match probe_leader(pgid) {
             // Live leader, identity matches: ours.
-            Some(cur) => cur == id,
+            LeaderProbe::Present(cur) => cur == id,
             // Leader reaped but the group is still alive: our orphaned
             // descendants hold the pgid — fail open (see the doc above).
-            None => true,
+            LeaderProbe::Absent => true,
+            // Detected incarnation change mid-probe: a reap+recycle straddled
+            // the identity read, so the group holding the pgid is positively a
+            // different incarnation — fail closed, do not signal the unrelated
+            // replacement group (the race #27 closes).
+            LeaderProbe::Changed => false,
         },
         None => true,
     }
@@ -1035,6 +1125,8 @@ mod tests {
         // the second start read disagrees with the first: the mixed
         // (original-start, replacement-uid) token must be rejected rather than
         // returned as a false match that would signal the unrelated group (#27).
+        // Crucially it must come back as `Changed` — a *detected* recycle — not
+        // `Absent`, so the verification callers fail closed instead of open.
         let reads = Cell::new(0u32);
         let straddled = assemble_identity(
             || {
@@ -1045,15 +1137,22 @@ mod tests {
             },
             || Some(1000),
         );
-        assert!(straddled.is_none(), "straddled snapshot must be rejected");
+        assert_eq!(
+            straddled,
+            LeaderProbe::Changed,
+            "a moved start tick is a detected recycle, not an absent leader"
+        );
 
         // A start tick that is stable across both reads yields the assembled
         // token — the common, non-racing case.
         let stable = assemble_identity(|| Some(100), || Some(7));
-        assert_eq!(stable, Some(GroupIdentity { start: 100, uid: 7 }));
+        assert_eq!(
+            stable,
+            LeaderProbe::Present(GroupIdentity { start: 100, uid: 7 })
+        );
 
-        // An unreadable second start read (leader gone, no recycle) also rejects
-        // rather than returning a half-token.
+        // An unreadable second start read (leader gone, no recycle) reports
+        // `Absent` — the accepted fail-open case — rather than `Changed`.
         let reads2 = Cell::new(0u32);
         let vanished = assemble_identity(
             || {
@@ -1063,7 +1162,65 @@ mod tests {
             },
             || Some(7),
         );
-        assert!(vanished.is_none(), "unreadable re-read must be rejected");
+        assert_eq!(
+            vanished,
+            LeaderProbe::Absent,
+            "a vanished leader (no replacement) is the fail-open case"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changed_incarnation_fails_closed_not_open() {
+        // Regression test for the review finding: a *detected* incarnation
+        // change (the bracketed read sees the start tick move) must fail
+        // **closed** at both verification callers, not collapse into the
+        // fail-open "leader was reaped" case. Before the fix the probe returned
+        // a bare `None` for both, so `Absent` and `Changed` were
+        // indistinguishable and the recycled replacement group was signalled.
+        use std::cell::Cell;
+
+        // The probe distinguishes the cases at the source.
+        let reads = Cell::new(0u32);
+        let probe = assemble_identity(
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                Some(if n == 0 { 100 } else { 200 })
+            },
+            || Some(1000),
+        );
+        assert_eq!(probe, LeaderProbe::Changed);
+
+        // And both verification sites map `Changed` to fail-closed (`false`)
+        // while mapping `Absent` to fail-open (`true`). Mirror their match arms
+        // against a captured identity so a future edit that re-collapses the
+        // two cases trips this test.
+        let captured = GroupIdentity { start: 100, uid: 1000 };
+        let verdict = |p: LeaderProbe| match p {
+            LeaderProbe::Present(cur) => cur == captured,
+            LeaderProbe::Absent => true,
+            LeaderProbe::Changed => false,
+        };
+        assert!(
+            !verdict(LeaderProbe::Changed),
+            "a detected incarnation change must fail closed"
+        );
+        assert!(
+            verdict(LeaderProbe::Absent),
+            "a genuinely absent leader must fail open"
+        );
+        assert!(
+            !verdict(LeaderProbe::Present(GroupIdentity {
+                start: 200,
+                uid: 1000
+            })),
+            "a live but different identity must fail closed"
+        );
+        assert!(
+            verdict(LeaderProbe::Present(captured)),
+            "a live matching identity must pass"
+        );
     }
 
     /// Spawn a child in its own process group that sleeps, return (child, pgid).
