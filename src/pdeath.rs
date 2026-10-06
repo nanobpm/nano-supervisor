@@ -587,7 +587,9 @@ impl Drop for GroupGuard {
             // empty the pid is no longer reserved as a pgid and may have been
             // recycled for an unrelated group, so an unconditional kill could hit
             // it. `still_ours` re-checks the leader's identity, so a recycled
-            // pgid is never signalled even when a live process group holds it.
+            // pgid is not signalled outside the accepted residual windows (see
+            // [`GroupIdentity`]) — including the same-tick, same-uid collision
+            // (window 3), where a live recycled group *is* signalled.
             if guard.still_ours() {
                 sigkill_group(guard.pgid());
             }
@@ -624,7 +626,8 @@ pub fn watch(agent_pid: u32) {
     // guaranteed alive, and hand it to the watchdog. The watchdog's final
     // SIGKILL is then gated on the identity (issue #27), so a pgid recycled by
     // an unrelated group between the agent's exit and the daemon's death is
-    // never signalled. Without this the watchdog only has the numeric pgid,
+    // not signalled outside the accepted residual windows (see
+    // [`GroupIdentity`]). Without this the watchdog only has the numeric pgid,
     // which proves liveness of *some* group, not the agent's.
     let group_identity = leader_identity(agent_pid);
     // Detached so it survives independently and can reap us; it exits on its own
@@ -744,7 +747,8 @@ pub fn reap_watchdog(
         // Re-verify the group's identity immediately before signalling: after the
         // parent exited the agent's group may already have vanished, freeing the
         // pid to be recycled by an unrelated group. The identity check gates the
-        // kill so a recycled pgid is never signalled (issue #27).
+        // kill so a recycled pgid is not signalled outside the accepted residual
+        // windows (see [`GroupIdentity`]) (issue #27).
         if parent_died && still_ours() {
             sigkill_group(pgid);
         }
