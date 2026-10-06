@@ -305,7 +305,8 @@ impl Agent {
         // redelivered. The spawn-time `group_guard` (not a fresh capture)
         // verifies the group's identity, so the group is still torn down even if
         // a prior `request` reaped the leader (dropping `child.id()` to None) —
-        // and a pgid recycled since spawn is never signalled; only then is the
+        // and a pgid recycled since spawn is not signalled outside the accepted
+        // residual windows (see `pdeath::GroupIdentity`); only then is the
         // guard disarmed (the pid must not be re-signalled once the group is
         // gone — it may be recycled).
         crate::pdeath::terminate_group_and_reap(

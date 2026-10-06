@@ -5,20 +5,26 @@
 //! and passes it the agent group's **identity** (the leader's start time + real
 //! uid, captured at spawn) via `--pgid-start`/`--pgid-uid`. Before the watchdog
 //! `SIGKILL`s the group it re-verifies that identity, so a pgid that was freed
-//! and recycled by an unrelated group is not signalled — **with two accepted
+//! and recycled by an unrelated group is not signalled — **with three accepted
 //! residual windows**: (1) a *nested recycle* — the group empties
 //! entirely, the pgid is recycled, *and* the recycled group's own leader is
 //! reaped too (all inside one poll interval), so the leader's identity source
 //! reads `None` and the check fails *open* to avoid leaking orphaned
-//! descendants; and (2) a *check-to-signal TOCTOU* — the identity check and the
+//! descendants; (2) a *check-to-signal TOCTOU* — the identity check and the
 //! `kill(2)` are separate syscalls, so a gone-leader group's last member can exit
-//! and the pgid be recycled between them. These windows apply to the in-process
-//! cleanup paths too (their call sites reap the leader before cleanup, so there
-//! is no zombie anchor), not only to the watchdog. Both are the documented,
-//! maintainer-accepted limit of the guarantee (closing them is tracked in #50);
-//! everywhere else (a live recycled leader, or any still-readable leader) the
-//! identity check refuses the signal. These tests pin the fail-closed live-leader
-//! case.
+//! and the pgid be recycled between them; and (3) a *same-tick, same-uid identity
+//! collision* — a recycled group whose leader shares the original's real uid and
+//! starts on the same clock tick has a byte-identical `(start, uid)` token and is
+//! mis-read as ours. Windows 1 and 2 are fail-open gaps that apply to the watchdog
+//! and only to the *reaped-first* in-process sub-paths (pipe EOF-with-exit,
+//! provision success, acp mid-request exit); the leader-still-alive paths (acp
+//! normal shutdown, pipe idle timeout) hold the leader unreaped through cleanup
+//! and close them. Window 3 shares that reaped-first precondition (the pgid can
+//! only be recycled once the leader is gone) but is a false-positive *match* on
+//! the colliding live leader rather than a fail-open. All are the documented, maintainer-accepted limit of the guarantee
+//! (closing windows 1/2 is tracked in #50); everywhere else (a live recycled
+//! leader with a different identity, or any still-readable leader) the identity
+//! check refuses the signal. These tests pin the fail-closed live-leader case.
 //!
 //! These tests are **engine-free** and drive the real binary's hidden
 //! `__reap-watchdog` subcommand directly. They are **Linux-only** (the identity

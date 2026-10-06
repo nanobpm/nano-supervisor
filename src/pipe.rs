@@ -190,7 +190,8 @@ async fn kill_tree(child: &mut tokio::process::Child, guard: Option<crate::pdeat
     // would only SIGKILL the direct agent and let a tool it started survive. The
     // spawn-time `guard` (not a fresh capture) verifies the group's identity, so
     // the group is still torn down even though the EOF path may already have
-    // reaped the leader — and a pgid recycled since spawn is never signalled.
+    // reaped the leader — and a pgid recycled since spawn is not signalled outside
+    // the accepted residual windows documented on `pdeath::GroupIdentity`.
     crate::pdeath::terminate_group_and_reap(child, guard, Duration::from_secs(3)).await;
 }
 
