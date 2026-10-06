@@ -3866,9 +3866,7 @@ mod tests {
         let quarantined: Vec<_> = std::fs::read_dir(&runs)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("42.retained-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("42.retained-"))
             .collect();
         assert_eq!(
             quarantined.len(),

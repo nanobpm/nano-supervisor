@@ -979,7 +979,12 @@ pub async fn prepare_work_branch(
     // prints the branch HEAD points at whether or not it has a commit, and still
     // fails on a detached HEAD (which we treat as "no branch", same as before).
     let checked_out = git(
-        &["symbolic-ref".into(), "--short".into(), "-q".into(), "HEAD".into()],
+        &[
+            "symbolic-ref".into(),
+            "--short".into(),
+            "-q".into(),
+            "HEAD".into(),
+        ],
         Some(workspace),
         timeout,
         None,
@@ -1212,7 +1217,9 @@ pub async fn prepare_work_branch(
         let target = cut_fallback(configured_base.as_deref().unwrap_or("detached"));
         match checkout(target).await {
             Ok(b) => working_branch = Some(b),
-            Err(e) => log(&format!("finalize: detached-HEAD fallback branch cut failed — {e}")),
+            Err(e) => log(&format!(
+                "finalize: detached-HEAD fallback branch cut failed — {e}"
+            )),
         }
     }
 
@@ -1559,11 +1566,9 @@ pub async fn finalize_git(
                         // provision): cannot prove side branches pre-existed, so
                         // treat the scan as incomplete and fail closed.
                         _ => {
-                            log(
-                                "finalize: no provision-time ref snapshot (its enumeration \
+                            log("finalize: no provision-time ref snapshot (its enumeration \
                                  failed); cannot prove side branches pre-existed, so treating the \
-                                 scan as incomplete and retaining the run dir",
-                            );
+                                 scan as incomplete and retaining the run dir");
                             out.retain = true;
                             // The snapshot is a WHOLE-SCAN condition (absent for
                             // every branch), so no later branch can clear it —
@@ -2407,11 +2412,8 @@ async fn git(
 /// the agent's injection surface is on-disk config (handled by the global/system
 /// isolation and `insteadOf` stripping on the finalize push) and `.git/hooks`
 /// (handled by `core.hooksPath=/dev/null`), not the environment.
-const GIT_CONFIG_INJECTION_ENV: &[&str] = &[
-    "GIT_CONFIG",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-];
+const GIT_CONFIG_INJECTION_ENV: &[&str] =
+    &["GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
 
 async fn git_untruncated(
     args: &[String],
@@ -2625,56 +2627,60 @@ async fn git_with_env_capture(
     };
     let (status, (stderr_tail, (stdout_tail, stdout_truncated))) =
         match tokio::time::timeout(timeout, wait).await {
-        Ok(res) => {
-            // git finished within the timeout, but a credential/remote helper it
-            // spawned can outlive the leader while sharing git's process group
-            // (`child.wait()` reaped only the direct git leader). Tear the whole
-            // group down before disarming the guard — mirroring the ACP and pipe
-            // paths — so a lingering helper can't keep mutating the run directory
-            // after provisioning "succeeds". `terminate_group_and_reap` gates on
-            // `group_alive`, so this is a no-op when git left nothing behind and
-            // never re-signals a pid that may have been recycled.
-            #[cfg(unix)]
-            {
-                crate::pdeath::terminate_group_and_reap(&mut child, gpid, Duration::from_secs(3))
+            Ok(res) => {
+                // git finished within the timeout, but a credential/remote helper it
+                // spawned can outlive the leader while sharing git's process group
+                // (`child.wait()` reaped only the direct git leader). Tear the whole
+                // group down before disarming the guard — mirroring the ACP and pipe
+                // paths — so a lingering helper can't keep mutating the run directory
+                // after provisioning "succeeds". `terminate_group_and_reap` gates on
+                // `group_alive`, so this is a no-op when git left nothing behind and
+                // never re-signals a pid that may have been recycled.
+                #[cfg(unix)]
+                {
+                    crate::pdeath::terminate_group_and_reap(
+                        &mut child,
+                        gpid,
+                        Duration::from_secs(3),
+                    )
                     .await;
-                group_guard.disarm();
-            }
-            res
-        }
-        Err(_) => {
-            // Timed out: SIGKILL the whole group (not just the leader that
-            // `kill_on_drop` reaps) so a helper git spawned cannot outlive it.
-            // Re-probe `group_alive` immediately before signalling — mirroring
-            // `terminate_group_and_reap` and the success path above: the `wait`
-            // future (and its `child.wait()`) is dropped when the timeout fires,
-            // so if git and every descendant exited in that interval the pgid can
-            // be released and recycled by an unrelated group before this call.
-            // Only signal while the group is genuinely still present, so a timeout
-            // never SIGKILLs a recycled pid — upholding the guard's guarantee.
-            #[cfg(unix)]
-            if let Some(pid) = gpid {
-                if crate::pdeath::group_alive(pid) {
-                    crate::pdeath::sigkill_group(pid);
+                    group_guard.disarm();
                 }
+                res
             }
-            #[cfg(unix)]
-            group_guard.disarm();
-            // Reap the just-killed leader (bounded) before returning. The `wait`
-            // future — which owns `child` — was dropped when the timeout fired,
-            // and `kill_on_drop` signals a dropped child but does *not* guarantee
-            // it is reaped; without an explicit wait, repeated clone/fetch
-            // timeouts would accumulate zombie git leaders in the long-lived
-            // daemon. The timeout bounds the wait so a wedged (uninterruptible)
-            // child cannot hang the slot.
-            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-            bail!(
-                "git {} timed out after {}s",
-                args.first().map(String::as_str).unwrap_or(""),
-                timeout.as_secs()
-            );
-        }
-    };
+            Err(_) => {
+                // Timed out: SIGKILL the whole group (not just the leader that
+                // `kill_on_drop` reaps) so a helper git spawned cannot outlive it.
+                // Re-probe `group_alive` immediately before signalling — mirroring
+                // `terminate_group_and_reap` and the success path above: the `wait`
+                // future (and its `child.wait()`) is dropped when the timeout fires,
+                // so if git and every descendant exited in that interval the pgid can
+                // be released and recycled by an unrelated group before this call.
+                // Only signal while the group is genuinely still present, so a timeout
+                // never SIGKILLs a recycled pid — upholding the guard's guarantee.
+                #[cfg(unix)]
+                if let Some(pid) = gpid {
+                    if crate::pdeath::group_alive(pid) {
+                        crate::pdeath::sigkill_group(pid);
+                    }
+                }
+                #[cfg(unix)]
+                group_guard.disarm();
+                // Reap the just-killed leader (bounded) before returning. The `wait`
+                // future — which owns `child` — was dropped when the timeout fired,
+                // and `kill_on_drop` signals a dropped child but does *not* guarantee
+                // it is reaped; without an explicit wait, repeated clone/fetch
+                // timeouts would accumulate zombie git leaders in the long-lived
+                // daemon. The timeout bounds the wait so a wedged (uninterruptible)
+                // child cannot hang the slot.
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                bail!(
+                    "git {} timed out after {}s",
+                    args.first().map(String::as_str).unwrap_or(""),
+                    timeout.as_secs()
+                );
+            }
+        };
     let status = status.context("waiting for git")?;
     if !status.success() {
         // Show the *last* 500 chars of the retained tail — a git failure message
@@ -2759,6 +2765,7 @@ where
     (buf, truncated)
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3441,7 +3448,12 @@ mod tests {
         // local `origin/HEAD` symref (what an ordinary clone of such a repo
         // leaves behind).
         git(
-            &["checkout".into(), "-B".into(), "develop".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-B".into(),
+                "develop".into(),
+                "--".into(),
+            ],
             Some(&dir),
             t,
             None,
@@ -3485,8 +3497,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(on.trim(), branch, "the checkout must move onto the fallback");
-        assert_ne!(on.trim(), "develop", "the shared default must never stay the work branch");
+        assert_eq!(
+            on.trim(),
+            branch,
+            "the checkout must move onto the fallback"
+        );
+        assert_ne!(
+            on.trim(),
+            "develop",
+            "the shared default must never stay the work branch"
+        );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
 
@@ -3499,7 +3519,12 @@ mod tests {
         let dir = git_workspace("verify-push").await;
         let t = Duration::from_secs(30);
         git(
-            &["checkout".into(), "-B".into(), "feat/work".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-B".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
             Some(&dir),
             t,
             None,
@@ -3573,7 +3598,12 @@ mod tests {
         let dir = git_workspace("verify-push-ff").await;
         let t = Duration::from_secs(30);
         git(
-            &["checkout".into(), "-B".into(), "feat/work".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-B".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
             Some(&dir),
             t,
             None,
@@ -3920,7 +3950,11 @@ mod tests {
         // there (a child of a non-descendant of the base), then abandons it by
         // switching back and deleting the branch.
         git(
-            &["checkout".into(), "--detach".into(), legacy_tip.trim().into()],
+            &[
+                "checkout".into(),
+                "--detach".into(),
+                legacy_tip.trim().into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -4039,7 +4073,10 @@ mod tests {
         let (repo, bare) = repo_with_reachable_remote(&dir).await;
         let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
         assert_eq!(res.commits.len(), 1, "the work-branch commit is enumerated");
-        assert!(res.pushed, "the clean work branch pushes to the reachable remote");
+        assert!(
+            res.pushed,
+            "the clean work branch pushes to the reachable remote"
+        );
         assert!(
             !res.retain,
             "a clean run with all work on the pushed branch must not be flagged retain"
@@ -4063,11 +4100,20 @@ mod tests {
         assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
         // Track a file on the branch, then stash a WIP modification.
         std::fs::write(dir_path(&dir).join("f.txt"), "v1\n").unwrap();
-        git(&["add".into(), ".".into(), "--".into()], Some(&dir), t, None)
-            .await
-            .unwrap();
+        git(
+            &["add".into(), ".".into(), "--".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
         commit(&dir, "add tracked file").await;
-        std::fs::write(dir_path(&dir).join("f.txt"), "v2 WIP — the stash holds the only copy\n").unwrap();
+        std::fs::write(
+            dir_path(&dir).join("f.txt"),
+            "v2 WIP — the stash holds the only copy\n",
+        )
+        .unwrap();
         git(
             &[
                 "-c".into(),
@@ -4090,7 +4136,10 @@ mod tests {
             res.retain,
             "stashed WIP is stranded agent work; finalize must retain"
         );
-        assert!(res.work_found, "the stash net records that real work exists");
+        assert!(
+            res.work_found,
+            "the stash net records that real work exists"
+        );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
 
@@ -4104,11 +4153,16 @@ mod tests {
         let t = Duration::from_secs(30);
         let prep =
             prepare_work_branch(&dir, &test_repo(), None, Some("feat/work"), false, "utg", t).await;
-        let tree = git(&["rev-parse".into(), "HEAD^{tree}".into()], Some(&dir), t, None)
-            .await
-            .unwrap()
-            .trim()
-            .to_string();
+        let tree = git(
+            &["rev-parse".into(), "HEAD^{tree}".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
         let newsha = git(
             &[
                 "-c".into(),
@@ -4130,9 +4184,14 @@ mod tests {
         .unwrap()
         .trim()
         .to_string();
-        git(&["tag".into(), "v-keep".into(), newsha.clone()], Some(&dir), t, None)
-            .await
-            .unwrap();
+        git(
+            &["tag".into(), "v-keep".into(), newsha.clone()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
         let res = finalize_git(&dir, &prep, &test_repo(), t).await;
         assert!(
             res.retain,
@@ -4151,9 +4210,14 @@ mod tests {
         let prep =
             prepare_work_branch(&dir, &test_repo(), None, Some("feat/work"), false, "utp", t).await;
         commit(&dir, "work on the branch").await;
-        git(&["tag".into(), "v-ok".into(), "HEAD".into()], Some(&dir), t, None)
-            .await
-            .unwrap();
+        git(
+            &["tag".into(), "v-ok".into(), "HEAD".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
         let res = finalize_git(&dir, &prep, &test_repo(), t).await;
         assert!(
             !res.retain,
@@ -4170,18 +4234,29 @@ mod tests {
         // commits with `branch: null`/`pushed: false`.
         let dir = git_workspace("prep-detached").await;
         let t = Duration::from_secs(30);
-        git(&["checkout".into(), "--detach".into(), "HEAD".into()], Some(&dir), t, None)
-            .await
-            .unwrap();
+        git(
+            &["checkout".into(), "--detach".into(), "HEAD".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
         let prep = prepare_work_branch(&dir, &test_repo(), None, None, true, "udp", t).await;
         let b = prep.working_branch.clone();
         assert!(
-            b.as_deref().is_some_and(|b| b.starts_with("nano/agent-work/")),
+            b.as_deref()
+                .is_some_and(|b| b.starts_with("nano/agent-work/")),
             "a push-enabled detached provision must cut a fallback branch, got {b:?}"
         );
-        let head = git(&["symbolic-ref".into(), "--short".into(), "HEAD".into()], Some(&dir), t, None)
-            .await
-            .unwrap();
+        let head = git(
+            &["symbolic-ref".into(), "--short".into(), "HEAD".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             head.trim(),
             b.as_deref().unwrap(),
@@ -4197,9 +4272,14 @@ mod tests {
         // detached HEAD is still protected by the finalize safety nets.
         let dir = git_workspace("prep-detached-ro").await;
         let t = Duration::from_secs(30);
-        git(&["checkout".into(), "--detach".into(), "HEAD".into()], Some(&dir), t, None)
-            .await
-            .unwrap();
+        git(
+            &["checkout".into(), "--detach".into(), "HEAD".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap();
         let prep = prepare_work_branch(&dir, &test_repo(), None, None, false, "udp2", t).await;
         assert!(
             prep.working_branch.is_none(),
@@ -4215,7 +4295,12 @@ mod tests {
         // the very first clone. The agent cannot mutate the daemon's env, so
         // transport vars are trusted; only the config-injection channels (which
         // bypass file isolation) are scrubbed universally.
-        for v in ["GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_PROXY_COMMAND"] {
+        for v in [
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_PROXY_COMMAND",
+        ] {
             assert!(
                 !GIT_CONFIG_INJECTION_ENV.contains(&v),
                 "{v} is operator-supplied transport auth and must not be scrubbed from every git child"
@@ -4450,9 +4535,7 @@ mod tests {
         let inc = dir_path(&dir).join("evil-include.cfg");
         std::fs::write(
             &inc,
-            format!(
-                "[url \"file:///nonexistent/attacker2\"]\n\tpushInsteadOf = {trusted}\n"
-            ),
+            format!("[url \"file:///nonexistent/attacker2\"]\n\tpushInsteadOf = {trusted}\n"),
         )
         .unwrap();
         git(
@@ -4507,7 +4590,12 @@ mod tests {
         // `FinalizePushContext` docs.)
         let dir = git_workspace("fin-ctxloc").await;
         git(
-            &["checkout".into(), "-B".into(), "feat/work".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-B".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -4517,7 +4605,9 @@ mod tests {
         commit(&dir, "work").await;
         let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
         let workspace = dir_path(&dir);
-        let run_dir = workspace.parent().expect("the checkout has a parent run dir");
+        let run_dir = workspace
+            .parent()
+            .expect("the checkout has a parent run dir");
         assert_eq!(
             ctx.dir.parent(),
             Some(run_dir),
@@ -4656,24 +4746,14 @@ mod tests {
         .await
         .unwrap();
         commit(&dir, "pre-existing remote work").await;
-        let pre_sha = git(
-            &["rev-parse".into(), "HEAD".into()],
-            Some(&dir),
-            t,
-            None,
-        )
-        .await
-        .unwrap()
-        .trim()
-        .to_string();
-        git(
-            &["checkout".into(), "main".into()],
-            Some(&dir),
-            t,
-            None,
-        )
-        .await
-        .unwrap();
+        let pre_sha = git(&["rev-parse".into(), "HEAD".into()], Some(&dir), t, None)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        git(&["checkout".into(), "main".into()], Some(&dir), t, None)
+            .await
+            .unwrap();
         git(
             &[
                 "update-ref".into(),
@@ -4721,8 +4801,16 @@ mod tests {
         repo.url = format!("file://{}", bare.display());
 
         // Provision snapshot taken here — must include origin/feat/pre's tip.
-        let prep =
-            prepare_work_branch(&dir, &repo, Some("main"), Some("feat/work"), true, "u-rt", t).await;
+        let prep = prepare_work_branch(
+            &dir,
+            &repo,
+            Some("main"),
+            Some("feat/work"),
+            true,
+            "u-rt",
+            t,
+        )
+        .await;
         assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
         assert!(
             prep.provision_shas
@@ -4792,9 +4880,16 @@ mod tests {
         let mut repo = test_repo();
         repo.url = format!("file://{}", bare.display());
 
-        let prep =
-            prepare_work_branch(&dir, &repo, Some("main"), Some("feat/work"), true, "u-rtp", t)
-                .await;
+        let prep = prepare_work_branch(
+            &dir,
+            &repo,
+            Some("main"),
+            Some("feat/work"),
+            true,
+            "u-rtp",
+            t,
+        )
+        .await;
         assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
 
         // Build the agent commit WITHOUT moving HEAD (via `commit-tree`), then
@@ -4882,12 +4977,19 @@ mod tests {
         let (fetch, cred) = trusted_fetch_source("./origin.git");
         let want = cwd.join("./origin.git").to_string_lossy().into_owned();
         assert_eq!(fetch, want, "a relative local source must be re-anchored");
-        assert!(cred.is_none(), "a credential-free source yields no credential");
+        assert!(
+            cred.is_none(),
+            "a credential-free source yields no credential"
+        );
 
         // Remote URLs and absolute paths pass through unchanged.
         let (remote, _) = trusted_fetch_source("https://github.com/o/r.git");
         assert_eq!(remote, "https://github.com/o/r.git");
-        let abs = if cfg!(windows) { "C:/x/y.git" } else { "/x/y.git" };
+        let abs = if cfg!(windows) {
+            "C:/x/y.git"
+        } else {
+            "/x/y.git"
+        };
         let (abs_out, _) = trusted_fetch_source(abs);
         assert_eq!(abs_out, abs);
     }
@@ -4926,7 +5028,12 @@ mod tests {
         // Agent creates the work branch with a commit, then a side branch with
         // its own commit, and leaves HEAD on the work branch.
         git(
-            &["checkout".into(), "-b".into(), "feat/work".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -4935,7 +5042,12 @@ mod tests {
         .unwrap();
         commit(&dir, "work commit").await;
         git(
-            &["checkout".into(), "-b".into(), "feat/side".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/side".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -4979,7 +5091,12 @@ mod tests {
         // post-provisioning agent work).
         let dir = empty_base_workspace("detached").await;
         git(
-            &["checkout".into(), "-b".into(), "feat/work".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -5031,7 +5148,12 @@ mod tests {
         let dir = git_workspace("nopush-side").await;
         // Agent creates a side branch with its own commit, then returns to main.
         git(
-            &["checkout".into(), "-b".into(), "feat/side".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/side".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -5079,13 +5201,30 @@ mod tests {
         // only copy) be reaped. Here the stranded side-branch commit trips
         // `retain`; the work branch's own (clean) commit must NOT be pushed.
         let dir = git_workspace("refuse-push").await;
-        let prep = prepare_work_branch(&dir, &test_repo(), None, None, true, "u5", Duration::from_secs(30)).await;
-        let branch = prep.working_branch.clone().expect("a fallback branch is cut");
+        let prep = prepare_work_branch(
+            &dir,
+            &test_repo(),
+            None,
+            None,
+            true,
+            "u5",
+            Duration::from_secs(30),
+        )
+        .await;
+        let branch = prep
+            .working_branch
+            .clone()
+            .expect("a fallback branch is cut");
         // Commit clean work on the work branch, then strand a commit on a side
         // branch and switch back.
         commit(&dir, "clean work-branch commit").await;
         git(
-            &["checkout".into(), "-b".into(), "feat/side".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/side".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -5123,8 +5262,20 @@ mod tests {
         // — without it a quiet commit-only run reads as an empty job and its
         // retry wipes the only copy.
         let dir = git_workspace("detached-wf").await;
-        let prep = prepare_work_branch(&dir, &test_repo(), None, None, true, "u6", Duration::from_secs(30)).await;
-        let branch = prep.working_branch.clone().expect("a fallback branch is cut");
+        let prep = prepare_work_branch(
+            &dir,
+            &test_repo(),
+            None,
+            None,
+            true,
+            "u6",
+            Duration::from_secs(30),
+        )
+        .await;
+        let branch = prep
+            .working_branch
+            .clone()
+            .expect("a fallback branch is cut");
         // Detach, commit, then switch back — the commit is on no branch.
         git(
             &["checkout".into(), "--detach".into(), "HEAD".into()],
@@ -5144,7 +5295,10 @@ mod tests {
         .await
         .unwrap();
         let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
-        assert!(res.retain, "a stranded detached-HEAD commit must flag retain");
+        assert!(
+            res.retain,
+            "a stranded detached-HEAD commit must flag retain"
+        );
         assert!(
             res.work_found,
             "a stranded detached-HEAD commit is real work — work_found must be set"
@@ -5338,7 +5492,10 @@ mod tests {
         // would end at, say, feat/work) does NOT equal the maximum -> flagged.
         let complete_last = "zzz-side";
         let truncated_last = "feat/work";
-        assert_eq!(complete_last, maximum, "complete listing ends at the maximum");
+        assert_eq!(
+            complete_last, maximum,
+            "complete listing ends at the maximum"
+        );
         assert_ne!(
             truncated_last, maximum,
             "a listing that dropped the trailing zzz-side ends at feat/work != maximum, so the \
@@ -5389,7 +5546,10 @@ mod tests {
         // would start at, say, feat/work) does NOT equal the minimum -> flagged.
         let complete_first = "aaa-side";
         let truncated_first = "feat/work";
-        assert_eq!(complete_first, minimum, "complete listing starts at the minimum");
+        assert_eq!(
+            complete_first, minimum,
+            "complete listing starts at the minimum"
+        );
         assert_ne!(
             truncated_first, minimum,
             "a listing that dropped the leading aaa-side starts at feat/work != minimum, so the \
@@ -5427,7 +5587,12 @@ mod tests {
         // The checkout is on the (still-unborn) fallback, and the agent's first
         // commit lands on it.
         let on = git(
-            &["symbolic-ref".into(), "--short".into(), "-q".into(), "HEAD".into()],
+            &[
+                "symbolic-ref".into(),
+                "--short".into(),
+                "-q".into(),
+                "HEAD".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -5456,7 +5621,7 @@ mod tests {
         // strand it (which would clear the real work-branch commits and refuse
         // the push).
         let dir = git_workspace("fin-preexist").await; // checkout on `main`, one commit
-        // Create a pre-existing divergent side branch BEFORE provisioning.
+                                                       // Create a pre-existing divergent side branch BEFORE provisioning.
         git(
             &["branch".into(), "preexisting".into()],
             Some(&dir),
@@ -5523,7 +5688,12 @@ mod tests {
         assert!(prep.working_branch.is_some());
         // Agent creates a NEW side branch and commits on it, then switches back.
         git(
-            &["checkout".into(), "-b".into(), "agent-side".into(), "--".into()],
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "agent-side".into(),
+                "--".into(),
+            ],
             Some(&dir),
             Duration::from_secs(30),
             None,
@@ -5709,8 +5879,10 @@ mod tests {
             None,
         )
         .await
-        .expect("control: the non-isolated push must land on the ATTACKER repo, proving the \
-                 planted insteadOf rewrite redirects the trusted URL");
+        .expect(
+            "control: the non-isolated push must land on the ATTACKER repo, proving the \
+                 planted insteadOf rewrite redirects the trusted URL",
+        );
         let on_trusted_before = git(
             &[
                 "--git-dir".into(),
