@@ -1293,8 +1293,8 @@ mod tests {
             // hardening the home lands 000 and the lock cannot be created or
             // (if created) reopened.
             unsafe { libc::umask(0o777) };
-            let lock = PinLock::acquire(&home)
-                .expect("first acquire must succeed under a hostile umask");
+            let lock =
+                PinLock::acquire(&home).expect("first acquire must succeed under a hostile umask");
             // The directory must be 0700 regardless of umask, so a concurrent
             // reader between acquire and write sees an owner-only home.
             let dir_mode = std::fs::metadata(&home).unwrap().permissions().mode();
@@ -1331,7 +1331,10 @@ mod tests {
             .env(CHILD_ENV, "1")
             .status()
             .expect("spawn umask-acquire child");
-        assert!(status.success(), "the umask-acquire child process must pass");
+        assert!(
+            status.success(),
+            "the umask-acquire child process must pass"
+        );
     }
 
     #[test]
