@@ -179,8 +179,8 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// identity becomes unverifiable. That is the gap behind the review finding this
 /// addresses. The cleanup paths below therefore (a) *can* hold the leader
 /// *unreaped* through the in-process terminate sequence so its identity stays
-/// readable (though the main call sites reap it first — see *Scope of the
-/// guarantee* below), and (b) treat a *gone* leader (re-read `None`) as
+/// readable (which is what [`terminate_group_and_reap`] does on its own unless
+/// the caller reaped the leader first — see *Scope of the guarantee* below), and (b) treat a *gone* leader (re-read `None`) as
 /// fail-**open** while treating a *live* leader with a *different* identity as
 /// fail-**closed**. See [`PgidGuard::still_ours`] for the policy and its
 /// residual recycle window.
@@ -203,21 +203,31 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 ///    unrelated group *without* the recycled leader needing to be reaped. This is
 ///    broader than window 1.
 ///
-/// Both are accepted as the price of not leaking `TERM`-resistant orphans, and
-/// **both apply to the in-process cleanup paths as well as the detached
-/// watchdog.** The in-process paths only close these windows when they hold the
-/// leader *unreaped* across the whole check→signal sequence (the zombie keeps
-/// the pgid un-recyclable). But the main call sites do not: `pipe.rs` (EOF
-/// path), `provision.rs` (success path) and `acp.rs` (request path) each reap
-/// the leader with `child.wait()` *before* [`terminate_group_and_reap`], so by
-/// the time the cleanup runs there is no zombie anchor, [`PgidGuard::still_ours`]
-/// takes its fail-open `leader_identity == None` branch, and windows 1 and 2
-/// apply exactly as in the watchdog. Deferring the leader reap until after the
-/// group SIGKILL — which would actually close the in-process window — and
-/// shrinking the watchdog window by detecting whether any non-zombie member
-/// still remains (so clean exits finish without waiting out the grace) are both
-/// tracked in #50. Everywhere else — a live recycled leader, or any group whose
-/// leader is still readable — the identity check refuses the signal.
+/// Both are accepted as the price of not leaking `TERM`-resistant orphans. They
+/// **apply to the in-process cleanup paths only when the leader has already been
+/// reaped before [`terminate_group_and_reap`] runs**, because that reap removes
+/// the zombie anchor and sends [`PgidGuard::still_ours`] down its fail-open
+/// `leader_identity == None` branch. That early reap happens on the
+/// leader-already-exited sub-paths: `pipe.rs` (EOF-with-exit, where the agent
+/// exits within the idle window and `child.wait()` completes), `provision.rs`
+/// (success path, which `tokio::join!(child.wait(), …)` before terminating), and
+/// `acp.rs` *only* when a prior `request` reaped the leader mid-request. On those
+/// sub-paths windows 1 and 2 apply as in the watchdog.
+///
+/// Otherwise — most notably `acp.rs`'s normal shutdown, where `acp::shutdown`
+/// calls [`terminate_group_and_reap`] after a successful `run()` with the agent
+/// still alive and unreaped, and `pipe.rs`'s idle-timeout path, where the loop
+/// exits without the EOF `child.wait()` completing — the leader is *not* reaped
+/// first. [`terminate_group_and_reap`] then holds it unreaped through its whole
+/// grace loop (the zombie keeps the pgid un-recyclable and the identity
+/// readable), so [`PgidGuard::still_ours`] stays fail-**closed** on a real match
+/// and both windows are **closed** for those paths. Deferring the leader reap
+/// until after the group SIGKILL on the reaped-first sub-paths — which would
+/// close the window there too — and shrinking the watchdog window by detecting
+/// whether any non-zombie member still remains (so clean exits finish without
+/// waiting out the grace) are both tracked in #50. Everywhere else — a live
+/// recycled leader, or any group whose leader is still readable — the identity
+/// check refuses the signal.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GroupIdentity {
@@ -343,10 +353,15 @@ impl PgidGuard {
     ///   follows it are separate syscalls, a gone-leader group's last member can
     ///   exit and the pgid be recycled *between* this returning true and the
     ///   signal. Both are accepted (the price of not leaking orphans). They are
-    ///   closed only when the caller holds the leader unreaped until after the
-    ///   SIGKILL; the main in-process call sites reap it first (see the module
-    ///   *Scope of the guarantee*), so they retain these windows just as the
-    ///   detached watchdog does (closing them is tracked in #50).
+    ///   closed whenever the leader is held unreaped until after the SIGKILL.
+    ///   [`terminate_group_and_reap`] does exactly that *unless the caller
+    ///   already reaped the leader first*: the reaped-first sub-paths (`pipe.rs`
+    ///   EOF-with-exit, `provision.rs` success, `acp.rs` mid-request exit) retain
+    ///   these windows like the detached watchdog, while the leader-still-alive
+    ///   paths (`acp.rs`'s normal shutdown, `pipe.rs`'s idle timeout) keep the
+    ///   leader as a zombie through the grace loop and so *close* them (see the
+    ///   module *Scope of the guarantee*; deferring the reap on the reaped-first
+    ///   sub-paths to close them there too is tracked in #50).
     pub(crate) fn still_ours(&self) -> bool {
         if !group_alive(self.pgid) {
             return false;
