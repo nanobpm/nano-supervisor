@@ -821,7 +821,8 @@ pub fn reap_watchdog(
         // Re-verify the group's identity immediately before signalling: the
         // parent may have exited while the agent's group already went away,
         // freeing the pid to be recycled by an unrelated group. The identity
-        // check gates the kill so a recycled pgid is never signalled (issue #27).
+        // check gates the kill so a recycled pgid is not signalled outside the
+        // accepted residual windows (see [`GroupIdentity`]) (issue #27).
         //
         // Residual check-to-signal TOCTOU: this predicate and `sigkill_group`
         // are separate syscalls, so in the fail-open (gone-leader) branch the
