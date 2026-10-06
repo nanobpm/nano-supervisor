@@ -284,6 +284,14 @@ enum LeaderProbe {
     /// The leader is gone (reaped); only descendants may hold the pgid.
     Absent,
     /// The leader's identity changed mid-read — a detected reap+recycle.
+    ///
+    /// Only the two-file Linux probe can straddle a recycle, so this variant is
+    /// constructed solely under `target_os = "linux"`; the macOS/other-unix
+    /// probes read a single snapshot and never produce it. It still exists on
+    /// the shared `cfg(unix)` enum because `still_ours`/`group_identity_matches`
+    /// match it exhaustively on every unix target, hence the platform-scoped
+    /// `dead_code` allow rather than cfg-gating the variant and every match arm.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Changed,
 }
 
@@ -1158,7 +1166,11 @@ mod tests {
             || {
                 let n = reads2.get();
                 reads2.set(n + 1);
-                if n == 0 { Some(100) } else { None }
+                if n == 0 {
+                    Some(100)
+                } else {
+                    None
+                }
             },
             || Some(7),
         );
@@ -1196,7 +1208,10 @@ mod tests {
         // while mapping `Absent` to fail-open (`true`). Mirror their match arms
         // against a captured identity so a future edit that re-collapses the
         // two cases trips this test.
-        let captured = GroupIdentity { start: 100, uid: 1000 };
+        let captured = GroupIdentity {
+            start: 100,
+            uid: 1000,
+        };
         let verdict = |p: LeaderProbe| match p {
             LeaderProbe::Present(cur) => cur == captured,
             LeaderProbe::Absent => true,
