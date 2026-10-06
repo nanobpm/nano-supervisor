@@ -2203,18 +2203,19 @@ async fn finalize_git_with_deadline(
                 //    insteadOf/proxy/TLS applies). The credential is still
                 //    delivered out of band by `git()`'s host-matched helper, so
                 //    the token never reaches argv.
-                let push_ctx = match finalize_push_context(workspace, branch).await {
-                    Ok(ctx) => Some(ctx),
-                    Err(e) => {
-                        log(&format!(
-                            "finalize: could not build a clean git admin context for the push \
-                             — {e}; skipping the push and retaining the run dir so work is not \
-                             pushed to a possibly rewritten/MITM'd destination"
-                        ));
-                        out.retain = true;
-                        None
-                    }
-                };
+                let push_ctx =
+                    match finalize_push_context(workspace, branch, timeout, deadline).await {
+                        Ok(ctx) => Some(ctx),
+                        Err(e) => {
+                            log(&format!(
+                                "finalize: could not build a clean git admin context for the push \
+                                 — {e}; skipping the push and retaining the run dir so work is not \
+                                 pushed to a possibly rewritten/MITM'd destination"
+                            ));
+                            out.retain = true;
+                            None
+                        }
+                    };
                 if let Some(push_ctx) = push_ctx {
                     // Push to the SAME trusted source the clone used: a
                     // relative local `repo.url` (e.g. `./origin.git`) must be
@@ -2262,7 +2263,8 @@ async fn finalize_git_with_deadline(
                                 &fetch_url,
                                 branch,
                                 cred.as_ref(),
-                                remaining!(),
+                                timeout,
+                                deadline,
                             )
                             .await
                             {
@@ -2587,7 +2589,26 @@ impl Drop for FinalizePushContext {
 /// from a same-UID agent (see the `FinalizePushContext` docs for the accepted
 /// residual risk). `workspace` is the pinned checkout handle; its parent is the
 /// pinned run dir.
-async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<FinalizePushContext> {
+async fn finalize_push_context(
+    workspace: &CwdHandle,
+    branch: &str,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<FinalizePushContext> {
+    // The two git probes below share the finalize stage's overall `deadline`
+    // with every other scan: a fixed per-probe timeout would let this helper
+    // overrun the stage budget by up to two full timeouts after earlier scans
+    // already consumed it. Recompute the remaining budget before EACH probe
+    // (`remaining` = min(per-command `timeout`, time left to `deadline`)); once
+    // the deadline has passed this is ~0, so the probe times out immediately
+    // and the caller fails closed (retains the run dir) instead of pushing on a
+    // half-finished scan.
+    let remaining = |timeout: Duration| -> Duration {
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(r) if !r.is_zero() => r.min(timeout),
+            _ => Duration::from_nanos(1),
+        }
+    };
     // Resolve the work-branch tip from the workspace's refs. This is the only
     // workspace read the push depends on; it carries no config influence.
     let tip = git(
@@ -2597,7 +2618,7 @@ async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<Fi
             format!("refs/heads/{branch}^{{commit}}"),
         ],
         Some(workspace),
-        Duration::from_secs(30),
+        remaining(timeout),
         None,
     )
     .await
@@ -2616,7 +2637,7 @@ async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<Fi
     let git_dir = git(
         &["rev-parse".into(), "--absolute-git-dir".into()],
         Some(workspace),
-        Duration::from_secs(30),
+        remaining(timeout),
         None,
     )
     .await
@@ -2721,7 +2742,23 @@ async fn remote_contains_branch_tip(
     branch: &str,
     cred: Option<&GitCredential>,
     timeout: Duration,
+    deadline: Instant,
 ) -> Option<bool> {
+    // This helper runs up to THREE git subprocesses serially (`ls-remote`,
+    // `fetch`, `merge-base`). Handing each the SAME full `timeout` would let the
+    // verification path consume ~3× the remaining stage budget; and ignoring the
+    // stage `deadline` would let it overrun the budget entirely after the push
+    // already consumed it. Recompute the remaining budget before EACH command
+    // (`remaining` = min(per-command `timeout`, time left to `deadline`)); once
+    // the deadline has passed this is ~0, so the next command times out
+    // immediately and the run fails closed (retained) rather than sweeping on an
+    // inconclusive verification.
+    let remaining = |timeout: Duration| -> Duration {
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(r) if !r.is_zero() => r.min(timeout),
+            _ => Duration::from_nanos(1),
+        }
+    };
     // The branch tip pinned into the clean context at build time is the trusted
     // local state (just prepared/committed); read it back from the context's own
     // ref, never from the agent-mutable checkout.
@@ -2737,7 +2774,9 @@ async fn remote_contains_branch_tip(
     ls.push("--".into());
     ls.push(fetch_url.to_string());
     ls.push(format!("refs/heads/{branch}"));
-    let listing = git_isolated(&ls, None, timeout, cred).await.ok()?;
+    let listing = git_isolated(&ls, None, remaining(timeout), cred)
+        .await
+        .ok()?;
     let remote_tip = listing
         .lines()
         .find_map(|l| l.split_whitespace().next())
@@ -2759,7 +2798,9 @@ async fn remote_contains_branch_tip(
     fetch.push("--".into());
     fetch.push(fetch_url.to_string());
     fetch.push(format!("refs/heads/{branch}"));
-    git_isolated(&fetch, None, timeout, cred).await.ok()?;
+    git_isolated(&fetch, None, remaining(timeout), cred)
+        .await
+        .ok()?;
     // `merge-base` must run against the SAME clean context the fetch wrote
     // into: without `cfg`'s `--git-dir` prefix (and with `cwd=None`) git cannot
     // find a repository at all and exits "not a git repository", which
@@ -2771,7 +2812,9 @@ async fn remote_contains_branch_tip(
     mb.push("--is-ancestor".into());
     mb.push(local_tip);
     mb.push(remote_tip);
-    let landed = git_isolated(&mb, None, timeout, None).await.is_ok();
+    let landed = git_isolated(&mb, None, remaining(timeout), None)
+        .await
+        .is_ok();
     Some(landed)
 }
 
@@ -3652,6 +3695,13 @@ mod tests {
         h.path().expect("recover test workspace path")
     }
 
+    /// A generous stage deadline for the push-context/verification helpers:
+    /// these tests exercise the happy path (no expiry), so supply a deadline far
+    /// in the future and let the per-command `timeout` govern.
+    fn test_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(300)
+    }
+
     fn test_repo() -> crate::envelope::Repository {
         crate::envelope::Repository {
             provider: "github".into(),
@@ -3951,10 +4001,13 @@ mod tests {
         let url = format!("file://{}", bare.display());
         // The verification runs from a clean push context built over the
         // workspace's object store + branch tip.
-        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        let ctx = finalize_push_context(&dir, "feat/work", t, test_deadline())
+            .await
+            .unwrap();
         // Before the branch exists on the remote: not published.
         assert_eq!(
-            remote_contains_branch_tip(&ctx, &[], &url, "feat/work", None, t).await,
+            remote_contains_branch_tip(&ctx, &[], &url, "feat/work", None, t, test_deadline())
+                .await,
             Some(false),
             "an absent remote branch must report not-published"
         );
@@ -3973,7 +4026,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            remote_contains_branch_tip(&ctx, &[], &url, "feat/work", None, t).await,
+            remote_contains_branch_tip(&ctx, &[], &url, "feat/work", None, t, test_deadline())
+                .await,
             Some(true),
             "an equal remote tip must confirm the push landed despite the error"
         );
@@ -4031,7 +4085,9 @@ mod tests {
         // The verification context is built over the workspace's object store +
         // branch tip; `cfg` carries its `--git-dir` prefix, exactly as the real
         // finalize caller passes it.
-        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        let ctx = finalize_push_context(&dir, "feat/work", t, test_deadline())
+            .await
+            .unwrap();
         let cfg: Vec<String> = vec![
             format!("--git-dir={}", ctx.dir.display()),
             "-c".into(),
@@ -4069,7 +4125,8 @@ mod tests {
         // The remote tip is now a DESCENDANT of the context's pinned tip: the
         // push must be confirmed durable, not reported unconfirmed.
         assert_eq!(
-            remote_contains_branch_tip(&ctx, &cfg, &url, "feat/work", None, t).await,
+            remote_contains_branch_tip(&ctx, &cfg, &url, "feat/work", None, t, test_deadline())
+                .await,
             Some(true),
             "a remote tip that is a descendant of ours must confirm the push landed"
         );
@@ -4998,7 +5055,14 @@ mod tests {
         .await
         .unwrap();
         commit(&dir, "work").await;
-        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        let ctx = finalize_push_context(
+            &dir,
+            "feat/work",
+            Duration::from_secs(30),
+            test_deadline(),
+        )
+        .await
+        .unwrap();
         let workspace = dir_path(&dir);
         let run_dir = workspace
             .parent()
@@ -5054,7 +5118,9 @@ mod tests {
         // Build the clean push context FIRST (as finalize does), THEN plant the
         // malicious rewrite in the checkout's local config — the exact ordering a
         // scrub-then-use race would need to exploit.
-        let ctx = finalize_push_context(&dir, "feat/work").await.unwrap();
+        let ctx = finalize_push_context(&dir, "feat/work", t, test_deadline())
+            .await
+            .unwrap();
         git(
             &[
                 "config".into(),

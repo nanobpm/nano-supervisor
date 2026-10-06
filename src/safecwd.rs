@@ -381,11 +381,25 @@ impl CwdHandle {
         }
         let c = CString::new(name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
+        // `O_NOFOLLOW` refuses a symlink planted at `name`, but a same-UID agent
+        // can instead pre-create `name` as a FIFO (or device): opening such a
+        // special file for write BLOCKS until a reader appears, hanging
+        // `execute` synchronously before settlement instead of taking the
+        // quarantine-on-write-error path. Open `O_NONBLOCK` so a FIFO open fails
+        // with `ENXIO` rather than blocking, then `fstat` the opened fd and
+        // reject anything that is not a regular file — the marker is always a
+        // regular file, so a FIFO/device/unix-socket at `name` is an attack (or
+        // corruption) and must fail closed, never be truncated or written.
         let fd = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
                 c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_TRUNC
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
                 0o600,
             )
         };
@@ -394,11 +408,39 @@ impl CwdHandle {
         }
         // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        // `O_NONBLOCK` was only needed to make the *open* non-blocking; clear it
+        // so the subsequent write/fsync use normal blocking semantics.
+        // SAFETY: `fd` (now `file`) is a valid open descriptor; F_SETFL with the
+        // current flags minus O_NONBLOCK cannot fail for a valid fd.
+        unsafe {
+            let cur = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+            if cur >= 0 {
+                libc::fcntl(file.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK);
+            }
+        }
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to write the marker over a non-regular file (FIFO/device/socket)",
+            ));
+        }
         file.write_all(contents)?;
-        // Durable before returning: fsync so a settlement-failure redelivery
-        // that crashes between the write and the next prepare still sees the
-        // marker (the whole point of the marker is cross-redelivery durability).
+        // Durable before returning: fsync the file so a settlement-failure
+        // redelivery that crashes between the write and the next prepare still
+        // sees the marker (the whole point of the marker is cross-redelivery
+        // durability).
         file.sync_all()?;
+        // `fsync` on the file makes its *contents* durable but NOT the new
+        // directory *entry* that names it: on a crash the entry can be lost even
+        // after a successful return, and redelivery would then treat the
+        // checkout as unmarked and wipe it. `fsync` the pinned directory fd too
+        // so the marker's name is durable before reporting success.
+        // SAFETY: `self.fd` is a valid open directory descriptor; `fsync` on a
+        // directory fd is the standard way to durably commit a dirent.
+        if unsafe { libc::fsync(self.fd.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -989,6 +1031,56 @@ mod tests {
             std::fs::canonicalize(child_cwd(&a)).unwrap(),
             std::fs::canonicalize(child_cwd(&b)).unwrap(),
             "clone and try_clone must bind the same pinned inode"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The retention marker is always a regular file. A same-UID agent can
+    /// pre-plant a FIFO at the marker path so the supervisor's marker open
+    /// BLOCKS waiting for a reader (hanging `execute` before settlement).
+    /// `write_child_file` must instead fail fast: open `O_NONBLOCK` (a FIFO
+    /// open then fails with `ENXIO` instead of blocking) and reject any
+    /// non-regular file that still opens. This test must return promptly — if
+    /// the open blocked, the test would hang and time out the whole suite.
+    #[cfg(unix)]
+    #[test]
+    fn write_child_file_refuses_a_planted_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("marker-fifo");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        let fifo = dir.join("marker");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path; mkfifo creates a FIFO.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
+        let err = handle
+            .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
+            .expect_err("writing the marker over a FIFO must fail, not block");
+        // Either the O_NONBLOCK open failed (ENXIO) or the fstat rejected the
+        // non-regular file — both fail closed without blocking.
+        assert!(
+            err.raw_os_error() == Some(libc::ENXIO)
+                || err.kind() == io::ErrorKind::InvalidInput,
+            "expected ENXIO or a non-regular-file refusal, got {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A normal marker write must succeed, land in the pinned directory, and be
+    /// readable back — the durability fsyncs (file + directory) must not break
+    /// the happy path or corrupt the contents.
+    #[cfg(unix)]
+    #[test]
+    fn write_child_file_writes_and_reads_back() {
+        let dir = scratch("marker-write");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        handle
+            .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
+            .expect("write the marker");
+        assert_eq!(
+            std::fs::read(dir.join("marker")).unwrap(),
+            b"retained",
+            "the marker contents must round-trip through the pinned dir"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
