@@ -89,38 +89,63 @@ fn run_work(
     // so as soon as the banner line appears on stderr the worker has done
     // everything under test and can be reaped (an unroutable `.invalid`
     // engine's DNS retry would otherwise hold the process for minutes).
+    run_to_banner(cmd)
+}
+
+/// Spawn `work` from a prepared command and collect its startup output through
+/// the `engine: ` banner AND any drift WARNING logged immediately after it
+/// (everything under test here is logged before the first activation attempt).
+/// The banner now LEADS startup output (issue #41) with the drift warning
+/// right behind it, so cutting the capture at the banner line would race the
+/// warning onto the pipe; instead keep reading until the stream has been quiet
+/// for a short window after the banner (or closes).
+fn run_to_banner(mut cmd: std::process::Command) -> contract_tests::CmdOutput {
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn work");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (byte_tx, byte_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         use std::io::Read;
-        let mut collected = Vec::new();
+        let mut stderr = stderr;
         let mut buf = [0u8; 4096];
         loop {
             match stderr.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    collected.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&collected);
-                    if text.contains("engine: ") {
-                        let _ = seen_tx.send(text.into_owned());
-                        // Keep draining so the child never blocks on a full pipe.
-                        while matches!(stderr.read(&mut buf), Ok(n) if n > 0) {}
+                    if byte_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-        let _ = seen_tx.send(String::from_utf8_lossy(&collected).into_owned());
+        // Channel closes when the reader thread ends (stream closed).
     });
-    let banner = seen_rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .unwrap_or_default();
+    let mut collected: Vec<u8> = Vec::new();
+    let mut saw_banner = false;
+    loop {
+        // Once the banner has been seen, only wait a short quiet window for a
+        // trailing drift warning; before that, hold out for the banner itself.
+        let wait = if saw_banner {
+            std::time::Duration::from_millis(400)
+        } else {
+            std::time::Duration::from_secs(30)
+        };
+        match byte_rx.recv_timeout(wait) {
+            Ok(chunk) => {
+                collected.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&collected).contains("engine: ") {
+                    saw_banner = true;
+                }
+            }
+            // Quiet window after the banner elapsed, or the stream closed.
+            Err(_) => break,
+        }
+    }
+    let banner = String::from_utf8_lossy(&collected).into_owned();
     let _ = child.kill();
     let out = child.wait_with_output().expect("reap work");
     contract_tests::CmdOutput {
@@ -478,50 +503,6 @@ fn env_pin_warns_when_the_env_is_removed_after_pinning() {
     );
 }
 
-/// Spawn `work` from a prepared command and collect its startup output up to
-/// the `engine: ` banner (everything under test here is logged before the
-/// first activation attempt).
-fn run_to_banner(mut cmd: std::process::Command) -> contract_tests::CmdOutput {
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn work");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut collected = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    collected.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&collected);
-                    if text.contains("engine: ") {
-                        let _ = seen_tx.send(text.into_owned());
-                        while matches!(stderr.read(&mut buf), Ok(n) if n > 0) {}
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = seen_tx.send(String::from_utf8_lossy(&collected).into_owned());
-    });
-    let banner = seen_rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .unwrap_or_default();
-    let _ = child.kill();
-    let out = child.wait_with_output().expect("reap work");
-    contract_tests::CmdOutput {
-        code: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: banner,
-    }
-}
-
 /// The sanity guard (proposal 4): a worker whose whole job-type matrix is
 /// test-looking (`probe-*`/`ct-*`) warns prominently, naming the engine, as
 /// soon as it touches the engine — the log clue the incident had to be
@@ -555,6 +536,53 @@ fn test_looking_job_types_still_start_and_banner() {
             .contains("engine: alpha (http://alpha.invalid:8080)"),
         "stderr was:\n{}",
         out.stderr
+    );
+}
+
+/// The banner must LEAD worker startup output (issue #41): an unknown hire is
+/// a config error, yet the engine line must still be logged first — the
+/// incident's clue was buried behind validation and sweep output. Regression
+/// guard for the ordering (the banner previously ran only after hire
+/// validation, run-root creation, and the startup stale-run sweep).
+#[test]
+fn banner_precedes_hire_validation_failure() {
+    let target = Target::from_env();
+    require_target!(target);
+    if target == Target::Node {
+        contract_tests::note_skip(module_path!(), "Rust target only (issue #41)");
+        return;
+    }
+    let home = TempHome::with_target(target);
+    hire(&home); // hires only "coder"; the run below asks for an unknown hire
+    let c8ctl = tempfile::tempdir().expect("c8ctl dir");
+    write_c8ctl_profiles(c8ctl.path());
+    set_active_profile(c8ctl.path(), "alpha");
+
+    let out = home
+        .cmd(&["work", "no-such-hire"])
+        .env("C8CTL_DATA_DIR", c8ctl.path())
+        .output()
+        .expect("spawn work no-such-hire");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(78),
+        "an unknown hire is a non-restartable config error (EX_CONFIG); stderr was:\n{stderr}"
+    );
+    let banner = stderr.find("engine: alpha (http://alpha.invalid:8080)");
+    let failure = stderr.find("No hire named");
+    assert!(
+        banner.is_some(),
+        "the engine banner must be logged even when the hire is unknown; stderr was:\n{stderr}"
+    );
+    assert!(
+        failure.is_some(),
+        "the unknown-hire error must still be reported; stderr was:\n{stderr}"
+    );
+    assert!(
+        banner < failure,
+        "the engine banner must precede the validation failure; stderr was:\n{stderr}"
     );
 }
 
