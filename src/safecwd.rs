@@ -471,8 +471,13 @@ impl CwdHandle {
     /// needs to operate *relative to this exact validated inode* through a
     /// different fd-relative API (e.g. wrapping it in a
     /// [`crate::saferoot::DirHandle`] via `DirHandle::from_fd` to seed children
-    /// without reopening the run dir by path (#35/#46)). The dup shares the
-    /// inode, not the file position, and is owned by the caller.
+    /// without reopening the run dir by path (#35/#46)). `F_DUPFD_CLOEXEC`
+    /// behaves like `dup`: the new fd shares the same open file description —
+    /// and thus the directory offset/file position — with `self.fd`, exactly as
+    /// documented for `dup` in `saferoot`'s directory enumeration. That
+    /// shared offset is harmless here because the dup is only ever used for
+    /// fd-relative operations (`openat*`), which ignore the file position; the
+    /// returned fd is owned by the caller.
     #[cfg(target_os = "linux")]
     pub(crate) fn try_clone_fd(&self) -> io::Result<std::os::unix::io::OwnedFd> {
         self.dup_fd()
