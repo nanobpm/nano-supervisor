@@ -6,14 +6,16 @@
 //! uid, captured at spawn) via `--pgid-start`/`--pgid-uid`. Before the watchdog
 //! `SIGKILL`s the group it re-verifies that identity, so a pgid that was freed
 //! and recycled by an unrelated group is not signalled — **with two accepted
-//! residual windows** (watchdog only): (1) a *nested recycle* — the group empties
+//! residual windows**: (1) a *nested recycle* — the group empties
 //! entirely, the pgid is recycled, *and* the recycled group's own leader is
 //! reaped too (all inside one poll interval), so the leader's identity source
-//! reads `None` and the watchdog fails *open* to avoid leaking orphaned
+//! reads `None` and the check fails *open* to avoid leaking orphaned
 //! descendants; and (2) a *check-to-signal TOCTOU* — the identity check and the
 //! `kill(2)` are separate syscalls, so a gone-leader group's last member can exit
-//! and the pgid be recycled between them. Both are the documented,
-//! maintainer-accepted limit of the guarantee (shrinking them is tracked in #50);
+//! and the pgid be recycled between them. These windows apply to the in-process
+//! cleanup paths too (their call sites reap the leader before cleanup, so there
+//! is no zombie anchor), not only to the watchdog. Both are the documented,
+//! maintainer-accepted limit of the guarantee (closing them is tracked in #50);
 //! everywhere else (a live recycled leader, or any still-readable leader) the
 //! identity check refuses the signal. These tests pin the fail-closed live-leader
 //! case.
