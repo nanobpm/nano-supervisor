@@ -1280,16 +1280,6 @@ pub async fn finalize_git(
     repo: &Repository,
     timeout: Duration,
 ) -> GitResult {
-    let mut out = GitResult {
-        branch: prep.working_branch.clone(),
-        commits: Vec::new(),
-        pushed: false,
-        pr: None,
-        retain: false,
-        work_found: false,
-        unborn_no_ref: false,
-    };
-
     // ONE overall finalize deadline. `timeout` bounds each INDIVIDUAL git
     // subprocess, but finalize launches many of them SERIALLY (a `rev-parse`/
     // `rev-list` per side branch up to `MAX_SIDE_BRANCH_SCAN`, a
@@ -1304,6 +1294,30 @@ pub async fn finalize_git(
     // overrun it. On expiry the scan is incomplete — fail CLOSED (`retain`) so
     // the run dir is kept rather than reaped on a half-finished sweep.
     let deadline = Instant::now() + finalize_deadline_budget(timeout);
+    finalize_git_with_deadline(workspace, prep, repo, timeout, deadline).await
+}
+
+/// The body of [`finalize_git`] with the overall stage `deadline` supplied by
+/// the caller, so tests can inject an already-expired deadline to drive the
+/// genuine expiry branch of `remaining!()` (a past deadline, NOT merely a tiny
+/// per-command `timeout`, is what makes `checked_duration_since` return `None`).
+async fn finalize_git_with_deadline(
+    workspace: &CwdHandle,
+    prep: &GitPrep,
+    repo: &Repository,
+    timeout: Duration,
+    deadline: Instant,
+) -> GitResult {
+    let mut out = GitResult {
+        branch: prep.working_branch.clone(),
+        commits: Vec::new(),
+        pushed: false,
+        pr: None,
+        retain: false,
+        work_found: false,
+        unborn_no_ref: false,
+    };
+
     // The timeout for the NEXT git subprocess: the smaller of the per-command
     // `timeout` and the time left to the overall deadline. Recomputed at each
     // call site so a stalled command cannot let the stage overrun the deadline
@@ -7095,13 +7109,16 @@ mod tests {
     #[tokio::test]
     async fn finalize_overall_deadline_fails_closed_and_returns_promptly() {
         // Regression for the missing overall finalize deadline: with an
-        // already-exhausted budget, finalize must not launch its serial chain of
-        // git subprocesses (each waiting out its own per-command timeout) — it
-        // must fail CLOSED (retain) and return in far less than one per-command
-        // timeout. Drive it with a tiny per-command timeout so the 60 s budget
-        // floor is already exhausted by the time the scan would run: the first
-        // probe gets a near-zero remaining budget and times out immediately,
-        // which the existing error path maps to `retain`.
+        // already-EXPIRED overall deadline, finalize must not launch its serial
+        // chain of git subprocesses — the very first `remaining!()` must hit the
+        // genuine expiry branch (`checked_duration_since` → `None`), yield a
+        // near-zero budget, and the error path must map that to `retain` (fail
+        // closed) and return promptly. This drives the real deadline-expiry
+        // branch by injecting a deadline in the PAST; a large per-command
+        // `timeout` is used deliberately so that the ONLY thing forcing the
+        // immediate timeout is the exhausted overall deadline — if the deadline
+        // machinery were removed, this test would hang for the full per-command
+        // timeout instead of returning promptly.
         let dir = empty_base_workspace("deadline").await;
         git(
             &[
@@ -7124,12 +7141,22 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        // A per-command timeout of 1 ns: every git subprocess times out at once,
-        // so the whole stage must still return promptly (not caps × 1 ns is
-        // trivially fast, but the point is the DEADLINE path returns `retain`
-        // rather than hanging or reporting a clean push).
+        // Deadline already in the past + a LARGE per-command timeout: the
+        // near-zero remaining budget comes solely from the exhausted overall
+        // deadline, so this exercises the genuine expiry branch (not merely a
+        // tiny per-command timeout).
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test clock is far enough from the epoch to subtract 1 s");
         let started = std::time::Instant::now();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_nanos(1)).await;
+        let res = finalize_git_with_deadline(
+            &dir,
+            &prep,
+            &test_repo(),
+            Duration::from_secs(300),
+            expired,
+        )
+        .await;
         let elapsed = started.elapsed();
         assert!(
             res.retain,
@@ -7141,7 +7168,50 @@ mod tests {
         );
         assert!(
             elapsed < Duration::from_secs(30),
-            "finalize must return promptly once the overall deadline is exhausted (took {elapsed:?})"
+            "finalize must return promptly once the overall deadline is exhausted (took \
+             {elapsed:?}); with the deadline machinery intact the near-zero remaining budget \
+             forces every probe to time out immediately despite the 300 s per-command timeout"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_per_command_timeout_fails_closed() {
+        // Companion to the overall-deadline test: even when the overall deadline
+        // is NOT exhausted, a tiny per-command `timeout` must still make every
+        // git subprocess time out and fail CLOSED (retain), never report a clean
+        // push. `remaining!()` returns `min(budget_left, timeout)`, so a 1 ns
+        // per-command timeout dominates and each probe times out at once.
+        let dir = empty_base_workspace("per-command").await;
+        git(
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "work commit").await;
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_nanos(1)).await;
+        assert!(
+            res.retain,
+            "a per-command timeout that expires every probe must fail closed and retain"
+        );
+        assert!(
+            !res.pushed,
+            "an incomplete (timed-out) scan must never report a clean push"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
