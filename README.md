@@ -54,6 +54,16 @@ the pinned engine (the dir is never left empty). An agent's `c8 use profile` /
 `c8 profile add` writes stay inside its run and the operator's
 `~/.config/c8ctl/session.json` is never touched.
 
+`C8CTL_DATA_DIR` is c8ctl's **entire** user-data root, so this isolation also
+hides the operator's installed `c8` plugins (e.g. `c8 nano`) from agents —
+c8ctl exposes no narrower lever (it ignores `C8CTL_CONFIG_DIR`). For this MVP
+that tradeoff is deliberate: agents run with `NANO_AGENTIC=off` and
+`guard_nested_supervisor` already blocks them from acting as a
+supervisor/worker, so they do not need the nano plugin, and we do **not**
+symlink the operator's plugins dir into the fail-closed per-run root. Isolating
+session/profiles without relocating the plugins dir is tracked in
+[#51](https://github.com/nanobpm/nano-supervisor/issues/51).
+
 ## Contract tests
 
 `contract-tests/` is a black-box suite (issues #3/#4/#5) that pins the fleet

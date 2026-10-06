@@ -2294,6 +2294,16 @@ fn build_agent_env(
     // agent. Running the agent unisolated would let its `c8 use profile` land
     // on the operator's global session — the exact write this prevents — so a
     // best-effort skip here would silently reopen the incident.
+    //
+    // DELIBERATE TRADEOFF (#46): `C8CTL_DATA_DIR` is c8ctl's *entire* user-data
+    // root, so redirecting it also hides the operator's installed `c8` plugins
+    // (e.g. `c8 nano`) from the agent — c8ctl has no finer lever (it ignores
+    // `C8CTL_CONFIG_DIR`; see `profile.rs`). For this MVP that is accepted: the
+    // agent runs with `NANO_AGENTIC=off` and `guard_nested_supervisor` already
+    // blocks it from acting as a supervisor/worker, so it does not need the
+    // nano plugin, and we deliberately do NOT symlink the operator's plugins
+    // dir into this fail-closed no-follow root. Isolating session/profiles
+    // without relocating the plugins dir is tracked in #51.
     let dir = seed_agent_c8ctl_dir(cfg, result_file)?;
     env.push(("C8CTL_DATA_DIR".into(), dir.to_string_lossy().into_owned()));
     Ok(env)
