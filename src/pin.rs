@@ -559,7 +559,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
             "connection.json exists but carries no connection pin (its `connection` \
              field is missing or null), so it cannot be enforced and would fall back \
              to resolving the mutable ambient profile — silently retargetable. \
-             Repair the pin in connection.json, or re-pin with --profile (issue #41)."
+             Repair the pin in connection.json, or re-pin with `--profile <name>` (issue #41)."
         );
     }
 
@@ -589,7 +589,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
                  to the ambient connection — silently retargetable. Setting an \
                  engine address alone will NOT repair this pin (this check runs \
                  before the environment is consulted): delete/reset the pin in \
-                 connection.json first, or re-pin with --profile (issue #41)."
+                 connection.json first, or re-pin with `--profile <name>` (issue #41)."
             );
         }
     }
@@ -690,7 +690,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
             "cannot pin the supervisor connection: no engine base URL could be \
              resolved from a c8ctl profile or CAMUNDA_REST_ADDRESS/\
              ZEEBE_REST_ADDRESS. Set an explicit engine address (or pass \
-             --profile) so the pin records a fingerprint instead of leaving the \
+             `--profile <name>`) so the pin records a fingerprint instead of leaving the \
              home retargetable (issue #41)."
         );
     }
@@ -764,7 +764,8 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
                 "WARNING: the pinned connection is profile {pinned:?} but c8ctl's active profile \
                  is now {active:?} — this supervisor keeps following the PIN; the active profile \
                  is IGNORED (an agent's `c8 use profile` cannot retarget this fleet). Restart with \
-                 --profile to re-pin, or edit {}",
+                 `--profile <name>` to re-pin (e.g. `--profile {pinned}` to re-affirm this pin, or \
+                 `--profile {active}` to adopt the active profile), or edit {}",
                 state_file_display(decision)
             ));
         }
@@ -782,7 +783,7 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
                  profile (session.json was removed or its activeProfile cleared) — this supervisor \
                  keeps following the PIN and connects to profile {pinned:?}; the unset session is \
                  IGNORED (clearing the active profile cannot retarget this fleet). Restart with \
-                 --profile to re-pin, or edit {}",
+                 `--profile <name>` to re-pin (e.g. `--profile {pinned}`), or edit {}",
                 state_file_display(decision)
             ));
         }
@@ -802,7 +803,8 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
                  ZEEBE_REST_ADDRESS, no c8ctl profile) but c8ctl now has active profile \
                  {active:?} — this supervisor keeps following the PINNED engine URL; the newly \
                  active profile is IGNORED (an agent's `c8 use profile` cannot retarget this \
-                 fleet). Restart with --profile to re-pin, or edit {}",
+                 fleet). Restart with `--profile <name>` to re-pin (e.g. `--profile {active}` to \
+                 adopt the active profile), or edit {}",
                 state_file_display(decision)
             ));
         }
@@ -828,7 +830,7 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
         // dangerous case: with no explicit address the client falls back to the
         // ambient/SDK-default endpoint, so an unset current value warns as
         // loudly as a changed one (symmetric with the env-only branch below).
-        (Some(_), Some(then)) => match profile::resolved_base_url(decision.profile.as_ref()) {
+        (Some(pinned), Some(then)) => match profile::resolved_base_url(decision.profile.as_ref()) {
             Some(now) if now == then => {}
             Some(now) => {
                 out.push(format!(
@@ -846,7 +848,8 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
                      removed under the same name) but the pin was taken against {} — \
                      with no explicit engine address the client falls back to the \
                      ambient/SDK-default endpoint, NOT the pinned engine. Restore the \
-                     profile's baseUrl, or re-pin with --profile / an explicit \
+                     {pinned:?} profile's baseUrl, or re-pin with `--profile <name>` \
+                     (naming a profile that resolves a baseUrl) / an explicit \
                      CAMUNDA_REST_ADDRESS, or delete the pin in {}",
                     redact(then),
                     state_file_display(decision)
@@ -1657,6 +1660,16 @@ mod tests {
             warnings.iter().any(|w| w.contains("no longer resolves a baseUrl")),
             "a removed profile baseUrl must warn about drift, not be silently skipped: {warnings:?}"
         );
+        // The remediation must NOT suggest re-pinning to the SAME (now
+        // baseUrl-less) profile — that would persist an unenforceable pin and
+        // fail closed next start — so it names the profile to restore and asks
+        // for a profile that still resolves a baseUrl.
+        assert!(
+            warnings.iter().any(|w| w.contains("\"merlin\" profile's baseUrl")
+                && w.contains("`--profile <name>`")
+                && w.contains("naming a profile that resolves a baseUrl")),
+            "the removed-baseUrl warning must give an effective, concrete re-pin remediation: {warnings:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1800,6 +1813,53 @@ mod tests {
             warnings.iter().any(|w| w.contains("NO active profile")),
             "an unset active profile under a named pin must warn: {warnings:?}"
         );
+        // The re-pin instruction must name the profile — a bare `--profile`
+        // takes a value, so the literal instruction is ineffective without it.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`--profile <name>`") && w.contains("`--profile merlin`")),
+            "the named-pin drift warning must give a concrete `--profile <name>` re-pin command: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The classic `c8 use profile` retarget: a named pin whose session's
+    /// active profile CHANGES to a different name. The supervisor keeps
+    /// following the PIN and warns, and the re-pin instruction must be a
+    /// concrete `--profile <name>` command (a bare `--profile` takes a value,
+    /// so the literal instruction is ineffective for a named profile).
+    #[test]
+    fn named_pin_warns_when_active_profile_changes_and_names_repin_command() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("activeprofilechanged");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-a:8080"},{"name":"other","baseUrl":"http://engine-b:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        let first = resolve_or_pin(&home, None).expect("first start pins merlin");
+        assert!(first.created);
+        // An agent runs `c8 use profile other`: active profile now differs.
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"other"}"#).unwrap();
+        let second = resolve_or_pin(&home, None).expect("second start follows the pin");
+        assert!(!second.created);
+        assert_eq!(second.pin.profile.as_deref(), Some("merlin"));
+        assert_eq!(second.active_profile.as_deref(), Some("other"));
+        let warnings = drift_warnings(&second);
+        // Both the re-affirm (pinned) and adopt (active) commands are named, so
+        // the operator has a copy-pasteable command for either intent.
+        assert!(
+            warnings.iter().any(|w| w.contains("active profile")
+                && w.contains("`--profile <name>`")
+                && w.contains("`--profile merlin`")
+                && w.contains("`--profile other`")),
+            "the active-profile-change drift warning must name both re-pin commands: {warnings:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1866,6 +1926,13 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("env-only") && w.contains("merlin")),
             "an active profile appearing under an env-only pin must warn: {warnings:?}"
+        );
+        // The re-pin instruction must name the now-active profile to adopt.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`--profile <name>`") && w.contains("`--profile merlin`")),
+            "the env-only drift warning must give a concrete `--profile <name>` re-pin command: {warnings:?}"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
