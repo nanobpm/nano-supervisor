@@ -743,11 +743,15 @@ fn prepare_run_dir_pinned(
 ///
 /// Everything is relative to the pinned `root` handle (`renameat`/`fstatat`),
 /// so a same-UID actor swapping an ancestor cannot redirect the check or the
-/// rename outside the runs root. Best-effort: a dir that has no marker, or
-/// whose marker read fails, is left for the caller's normal wipe — the marker
-/// is a durability hint, never a reason to fail preparing a new attempt. A
+/// rename outside the runs root. A dir that definitively has no marker
+/// (`NotFound`) is left for the caller's normal wipe — the marker is a
+/// durability hint, never a reason to fail preparing a new attempt. A
 /// symlinked `<name>` is left untouched (the rename would target the link, not
 /// a retained checkout) and handed to the caller's no-follow wipe as usual.
+/// But the marker LOOKUP fails closed: any open/stat error other than
+/// "definitively absent" (a transient I/O or permission failure) is
+/// propagated, so preparation stops rather than risk wiping a possibly-retained
+/// checkout whose marker could not be read.
 #[cfg(unix)]
 fn quarantine_retained_run_dir(
     root: &crate::saferoot::DirHandle,
@@ -755,15 +759,57 @@ fn quarantine_retained_run_dir(
 ) -> std::result::Result<(), crate::saferoot::PinError> {
     use crate::saferoot::PinError;
     // Does `<name>/<RETENTION_MARKER>` exist? Open the child dir no-follow and
-    // stat the marker within it. Any error (no such dir, no marker, a symlinked
-    // `<name>` refused with ELOOP) means "not a retained checkout" — leave it
-    // to the caller's normal wipe.
+    // stat the marker within it. FAIL CLOSED: only a definitively-NOT-retained
+    // leaf falls through to the caller's normal wipe — `NotFound` (no such dir
+    // / no marker) or a non-directory `<name>` (a symlink or plain file is not
+    // a retained checkout; the rename would target the link, so it is handed to
+    // the caller's no-follow wipe as usual). Any OTHER open/stat error (a
+    // transient I/O or permission failure) leaves the marker's presence
+    // UNKNOWN, and the dir may hold the only copy of retained unpushed work:
+    // propagate the error so preparation stops WITHOUT deleting it, rather than
+    // collapsing the error to "no marker" and letting `prepare_child_dir` wipe
+    // the retained checkout.
+    let marker_absent = |e: std::io::Error| -> std::result::Result<bool, PinError> {
+        // The no-follow dir open refuses a symlinked `<name>` with ELOOP (or
+        // ENOTDIR when O_DIRECTORY is checked first, or the portable post-open
+        // check's InvalidInput); a plain-file `<name>` fails it with ENOTDIR.
+        // None of these is a real retained checkout directory, so each falls
+        // through to the caller's no-follow wipe.
+        let raw = e.raw_os_error();
+        let not_a_checkout_dir = e.kind() == std::io::ErrorKind::InvalidInput
+            || raw == Some(libc::ELOOP)
+            || raw == Some(libc::ENOTDIR);
+        if e.kind() == std::io::ErrorKind::NotFound || not_a_checkout_dir {
+            Ok(true)
+        } else {
+            Err(PinError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "could not determine whether run dir {} carries a retention marker; \
+                     refusing to wipe a possibly-retained checkout",
+                    name.to_string_lossy()
+                ),
+            )))
+        }
+    };
     let marker_present = match root.open_child_dir(name, false) {
-        Ok(child) => child
-            .symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER))
-            .map(|m| !m.is_dir || m.is_symlink) // a regular file / symlink marker
-            .unwrap_or(false),
-        Err(_) => false,
+        Ok(child) => match child.symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER)) {
+            Ok(m) => !m.is_dir || m.is_symlink, // a regular file / symlink marker
+            Err(e) => {
+                if marker_absent(e)? {
+                    false
+                } else {
+                    unreachable!("marker_absent returns Ok(true) or Err")
+                }
+            }
+        },
+        Err(e) => {
+            if marker_absent(e)? {
+                false
+            } else {
+                unreachable!("marker_absent returns Ok(true) or Err")
+            }
+        }
     };
     if !marker_present {
         return Ok(());
@@ -3840,6 +3886,80 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_fails_closed_when_the_marker_lookup_errors() {
+        // Regression for the fail-open retention-marker finding (HIGH), unit
+        // style: drive `quarantine_retained_run_dir` directly so the assertion
+        // isolates the marker DECISION from `prepare_child_dir`'s wipe (which
+        // cannot read a searchless dir either, and so would mask the bug).
+        // Make the retained run dir readable-but-not-executable (0o444): the
+        // no-follow open (O_RDONLY) SUCCEEDS, but stating the marker within it
+        // fails with EACCES (no search bit). The fail-open code collapsed that
+        // EACCES to "no marker" and returned Ok — telling the caller the dir is
+        // UNMARKED and safe to wipe (RED). The fail-closed code propagates the
+        // lookup error, so preparation stops without the retained checkout
+        // being treated as unmarked (GREEN).
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses the directory permission check");
+            return;
+        }
+        let runs = unique_tmp("quar-marker-failclosed");
+        let run = runs.join("43");
+
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RETENTION_MARKER), b"retained\n").unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let root = crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs, 0o700).unwrap();
+        let result = quarantine_retained_run_dir(&root, std::ffi::OsStr::new("43"));
+
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a marker lookup error (EACCES) must fail closed, not be misread as 'no marker'"
+        );
+        assert!(
+            run.join(RETENTION_MARKER).exists(),
+            "the retained checkout must be left untouched when its marker cannot be read"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_wipes_a_symlinked_run_dir_leaf() {
+        // Guard the fail-closed classification: a SYMLINKED `<name>` is NOT a
+        // retained checkout, so the no-follow open refuses it (ELOOP/ENOTDIR)
+        // and it must fall through to the caller's normal wipe — the symlink
+        // itself is removed and a fresh real run dir is prepared — while the
+        // link's TARGET is never touched. This must NOT be misread as a marker
+        // lookup error and fail closed.
+        let runs = unique_tmp("prep-symlink-leaf");
+        let outside = unique_tmp("prep-symlink-target");
+        std::fs::write(outside.join("keep.txt"), b"not ours").unwrap();
+        let run = runs.join("43");
+        std::os::unix::fs::symlink(&outside, &run).unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "a fresh run dir must be prepared");
+        assert!(
+            !run.symlink_metadata().unwrap().file_type().is_symlink(),
+            "the symlinked leaf must be replaced by a real directory"
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "the symlink target must never be touched by the wipe"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[cfg(unix)]
