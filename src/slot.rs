@@ -1855,10 +1855,13 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
     // the empty-job detector can tell whether the agent committed anything.
     // Node feeds `gitResult.commits`/`pushed` into `detectEmptyAgentJob`; the
-    // Rust worker has no `finalizeGit` push stage yet, so it derives the
-    // "commits" signal from a pre/post `rev-parse` of this HEAD (any advance =
-    // a commit) and reports no push. `None` for a non-git run dir (no
-    // repository) or when HEAD can't be read — treated as "no commits".
+    // Rust worker's `finalize_git` stage enumerates and pushes the agent's
+    // commits, but its enumeration is authoritative ONLY when it finds commits —
+    // a rev-list failure (or a >1 MiB stdout-tail truncation inside `git()`)
+    // also reads as an empty list. This pre/post `rev-parse` of HEAD is the
+    // best-effort fallback for that case (any advance = a commit); `None` for a
+    // non-git run dir (no repository) or when HEAD can't be read — treated as
+    // "no commits".
     // Dup the pinned handle FALLIBLY: this probe is best-effort (a failure is
     // already `None` = "HEAD unreadable"), so a dup failure (descriptor
     // exhaustion, EMFILE) must yield `None` here, never a worker-crashing
