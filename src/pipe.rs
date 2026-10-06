@@ -144,7 +144,7 @@ pub async fn run(
     };
 
     // Kill the whole process group (agent + any tools it started), then reap.
-    kill_tree(&mut child, pgid).await;
+    kill_tree(&mut child, group_guard.guard()).await;
     // The group is now torn down and the child reaped, so its pid must not be
     // signalled again (it may be recycled by the OS): disarm the guard.
     group_guard.disarm();
@@ -184,13 +184,15 @@ pub(crate) fn bound_capture(collected: &mut String) -> bool {
     true
 }
 
-async fn kill_tree(child: &mut tokio::process::Child, pgid: Option<u32>) {
+async fn kill_tree(child: &mut tokio::process::Child, guard: Option<crate::pdeath::PgidGuard>) {
     // TERM the whole group, grace, then SIGKILL the group (catching a
     // TERM-resistant descendant) before reaping the leader — `start_kill` alone
     // would only SIGKILL the direct agent and let a tool it started survive. The
-    // preserved `pgid` is used so the group is still torn down even though the
-    // EOF path may already have reaped the leader.
-    crate::pdeath::terminate_group_and_reap(child, pgid, Duration::from_secs(3)).await;
+    // spawn-time `guard` (not a fresh capture) verifies the group's identity, so
+    // the group is still torn down even though the EOF path may already have
+    // reaped the leader — and a pgid recycled since spawn is not signalled outside
+    // the accepted residual windows documented on `pdeath::GroupIdentity`.
+    crate::pdeath::terminate_group_and_reap(child, guard, Duration::from_secs(3)).await;
 }
 
 #[cfg(test)]
