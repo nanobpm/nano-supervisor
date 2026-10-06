@@ -1310,9 +1310,17 @@ mod tests {
     /// warning instead of the banner, contradicting the PR's first-line
     /// visibility guarantee (issue #41). The warning must be CARRIED back in
     /// the decision for the caller to emit after the banner.
+    ///
+    /// The test is hermetic: it runs under `ENV_LOCK` against an isolated
+    /// `C8CTL_DATA_DIR` carrying its own `merlin` profile, so it neither reads
+    /// nor depends on the host's ambient c8ctl config (which a clean CI host
+    /// may not have at all — and whose `merlin` profile, if present, could
+    /// point anywhere), and it cannot race the other env-mutating tests in
+    /// this binary.
     #[cfg(unix)]
     #[test]
     fn resolve_or_pin_defers_the_dir_fsync_warning_for_after_the_banner() {
+        let _lock = ENV_LOCK.lock().unwrap();
         fn fail_sync(_dir: &Path) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1330,6 +1338,16 @@ mod tests {
         let _guard = HookGuard;
 
         let home = temp_home("pin-defers-dirfsync-warning");
+        // An isolated c8ctl config dir supplying the `merlin` profile, so the
+        // pin below never consults the host's ambient c8ctl config.
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://m:8080"}]}"#,
+        )
+        .unwrap();
         let decision = resolve_or_pin(&home, Some("merlin")).expect("explicit first pin");
         assert!(decision.created, "a fresh home pins on first start");
         assert_eq!(
