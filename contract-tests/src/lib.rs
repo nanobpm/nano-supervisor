@@ -69,7 +69,7 @@ fn is_fleet_var(key: &str) -> bool {
 /// fleet-related variable (see [`is_fleet_var`]), then set the isolated
 /// `C8CTL_NANO_HOME` and the launchd/update-notifier suppressors. Shared by
 /// [`Target::available`] and [`TempHome`] so both isolate identically.
-fn apply_hermetic_env(c: &mut Command, home: &Path) {
+fn apply_hermetic_env(c: &mut Command, home: &Path, target: Target) {
     for (key, _) in std::env::vars_os() {
         if let Some(k) = key.to_str() {
             if is_fleet_var(k) {
@@ -77,8 +77,28 @@ fn apply_hermetic_env(c: &mut Command, home: &Path) {
             }
         }
     }
-    c.env("C8CTL_NANO_HOME", home)
-        .env("C8CTL_NANO_NO_LAUNCHD", "1")
+    c.env("C8CTL_NANO_HOME", home);
+    // Also isolate the c8ctl *data* dir (profiles.json / session.json) — but
+    // ONLY for the Rust target. Without this a Rust worker under test reads the
+    // developer's real ~/.config/c8ctl, and the issue-#41 first-start
+    // precedence (the ambient active profile is resolved before
+    // `CAMUNDA_REST_ADDRESS`) could pin the operator's global profile and poll
+    // a REAL engine instead of the guarded local test one. Point it at an
+    // empty per-home dir; a test that needs seeded profiles overrides this key
+    // with a later `.env("C8CTL_DATA_DIR", …)` (a later set on the same key
+    // wins).
+    //
+    // The Node target runs `c8 nano`, and the `c8` CLI resolves its plugins —
+    // including the nano plugin itself — from the data dir. Pointing
+    // `C8CTL_DATA_DIR` at an empty dir makes c8 unable to find the nano plugin,
+    // so every Node-target test fails with `Unknown command: nano hire`. The
+    // Node plugin does not read profiles/session from `C8CTL_DATA_DIR` the way
+    // the Rust binary does, so it must keep c8's real data dir and is left
+    // unset here.
+    if target == Target::Rust {
+        c.env("C8CTL_DATA_DIR", home.join("c8ctl"));
+    }
+    c.env("C8CTL_NANO_NO_LAUNCHD", "1")
         .env("NANO_NO_UPDATE_NOTIFIER", "1");
 }
 
@@ -183,7 +203,7 @@ impl Target {
             Err(_) => return false,
         };
         let mut probe = self.cmd(&["--help"]);
-        apply_hermetic_env(&mut probe, probe_home.path());
+        apply_hermetic_env(&mut probe, probe_home.path(), self);
         probe
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -245,7 +265,7 @@ impl TempHome {
     /// variable cleared. Used by the worker harness, which builds its command
     /// from [`Target::cmd`] and then layers this home on top.
     pub fn apply(&self, cmd: &mut Command) {
-        apply_hermetic_env(cmd, self.path());
+        apply_hermetic_env(cmd, self.path(), self.target);
     }
 
     /// A `Command` for the bound target, with this home and the standard
@@ -257,7 +277,7 @@ impl TempHome {
     /// `.env(...)` on the returned `Command` (a later set on the same key wins).
     pub fn cmd(&self, args: &[&str]) -> Command {
         let mut c = self.target.cmd(args);
-        apply_hermetic_env(&mut c, self.path());
+        apply_hermetic_env(&mut c, self.path(), self.target);
         c
     }
 
@@ -993,10 +1013,45 @@ pub fn run_worker_job(
         worker_flags,
         extra_env,
         &[],
+        "junior",
     );
     // The outcome cloned the home's path (it borrows nothing from `home`), so
     // now that the `&home` borrow has ended, move the home into the outcome to
     // keep the temp dir alive for the outcome's lifetime.
+    outcome._home = Some(home);
+    outcome
+}
+
+/// [`run_worker_job`] with a caller-chosen hire rank. The sanity-guard test
+/// needs a TEST-LOOKING rank (`ct-worker`) so the worker's whole served matrix
+/// is `ct-*`/`probe-*` and the issue-#41 warning can actually fire — the default
+/// `junior` rank adds the production-looking `junior` job type, which
+/// disqualifies `all_test_looking`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_with_rank(
+    engine: &Engine,
+    target: &Target,
+    test: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    rank: &str,
+) -> JobOutcome {
+    let home = TempHome::new();
+    let mut outcome = run_worker_job_with_home(
+        engine,
+        target,
+        &home,
+        None,
+        test,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+        &[],
+        rank,
+    );
     outcome._home = Some(home);
     outcome
 }
@@ -1031,6 +1086,7 @@ pub fn run_worker_job_in(
         worker_flags,
         extra_env,
         &[],
+        "junior",
     )
 }
 
@@ -1060,6 +1116,7 @@ pub fn run_worker_job_with(
         worker_flags,
         extra_env,
         custom_headers,
+        "junior",
     )
 }
 
@@ -1399,6 +1456,7 @@ fn run_worker_job_with_home(
     worker_flags: &[&str],
     extra_env: &[(&str, &str)],
     custom_headers: &[(&str, &str)],
+    rank: &str,
 ) -> JobOutcome {
     let job_type = engine.unique_type(test);
     let process_id = format!("p-{job_type}");
@@ -1434,7 +1492,7 @@ fn run_worker_job_with_home(
     // vocabulary, which the Rust `work` mirrors). The Rust worker additionally
     // takes `--max-jobs 1` so it exits once the job is handled.
     let profile = format!("ctfake{}", rand_suffix());
-    hire_profile(*target, home, &profile);
+    hire_profile_with_rank(*target, home, &profile, rank);
     let mut cmd = work_command(*target, &profile, &job_type, worker_flags);
     home.apply(&mut cmd);
     // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
@@ -1487,6 +1545,14 @@ fn run_worker_job_with_home(
 /// command yet, so the harness writes the same `config.json` entry the Node CLI
 /// writes (the Rust worker reads Node's state format).
 fn hire_profile(target: Target, home: &TempHome, profile: &str) {
+    hire_profile_with_rank(target, home, profile, "junior")
+}
+
+/// [`hire_profile`] with a caller-chosen rank. The sanity-guard test needs a
+/// TEST-LOOKING rank (`ct-worker`) so the worker's whole served matrix is
+/// `ct-*`/`probe-*` — a `junior` rank would add the production-looking `junior`
+/// type and disqualify `all_test_looking`, so the warning could never fire.
+fn hire_profile_with_rank(target: Target, home: &TempHome, profile: &str, rank: &str) {
     let agent = fake_agent_path();
     let agent = agent.to_string_lossy();
     match target {
@@ -1496,7 +1562,7 @@ fn hire_profile(target: Target, home: &TempHome, profile: &str) {
                 "--name",
                 profile,
                 "--rank",
-                "junior",
+                rank,
                 "--command",
                 &agent,
                 "--arg",
@@ -1518,7 +1584,7 @@ fn hire_profile(target: Target, home: &TempHome, profile: &str) {
             let config = serde_json::json!({
                 "hires": {
                     profile: {
-                        "rank": "junior",
+                        "rank": rank,
                         "command": agent,
                         "args": ["--acp"],
                         "protocol": "acp",

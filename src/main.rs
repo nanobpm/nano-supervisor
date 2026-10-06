@@ -12,6 +12,7 @@ mod engine;
 mod envelope;
 mod jobs;
 mod pdeath;
+mod pin;
 mod pipe;
 mod profile;
 mod provision;

@@ -497,6 +497,66 @@ impl DirHandle {
         Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
+    /// Create a direct child **regular file** (`name`) relative to this handle,
+    /// write `contents`, and set it to `mode` — all no-follow and beneath this
+    /// directory (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, plus
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW`). `O_EXCL` makes the create **fail
+    /// closed** if `name` already exists as anything (a planted symlink, a
+    /// pre-existing file, a FIFO): a same-UID sibling cannot pre-plant
+    /// `name` as a symlink and have this write land on its target.
+    ///
+    /// Used to seed the agent's isolated c8ctl config files (issue #41) through
+    /// the pinned per-run directory handle, so the write cannot be redirected
+    /// outside the run dir onto the operator's global c8ctl config.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_new_child_file(
+        &self,
+        name: &OsStr,
+        contents: &[u8],
+        mode: u32,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        let c = cstr(name)?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = match openat2_raw(
+            self.fd.as_raw_fd(),
+            &c,
+            flags as u64,
+            RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        ) {
+            Ok(fd) => fd,
+            // Pre-5.6 kernel without `openat2`: a single-component `openat`
+            // anchored on this pinned handle, `O_NOFOLLOW | O_EXCL`, cannot
+            // escape it or land on a planted symlink.
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                let bytes = name.as_bytes();
+                if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "refusing non-single-component child name",
+                    ));
+                }
+                let raw = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), flags, 0) };
+                if raw < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: `raw` is a fresh, owned descriptor just returned by `openat`.
+                unsafe { OwnedFd::from_raw_fd(raw) }
+            }
+            Err(e) => return Err(e),
+        };
+        let mut f = std::fs::File::from(fd);
+        // `openat2` created the file with mode 0 (we pass `mode: 0` in the
+        // `open_how`), narrower than the target; `fchmod` on the fd makes the
+        // final mode exact and immune to umask, without re-resolving the path.
+        if unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        f.write_all(contents)?;
+        f.flush()
+    }
+
     /// `lstat` a direct child (relative, never following the entry).
     pub(crate) fn symlink_metadata(&self, name: &OsStr) -> io::Result<EntryMeta> {
         let c = cstr(name)?;
@@ -695,6 +755,18 @@ impl DirHandle {
     /// without reopening it by path.
     pub(crate) fn into_fd(self) -> OwnedFd {
         self.fd
+    }
+
+    /// Wrap an already-pinned, no-follow directory fd as a `DirHandle`, without
+    /// re-resolving any path. The inverse of [`into_fd`]: lets a consumer that
+    /// retained the exact validated run-dir inode (as a [`crate::safecwd::CwdHandle`])
+    /// seed children *relative to that capability* instead of reopening the run
+    /// dir by name — which a same-UID actor could swap for an ordinary tree in
+    /// between (#35/#46). The caller owns the fd's no-follow provenance; this
+    /// only rebinds it to the handle-relative mkdir/openat helpers.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_fd(fd: OwnedFd) -> DirHandle {
+        DirHandle { fd }
     }
 
     /// Ensure a direct child directory `name` exists under this pinned handle,

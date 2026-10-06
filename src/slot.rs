@@ -64,6 +64,14 @@ pub struct SlotConfig {
     pub propagate_job_panic: bool,
     /// Keep per-job run directories instead of reaping them (`--keep-runs`).
     pub keep_runs: bool,
+    /// The connection this worker is pinned to (issue #41), used to seed every
+    /// agent's isolated c8ctl config dir: the agent's own `c8` commands see
+    /// exactly the job's engine and nothing else, and its `c8 use profile`
+    /// writes stay inside the run directory.
+    pub connection: crate::pin::ConnectionPin,
+    /// The pinned connection fully resolved, when it names a c8ctl profile —
+    /// the seed content for the agent's isolated `profiles.json`.
+    pub connection_profile: Option<crate::profile::Profile>,
 }
 
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
@@ -482,7 +490,7 @@ fn restrict_dir_mode(dir: &Path) -> Result<()> {
 /// On Unix the pinned prepare/sweep paths refuse a symlink atomically at the
 /// no-follow open instead, so this path-based check is only reached by the
 /// non-Unix fallback (and the tests exercising the rejection).
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn reject_symlink(dir: &Path) -> Result<()> {
     if std::fs::symlink_metadata(dir)
         .map(|m| m.file_type().is_symlink())
@@ -542,11 +550,17 @@ pub(crate) fn reject_symlinked_ancestors(dir: &Path) -> Result<()> {
 /// `anchor` must be an ancestor of `dir` (or equal to it); components at or
 /// above `anchor` are trusted and skipped. A non-existent component is skipped:
 /// `create_dir_all` materialises it as a fresh real directory, not a link.
-/// Only the non-Unix fallback (and the tests exercising the rejection) use this
-/// now: on Unix the worker-namespace bootstrap materialises the root via the
-/// component-wise pinned `open_or_create_root_nofollow` instead, which closes
-/// the check→create race rather than merely re-checking after it.
-#[cfg(any(not(unix), test))]
+/// Two path-based fallbacks use this (and the tests exercising the rejection):
+/// the non-Unix run-dir bootstrap, and the non-Linux agent-`c8ctl`-seed
+/// fallback ([`create_agent_c8ctl_dir_path_based`], reached on macOS where the
+/// strict whole-chain no-follow open would reject legitimate platform symlinks
+/// like `/var` → `/private/var`). On Linux the worker-namespace bootstrap and
+/// the seed both materialise/pin no-follow (`open_or_create_root_nofollow` /
+/// `open_root_nofollow`) instead, closing the check→create race rather than
+/// merely re-checking after it — so this path-based check is compiled off there
+/// (outside tests). Gated `not(target_os = "linux")` (not `not(unix)`) so the
+/// macOS seed fallback can anchor its ancestor check at the trusted runs root.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn reject_symlinked_ancestors_below(dir: &Path, anchor: &Path) -> Result<()> {
     // Walk dir's ancestors from the leaf up to (but not past) `anchor`, stopping
     // before the anchor's own (trusted) ancestors. The anchor itself is trusted:
@@ -1735,7 +1749,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     };
 
     let result_file = run_dir.join("result.json");
-    let agent_env = build_agent_env(&cfg, &key, &job, &result_file, &run_dir);
+    let agent_env = build_agent_env(
+        &cfg,
+        &key,
+        &job,
+        &result_file,
+        &run_dir,
+        Some(prepared.agent_cwd()),
+    )?;
     let payload = build_agent_payload(&cfg, &job, &env);
     let acp = cfg.hire.protocol == Protocol::Acp;
 
@@ -2228,7 +2249,8 @@ fn build_agent_env(
     job: &ActivatedJobResult,
     result_file: &std::path::Path,
     run_dir: &std::path::Path,
-) -> Vec<(String, String)> {
+    run_dir_handle: Option<&crate::safecwd::CwdHandle>,
+) -> Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = Vec::new();
     // #283: a headless agent has no interactive terminal, so any git command that
     // launches an editor (a `commit` without `-m`, a `rebase -i`/`merge` without a
@@ -2273,7 +2295,398 @@ fn build_agent_env(
     env.push(("AGENT_MODEL".into(), cfg.hire.model.clone()));
     env.push(("AGENT_CAPABILITIES".into(), cfg.hire.capabilities.join(",")));
     env.push(("AGENT_JOB_TYPE".into(), job.r#type.clone()));
-    env
+    // Issue #41, proposal 3: quarantine the agent's c8ctl session. Agents run
+    // as the same OS user as the operator, so an agent's `c8 use profile`
+    // otherwise rewrites the operator's global `~/.config/c8ctl/session.json`
+    // and the next supervisor/worker start follows it onto a different engine.
+    // Point the agent at an isolated per-run config dir, seeded with exactly
+    // the pinned connection, so its profile changes stay inside the run and
+    // its own `c8` commands see only the job's engine.
+    //
+    // This FAILS CLOSED: if the isolated dir cannot be created/secured/seeded,
+    // propagate the error so the caller fails the job BEFORE launching the
+    // agent. Running the agent unisolated would let its `c8 use profile` land
+    // on the operator's global session — the exact write this prevents — so a
+    // best-effort skip here would silently reopen the incident.
+    //
+    // DELIBERATE TRADEOFF (#46): `C8CTL_DATA_DIR` is c8ctl's *entire* user-data
+    // root, so redirecting it also hides the operator's installed `c8` plugins
+    // (e.g. `c8 nano`) from the agent — c8ctl has no finer lever (it ignores
+    // `C8CTL_CONFIG_DIR`; see `profile.rs`). For this MVP that is accepted: the
+    // agent runs with `NANO_AGENTIC=off` and `guard_nested_supervisor` already
+    // blocks it from acting as a supervisor/worker, so it does not need the
+    // nano plugin, and we deliberately do NOT symlink the operator's plugins
+    // dir into this fail-closed no-follow root. Isolating session/profiles
+    // without relocating the plugins dir is tracked in #51.
+    let dir = seed_agent_c8ctl_dir(cfg, result_file, run_dir_handle)?;
+    // RESIDUAL RISK (#46, accepted): the seed WRITE is pinned to the run-dir
+    // inode (via `run_dir_handle`, no-follow), but `C8CTL_DATA_DIR` is still
+    // exported as the nominal PATH (`<run dir>/c8ctl`), which the agent's `c8`
+    // re-resolves by name at read time. A same-UID sibling could therefore swap
+    // `run_dir` for a different directory between seed and the agent's later `c8`
+    // invocation, redirecting those reads/writes. We accept this read-side
+    // TOCTOU rather than binding the export to the inode: the only robust fixes
+    // are a cwd-relative export (fragile — the external agent may `chdir` before
+    // calling `c8`) or an inherited non-CLOEXEC dir fd exported as
+    // `/proc/self/fd/N` (Linux-only, and depends on the external `c8` binary
+    // accepting a procfs path as its data dir, which we cannot verify). Neither
+    // is warranted under this PR's same-UID threat model: an actor who can swap
+    // `run_dir` already shares the UID and can edit the `0600` seed files — or
+    // the operator's global config — directly, so the export adds no new
+    // boundary here. This mirrors the accepted plugins-dir tradeoff in #51.
+    env.push(("C8CTL_DATA_DIR".into(), dir.to_string_lossy().into_owned()));
+    Ok(env)
+}
+
+/// Synthetic c8ctl profile name for an env-only / `--base-url` pin that has no
+/// named c8ctl profile. Seeded as the agent's `activeProfile` so its `c8` still
+/// resolves the pinned engine (issue #41).
+const PINNED_ENGINE_PROFILE: &str = "pinned";
+
+/// Create the per-run isolated c8ctl config dir (`<run dir>/c8ctl`, `0700`)
+/// and seed it from the worker's pinned connection: a `session.json` whose
+/// `activeProfile` is the pinned profile and a `profiles.json` carrying only
+/// that profile's **non-secret connection identity**, both written `0600`.
+/// Returns the dir to export as `C8CTL_DATA_DIR`.
+///
+/// The dir is created for EVERY job. A `CAMUNDA_*`-env (or `--base-url`) pin
+/// has no c8ctl profile object, so the seed profile is SYNTHESIZED from the
+/// pinned `base_url` under a stable name (`PINNED_ENGINE_PROFILE`) — the agent
+/// still gets a `session.json`/`profiles.json` naming exactly the pinned
+/// engine, because the ACP/pipe launchers strip `CAMUNDA_REST_ADDRESS` so the
+/// agent's `c8` has no other way to see it. An agent without `C8CTL_DATA_DIR`
+/// would instead inherit the operator's ambient c8ctl session, and its
+/// `c8 use profile X` would rewrite the operator's global
+/// `~/.config/c8ctl/session.json` — the exact write that retargeted the fleet
+/// in the issue-#41 incident. With the env var pointing inside the run dir,
+/// that write lands in the (per-run) dir instead and is reaped with the run.
+///
+/// FAILS CLOSED: every error propagates. The agent must never launch
+/// unisolated (its `c8` would reach the operator's global config), so the
+/// caller fails the job on any error here rather than skipping the override.
+///
+/// Symlink-race-hardened like the run-directory provisioning
+/// ([`prepare_run_dir`]): on Linux the dir and its files are created through
+/// pinned no-follow handles, *anchored on the retained run-directory capability*
+/// (`run_dir_handle`, the pinned fd `execute` carries in `PreparedRun`) rather
+/// than by re-resolving `run_dir` by name — so a same-UID sibling can neither
+/// plant `<run dir>/c8ctl` (or a seed file) as a symlink nor swap the whole run
+/// dir for a different ordinary directory to redirect the create/write onto the
+/// operator's config (#35/#46). Only a non-Linux host falls back to the
+/// best-effort path-based seed; on Linux (including pre-5.6 kernels) the pinned
+/// path stays on fd-relative handles, degrading from `openat2` to the portable
+/// `O_NOFOLLOW` `openat` chain — never to the path-based seed. The dir is derived from `result_file`
+/// (`<run dir>/result.json` → its parent is the run dir) so the env builder's
+/// unit tests stay pure; those tests pass no handle and exercise the path-based
+/// (or reopen) fallback.
+fn seed_agent_c8ctl_dir(
+    cfg: &SlotConfig,
+    result_file: &std::path::Path,
+    run_dir_handle: Option<&crate::safecwd::CwdHandle>,
+) -> Result<PathBuf> {
+    let run_dir = result_file
+        .parent()
+        .context("the agent result file has no parent run dir")?
+        .to_path_buf();
+    // Seed only the non-secret connection IDENTITY — never the daemon's engine
+    // credentials (clientSecret / basic-auth password). The agent runs as the
+    // same OS user, so a 0600 file does not hide its contents from the agent;
+    // `connection_identity()` strips every credential field.
+    let profile = cfg
+        .connection_profile
+        .as_ref()
+        .map(crate::profile::Profile::connection_identity)
+        .map(|mut identity| {
+            // A named profile may omit `baseUrl`, in which case the worker
+            // resolved the engine from the ambient `CAMUNDA_*`/`ZEEBE_*` env and
+            // fingerprinted THAT URL (`resolved_base_url`). Seeding the bare
+            // identity would hand the agent a profile with no engine, so its
+            // `c8` could not reach the engine the worker is pinned to. Backfill
+            // the pinned connection URL (redacted like the env-only branch
+            // below) so the agent targets the SAME engine (issue #41).
+            if identity.base_url.is_none() {
+                identity.base_url = cfg.connection.base_url.as_deref().map(redact_url);
+            }
+            identity
+        })
+        .or_else(|| {
+            // No cached `Profile` object to clone: synthesize the non-secret
+            // connection identity from the pinned `base_url` so the agent's
+            // `c8` still resolves the pinned engine. This covers the two pins
+            // that carry only a URL:
+            //   * a profile pin whose `Profile` was not cached — keep its name;
+            //   * an ENV-ONLY pin (`CAMUNDA_*` / `--base-url`, no c8ctl profile)
+            //     — give it a synthetic profile name so the seeded
+            //     `session.json`'s `activeProfile` can point at it. Without this
+            //     an env-only pin seeds NO files, and because the ACP/pipe
+            //     launchers strip `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`
+            //     the agent's `c8` would see no engine at all — contradicting
+            //     the pin's promise to show the agent exactly the pinned engine.
+            // Strip any embedded HTTP(S) userinfo exactly like
+            // `connection_identity` (the pinned URL may carry a credential).
+            cfg.connection
+                .base_url
+                .as_deref()
+                .map(|url| crate::profile::Profile {
+                    name: cfg
+                        .connection
+                        .profile
+                        .clone()
+                        .unwrap_or_else(|| PINNED_ENGINE_PROFILE.to_string()),
+                    base_url: Some(redact_url(url)),
+                    ..Default::default()
+                })
+        });
+    create_agent_c8ctl_dir(&run_dir, profile.as_ref(), run_dir_handle)
+}
+
+/// Create `<run dir>/c8ctl` (wiping any stale/planted entry), restrict it to
+/// `0700`, and write the seed files — dispatching to the pinned no-follow
+/// implementation on Linux and the path-based fallback elsewhere. Returns the
+/// created dir.
+///
+/// `run_dir_handle` is the EXACT pinned run-directory capability `execute`
+/// retained (`PreparedRun`) — when present (production), the Linux path seeds
+/// *relative to that fd* instead of reopening `run_dir` by name, so a same-UID
+/// actor that swaps `run_dir` for a different ordinary directory between
+/// preparation and here cannot redirect the wipe/seed onto an inode that was
+/// never prepared or secured (#35/#46). `None` (the unit tests, which hold no
+/// handle) falls back to the path-based reopen.
+fn create_agent_c8ctl_dir(
+    run_dir: &Path,
+    profile: Option<&crate::profile::Profile>,
+    run_dir_handle: Option<&crate::safecwd::CwdHandle>,
+) -> Result<PathBuf> {
+    let dir = run_dir.join("c8ctl");
+    #[cfg(target_os = "linux")]
+    {
+        use crate::saferoot::{DirHandle, PinError};
+        // Prefer the retained run-dir capability; only reopen by path when no
+        // handle was threaded (unit tests). Either way we seed through a
+        // DirHandle pinned to the run-dir inode.
+        let seeded = match run_dir_handle {
+            Some(handle) => {
+                let fd = handle
+                    .try_clone_fd()
+                    .map_err(PinError::Io)
+                    .map_err(|e| anyhow_from_pin(e, &dir))?;
+                seed_agent_c8ctl_pinned(&DirHandle::from_fd(fd), profile)
+            }
+            None => {
+                let root = DirHandle::open_root_nofollow(run_dir, false)
+                    .map_err(|e| anyhow_from_pin(e, &dir))?;
+                seed_agent_c8ctl_pinned(&root, profile)
+            }
+        };
+        // A refused symlinked component (ELOOP) or any other I/O error is a
+        // real, security-relevant outcome — surface it, never retry the
+        // weaker path-based create that would follow the very link refused.
+        seeded.map_err(|e| anyhow_from_pin(e, &dir))?;
+        Ok(dir)
+    }
+    // Non-Linux: the strict no-follow chain would refuse legitimate platform
+    // symlinks in the run path (macOS `/var` -> `/private/var`), so seed via the
+    // path-based fallback, which still fails closed on a symlinked `c8ctl` leaf.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = run_dir_handle;
+        create_agent_c8ctl_dir_path_based(run_dir, &dir, profile)?;
+        Ok(dir)
+    }
+}
+
+/// Map a `PinError` from the pinned c8ctl seed onto a job error that names the
+/// config dir. Every variant is a real, security-relevant failure to surface —
+/// the caller fails the job rather than launching the agent unisolated.
+#[cfg(target_os = "linux")]
+fn anyhow_from_pin(e: crate::saferoot::PinError, dir: &Path) -> anyhow::Error {
+    match e {
+        crate::saferoot::PinError::Io(e) => anyhow::Error::new(e).context(format!(
+            "seeding the agent's isolated c8ctl config dir {}",
+            dir.display()
+        )),
+    }
+}
+
+/// Seed `<pinned run dir>/c8ctl` relative to an already-pinned run-directory
+/// handle: wipe any stale/planted `c8ctl`, recreate it 0700, and write each
+/// seed file through `O_CREAT | O_EXCL` no-follow handles. Every step is
+/// anchored on `root`'s fd, so nothing is resolved by path and a planted
+/// symlink (or a swapped run dir) cannot redirect the create/write.
+#[cfg(target_os = "linux")]
+fn seed_agent_c8ctl_pinned(
+    root: &crate::saferoot::DirHandle,
+    profile: Option<&crate::profile::Profile>,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::PinError;
+    use std::ffi::OsStr;
+    // Wipe any stale/planted `c8ctl` entry and recreate it 0700, relative to the
+    // pinned run-dir handle — `prepare_child_dir` fails closed on a planted
+    // symlink rather than following it. RETAIN the returned handle: it is
+    // pinned to the exact inode just created and mode-restricted, so seeding
+    // through it (instead of reopening `c8ctl` by name) leaves no window in
+    // which a same-UID sibling can rename the prepared child aside and
+    // substitute a different ordinary directory for the seed writes to land in.
+    let c8 = root
+        .prepare_child_dir(OsStr::new("c8ctl"), 0o700)
+        .map_err(PinError::Io)?;
+    if let Some(profile) = profile {
+        // Write each seed file through the retained handle with
+        // `O_CREAT | O_EXCL` no-follow, so a seed-file symlink planted in the
+        // tiny window cannot redirect the write outside the run dir.
+        for (name, bytes) in seed_c8ctl_files(profile).map_err(PinError::Io)? {
+            c8.write_new_child_file(OsStr::new(name), bytes.as_bytes(), 0o600)
+                .map_err(PinError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Path-based fallback (non-Linux; on Linux the pinned path handles pre-5.6
+/// kernels internally): reject a symlinked leaf, create the dir, restrict it, then write
+/// the seed files. This cannot fully close the TOCTOU window — hence the pinned
+/// path above — but is the best available guarantee where `openat2` is
+/// unavailable, and still fails closed on a symlinked `c8ctl` leaf.
+///
+/// Also rejects a symlinked **ancestor** below the trusted runs root (the run
+/// dir itself): `reject_symlink(dir)` only inspects the final `c8ctl` leaf after
+/// the OS has already resolved its ancestors, so a same-UID sibling that swaps
+/// the prepared `run_dir` for a symlink to (e.g.) the parent of the operator's
+/// real `c8ctl` config would have `dir` resolve onto that config — and the
+/// `remove_dir_all(dir)` below would then delete/reseed it, the exact write this
+/// quarantine exists to prevent. `run_dir` is the no-follow-prepared,
+/// 0700-owned anchor; its parent (the runs root) and above — including macOS
+/// platform links like `/var` — stay trusted, so we only reject links in the
+/// operator-plantable tail beneath the runs root. Mirrors the
+/// before-*and*-after-the-non-atomic-mutation re-check in
+/// [`prepare_run_dir_path_based`].
+#[cfg(any(not(target_os = "linux"), test))]
+fn create_agent_c8ctl_dir_path_based(
+    run_dir: &Path,
+    dir: &Path,
+    profile: Option<&crate::profile::Profile>,
+) -> Result<()> {
+    // The runs root (run_dir's parent) and above are trusted; validate the tail
+    // beneath it so a swapped run-dir ancestor cannot redirect the wipe/create.
+    let runs_root = run_dir.parent().unwrap_or(run_dir);
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors_below(dir, runs_root)?;
+    reject_symlink(dir)?;
+    // Wipe any pre-existing `c8ctl` entry before (re)creating it, so a planted
+    // child — e.g. a `session.json` symlink left inside an existing regular
+    // directory — cannot survive into the agent. Without this the path-based
+    // fallback accepts an existing dir and (when there is no profile to
+    // overwrite its children) ships whatever was planted there, redirecting the
+    // agent's `c8 use profile` back at the operator's session. This mirrors the
+    // pinned path's `prepare_child_dir`, which also wipes-and-recreates.
+    // `reject_symlink` above guarantees `dir` itself is a real leaf, so we
+    // delete it in place rather than following a link out of the run dir;
+    // `remove_dir_all` unlinks a nested symlink entry instead of following it.
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(dir).with_context(|| {
+            format!("clearing a stale agent c8ctl config dir {}", dir.display())
+        })?,
+        Ok(_) => std::fs::remove_file(dir)
+            .with_context(|| format!("clearing a stale agent c8ctl entry {}", dir.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("inspecting the agent c8ctl path {}", dir.display())))
+        }
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating the agent's c8ctl config dir {}", dir.display()))?;
+    // Re-validate the whole tail after the non-atomic remove+create: a sibling
+    // could have swapped the run dir (or the fresh leaf) for a symlink in the
+    // window between the checks above and the create.
+    reject_symlink(run_dir)?;
+    reject_symlinked_ancestors_below(dir, runs_root)?;
+    reject_symlink(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", dir.display()))?;
+    }
+    if let Some(profile) = profile {
+        seed_c8ctl_dir(dir, profile)?;
+    }
+    Ok(())
+}
+
+/// The two seed files' `(name, pretty-JSON-with-trailing-newline)` pairs for a
+/// pinned profile: `session.json` (`activeProfile`) and `profiles.json` (the
+/// single profile). `profile` must already be the non-secret identity
+/// ([`crate::profile::Profile::connection_identity`]). Shared by the pinned and
+/// path-based seeders so both write identical bytes.
+fn seed_c8ctl_files(
+    profile: &crate::profile::Profile,
+) -> std::io::Result<[(&'static str, String); 2]> {
+    let session = serde_json::json!({ "activeProfile": profile.name });
+    let profiles = serde_json::json!({ "profiles": [profile] });
+    let to_bytes = |v: &serde_json::Value| -> std::io::Result<String> {
+        Ok(format!("{}\n", serde_json::to_string_pretty(v)?))
+    };
+    Ok([
+        ("session.json", to_bytes(&session)?),
+        ("profiles.json", to_bytes(&profiles)?),
+    ])
+}
+
+/// Write the isolated c8ctl config dir's two seed files via plain path-based
+/// I/O (the dir itself is created and restricted by the caller). The
+/// path-based fallback's file writer; the Linux path uses pinned no-follow
+/// handles instead. `profile` must already be the non-secret identity.
+#[cfg(any(not(target_os = "linux"), test))]
+pub(crate) fn seed_c8ctl_dir(dir: &Path, profile: &crate::profile::Profile) -> Result<()> {
+    for (name, body) in seed_c8ctl_files(profile)? {
+        let path = dir.join(name);
+        // Create each seed EXCLUSIVELY (`create_new`): a plain `fs::write`
+        // truncates whatever already sits at `path`, and `reject_symlink`
+        // alone does not catch a HARD link, so a same-UID sibling that plants
+        // `session.json` as a hard link to the operator's real session would
+        // have that file overwritten by this seed. `O_CREAT | O_EXCL` fails
+        // closed on any pre-existing symlink, hard link, or regular file —
+        // matching the Linux pinned path's `write_new_child_file`. The dir was
+        // just wiped-and-recreated by the caller, so the exclusive create
+        // succeeds on the fresh, empty directory.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            // `mode(0o600)` is filtered through the process umask, so a
+            // restrictive owner-bit umask (e.g. 0o777) would leave the seed
+            // `000` and the agent unable to read or update its own isolated
+            // c8ctl session. Re-assert the exact mode with `fchmod` on the
+            // open fd — immune to umask and re-resolving no path — mirroring
+            // the Linux pinned path's `write_new_child_file`.
+            if unsafe { libc::fchmod(f.as_raw_fd(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("chmod 0600 {}", path.display()));
+            }
+            f.write_all(body.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            f.write_all(body.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2317,7 +2730,36 @@ mod tests {
             max_jobs: None,
             propagate_job_panic: false,
             keep_runs: false,
+            connection: crate::pin::ConnectionPin {
+                profile: Some("merlin".into()),
+                base_url: Some("http://merlin:8080".into()),
+                rest: Default::default(),
+            },
+            connection_profile: Some(crate::profile::Profile {
+                name: "merlin".into(),
+                base_url: Some("http://merlin:8080".into()),
+                ..Default::default()
+            }),
         }
+    }
+
+    /// A hermetic, unique `result.json` path for a `build_agent_env` test.
+    /// `build_agent_env` now creates `<run dir>/c8ctl` and fails closed, so the
+    /// tests must give it a private run dir rather than a shared `/tmp/r.json`
+    /// (which would race sibling tests on one `/tmp/c8ctl`). Returns a
+    /// `(run_dir, result_file)` guard the test drops/cleans itself.
+    fn tmp_run(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nano-slot-env-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -2326,14 +2768,19 @@ mod tests {
             r#type: "senior:pr-review".into(),
             ..Default::default()
         };
-        let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/run"));
+        let run = tmp_run("reserved");
+        let rf = run.join("result.json");
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run, None).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("NANO_AGENTIC"), Some("off"));
         assert_eq!(get("NANO_JOB_KEY"), Some("42"));
-        assert_eq!(get("AGENT_RESULT_FILE"), Some("/tmp/r.json"));
+        assert_eq!(
+            get("AGENT_RESULT_FILE"),
+            Some(rf.to_string_lossy().as_ref())
+        );
         assert_eq!(get("AGENT_JOB_TYPE"), Some("senior:pr-review"));
         assert_eq!(get("AGENT_PROFILE"), Some("coder"));
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]
@@ -2342,11 +2789,16 @@ mod tests {
         // it tries to start can refuse to daemonise and a host sweep can find its
         // descendants by cwd.
         let job = ActivatedJobResult::default();
-        let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/runs/42"));
+        let run = tmp_run("agent-run");
+        let rf = run.join("result.json");
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run, None).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("NANO_AGENT_RUN"), Some("42"));
-        assert_eq!(get("NANO_AGENT_RUN_DIR"), Some("/tmp/runs/42"));
+        assert_eq!(
+            get("NANO_AGENT_RUN_DIR"),
+            Some(run.to_string_lossy().as_ref())
+        );
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]
@@ -2355,14 +2807,16 @@ mod tests {
             r#type: "senior:pr-review".into(),
             ..Default::default()
         };
-        let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&cfg(), "42", &job, rf, std::path::Path::new("/tmp/run"));
+        let run = tmp_run("editor");
+        let rf = run.join("result.json");
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run, None).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         // #283: every editor git might spawn points at the `:` no-op so a headless
         // agent's `git commit`/`rebase -i` can never block on an interactive editor.
         for k in ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL"] {
             assert_eq!(get(k), Some(":"), "{k} must default to the git no-op");
         }
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]
@@ -2376,8 +2830,9 @@ mod tests {
             r#type: "t".into(),
             ..Default::default()
         };
-        let rf = std::path::Path::new("/tmp/r.json");
-        let env = build_agent_env(&c, "1", &job, rf, std::path::Path::new("/tmp/run"));
+        let run = tmp_run("override");
+        let rf = run.join("result.json");
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         // `.envs()` is last-wins, so the LAST entry for a key is the effective value.
         let last = |k: &str| {
             env.iter()
@@ -2391,6 +2846,7 @@ mod tests {
         assert_eq!(last("GIT_EDITOR"), Some(":"));
         // …and a reserved var the hire tried to shadow is still forced off.
         assert_eq!(last("NANO_AGENTIC"), Some("off"));
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]
@@ -2427,19 +2883,15 @@ mod tests {
             );
         }
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(
-            &cfg(),
-            "1",
-            &job,
-            std::path::Path::new("/tmp/r.json"),
-            std::path::Path::new("/tmp/run"),
-        );
+        let run = tmp_run("secrets");
+        let env = build_agent_env(&cfg(), "1", &job, &run.join("result.json"), &run, None).unwrap();
         for (k, _) in &env {
             assert!(
                 !SENSITIVE_DAEMON_ENV.contains(&k.as_str()),
                 "build_agent_env must never emit daemon secret {k}"
             );
         }
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]
@@ -2447,13 +2899,8 @@ mod tests {
         let mut c = cfg();
         c.hire.env.insert("NANO_AGENTIC".into(), "on".into());
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(
-            &c,
-            "1",
-            &job,
-            std::path::Path::new("/tmp/r.json"),
-            std::path::Path::new("/tmp/run"),
-        );
+        let run = tmp_run("shadow");
+        let env = build_agent_env(&c, "1", &job, &run.join("result.json"), &run, None).unwrap();
         // The reserved value is pushed AFTER the hire env, so it wins for any
         // consumer that reads the last occurrence (as a child process does).
         let last = env
@@ -2461,6 +2908,520 @@ mod tests {
             .rfind(|(k, _)| k == "NANO_AGENTIC")
             .map(|(_, v)| v.as_str());
         assert_eq!(last, Some("off"));
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, the env-only gap: a worker pinned to the `CAMUNDA_*`
+    /// environment (no c8ctl profile) must STILL hand every agent an isolated
+    /// per-run `C8CTL_DATA_DIR`. It is also SEEDED with a synthetic profile
+    /// built from the pinned `base_url`: the ACP/pipe launchers strip
+    /// `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`, so without a seeded profile
+    /// the agent's own `c8` would see no engine at all — contradicting the pin's
+    /// promise to show the agent exactly the pinned engine.
+    #[test]
+    fn env_only_pin_seeds_a_synthetic_profile_for_the_agent() {
+        let mut c = cfg();
+        c.connection = crate::pin::ConnectionPin {
+            profile: None,
+            base_url: Some("http://env-engine:8080".into()),
+            rest: Default::default(),
+        };
+        c.connection_profile = None;
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-envpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("an env-only pin must still export C8CTL_DATA_DIR");
+        assert_eq!(dir, run.join("c8ctl").to_string_lossy());
+        let dir = std::path::Path::new(&dir);
+        // The dir exists and is owner-only.
+        let meta = std::fs::metadata(dir).expect("the isolated dir was created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        // session.json points at the synthetic pinned profile, and
+        // profiles.json carries exactly that engine's address.
+        let session: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("session.json")).unwrap())
+                .unwrap();
+        assert_eq!(session["activeProfile"], serde_json::json!("pinned"));
+        let profiles: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("profiles.json")).unwrap())
+                .unwrap();
+        assert_eq!(profiles["profiles"][0]["name"], serde_json::json!("pinned"));
+        assert_eq!(
+            profiles["profiles"][0]["baseUrl"],
+            serde_json::json!("http://env-engine:8080")
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, env-only base_url credential leak: an operator may embed
+    /// HTTP(S) userinfo in `CAMUNDA_REST_ADDRESS`. The synthesized seed profile
+    /// is a non-secret identity, so that userinfo must be stripped before it
+    /// lands in the agent-readable `profiles.json`.
+    #[test]
+    fn env_only_pin_strips_base_url_userinfo_from_the_seed() {
+        let mut c = cfg();
+        // Build the userinfo at runtime so no credential-like literal is stored
+        // in source.
+        let url = format!("http://{}:{}@env-engine:8080", "user", "SECRET");
+        c.connection = crate::pin::ConnectionPin {
+            profile: None,
+            base_url: Some(url),
+            rest: Default::default(),
+        };
+        c.connection_profile = None;
+        let run = std::env::temp_dir().join(format!(
+            "nano-slot-test-envpin-redact-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("an env-only pin must still export C8CTL_DATA_DIR");
+        let raw =
+            std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap();
+        assert!(
+            !raw.contains("SECRET") && !raw.contains("user@"),
+            "seeded env-only profiles.json leaked base_url userinfo: {raw}"
+        );
+        assert!(
+            raw.contains("http://env-engine:8080"),
+            "seeded env-only profiles.json must keep the engine location: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, the planted-session symlink class: the path-based fallback
+    /// (non-Linux; on Linux the pinned path handles pre-5.6 kernels internally)
+    /// must WIPE an existing `c8ctl` leaf before
+    /// recreating it, so a child planted in a pre-existing regular directory
+    /// cannot survive into the agent — even when there is no profile to
+    /// overwrite it. Without the wipe a planted `session.json` would redirect
+    /// the agent's `c8 use profile` back at the operator's session.
+    #[test]
+    fn path_based_seed_wipes_a_planted_leaf_even_without_a_profile() {
+        let run = std::env::temp_dir().join(format!("nano-slot-test-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        let dir = run.join("c8ctl");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stale/planted child from a previous (or hostile) occupant.
+        std::fs::write(dir.join("session.json"), "{\"activeProfile\":\"operator\"}").unwrap();
+        // No profile: the fallback must still clear the directory.
+        create_agent_c8ctl_dir_path_based(&run, &dir, None).unwrap();
+        assert!(
+            !dir.join("session.json").exists(),
+            "the path-based fallback must wipe a planted session.json even with no profile"
+        );
+        assert!(dir.is_dir(), "the c8ctl dir must be recreated");
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41, swapped-ancestor defence (review 5422432257): the path-based
+    /// fallback's `reject_symlink(dir)` inspects only the final `c8ctl` leaf —
+    /// *after* the OS has resolved its ancestors. A same-UID sibling that swaps
+    /// the prepared run dir for a symlink to the parent of the operator's real
+    /// `c8ctl` config makes `dir` resolve onto that config, and the fallback's
+    /// `remove_dir_all(dir)` would then delete it — the exact write this
+    /// quarantine prevents. The ancestor check anchored at the trusted runs root
+    /// must FAIL CLOSED on the symlinked run dir and leave the operator's config
+    /// untouched.
+    #[cfg(unix)]
+    #[test]
+    fn path_based_seed_fails_closed_on_a_symlinked_run_dir_ancestor() {
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-ancestor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let runs_root = base.join("runs");
+        std::fs::create_dir_all(&runs_root).unwrap();
+        // The operator's real c8ctl config, with a sentinel the seed must not
+        // delete. `operator` stands in for the parent the attacker links at.
+        let operator = base.join("operator");
+        let operator_c8ctl = operator.join("c8ctl");
+        std::fs::create_dir_all(&operator_c8ctl).unwrap();
+        std::fs::write(operator_c8ctl.join("session.json"), "OPERATOR").unwrap();
+        // Attacker swaps the prepared run dir for a symlink to `operator`, so
+        // `run_dir/c8ctl` resolves onto the operator's real config dir.
+        let run_dir = runs_root.join("job-1");
+        std::os::unix::fs::symlink(&operator, &run_dir).unwrap();
+        let dir = run_dir.join("c8ctl");
+        let err = create_agent_c8ctl_dir_path_based(&run_dir, &dir, None)
+            .expect_err("a symlinked run-dir ancestor must be refused, not followed");
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected a symlink rejection, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(operator_c8ctl.join("session.json")).unwrap(),
+            "OPERATOR",
+            "the operator's real c8ctl config must never be deleted/reseeded"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #46 (review 5428450727), the "prepare-then-reopen" class: the
+    /// pinned seeder must write the seed files through the VERY `DirHandle`
+    /// `prepare_child_dir` returned — the capability pinned to the freshly
+    /// created 0700 `c8ctl` inode — not reopen `c8ctl` by name afterwards. A
+    /// same-UID sibling can rename the prepared child aside and substitute a
+    /// different ordinary directory in between; a by-name reopen would accept
+    /// the substitute and seed IT. This test performs exactly that swap after
+    /// preparation and asserts the seed still lands in the prepared inode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_seed_survives_a_child_substituted_after_prepare() {
+        use crate::saferoot::DirHandle;
+        use std::ffi::OsStr;
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-prep-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let run_dir = base.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let root = DirHandle::open_root_nofollow(&run_dir, false).expect("pin the run dir");
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+
+        // Recreate the production sequence with the attacker's rename injected
+        // between the prepare and the seed: prepare the child, then rename it
+        // aside and substitute a DIFFERENT ordinary directory at the `c8ctl`
+        // path (no symlink, so a no-follow reopen by name would accept the
+        // substitute). Renaming a directory away does NOT invalidate an open
+        // handle to it, so seeding through the RETAINED handle must still land
+        // in the prepared inode — not in the substitute at the path.
+        let prepared = root
+            .prepare_child_dir(OsStr::new("c8ctl"), 0o700)
+            .expect("prepare the c8ctl child");
+        std::fs::rename(run_dir.join("c8ctl"), run_dir.join("c8ctl.attacker-moved")).unwrap();
+        std::fs::create_dir_all(run_dir.join("c8ctl")).unwrap();
+        std::fs::write(run_dir.join("c8ctl").join("marker"), "SUBSTITUTE").unwrap();
+        for (name, bytes) in seed_c8ctl_files(&profile).expect("seed files") {
+            prepared
+                .write_new_child_file(OsStr::new(name), bytes.as_bytes(), 0o600)
+                .expect("seed through the retained handle");
+        }
+        drop(prepared);
+
+        // The substitute directory (now at the `c8ctl` path) must NOT carry the
+        // seed — a by-name reopen would have written into it.
+        assert!(
+            !run_dir.join("c8ctl").join("session.json").exists(),
+            "a substituted child must never receive the seed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("c8ctl").join("marker")).unwrap(),
+            "SUBSTITUTE",
+            "the substitute directory is what sits at the c8ctl path now"
+        );
+        // The seed landed in the PREPARED inode (renamed aside by the
+        // "attacker"), proving the write went through the retained capability.
+        assert!(
+            run_dir
+                .join("c8ctl.attacker-moved")
+                .join("session.json")
+                .is_file(),
+            "the seed must land in the prepared inode, wherever the path now points"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #46 (review 5423119368), the "reopen retained run dir by path"
+    /// class: the Linux pinned seeder must write *relative to the retained
+    /// run-directory capability* (`PreparedRun`'s pinned fd), never by
+    /// re-resolving `run_dir` by name. A same-UID sibling can swap the run-dir
+    /// path for a DIFFERENT ordinary directory (not a symlink, so a no-follow
+    /// path reopen would accept it) between preparation and seeding; threading
+    /// the handle makes the swap irrelevant — the seed lands in the exact inode
+    /// preparation secured, not the swapped path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_seed_writes_through_the_retained_handle_not_the_path() {
+        use crate::safecwd::CwdHandle;
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-pinhandle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // The real, prepared run dir — pinned by inode, as `execute` retains it.
+        let real = base.join("real-run");
+        std::fs::create_dir_all(&real).unwrap();
+        let handle = CwdHandle::open(&real).expect("pin the real run dir by inode");
+        // The attacker-controlled path the seeder is *told* to use: a different
+        // ordinary directory (no symlink, so a path reopen's no-follow check
+        // would pass and seed the wrong inode).
+        let swapped = base.join("swapped-run");
+        std::fs::create_dir_all(&swapped).unwrap();
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+        let dir = create_agent_c8ctl_dir(&swapped, Some(&profile), Some(&handle))
+            .expect("seed through the pinned handle");
+        // The seed landed in the PINNED inode, not the swapped path.
+        assert!(
+            real.join("c8ctl").join("session.json").is_file(),
+            "seed must be written relative to the retained run-dir handle"
+        );
+        assert!(
+            !swapped.join("c8ctl").exists(),
+            "seed must NOT be written to the swapped run-dir path"
+        );
+        assert_eq!(dir, swapped.join("c8ctl"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    /// EXCLUSIVELY (`O_CREAT | O_EXCL`), so a same-UID sibling who plants a
+    /// hard link (or any regular file) at the seed path — a case `reject_symlink`
+    /// does NOT catch — cannot have the operator's real file silently
+    /// overwritten. The seed must FAIL CLOSED, leaving the planted content
+    /// untouched.
+    #[test]
+    fn seed_c8ctl_dir_fails_closed_on_a_preexisting_seed_file() {
+        let dir = std::env::temp_dir().join(format!("nano-slot-test-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A planted file (stand-in for a hard link to the operator's session).
+        std::fs::write(dir.join("session.json"), "PLANTED").unwrap();
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+        seed_c8ctl_dir(&dir, &profile)
+            .expect_err("an exclusive create must fail closed on a pre-existing seed file");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("session.json")).unwrap(),
+            "PLANTED",
+            "the planted file must never be overwritten by the seed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #41, umask defence: `seed_c8ctl_dir`'s `mode(0o600)` is filtered
+    /// through the process umask, so under a restrictive owner-bit umask (e.g.
+    /// 0o777) the seeds would come out `000` and the agent could not read or
+    /// update its own isolated c8ctl session. The `fchmod` on the open fd must
+    /// re-assert the exact `0o600` regardless of the inherited umask.
+    ///
+    /// The umask is **process-global**, so tightening it in-process would race
+    /// with parallel tests that create files. Run the seed in a child process
+    /// (a re-invocation of this test binary, gated by an env var) so the parent
+    /// process's umask — and every sibling test — is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn seed_c8ctl_dir_files_are_0600_even_under_a_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ENV: &str = "NANO_SLOT_UMASK_SEED_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Child: running alone in its own process, so a restrictive umask is
+            // safe here. Seed under 0o777 and exit 0 only if both files are 0600.
+            let dir = std::env::temp_dir()
+                .join(format!("nano-slot-test-umask-child-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let profile = crate::profile::Profile {
+                name: "merlin".into(),
+                base_url: Some("http://engine:8080".into()),
+                ..Default::default()
+            };
+            unsafe { libc::umask(0o777) };
+            seed_c8ctl_dir(&dir, &profile).expect("seeding must succeed under a restrictive umask");
+            for name in ["session.json", "profiles.json"] {
+                let mode = std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "{name} must be exactly 0600, got {mode:o}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // Parent: re-run THIS test in a child process with the guard set, so the
+        // child's umask change cannot leak into the parent's parallel tests.
+        // `--exact` needs the full module path, or the child matches 0 tests and
+        // exits 0 without ever running the seed (a vacuous pass).
+        let exe = std::env::current_exe().expect("current test binary");
+        let status = std::process::Command::new(exe)
+            .arg("slot::tests::seed_c8ctl_dir_files_are_0600_even_under_a_restrictive_umask")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn umask-seed child");
+        assert!(status.success(), "the umask-seed child process must pass");
+    }
+
+    /// The profiled counterpart: a pinned profile seeds the isolated dir with
+    /// exactly that profile, so the agent's own `c8` sees the job's engine.
+    #[test]
+    fn profiled_pin_seeds_the_agents_c8ctl_dir() {
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-profpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&cfg(), "1", &job, &rf, &run, None).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
+        let session: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::path::Path::new(&dir).join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session["activeProfile"], serde_json::json!("merlin"));
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #41 (review round 10): a named profile may OMIT `baseUrl`, in which
+    /// case the worker resolved (and fingerprinted) the engine from the ambient
+    /// `CAMUNDA_*`/`ZEEBE_*` env. The `connection_identity` arm would otherwise
+    /// seed the agent a profile with NO engine, so its `c8` could not reach the
+    /// engine the worker is pinned to. The seed must backfill the pinned
+    /// connection URL (redacted) so the agent targets the SAME engine.
+    #[test]
+    fn profile_without_base_url_seeds_the_pinned_connection_url() {
+        let mut c = cfg();
+        // The pin's profile object carries no baseUrl…
+        c.connection_profile = Some(crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: None,
+            ..Default::default()
+        });
+        // …but the worker fingerprinted this engine from the env.
+        c.connection = crate::pin::ConnectionPin {
+            profile: Some("merlin".into()),
+            base_url: Some("http://env-engine:8080".into()),
+            rest: Default::default(),
+        };
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-nobaseurl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
+        let profiles: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(profiles["profiles"][0]["name"], serde_json::json!("merlin"));
+        assert_eq!(
+            profiles["profiles"][0]["baseUrl"],
+            serde_json::json!("http://env-engine:8080"),
+            "a baseUrl-less profile must seed the pinned connection URL so the agent sees the engine"
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// The round-10 backfill must honour the SAME credential boundary as the
+    /// env-only branch: when the pinned connection URL embeds HTTP(S) userinfo,
+    /// backfilling a baseUrl-less profile's address must strip it before it
+    /// lands in the agent-readable `profiles.json`.
+    #[test]
+    fn profile_without_base_url_strips_userinfo_when_backfilling() {
+        let mut c = cfg();
+        c.connection_profile = Some(crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: None,
+            ..Default::default()
+        });
+        let url = format!("http://{}:{}@env-engine:8080", "user", "SECRET");
+        c.connection = crate::pin::ConnectionPin {
+            profile: Some("merlin".into()),
+            base_url: Some(url),
+            rest: Default::default(),
+        };
+        let run = std::env::temp_dir().join(format!(
+            "nano-slot-test-nobaseurl-redact-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
+        let raw =
+            std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap();
+        assert!(
+            !raw.contains("SECRET") && !raw.contains("user@"),
+            "backfilled profiles.json leaked base_url userinfo: {raw}"
+        );
+        assert!(
+            raw.contains("http://env-engine:8080"),
+            "backfilled profiles.json must keep the engine location: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// c8ctl dir is a CONNECTION IDENTITY only — the agent's own `c8` must reach
+    /// the job's engine without ever being handed the operator's long-lived
+    /// secrets. A seeded `profiles.json` must therefore carry no credential of
+    /// any kind, no matter what the daemon's resolved profile held.
+    #[test]
+    fn profiled_pin_seeds_no_credentials() {
+        let mut c = cfg();
+        // A fully-loaded daemon profile: every credential shape populated.
+        c.connection_profile = Some(crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://merlin:8080".into()),
+            client_id: Some("id".into()),
+            client_secret: Some("SECRET".into()),
+            username: Some("user".into()),
+            password: Some("PASSWORD".into()),
+            o_auth_url: Some("http://auth".into()),
+            ..Default::default()
+        });
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-nosecret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        std::fs::create_dir_all(&run).unwrap();
+        let rf = run.join("result.json");
+        let job = ActivatedJobResult::default();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
+        let dir = env
+            .iter()
+            .find(|(k, _)| k == "C8CTL_DATA_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("a profiled pin exports C8CTL_DATA_DIR");
+        let raw =
+            std::fs::read_to_string(std::path::Path::new(&dir).join("profiles.json")).unwrap();
+        for secret in ["SECRET", "PASSWORD"] {
+            assert!(
+                !raw.contains(secret),
+                "seeded profiles.json leaked a credential: {secret} in {raw}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&run);
     }
 
     #[test]

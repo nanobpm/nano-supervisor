@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::watch;
 
 use crate::engine;
+use crate::pin;
 use crate::runtime::log;
 use crate::slot::{self, SlotConfig};
 use crate::state::{self, Hire, Protocol};
@@ -52,6 +53,39 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             anyhow::anyhow!("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
         })?,
     };
+
+    // Issue #41: resolve & pin the connection BEFORE reading hires so the
+    // daemon's VERY FIRST startup line names the engine it is about to serve
+    // (the incident's only clue was buried in per-worker logs). Resolve the
+    // profile ONCE (explicit `--profile`, else the pin this state home
+    // recorded, else the current active profile) and persist the choice in
+    // `connection.json`, so a later `c8 use profile` — by an agent or an
+    // operator — can never silently retarget this daemon's fleet on its next
+    // start.
+    let state_home = state::state_home().ok_or_else(|| {
+        anyhow::anyhow!("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
+    })?;
+    let decision = pin::resolve_or_pin(&state_home, opts.profile.as_deref())?;
+    let engine_desc = decision.pin.describe();
+    // The console header leads daemon startup output with the engine it is
+    // about to serve: the incident's only clue was buried in per-worker logs,
+    // so this banner must precede every other startup line (including the
+    // config-path log below).
+    log(&format!("engine: {engine_desc}"));
+    if decision.created {
+        log(&format!(
+            "pinned the connection in {}: engine: {engine_desc}",
+            pin::state_file(&state_home).display()
+        ));
+    }
+    pin::warn_if_drifted(&decision);
+    // Non-fatal pin-write warnings (e.g. a failed best-effort directory fsync)
+    // were carried back in the decision rather than logged inside
+    // `resolve_or_pin`, precisely so they land HERE — after the banner — and a
+    // first start on a filesystem that rejects directory fsync still opens
+    // with `engine: ...` (issue #41).
+    pin::emit_deferred_warnings(&decision);
+
     log(&format!("reading hires from {}", config_path.display()));
     let all = state::read_hires_from(&config_path)?;
     if all.is_empty() {
@@ -69,10 +103,6 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         bail!("no hires matched --hire {:?}", opts.only);
     }
 
-    let (_profile, jobs) = engine::connect(opts.profile.as_deref())?;
-    let host = short_hostname();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
     // Normalize the runs root to the SAME absolute, parent-free lexical form
     // `slot::execute` registers in `active_runs` (via
     // `safecwd::normalize_run_path`). `execute` registers each in-flight run by
@@ -86,13 +116,46 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let runs_dir = crate::safecwd::normalize_run_path(&opts.runs_dir)
         .context("resolving absolute daemon runs-dir")?;
 
-    let mut handles = Vec::new();
-    let mut running_hires = 0usize;
+    // Every slot of this daemon connects through the PINNED profile — never
+    // the ambient session — so a moved active profile cannot split the fleet.
+    let pinned_base_url = decision.pin.base_url.clone();
+    // The sanity guard's engine identity must be built from the hires this
+    // daemon will ACTUALLY run — not every selected hire. A selected-but-invalid
+    // hire (rejected by `validate` below) contributes no job types the daemon
+    // serves; folding its production-looking matrix into the identity could make
+    // `looks_like_test_engine` false even when every runnable hire is
+    // `probe-*`/`ct-*`, suppressing the issue-#41 warning. So partition first.
+    let mut runnable: Vec<&Hire> = Vec::new();
     for hire in &selected {
         if let Err(reason) = validate(hire) {
             log(&format!("skipping hire {:?}: {reason}", hire.name));
             continue;
         }
+        runnable.push(hire);
+    }
+    if runnable.is_empty() {
+        bail!("no runnable hires (all were skipped — see the warnings above)");
+    }
+    let all_types: Vec<String> = runnable
+        .iter()
+        .flat_map(|h| state::job_type_matrix(&h.rank, &h.capabilities))
+        .collect();
+    // Connect with the profile the pin already resolved (issue #41): passing the
+    // pinned snapshot in rather than re-resolving `profiles.json` here closes
+    // the window where a concurrent profile change could connect the client to
+    // a different engine than the pin and banner.
+    let jobs = engine::connect(
+        decision.profile.as_ref(),
+        &engine_desc,
+        &all_types,
+        pinned_base_url.as_deref(),
+    )?;
+    let host = short_hostname();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut handles = Vec::new();
+    let mut running_hires = 0usize;
+    for hire in &runnable {
         let job_types = state::job_type_matrix(&hire.rank, &hire.capabilities);
         log(&format!(
             "hire {:?} [{}]: {} slot(s) over job types {:?}",
@@ -101,7 +164,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         running_hires += 1;
         for slot_idx in 0..opts.slots {
             let cfg = Arc::new(SlotConfig {
-                hire: hire.clone(),
+                hire: (*hire).clone(),
                 worker_name: format!("{host}-nanod-{}-{slot_idx}", hire.name),
                 job_types: job_types.clone(),
                 recovery_window: opts.recovery_window,
@@ -114,9 +177,17 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 max_jobs: None,
                 propagate_job_panic: false,
                 keep_runs: false,
+                connection: decision.pin.clone(),
+                connection_profile: decision.profile.clone(),
             });
+            // Issue #41 sanity guard: judge each SLOT's own job-type matrix, not
+            // the daemon-wide aggregate `all_types` the shared `jobs` was built
+            // with. A daemon mixing a normal hire with a `ct-*`-only hire would
+            // otherwise see the normal type in the aggregate and never warn for
+            // the slot serving only test jobs. `for_slot` shares the client (and
+            // its HTTP pool) but gives the slot its own matrix + warn-once latch.
             handles.push(tokio::spawn(slot::run(
-                jobs.clone(),
+                jobs.for_slot(job_types.clone()),
                 cfg,
                 shutdown_rx.clone(),
                 shutdown_tx.clone(),
@@ -125,7 +196,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     }
 
     if handles.is_empty() {
-        bail!("no runnable hires (all were skipped — see the warnings above)");
+        bail!("no slots started (is --slots 0?)");
     }
     log(&format!(
         "daemon up: {} hire(s), {} slot(s) total; waiting for jobs. Ctrl-C to drain.",
