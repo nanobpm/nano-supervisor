@@ -850,13 +850,19 @@ async fn git(
             // (`child.wait()` reaped only the direct git leader). Tear the whole
             // group down before disarming the guard — mirroring the ACP and pipe
             // paths — so a lingering helper can't keep mutating the run directory
-            // after provisioning "succeeds". `terminate_group_and_reap` gates on
-            // `group_alive`, so this is a no-op when git left nothing behind and
-            // never re-signals a pid that may have been recycled.
+            // after provisioning "succeeds". The spawn-time `group_guard` (not a
+            // fresh capture) verifies the group's identity, so this is a no-op
+            // when git left nothing behind and does not re-signal a recycled
+            // pgid outside the accepted residual windows (see
+            // `pdeath::GroupIdentity`).
             #[cfg(unix)]
             {
-                crate::pdeath::terminate_group_and_reap(&mut child, gpid, Duration::from_secs(3))
-                    .await;
+                crate::pdeath::terminate_group_and_reap(
+                    &mut child,
+                    group_guard.guard(),
+                    Duration::from_secs(3),
+                )
+                .await;
                 group_guard.disarm();
             }
             res
@@ -864,21 +870,20 @@ async fn git(
         Err(_) => {
             // Timed out: SIGKILL the whole group (not just the leader that
             // `kill_on_drop` reaps) so a helper git spawned cannot outlive it.
-            // Re-probe `group_alive` immediately before signalling — mirroring
-            // `terminate_group_and_reap` and the success path above: the `wait`
+            // Reuse the guard captured at spawn (`group_guard`, line ~733)
+            // rather than re-capturing the pgid's identity here: the `wait`
             // future (and its `child.wait()`) is dropped when the timeout fires,
             // so if git and every descendant exited in that interval the pgid can
-            // be released and recycled by an unrelated group before this call.
-            // Only signal while the group is genuinely still present, so a timeout
-            // never SIGKILLs a recycled pid — upholding the guard's guarantee.
+            // be released and recycled by an unrelated group before this call. A
+            // fresh `PgidGuard::capture` at signal time would read *that*
+            // recycled group's identity and bless it; the spawn-time guard still
+            // holds git's original identity, so `kill_group_if_ours` declines a
+            // recycled pgid (issue #27) — upholding the guard's guarantee.
             #[cfg(unix)]
-            if let Some(pid) = gpid {
-                if crate::pdeath::group_alive(pid) {
-                    crate::pdeath::sigkill_group(pid);
-                }
+            {
+                group_guard.kill_group_if_ours();
+                group_guard.disarm();
             }
-            #[cfg(unix)]
-            group_guard.disarm();
             // Reap the just-killed leader (bounded) before returning. The `wait`
             // future — which owns `child` — was dropped when the timeout fired,
             // and `kill_on_drop` signals a dropped child but does *not* guarantee
