@@ -55,6 +55,18 @@ pub(crate) fn validate_job_key(key: &str) -> Result<()> {
 #[derive(Clone)]
 pub struct Jobs {
     client: Box<CamundaClient>,
+    /// The pinned engine identity (`engine: <profile> (<baseUrl>)`), carried so
+    /// the sanity guard can name the engine in its warning.
+    engine_desc: Option<String>,
+    /// The job-type prefixes that mark a throwaway contract-test engine
+    /// (issue #41): a worker whose whole matrix matches only these is almost
+    /// certainly pointed at a test cluster, so the first activation logs a
+    /// prominent warning naming the engine.
+    test_type_prefixes: Vec<String>,
+    /// Fires the sanity-guard warning at most once per worker process. Kept for
+    /// backwards compatibility with [`Jobs::with_identity`]; the daemon instead
+    /// latches PER SLOT via [`Jobs::for_slot`] (see [`Jobs::activate_for`]).
+    sanity_warned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Preserve an SDK error as a STRUCTURED [`anyhow`] link rather than flattening
@@ -102,6 +114,29 @@ fn token_of(lease: &Option<String>) -> Option<Option<JobLeaseToken>> {
     lease
         .as_ref()
         .map(|t| Some(JobLeaseToken::assume_exists(t.clone())))
+}
+
+/// True when `prefixes` is non-empty and every entry looks like a throwaway
+/// test type (`probe-*` / `ct-*`). Pure classifier behind
+/// [`Jobs::looks_like_test_engine`], unit-tested without a live client.
+fn all_test_looking(prefixes: &[String]) -> bool {
+    !prefixes.is_empty()
+        && prefixes
+            .iter()
+            .all(|t| t.starts_with("probe-") || t.starts_with("ct-"))
+}
+
+/// The one-shot issue-#41 sanity-warning decision, factored out of
+/// [`Jobs::should_warn_sanity`] so it is testable without an engine round-trip.
+/// Fires only when the activation returned jobs AND every served type looks
+/// test-ish AND the latch had not already tripped; latches `true` on the first
+/// qualifying call so the warning is emitted at most once per worker.
+fn warn_sanity_decision(
+    got_jobs: bool,
+    looks_test: bool,
+    latch: &std::sync::atomic::AtomicBool,
+) -> bool {
+    got_jobs && looks_test && !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Derive a monotonic lease-start anchor from the engine-provided `deadline`.
@@ -171,10 +206,65 @@ impl Jobs {
     pub fn new(client: CamundaClient) -> Self {
         Jobs {
             client: Box::new(client),
+            engine_desc: None,
+            test_type_prefixes: Vec::new(),
+            sanity_warned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    pub async fn activate(
+    /// Attach the pinned engine identity and the worker's test-looking job-type
+    /// prefixes for the issue-#41 sanity guard (see [`Jobs::activate`]).
+    pub fn with_identity(self, engine_desc: String, test_type_prefixes: Vec<String>) -> Self {
+        Jobs {
+            engine_desc: Some(engine_desc),
+            test_type_prefixes,
+            ..self
+        }
+    }
+
+    /// Derive a PER-SLOT view of this shared client for the issue-#41 sanity
+    /// guard (issue #41, proposal 4). The daemon shares one `Jobs` across every
+    /// slot, but the "every served type looks test-ish" judgement must be made
+    /// against the SLOT's own job-type matrix — not the aggregate of every hire
+    /// — or a daemon mixing a normal hire with a `ct-*`-only hire would see the
+    /// normal type in the aggregate, make `all_test_looking` false, and never
+    /// warn for the slot that is actually serving only test jobs. This view
+    /// carries the slot's own matrix and a FRESH one-shot latch, so the warning
+    /// fires once per slot. The underlying client (and its HTTP pool) is still
+    /// shared — only the guard identity/latch are per-slot.
+    pub fn for_slot(&self, slot_job_types: Vec<String>) -> Self {
+        Jobs {
+            client: self.client.clone(),
+            engine_desc: self.engine_desc.clone(),
+            test_type_prefixes: slot_job_types,
+            sanity_warned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// True when every served job type looks like a throwaway test type — the
+    /// exact shape of the issue-#41 incident, where a retargeted fleet served a
+    /// stray engine's `probe-*`/`ct-*` jobs. A production hire's matrix
+    /// (`senior`, `senior:feature`, …) never matches, so this only fires for
+    /// workers whose whole purpose is test types (an explicit `--job-type`
+    /// selection, or a hire configured for them).
+    fn looks_like_test_engine(&self) -> bool {
+        all_test_looking(&self.test_type_prefixes)
+    }
+
+    /// Decide whether the issue-#41 sanity warning should fire for this
+    /// activation, and latch it so it fires at most once per worker. Pure given
+    /// the receiver's state: it is `true` only when the activation returned
+    /// jobs, every served type looks test-ish ([`Self::looks_like_test_engine`]),
+    /// and the one-shot latch had not already tripped. Extracted so the decision
+    /// is unit-testable without a live engine round-trip.
+    fn should_warn_sanity(&self, got_jobs: bool) -> bool {
+        warn_sanity_decision(got_jobs, self.looks_like_test_engine(), &self.sanity_warned)
+    }
+
+    /// Activate against this view's own sanity-guard identity. This is the body
+    /// of [`Jobs::activate`]; a slot calls it via [`Jobs::for_slot`] so the
+    /// guard judges the slot's own matrix and latches per slot.
+    pub async fn activate_for(
         &self,
         job_type: &str,
         worker: &str,
@@ -190,6 +280,23 @@ impl Jobs {
             req.with_lease = Some(Some(true));
         }
         let r = self.client.activate_jobs(req).await.map_err(sdk_error)?;
+        // Sanity guard (issue #41, proposal 4): a worker that only serves
+        // test-looking job types and got a LIVE answer from its engine is very
+        // likely the retargeted-fleet incident — the only clue then was the
+        // worker log. Warn once, prominently, naming the engine URL, so the
+        // next retarget is diagnosable from the log instead of from burned
+        // tokens. The worker keeps running: a contract-test fleet is a
+        // legitimate configuration, so this must inform, never block.
+        if self.should_warn_sanity(!r.jobs.is_empty()) {
+            crate::runtime::log(&format!(
+                "WARNING: worker {worker} is connected to {} but every job type it serves is \
+                 test-looking ({:?}); if this is not a throwaway test engine, the worker was \
+                 likely re-pointed by a changed c8ctl active profile — check the pinned \
+                 connection in connection.json (issue #41)",
+                self.engine_desc.as_deref().unwrap_or("the engine"),
+                self.test_type_prefixes
+            ));
+        }
         // The lease anchor must be a LOWER bound on when the engine started each
         // job's lease (at dispatch — before the response crossed the wire and was
         // decoded here). Anchor it on the engine-provided `deadline` (the
@@ -210,6 +317,18 @@ impl Jobs {
                 }
             })
             .collect())
+    }
+
+    pub async fn activate(
+        &self,
+        job_type: &str,
+        worker: &str,
+        timeout: Duration,
+        poll: Duration,
+        with_lease: bool,
+    ) -> Result<Vec<Job>> {
+        self.activate_for(job_type, worker, timeout, poll, with_lease)
+            .await
     }
 
     /// Extend the activation timeout (the lease refresh).
@@ -272,7 +391,94 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::validate_job_key;
-    use super::{lease_anchor, sdk_error, status_of};
+    use super::{all_test_looking, warn_sanity_decision};
+    use super::{sdk_error, status_of};
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn all_test_looking_classifies_prefix_sets() {
+        // Empty matrix is never "all test-looking" (a plain worker, no types).
+        assert!(!all_test_looking(&[]));
+        // A pure test fleet (`ct-*` / `probe-*`) matches.
+        assert!(all_test_looking(&["ct-foo".into(), "probe-bar".into()]));
+        // A single production type anywhere in the matrix disqualifies it.
+        assert!(!all_test_looking(&[
+            "ct-foo".into(),
+            "senior:feature".into()
+        ]));
+        assert!(!all_test_looking(&["senior".into()]));
+    }
+
+    #[test]
+    fn warn_sanity_decision_is_one_shot_and_gated() {
+        // No jobs → never warn, and the latch stays untripped so a later live
+        // answer can still warn.
+        let latch = AtomicBool::new(false);
+        assert!(!warn_sanity_decision(false, true, &latch));
+        assert!(!latch.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Jobs but not a test-looking engine → never warn, latch untouched.
+        assert!(!warn_sanity_decision(true, false, &latch));
+        assert!(!latch.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Jobs on a test-looking engine → warn exactly once, then latched off.
+        assert!(warn_sanity_decision(true, true, &latch));
+        assert!(!warn_sanity_decision(true, true, &latch));
+        assert!(!warn_sanity_decision(true, true, &latch));
+    }
+
+    /// Issue #41, the mixed-hire gap: the sanity guard must judge each SLOT's
+    /// own job-type matrix, not the daemon-wide aggregate. A daemon running one
+    /// normal hire and one `ct-*`-only hire has a non-test-looking AGGREGATE,
+    /// but the slot serving only `ct-*` must still warn. `for_slot` gives each
+    /// slot its own matrix and warn-once latch while sharing the client.
+    #[test]
+    fn for_slot_judges_the_slots_own_matrix_with_a_fresh_latch() {
+        let client = camunda_orchestration_sdk::CamundaClient::new(
+            camunda_orchestration_sdk::CamundaOptions::new(),
+        )
+        .expect("a default client builds");
+        // The shared daemon client carries the AGGREGATE matrix: a normal type
+        // plus a test type, so the aggregate is NOT all-test-looking.
+        let shared = super::Jobs::new(client).with_identity(
+            "engine: test (http://engine:8080)".to_string(),
+            vec!["senior".into(), "ct-smoke".into()],
+        );
+        assert!(
+            !shared.looks_like_test_engine(),
+            "the aggregate matrix (senior + ct-*) is not all-test-looking"
+        );
+
+        // Deriving the ct-*-only slot's view judges THAT slot's matrix…
+        let ct_slot = shared.for_slot(vec!["ct-smoke".into()]);
+        assert!(
+            ct_slot.looks_like_test_engine(),
+            "the ct-*-only slot must be judged test-looking on its own matrix"
+        );
+        // …with a FRESH latch, independent of the shared one and of a sibling
+        // slot's latch.
+        let normal_slot = shared.for_slot(vec!["senior".into()]);
+        assert!(!normal_slot.looks_like_test_engine());
+        assert!(
+            ct_slot.should_warn_sanity(true),
+            "first live activation warns"
+        );
+        assert!(
+            !ct_slot.should_warn_sanity(true),
+            "the ct slot's latch is one-shot"
+        );
+        assert!(
+            !shared
+                .sanity_warned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the shared latch is untouched by the slot's latch"
+        );
+        assert!(
+            !normal_slot.should_warn_sanity(true),
+            "the normal slot never warns (its matrix is not test-looking)"
+        );
+    }
+    use super::lease_anchor;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]

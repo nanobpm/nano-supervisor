@@ -12,6 +12,7 @@ mod engine;
 mod envelope;
 mod jobs;
 mod pdeath;
+mod pin;
 mod pipe;
 mod profile;
 mod provision;
@@ -170,6 +171,15 @@ enum Cmd {
         /// read `/proc` itself.
         #[arg(long)]
         parent_start: Option<u64>,
+        /// The agent group leader's start time, captured by the daemon at spawn
+        /// (issue #27). Together with `--pgid-uid` it lets the watchdog verify
+        /// the pgid still names the agent's group — not a recycled one — before
+        /// the cleanup SIGKILL.
+        #[arg(long)]
+        pgid_start: Option<u64>,
+        /// The agent group leader's real uid, captured by the daemon at spawn.
+        #[arg(long)]
+        pgid_uid: Option<u32>,
     },
 }
 
@@ -377,9 +387,11 @@ async fn main() -> Result<()> {
             parent_pid,
             pgid,
             parent_start,
+            pgid_start,
+            pgid_uid,
         } => {
             tokio::task::spawn_blocking(move || {
-                pdeath::reap_watchdog(parent_pid, pgid, parent_start)
+                pdeath::reap_watchdog(parent_pid, pgid, parent_start, pgid_start, pgid_uid)
             })
             .await
             .ok();

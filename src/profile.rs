@@ -1,30 +1,80 @@
 //! Resolve a c8ctl connection profile and turn it into SDK configuration.
 //!
-//! c8ctl keeps profiles in `<config>/c8ctl/profiles.json` (`{"profiles": [...]}`)
-//! and the active profile in `<config>/c8ctl/session.json` (`activeProfile`).
-//! `<config>` is `$XDG_CONFIG_HOME` or `~/.config` on Linux, and
-//! `~/Library/Application Support` on macOS.
+//! c8ctl keeps profiles in `<datadir>/profiles.json` (`{"profiles": [...]}`)
+//! and the active profile in `<datadir>/session.json` (`activeProfile`).
+//! `<datadir>` mirrors c8ctl's own `getUserDataDir()`: `$C8CTL_DATA_DIR`
+//! verbatim when set, else `$XDG_CONFIG_HOME/c8ctl` or `~/.config/c8ctl` on
+//! Linux and `~/Library/Application Support/c8ctl` on macOS. The supervisor
+//! MUST read the same `C8CTL_DATA_DIR` the `c8` CLI honours (c8ctl ignores
+//! `C8CTL_CONFIG_DIR`), or it would isolate a different directory than the
+//! agents it is trying to quarantine (issue #41).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use camunda_orchestration_sdk::{CamundaClient, CamundaConfig, CamundaOptions, TlsConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
     pub name: String,
+    // c8ctl's `isValidProfile` accepts an optional field only when it is ABSENT
+    // or a string — a JSON `null` (which `Serialize` emits for `None` by
+    // default) is rejected, so the seeded `profiles.json` would be thrown out
+    // and the agent would never see the pinned profile. Omit every `None`
+    // field so the seed matches c8ctl's own on-disk shape (issue #41).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub o_auth_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_tenant_id: Option<String>,
+}
+
+impl Profile {
+    /// A copy carrying only the **non-secret connection identity** — `name`,
+    /// `baseUrl`, and `defaultTenantId` — with every credential field cleared
+    /// (`clientId`/`clientSecret`, the OAuth coordinates, and the basic-auth
+    /// `username`/`password`).
+    ///
+    /// Issue #41: the worker seeds this into the agent's isolated c8ctl
+    /// `profiles.json`. The agent runs as the **same OS user** as the daemon,
+    /// so a `0600` file does not hide its contents from the agent — serializing
+    /// the full profile would copy the daemon's engine `clientSecret` / basic
+    /// auth `password` into an agent-readable file and bypass the credential
+    /// boundary the launchers enforce elsewhere. The agent only needs to know
+    /// *which engine* the job is pinned to, so only the connection identity is
+    /// seeded; authenticated `c8` access, if ever required, must come from a
+    /// deliberately scoped agent credential, never the daemon's.
+    ///
+    /// The `baseUrl` itself can carry a credential: an operator may embed
+    /// HTTP(S) userinfo (`https://user:secret@host`) directly in the address
+    /// (the same secret `SENSITIVE_DAEMON_ENV` strips from `*_REST_ADDRESS`).
+    /// Copying it verbatim into the agent-readable seed would leak it, so the
+    /// userinfo is stripped here too — the agent needs the engine's *location*,
+    /// never the credential embedded in its URL.
+    pub fn connection_identity(&self) -> Profile {
+        Profile {
+            name: self.name.clone(),
+            base_url: self.base_url.as_deref().map(crate::slot::redact_url),
+            default_tenant_id: self.default_tenant_id.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -39,7 +89,17 @@ struct SessionFile {
     active_profile: Option<String>,
 }
 
-pub fn c8ctl_config_dir() -> Option<PathBuf> {
+pub fn c8ctl_data_dir() -> Option<PathBuf> {
+    // Issue #41: an explicit override wins first. The worker seeds every agent
+    // with an isolated per-run `C8CTL_DATA_DIR` so an agent's
+    // `c8 use profile` / `c8 profile add` lands inside its own run directory
+    // and can never rewrite the operator's global c8ctl session — which every
+    // supervisor/worker on the host would otherwise follow on its next start.
+    if let Some(dir) = std::env::var_os("C8CTL_DATA_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME")?;
         return Some(PathBuf::from(home).join("Library/Application Support/c8ctl"));
@@ -51,20 +111,51 @@ pub fn c8ctl_config_dir() -> Option<PathBuf> {
     Some(base.join("c8ctl"))
 }
 
+/// The name of c8ctl's currently active profile, if a session names one.
+/// Compared against the pinned connection to detect drift (issue #41): an
+/// agent's `c8 use profile` rewrites exactly this, so a mismatch after the
+/// fact is the observable signal that the ambient session moved.
+pub fn active_profile_name() -> Option<String> {
+    let dir = c8ctl_data_dir()?;
+    std::fs::read(dir.join("session.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
+        .and_then(|s| s.active_profile)
+}
+
 /// Pick the profile named `wanted`, else the session's active profile.
 /// Returns `None` when neither is set (the caller falls back to `CAMUNDA_*` env).
 pub fn resolve(wanted: Option<&str>) -> Result<Option<Profile>> {
-    let Some(dir) = c8ctl_config_dir() else {
+    resolve_with_base_override(wanted, None)
+}
+
+/// [`resolve`], plus an explicit base URL that beats the environment when the
+/// connection comes from the `CAMUNDA_*` env (no profile). This is how an
+/// env-only connection pin (issue #41) is ENFORCED rather than just recorded:
+/// the pin's baseUrl fingerprint is passed here, so a later start whose
+/// `CAMUNDA_REST_ADDRESS` drifted still builds its client for the PINNED
+/// engine. A resolved profile always keeps its own `baseUrl` — the override
+/// only ever applies to the env fallback.
+pub fn resolve_with_base_override(
+    wanted: Option<&str>,
+    base_url_override: Option<&str>,
+) -> Result<Option<Profile>> {
+    let Some(dir) = c8ctl_data_dir() else {
         return Ok(None);
     };
-    // An explicit engine address in the environment beats c8ctl's remembered
-    // active profile (but not an explicit --profile).
-    let env_address = ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    // The documented resolution order is `--profile`, then c8ctl's active
+    // profile, then the engine environment (issue #41). Only an existing env
+    // pin — passed here as `base_url_override`, the recorded connection
+    // decision — beats the active profile; a RAW `CAMUNDA_REST_ADDRESS` /
+    // `ZEEBE_REST_ADDRESS` in the environment must NOT suppress `activeProfile`
+    // (otherwise a first start with both configured would silently pin the
+    // ambient env target instead of the active profile, with no drift warning).
+    // So: `--profile` wins; else an existing env pin keeps the env-only
+    // fallback; else consult the session, falling back to the environment only
+    // when no profile is active.
     let name = match wanted {
         Some(n) => Some(n.to_string()),
-        None if env_address => None,
+        None if base_url_override.is_some() => None,
         None => std::fs::read(dir.join("session.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionFile>(&b).ok())
@@ -81,14 +172,38 @@ pub fn resolve(wanted: Option<&str>) -> Result<Option<Profile>> {
     }
 }
 
+/// Normalize an engine base URL the single, canonical way the supervisor both
+/// fingerprints and connects: trim surrounding whitespace, drop trailing
+/// slashes, strip the optional `/v2` suffix (c8ctl profiles may carry it; the
+/// SDK appends it itself), then drop any slashes the strip exposed. A URL that
+/// reduces to nothing (e.g. `/`, `/v2`, or whitespace) is not a usable address,
+/// so it yields `None`.
+///
+/// This is the ONE normalizer shared by the SDK config ([`sdk_settings`]) and
+/// the pin fingerprint ([`resolved_base_url`]): routing both through it is what
+/// guarantees a pin can never name one engine while the client is built for
+/// another (issue #41).
+pub fn normalize_base_url(raw: &str) -> Option<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let url = url.strip_suffix("/v2").unwrap_or(url).trim_end_matches('/');
+    (!url.is_empty()).then(|| url.to_string())
+}
+
 /// Map a c8ctl profile onto the SDK's `CAMUNDA_*` configuration keys.
 pub fn sdk_settings(p: &Profile) -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     if let Some(url) = &p.base_url {
-        // c8ctl profiles may carry the `/v2` suffix; the SDK appends it itself.
-        let url = url.trim_end_matches('/');
-        let url = url.strip_suffix("/v2").unwrap_or(url);
-        m.insert("CAMUNDA_REST_ADDRESS", url.to_string());
+        // An explicit profile `baseUrl` dictates the engine for the client; run
+        // it through the shared normalizer so the SDK target matches the pinned
+        // fingerprint ([`resolved_base_url`]) byte-for-byte. An explicit-but-
+        // unusable URL normalizes to `None`; set an EMPTY address so the client
+        // fails closed on this profile rather than silently falling through to
+        // the ambient `CAMUNDA_*` env — the same fail-closed stance
+        // `resolved_base_url` takes by returning `None` (issue #41).
+        m.insert(
+            "CAMUNDA_REST_ADDRESS",
+            normalize_base_url(url).unwrap_or_default(),
+        );
     }
     let oauth = p.client_id.is_some() && p.client_secret.is_some();
     let basic = p.username.is_some() && p.password.is_some();
@@ -125,14 +240,41 @@ pub fn sdk_settings(p: &Profile) -> BTreeMap<&'static str, String> {
     m
 }
 
-/// Build an SDK client from the profile (if any) layered over the environment.
-pub fn client(profile: Option<&Profile>) -> Result<CamundaClient> {
+/// Build the SDK options for a connection: the env-only pin fingerprint
+/// (`base_url_override`) applied FIRST as a fallback target, then any resolved
+/// profile layered on top. Because `CamundaOptions::with` is last-wins, a
+/// profile that carries its own `baseUrl` overwrites the override, while a
+/// profile that omits `baseUrl` keeps pointing at the normalized pinned URL
+/// instead of falling through to the raw ambient `CAMUNDA_REST_ADDRESS` (which
+/// may differ from the pin/banner, e.g. a trailing `/v2`) — issue #41.
+fn base_override_opts(
+    profile: Option<&Profile>,
+    base_url_override: Option<&str>,
+) -> CamundaOptions {
     let mut opts = CamundaOptions::new();
+    if let Some(url) = base_url_override {
+        opts = opts.with("CAMUNDA_REST_ADDRESS", url.to_string());
+    }
     if let Some(p) = profile {
         for (k, v) in sdk_settings(p) {
             opts = opts.with(k, v);
         }
     }
+    opts
+}
+
+/// Build an SDK client from the profile (if any) layered over the environment,
+/// plus the env-only connection pin's baseUrl fingerprint as a fallback target
+/// (issue #41). Setting `CAMUNDA_REST_ADDRESS` on the options beats the process
+/// environment, so a drifted `CAMUNDA_*` env cannot retarget a pinned worker; a
+/// resolved profile's own `baseUrl` still wins over the override, and a profile
+/// that omits `baseUrl` targets the pinned fingerprint rather than the ambient
+/// env (see [`base_override_opts`]).
+pub fn client_with_base_override(
+    profile: Option<&Profile>,
+    base_url_override: Option<&str>,
+) -> Result<CamundaClient> {
+    let opts = base_override_opts(profile, base_url_override);
     // One pooled HTTP client for the whole process (the SDK shares it across
     // every slot's activate/extend/complete/fail). reqwest already pools and
     // reuses keep-alive connections by default; these settings bound the pool's
@@ -249,6 +391,40 @@ fn build_identity(cert: &[u8], key: &[u8], passphrase: Option<&str>) -> Result<r
     reqwest::Identity::from_pem(&pem).context("invalid client certificate/key")
 }
 
+/// The engine base URL a connection resolved to, normalized the same way
+/// [`sdk_settings`] normalizes it for the SDK (both go through
+/// [`normalize_base_url`]). Used as the connection *fingerprint* in the pinned
+/// state (issue #41): the supervisor records it next to the profile name so a
+/// later start can tell "same profile name, different engine" apart from "same
+/// engine". With no profile this is the ambient
+/// `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`.
+pub fn resolved_base_url(profile: Option<&Profile>) -> Option<String> {
+    // An explicit profile `baseUrl` DICTATES the engine: normalize it the one
+    // shared way and return that result directly — including `None` for an
+    // unusable explicit URL (e.g. `/`, `/v2`, whitespace). Do NOT fall through
+    // to the ambient env in that case: the client ([`sdk_settings`]) is built
+    // for THIS profile's URL, so fingerprinting a different (env) engine would
+    // make the pin/banner name one engine while the client targets another
+    // (issue #41). A `None` here then fails the pin closed at creation.
+    //
+    // Only a profile that OMITS `baseUrl` (or no profile at all) consults the
+    // env; an empty env key falls through to the next key (ultimately `None`)
+    // so a self-invalid `Some("")` pin is never recorded.
+    if let Some(p) = profile {
+        if let Some(url) = &p.base_url {
+            return normalize_base_url(url);
+        }
+    }
+    for key in ["CAMUNDA_REST_ADDRESS", "ZEEBE_REST_ADDRESS"] {
+        if let Some(v) = std::env::var_os(key) {
+            if let Some(normalized) = normalize_base_url(&v.to_string_lossy()) {
+                return Some(normalized);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +465,182 @@ mod tests {
         let m = sdk_settings(&p);
         assert_eq!(m["CAMUNDA_REST_ADDRESS"], "http://192.168.0.21:8080");
         assert_eq!(m["CAMUNDA_AUTH_STRATEGY"], "NONE");
+    }
+
+    /// Issue #41 (review round 20): a named profile that omits `baseUrl` must
+    /// still target the normalized env-only pin fingerprint passed as
+    /// `base_url_override`, not fall through to the raw ambient
+    /// `CAMUNDA_REST_ADDRESS`. The override is applied first as a fallback and
+    /// survives because the credential-only profile never sets the address.
+    #[test]
+    fn base_override_survives_profile_without_baseurl() {
+        let p = profile(r#"{"name":"merlin","username":"u","password":"p"}"#);
+        let opts = base_override_opts(Some(&p), Some("http://pinned:8080"));
+        assert_eq!(
+            opts.config.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://pinned:8080"),
+            "a baseUrl-less profile must keep the pinned override address"
+        );
+        assert_eq!(
+            opts.config.get("CAMUNDA_AUTH_STRATEGY").map(String::as_str),
+            Some("BASIC")
+        );
+    }
+
+    /// The complement: a profile that DOES carry its own `baseUrl` overwrites
+    /// the override (last-wins), so an explicit profile address always beats the
+    /// env-only fingerprint — and both are normalized identically.
+    #[test]
+    fn profile_baseurl_overrides_the_fallback() {
+        let p = profile(r#"{"name":"merlin","baseUrl":"http://profile:8080/v2"}"#);
+        let opts = base_override_opts(Some(&p), Some("http://pinned:8080"));
+        assert_eq!(
+            opts.config.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://profile:8080"),
+            "an explicit profile baseUrl must overwrite the override"
+        );
+    }
+
+    /// With no profile at all, the env-only override is the client's address.
+    #[test]
+    fn override_applies_with_no_profile() {
+        let opts = base_override_opts(None, Some("http://pinned:8080"));
+        assert_eq!(
+            opts.config.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://pinned:8080")
+        );
+    }
+
+    /// Issue #41 (review round 10): the SDK client config and the pin
+    /// fingerprint must normalize a profile URL identically — a whitespace-
+    /// padded (or `/v2`-suffixed) URL must not leave the client with stray
+    /// characters the pin stripped. Both now route through `normalize_base_url`.
+    #[test]
+    fn sdk_settings_and_fingerprint_normalize_url_identically() {
+        for (raw, want) in [
+            ("  http://host:8080/v2/  ", "http://host:8080"),
+            ("http://host:8080//", "http://host:8080"),
+            ("https://x.camunda.io/v2", "https://x.camunda.io"),
+        ] {
+            let p = profile(&format!(r#"{{"name":"m","baseUrl":"{raw}"}}"#));
+            assert_eq!(
+                sdk_settings(&p)["CAMUNDA_REST_ADDRESS"],
+                want,
+                "sdk_settings normalized {raw:?} unexpectedly"
+            );
+            assert_eq!(
+                resolved_base_url(Some(&p)).as_deref(),
+                Some(want),
+                "resolved_base_url normalized {raw:?} unexpectedly"
+            );
+        }
+    }
+
+    /// Issue #41 (review round 10): an explicit profile `baseUrl` that
+    /// normalizes to nothing (`/`, `/v2`, whitespace) must FAIL CLOSED, not fall
+    /// through to the ambient env differently in the two code paths. The pin
+    /// fingerprint (`resolved_base_url`) returns `None` for such a URL REGARDLESS
+    /// of any `CAMUNDA_*`/`ZEEBE_*` env (it never consults it for an explicit
+    /// profile URL), and `sdk_settings` agrees by setting an EMPTY address — so
+    /// the pin/banner can never name the env engine while the client is built
+    /// for a different one.
+    #[test]
+    fn explicit_unusable_profile_url_fails_closed_without_env_fallthrough() {
+        for degenerate in ["/", "/v2", "/v2/", "   ", "  /v2  "] {
+            let p = profile(&format!(r#"{{"name":"m","baseUrl":"{degenerate}"}}"#));
+            assert_eq!(
+                resolved_base_url(Some(&p)),
+                None,
+                "explicit baseUrl {degenerate:?} must fingerprint as None, not fall through to env"
+            );
+            assert_eq!(
+                sdk_settings(&p)["CAMUNDA_REST_ADDRESS"],
+                "",
+                "explicit baseUrl {degenerate:?} must set an empty REST address, not inherit env"
+            );
+        }
+    }
+
+    /// Issue #41: the identity seeded into the agent's isolated c8ctl dir must
+    /// carry ONLY non-secret connection identity. Serializing the stripped
+    /// profile must not leak the daemon's engine `clientSecret`/`password` (or
+    /// any other credential) into an agent-readable file.
+    #[test]
+    fn connection_identity_strips_every_credential() {
+        let p = profile(
+            r#"{"name":"saas","baseUrl":"https://x.camunda.io","clientId":"id","clientSecret":"SECRET",
+                "oAuthUrl":"https://login/oauth/token","audience":"zeebe.camunda.io","scope":"sc",
+                "username":"u","password":"PASSWORD","defaultTenantId":"t1"}"#,
+        );
+        let id = p.connection_identity();
+        // Non-secret identity is preserved…
+        assert_eq!(id.name, "saas");
+        assert_eq!(id.base_url.as_deref(), Some("https://x.camunda.io"));
+        assert_eq!(id.default_tenant_id.as_deref(), Some("t1"));
+        // …and every credential field is cleared.
+        assert!(id.client_id.is_none());
+        assert!(id.client_secret.is_none());
+        assert!(id.o_auth_url.is_none());
+        assert!(id.audience.is_none());
+        assert!(id.scope.is_none());
+        assert!(id.username.is_none());
+        assert!(id.password.is_none());
+        // The serialized form (what the worker writes to profiles.json) leaks
+        // no secret substring.
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(!json.contains("SECRET"), "clientSecret leaked: {json}");
+        assert!(!json.contains("PASSWORD"), "password leaked: {json}");
+    }
+
+    /// Issue #41: the `baseUrl` itself can carry a credential — HTTP(S)
+    /// userinfo (`https://user:secret@host`). The seeded identity must strip it
+    /// so the agent-readable `profiles.json` never leaks the embedded secret.
+    #[test]
+    fn connection_identity_strips_url_userinfo() {
+        let p = profile(
+            r#"{"name":"saas","baseUrl":"https://user:secret@host.example:8443/v2","clientId":"id","clientSecret":"SECRET"}"#,
+        );
+        let id = p.connection_identity();
+        assert_eq!(
+            id.base_url.as_deref(),
+            Some("https://host.example:8443/v2"),
+            "the URL userinfo credential must be stripped from the seeded identity"
+        );
+        let json = serde_json::to_string(&id).unwrap();
+        assert!(!json.contains("secret"), "URL userinfo leaked: {json}");
+    }
+
+    /// Issue #41: c8ctl's `isValidProfile` accepts an optional field only when
+    /// it is ABSENT or a string — a JSON `null` is rejected and the whole
+    /// seeded `profiles.json` is thrown out, so the agent never sees the pinned
+    /// profile. The serialized identity must therefore OMIT every `None` field,
+    /// never emit `"clientId":null`.
+    #[test]
+    fn connection_identity_omits_null_fields() {
+        let p = profile(r#"{"name":"merlin","baseUrl":"http://engine:8080"}"#);
+        let json = serde_json::to_string(&p.connection_identity()).unwrap();
+        assert!(
+            !json.contains("null"),
+            "c8ctl rejects JSON null for optional fields; they must be omitted: {json}"
+        );
+        for field in [
+            "clientId",
+            "clientSecret",
+            "audience",
+            "oAuthUrl",
+            "scope",
+            "username",
+            "password",
+            "defaultTenantId",
+        ] {
+            assert!(
+                !json.contains(field),
+                "absent field {field} must be omitted, not serialized: {json}"
+            );
+        }
+        // The fields that ARE present round-trip as strings.
+        assert!(json.contains(r#""name":"merlin""#), "{json}");
+        assert!(json.contains(r#""baseUrl":"http://engine:8080""#), "{json}");
     }
 
     // Regression tests for nanobpm/nano-supervisor#37: a caller-supplied

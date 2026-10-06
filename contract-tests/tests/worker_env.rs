@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use contract_tests::fake::FakeAgent;
-use contract_tests::{require_engine_and_target, run_worker_job, skip, Skip};
+use contract_tests::{require_engine_and_target, run_worker_job, skip, Skip, Target};
 use serde_json::json;
 
 /// CI, no engine: every `AGENT_*` / `NANO_*` variable the agent is given is
@@ -252,5 +252,111 @@ fn worker_provisions_the_repository_into_the_run_dir() {
         payload["task"]["repository"]["url"].as_str().unwrap_or(""),
         repo_url,
         "payload: {payload:#}"
+    );
+}
+
+/// #41, acceptance: an agent job runs with an ISOLATED c8ctl config dir, so an
+/// agent's `c8 use profile X` can never rewrite the operator's
+/// `~/.config/c8ctl/session.json` (the write that retargeted the production
+/// fleet). The worker hands the agent a per-run `C8CTL_DATA_DIR` seeded with
+/// exactly the pinned connection, and marks the run with `NANO_AGENT_RUN`.
+#[test]
+fn worker_isolates_the_agents_c8ctl_session() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    if target != Target::Rust {
+        skip!("the isolated agent c8ctl session is the Rust worker's fix for issue #41");
+    }
+    // Run with `--keep-runs` so the run directory (and the agent's isolated
+    // c8ctl config inside it) SURVIVES the successful run — otherwise the
+    // worker reaps it before the assertions below and `session.exists()` is
+    // vacuously false, so the test would pass even if the isolated dir was
+    // never created or seeded. The agent also exercises a real write into the
+    // isolated dir (via the `shell` step, which runs in the per-run cwd) to
+    // prove it is a writable, agent-owned config root.
+    let outcome = run_worker_job(
+        &engine,
+        &target,
+        "c8ctl-isolation",
+        &[
+            json!({ "emit": "ok" }),
+            json!({ "shell": "printf 'agent-was-here' > \"$C8CTL_DATA_DIR/agent-write.txt\"" }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({ "prompt": "note your environment" }),
+        &["--keep-runs"],
+        &[],
+    );
+    let record = outcome.record();
+    let env = &record.env;
+
+    // The agent's c8ctl is pointed INSIDE its own run dir — never at the
+    // operator's global config — so its `c8 use profile` writes stay in the
+    // run and the operator's session.json is untouched.
+    let dir = env
+        .get("C8CTL_DATA_DIR")
+        .unwrap_or_else(|| panic!("worker must set C8CTL_DATA_DIR for the agent; env was {env:?}"));
+    assert!(
+        dir.contains("agent-runs"),
+        "the agent's c8ctl config dir must live under the per-run tree, not the operator's ~/.config; got {dir}"
+    );
+
+    // Under `--keep-runs` the isolated dir MUST exist after the run — assert it
+    // unconditionally (no `if exists`), so a worker that failed to create or
+    // seed it fails the test rather than silently passing.
+    let dir_path = std::path::Path::new(dir);
+    assert!(
+        dir_path.is_dir(),
+        "the isolated c8ctl config dir must exist after a --keep-runs run: {dir}"
+    );
+    // The agent's own write landed inside the isolated dir, proving it is a
+    // writable, agent-owned config root (not a read-only mount or a symlink
+    // onto the operator's config).
+    let agent_write = dir_path.join("agent-write.txt");
+    assert_eq!(
+        std::fs::read_to_string(&agent_write)
+            .expect("the agent's write must exist in its isolated c8ctl dir"),
+        "agent-was-here",
+        "the agent must be able to write inside its isolated c8ctl config dir"
+    );
+
+    // The seed is exactly the pinned connection: the session's activeProfile
+    // and a profiles.json carrying only that profile, so the agent's own `c8`
+    // sees the job's engine and nothing else. This engine-gated harness
+    // connects the worker via `CAMUNDA_REST_ADDRESS` — an env-only pin — which
+    // no longer leaves the dir empty: the worker now SYNTHESIZES a `pinned`
+    // profile from the pinned base URL, so `session.json`/`profiles.json` are
+    // written unconditionally (the unit tests pin the exact seeded shape for a
+    // profiled connection). Assert the seed exists with no `if exists` guard,
+    // so a worker that failed to synthesize and seed it fails the test rather
+    // than silently passing.
+    let session = dir_path.join("session.json");
+    assert!(
+        session.exists(),
+        "the isolated c8ctl dir must carry a seeded session.json naming the pinned engine: {dir}"
+    );
+    let seeded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&session).expect("read seeded session.json"))
+            .expect("seeded session.json is JSON");
+    assert!(
+        seeded["activeProfile"].is_string(),
+        "the seeded session names the pinned profile: {seeded}"
+    );
+    let profiles: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(session.with_file_name("profiles.json"))
+            .expect("read seeded profiles.json"),
+    )
+    .expect("seeded profiles.json is JSON");
+    assert_eq!(
+        profiles["profiles"].as_array().map(Vec::len),
+        Some(1),
+        "the agent's isolated config carries ONLY the pinned profile: {profiles}"
+    );
+    // The run is marked as agent-owned (the issue-#40 sibling marker).
+    assert!(
+        env.get("NANO_AGENT_RUN").is_some_and(|v| !v.is_empty()),
+        "worker must mark the agent run with NANO_AGENT_RUN; env was {env:?}"
     );
 }
