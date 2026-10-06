@@ -181,7 +181,12 @@ fn read_state(state_home: &Path) -> Result<Option<PinState>> {
 /// EVERY writer of the file, so it fully removes the read-modify-write race
 /// (unlike the old shared `supervisor.json`, which the Node side could still
 /// rewrite outside any lock we hold).
-fn write(state_home: &Path, pin: &ConnectionPin, lock: &PinLock) -> Result<()> {
+fn write(
+    state_home: &Path,
+    pin: &ConnectionPin,
+    lock: &PinLock,
+    warnings: Option<&mut Vec<String>>,
+) -> Result<()> {
     std::fs::create_dir_all(state_home)
         .with_context(|| format!("creating state home {}", state_home.display()))?;
     #[cfg(unix)]
@@ -200,14 +205,19 @@ fn write(state_home: &Path, pin: &ConnectionPin, lock: &PinLock) -> Result<()> {
     let mut state: PinState = read_state(state_home)?.unwrap_or_default();
     state.connection = Some(pin.clone());
     let json = serde_json::to_string_pretty(&state).context("serializing connection.json")?;
-    write_atomic(&path, format!("{json}\n").as_bytes())
+    write_atomic(&path, format!("{json}\n").as_bytes(), warnings)
 }
 
 /// Write `bytes` to `path` atomically and owner-only: create a `0600` temp file
 /// in the same directory, flush + `fsync` it, then `rename` it over `path`. The
 /// temp file is unlinked on any failure so a crash never leaves a stray
 /// `*.tmp` beside the state file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// `warnings`, when given, collects the non-fatal post-rename directory-fsync
+/// failure instead of logging it immediately — the pin module's startup path
+/// defers that warning until after the caller's `engine: ...` banner so the
+/// banner still leads startup output (issue #41). `None` logs it directly.
+fn write_atomic(path: &Path, bytes: &[u8], mut warnings: Option<&mut Vec<String>>) -> Result<()> {
     use std::io::Write;
     let dir = path
         .parent()
@@ -286,7 +296,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         // on rather than failing closed on it.
         #[cfg(unix)]
         {
-            sync_dir_best_effort(dir);
+            sync_dir_best_effort(dir, warnings.as_deref_mut());
         }
         Ok(())
     })();
@@ -311,8 +321,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// failure must NOT fail the pin write — the file is already written and
 /// atomically renamed into place. Tests override this via [`SYNC_DIR_HOOK`] to
 /// force an error and assert the write still succeeds.
+///
+/// The warning is pushed onto `warnings` when a sink is given (the startup pin
+/// path defers it until after the caller's `engine: ...` banner — issue #41);
+/// with no sink it is logged immediately.
 #[cfg(unix)]
-fn sync_dir_best_effort(dir: &Path) {
+fn sync_dir_best_effort(dir: &Path, warnings: Option<&mut Vec<String>>) {
     let result = {
         #[cfg(test)]
         if let Some(hook) = SYNC_DIR_HOOK.with(|h| *h.borrow()) {
@@ -324,12 +338,16 @@ fn sync_dir_best_effort(dir: &Path) {
         real_sync_dir(dir)
     };
     if let Err(e) = result {
-        log(&format!(
+        let warning = format!(
             "warning: could not fsync state directory {} ({e}); \
              the pin is written but its on-disk rename may be less \
              durable across a power loss",
             dir.display()
-        ));
+        );
+        match warnings {
+            Some(w) => w.push(warning),
+            None => log(&warning),
+        }
     }
 }
 
@@ -438,6 +456,15 @@ pub struct PinDecision {
     /// a re-pointed profile (engine A → B under the same name) would warn about
     /// nothing.
     pub stored_base_url: Option<String>,
+    /// Non-fatal warnings raised while the pin was being written (currently: a
+    /// failed best-effort directory fsync after the atomic rename). They are
+    /// CARRIED here rather than logged inside `resolve_or_pin` so the caller
+    /// can emit them AFTER its `engine: ...` banner — the banner must lead
+    /// startup output (issue #41), and a first start on a filesystem that
+    /// rejects directory fsync (notably some macOS setups) would otherwise
+    /// open with this warning instead. Emit them with [`emit_deferred_warnings`]
+    /// once the banner is out.
+    pub deferred_warnings: Vec<String>,
 }
 
 /// Does an engine base URL embed HTTP(S) userinfo (`user:pass@host`)? Such a
@@ -652,8 +679,9 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
             .map(|e| e.rest.clone())
             .unwrap_or_default(),
     };
+    let mut deferred_warnings: Vec<String> = Vec::new();
     if created {
-        write(state_home, &pin, &_pin_lock)?;
+        write(state_home, &pin, &_pin_lock, Some(&mut deferred_warnings))?;
     }
     Ok(PinDecision {
         pin,
@@ -661,6 +689,7 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
         created,
         active_profile,
         stored_base_url,
+        deferred_warnings,
     })
 }
 
@@ -681,6 +710,17 @@ pub fn resolve_or_pin(state_home: &Path, explicit: Option<&str>) -> Result<PinDe
 pub fn warn_if_drifted(decision: &PinDecision) {
     for warning in drift_warnings(decision) {
         log(&warning);
+    }
+}
+
+/// Emit the non-fatal pin-write warnings `resolve_or_pin` carried back in the
+/// decision (currently: a failed best-effort directory fsync). Callers invoke
+/// this AFTER their `engine: ...` banner (and the drift warnings above) so the
+/// banner still leads startup output (issue #41) even on a filesystem that
+/// rejects directory fsync — see [`PinDecision::deferred_warnings`].
+pub fn emit_deferred_warnings(decision: &PinDecision) {
+    for warning in &decision.deferred_warnings {
+        log(warning);
     }
 }
 
@@ -909,6 +949,7 @@ mod tests {
                 rest: Default::default(),
             },
             &lock,
+            None,
         )
         .unwrap();
         let raw: serde_json::Value =
@@ -954,6 +995,7 @@ mod tests {
                 rest: pin.rest.clone(),
             },
             &lock,
+            None,
         )
         .unwrap();
         let raw: serde_json::Value =
@@ -1161,7 +1203,7 @@ mod tests {
             // Strip ALL owner bits via the umask; without the `fchmod` the temp
             // file (and the renamed pin) would land `000`.
             unsafe { libc::umask(0o700) };
-            write_atomic(&path, b"{\"pinned\":true}\n")
+            write_atomic(&path, b"{\"pinned\":true}\n", None)
                 .expect("write must succeed under a hostile umask");
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(
@@ -1208,14 +1250,14 @@ mod tests {
         // the directory fsync to fail via the SYNC_DIR_HOOK seam.
         let home = temp_home("write-atomic-durable");
         let path = state_file(&home);
-        write_atomic(&path, b"{\"first\":true}\n").expect("first write must succeed");
+        write_atomic(&path, b"{\"first\":true}\n", None).expect("first write must succeed");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{\"first\":true}\n"
         );
         // A re-pin over the existing file must also succeed (exercises the same
         // durability path a second time).
-        write_atomic(&path, b"{\"second\":true}\n").expect("re-write must succeed");
+        write_atomic(&path, b"{\"second\":true}\n", None).expect("re-write must succeed");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{\"second\":true}\n"
@@ -1252,11 +1294,63 @@ mod tests {
         let home = temp_home("write-atomic-dirfsync-fails");
         let path = state_file(&home);
         // The write must SUCCEED despite the directory fsync failing.
-        write_atomic(&path, b"{\"pinned\":true}\n")
+        write_atomic(&path, b"{\"pinned\":true}\n", None)
             .expect("write must succeed even when the directory fsync fails");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{\"pinned\":true}\n"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Red-first regression for PR #46 (review 5428450727): the directory-fsync
+    /// warning must NOT be logged from inside `resolve_or_pin` — that runs
+    /// before either caller can print its `engine: ...` banner, so a first
+    /// start on a filesystem that rejects directory fsync would open with the
+    /// warning instead of the banner, contradicting the PR's first-line
+    /// visibility guarantee (issue #41). The warning must be CARRIED back in
+    /// the decision for the caller to emit after the banner.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_or_pin_defers_the_dir_fsync_warning_for_after_the_banner() {
+        fn fail_sync(_dir: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "EINVAL: fsync not supported on directory (simulated macOS)",
+            ))
+        }
+        SYNC_DIR_HOOK.with(|h| *h.borrow_mut() = Some(fail_sync));
+        // Ensure the hook is cleared even if the test panics.
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                SYNC_DIR_HOOK.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        let _guard = HookGuard;
+
+        let home = temp_home("pin-defers-dirfsync-warning");
+        let decision = resolve_or_pin(&home, Some("merlin")).expect("explicit first pin");
+        assert!(decision.created, "a fresh home pins on first start");
+        assert_eq!(
+            decision.deferred_warnings.len(),
+            1,
+            "the directory-fsync warning must be carried in the decision, not logged: {:?}",
+            decision.deferred_warnings
+        );
+        assert!(
+            decision.deferred_warnings[0].contains("could not fsync state directory"),
+            "the deferred warning must describe the directory fsync failure: {}",
+            decision.deferred_warnings[0]
+        );
+        // The pin itself is written and readable despite the failed fsync.
+        assert_eq!(
+            read_state(&home)
+                .expect("state readable")
+                .and_then(|s| s.connection)
+                .and_then(|c| c.profile)
+                .as_deref(),
+            Some("merlin")
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1322,6 +1416,7 @@ mod tests {
                 rest: Default::default(),
             },
             &lock,
+            None,
         )
         .unwrap();
         // The state file is valid JSON with the pin…

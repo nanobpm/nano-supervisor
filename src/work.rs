@@ -84,6 +84,12 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         ));
     }
     pin::warn_if_drifted(&decision);
+    // Non-fatal pin-write warnings (e.g. a failed best-effort directory fsync)
+    // were carried back in the decision rather than logged inside
+    // `resolve_or_pin`, precisely so they land HERE — after the banner — and a
+    // first start on a filesystem that rejects directory fsync still opens
+    // with `engine: ...` (issue #41).
+    pin::emit_deferred_warnings(&decision);
 
     let config_path = match opts.config_path.clone() {
         Some(p) => p,

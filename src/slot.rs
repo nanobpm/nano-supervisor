@@ -2520,16 +2520,18 @@ fn seed_agent_c8ctl_pinned(
     use std::ffi::OsStr;
     // Wipe any stale/planted `c8ctl` entry and recreate it 0700, relative to the
     // pinned run-dir handle — `prepare_child_dir` fails closed on a planted
-    // symlink rather than following it.
-    root.prepare_child_dir(OsStr::new("c8ctl"), 0o700)
+    // symlink rather than following it. RETAIN the returned handle: it is
+    // pinned to the exact inode just created and mode-restricted, so seeding
+    // through it (instead of reopening `c8ctl` by name) leaves no window in
+    // which a same-UID sibling can rename the prepared child aside and
+    // substitute a different ordinary directory for the seed writes to land in.
+    let c8 = root
+        .prepare_child_dir(OsStr::new("c8ctl"), 0o700)
         .map_err(PinError::Io)?;
     if let Some(profile) = profile {
-        // Pin the freshly created dir and write each seed file through it with
+        // Write each seed file through the retained handle with
         // `O_CREAT | O_EXCL` no-follow, so a seed-file symlink planted in the
         // tiny window cannot redirect the write outside the run dir.
-        let c8 = root
-            .open_child_dir(OsStr::new("c8ctl"), false)
-            .map_err(PinError::Io)?;
         for (name, bytes) in seed_c8ctl_files(profile).map_err(PinError::Io)? {
             c8.write_new_child_file(OsStr::new(name), bytes.as_bytes(), 0o600)
                 .map_err(PinError::Io)?;
@@ -3066,6 +3068,74 @@ mod tests {
             std::fs::read_to_string(operator_c8ctl.join("session.json")).unwrap(),
             "OPERATOR",
             "the operator's real c8ctl config must never be deleted/reseeded"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #46 (review 5428450727), the "prepare-then-reopen" class: the
+    /// pinned seeder must write the seed files through the VERY `DirHandle`
+    /// `prepare_child_dir` returned — the capability pinned to the freshly
+    /// created 0700 `c8ctl` inode — not reopen `c8ctl` by name afterwards. A
+    /// same-UID sibling can rename the prepared child aside and substitute a
+    /// different ordinary directory in between; a by-name reopen would accept
+    /// the substitute and seed IT. This test performs exactly that swap after
+    /// preparation and asserts the seed still lands in the prepared inode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_seed_survives_a_child_substituted_after_prepare() {
+        use crate::saferoot::DirHandle;
+        use std::ffi::OsStr;
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-prep-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let run_dir = base.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let root = DirHandle::open_root_nofollow(&run_dir, false).expect("pin the run dir");
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+
+        // Recreate the production sequence with the attacker's rename injected
+        // between the prepare and the seed: prepare the child, then rename it
+        // aside and substitute a DIFFERENT ordinary directory at the `c8ctl`
+        // path (no symlink, so a no-follow reopen by name would accept the
+        // substitute). Renaming a directory away does NOT invalidate an open
+        // handle to it, so seeding through the RETAINED handle must still land
+        // in the prepared inode — not in the substitute at the path.
+        let prepared = root
+            .prepare_child_dir(OsStr::new("c8ctl"), 0o700)
+            .expect("prepare the c8ctl child");
+        std::fs::rename(run_dir.join("c8ctl"), run_dir.join("c8ctl.attacker-moved")).unwrap();
+        std::fs::create_dir_all(run_dir.join("c8ctl")).unwrap();
+        std::fs::write(run_dir.join("c8ctl").join("marker"), "SUBSTITUTE").unwrap();
+        for (name, bytes) in seed_c8ctl_files(&profile).expect("seed files") {
+            prepared
+                .write_new_child_file(OsStr::new(name), bytes.as_bytes(), 0o600)
+                .expect("seed through the retained handle");
+        }
+        drop(prepared);
+
+        // The substitute directory (now at the `c8ctl` path) must NOT carry the
+        // seed — a by-name reopen would have written into it.
+        assert!(
+            !run_dir.join("c8ctl").join("session.json").exists(),
+            "a substituted child must never receive the seed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_dir.join("c8ctl").join("marker")).unwrap(),
+            "SUBSTITUTE",
+            "the substitute directory is what sits at the c8ctl path now"
+        );
+        // The seed landed in the PREPARED inode (renamed aside by the
+        // "attacker"), proving the write went through the retained capability.
+        assert!(
+            run_dir
+                .join("c8ctl.attacker-moved")
+                .join("session.json")
+                .is_file(),
+            "the seed must land in the prepared inode, wherever the path now points"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
