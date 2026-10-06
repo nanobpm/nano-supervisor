@@ -430,7 +430,14 @@ pub struct PinDecision {
 /// `/`, `?` or `#`; a `@` there is userinfo. Scheme-relative or opaque strings
 /// are treated as their own authority so a `user@host`-style value is caught.
 fn base_url_has_userinfo(url: &str) -> bool {
-    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let after_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        // Scheme-relative `//user:pass@host` carries an authority but no
+        // `://`; strip the leading `//` so the split-at-`/` below does not
+        // swallow the whole authority into an empty first segment and wave the
+        // credential through (issue #41).
+        None => url.trim_start().strip_prefix("//").unwrap_or(url),
+    };
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
@@ -946,7 +953,9 @@ mod tests {
             let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://ambient:8080");
 
             let err = resolve_or_pin(&home, None).err().unwrap_or_else(|| {
-                panic!("present-but-pinless {pinless:?} must fail closed, never adopt the ambient env")
+                panic!(
+                    "present-but-pinless {pinless:?} must fail closed, never adopt the ambient env"
+                )
             });
             assert!(
                 format!("{err:#}").contains("no connection pin"),
@@ -972,42 +981,63 @@ mod tests {
     /// the live `connection.json` — as `000`. An unreadable pin fails closed
     /// (issue #41) and permanently wedges startup. `write_atomic` must
     /// `fchmod(0600)` the open fd so the persisted file is owner-rw regardless
-    /// of umask, with no post-rename chmod window. Serialized under `ENV_LOCK`
-    /// because `umask` is process-global.
+    /// of umask, with no post-rename chmod window.
+    ///
+    /// The umask is **process-global**, so tightening it in-process would race
+    /// with the parallel tests Rust runs in this same binary — `ENV_LOCK` only
+    /// serializes this module's tests, not file-creating tests elsewhere, which
+    /// could then land `000` and fail nondeterministically. Run the hostile
+    /// umask in a re-invoked child process (gated by an env var), exactly as
+    /// `slot::tests::seed_c8ctl_dir_files_are_0600_even_under_a_restrictive_umask`
+    /// does, so the parent's umask and every sibling test are never touched.
     #[cfg(unix)]
     #[test]
     fn write_atomic_is_0600_even_under_an_owner_stripping_umask() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.lock().unwrap();
-        // Create the home dir FIRST, under the normal umask, so the hostile
-        // umask applies only to the temp file `write_atomic` creates — not to
-        // the containing directory (a 0o700 umask on `create_dir_all` would
-        // leave the dir itself inaccessible and fail the write for an unrelated
-        // reason).
-        let home = temp_home("hostile-umask");
-        let path = state_file(&home);
-        // Strip ALL owner bits via the umask; without the `fchmod` the temp
-        // file (and the renamed pin) would land `000`.
-        let prev = unsafe { libc::umask(0o700) };
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                unsafe { libc::umask(self.0) };
-            }
+        const CHILD_ENV: &str = "NANO_PIN_UMASK_WRITE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Child: running alone in its own process, so tightening the
+            // process-global umask here cannot leak into any sibling test.
+            // Create the home dir FIRST under the normal umask, so the hostile
+            // umask applies only to the temp file `write_atomic` creates — not
+            // to the containing directory (a 0o700 umask on `create_dir_all`
+            // would leave the dir inaccessible and fail the write for an
+            // unrelated reason).
+            let home = temp_home("hostile-umask");
+            let path = state_file(&home);
+            // Strip ALL owner bits via the umask; without the `fchmod` the temp
+            // file (and the renamed pin) would land `000`.
+            unsafe { libc::umask(0o700) };
+            write_atomic(&path, b"{\"pinned\":true}\n")
+                .expect("write must succeed under a hostile umask");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "connection.json must be 0600 regardless of the process umask, got {:o}",
+                mode & 0o777
+            );
+            // And it is genuinely readable back.
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "{\"pinned\":true}\n"
+            );
+            let _ = std::fs::remove_dir_all(&home);
+            return;
         }
-        let _umask = UmaskGuard(prev);
-
-        write_atomic(&path, b"{\"pinned\":true}\n").expect("write must succeed under a hostile umask");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "connection.json must be 0600 regardless of the process umask, got {:o}",
-            mode & 0o777
-        );
-        // And it is genuinely readable back.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"pinned\":true}\n");
-        let _ = std::fs::remove_dir_all(&home);
+        // Parent: re-run THIS test in a child process with the guard set, so the
+        // child's umask change cannot leak into the parent's parallel tests.
+        // `--exact` needs the full module path, or the child matches 0 tests and
+        // exits 0 without ever running the body (a vacuous pass).
+        let exe = std::env::current_exe().expect("current test binary");
+        let status = std::process::Command::new(exe)
+            .arg("pin::tests::write_atomic_is_0600_even_under_an_owner_stripping_umask")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn umask-write child");
+        assert!(status.success(), "the umask-write child process must pass");
     }
 
     #[test]
@@ -1585,6 +1615,12 @@ mod tests {
         // A `@` only in the path/query is not userinfo.
         assert!(!base_url_has_userinfo("http://engine:8080/a@b"));
         assert!(!base_url_has_userinfo("http://engine:8080/p?u=a@b"));
+        // Scheme-relative authorities carry userinfo too, and must not slip
+        // through on the missing `://` (issue #41).
+        assert!(base_url_has_userinfo("//user:secret@engine:8080"));
+        assert!(base_url_has_userinfo("//token@engine:8080/v2"));
+        assert!(!base_url_has_userinfo("//engine:8080"));
+        assert!(!base_url_has_userinfo("//engine:8080/a@b"));
     }
 
     /// Issue #41, credential-in-pin: an engine URL that embeds `user:pass@host`

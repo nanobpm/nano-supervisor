@@ -237,24 +237,41 @@ pub fn sdk_settings(p: &Profile) -> BTreeMap<&'static str, String> {
     m
 }
 
-/// Build an SDK client from the profile (if any) layered over the environment,
-/// plus an explicit base URL applied only when the connection has no profile
-/// of its own — the env-only connection pin's fingerprint (issue #41). Setting
-/// `CAMUNDA_REST_ADDRESS` on the options beats the process environment, so a
-/// drifted `CAMUNDA_*` env cannot retarget a pinned worker; a resolved
-/// profile's own `baseUrl` still wins over the override.
-pub fn client_with_base_override(
+/// Build the SDK options for a connection: the env-only pin fingerprint
+/// (`base_url_override`) applied FIRST as a fallback target, then any resolved
+/// profile layered on top. Because `CamundaOptions::with` is last-wins, a
+/// profile that carries its own `baseUrl` overwrites the override, while a
+/// profile that omits `baseUrl` keeps pointing at the normalized pinned URL
+/// instead of falling through to the raw ambient `CAMUNDA_REST_ADDRESS` (which
+/// may differ from the pin/banner, e.g. a trailing `/v2`) — issue #41.
+fn base_override_opts(
     profile: Option<&Profile>,
     base_url_override: Option<&str>,
-) -> Result<CamundaClient> {
+) -> CamundaOptions {
     let mut opts = CamundaOptions::new();
+    if let Some(url) = base_url_override {
+        opts = opts.with("CAMUNDA_REST_ADDRESS", url.to_string());
+    }
     if let Some(p) = profile {
         for (k, v) in sdk_settings(p) {
             opts = opts.with(k, v);
         }
-    } else if let Some(url) = base_url_override {
-        opts = opts.with("CAMUNDA_REST_ADDRESS", url.to_string());
     }
+    opts
+}
+
+/// Build an SDK client from the profile (if any) layered over the environment,
+/// plus the env-only connection pin's baseUrl fingerprint as a fallback target
+/// (issue #41). Setting `CAMUNDA_REST_ADDRESS` on the options beats the process
+/// environment, so a drifted `CAMUNDA_*` env cannot retarget a pinned worker; a
+/// resolved profile's own `baseUrl` still wins over the override, and a profile
+/// that omits `baseUrl` targets the pinned fingerprint rather than the ambient
+/// env (see [`base_override_opts`]).
+pub fn client_with_base_override(
+    profile: Option<&Profile>,
+    base_url_override: Option<&str>,
+) -> Result<CamundaClient> {
+    let opts = base_override_opts(profile, base_url_override);
     // One pooled HTTP client for the whole process (the SDK shares it across
     // every slot's activate/extend/complete/fail). reqwest already pools and
     // reuses keep-alive connections by default; these settings bound the pool's
@@ -445,6 +462,50 @@ mod tests {
         let m = sdk_settings(&p);
         assert_eq!(m["CAMUNDA_REST_ADDRESS"], "http://192.168.0.21:8080");
         assert_eq!(m["CAMUNDA_AUTH_STRATEGY"], "NONE");
+    }
+
+    /// Issue #41 (review round 20): a named profile that omits `baseUrl` must
+    /// still target the normalized env-only pin fingerprint passed as
+    /// `base_url_override`, not fall through to the raw ambient
+    /// `CAMUNDA_REST_ADDRESS`. The override is applied first as a fallback and
+    /// survives because the credential-only profile never sets the address.
+    #[test]
+    fn base_override_survives_profile_without_baseurl() {
+        let p = profile(r#"{"name":"merlin","username":"u","password":"p"}"#);
+        let opts = base_override_opts(Some(&p), Some("http://pinned:8080"));
+        assert_eq!(
+            opts.config.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://pinned:8080"),
+            "a baseUrl-less profile must keep the pinned override address"
+        );
+        assert_eq!(
+            opts.config.get("CAMUNDA_AUTH_STRATEGY").map(String::as_str),
+            Some("BASIC")
+        );
+    }
+
+    /// The complement: a profile that DOES carry its own `baseUrl` overwrites
+    /// the override (last-wins), so an explicit profile address always beats the
+    /// env-only fingerprint — and both are normalized identically.
+    #[test]
+    fn profile_baseurl_overrides_the_fallback() {
+        let p = profile(r#"{"name":"merlin","baseUrl":"http://profile:8080/v2"}"#);
+        let opts = base_override_opts(Some(&p), Some("http://pinned:8080"));
+        assert_eq!(
+            opts.config.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://profile:8080"),
+            "an explicit profile baseUrl must overwrite the override"
+        );
+    }
+
+    /// With no profile at all, the env-only override is the client's address.
+    #[test]
+    fn override_applies_with_no_profile() {
+        let opts = base_override_opts(None, Some("http://pinned:8080"));
+        assert_eq!(
+            opts.config.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://pinned:8080")
+        );
     }
 
     /// Issue #41 (review round 10): the SDK client config and the pin
