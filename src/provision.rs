@@ -7,6 +7,7 @@
 //! issue; the agent (or a future finalize step) owns committing and pushing.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,16 @@ use crate::runtime::log;
 use std::path::PathBuf;
 /// git config/FETCH_HEAD while still bounding a hostile one.
 const MAX_SCRUB_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Process-local monotonically increasing sequence folded into the finalize
+/// push-context directory name. All slots share the worker PID and two
+/// concurrent finalizers can observe the SAME wall-clock tick (or the clock can
+/// move backward), so `pid`+`nanos` alone is not unique — the second
+/// `create_dir` would fail and incorrectly leave otherwise pushable work
+/// retained. This counter guarantees two finalizers in one process never mint
+/// the same context name (mirroring `slot.rs`'s `ACTIVATION_SEQ`). `Relaxed`
+/// ordering suffices — only the fetch_add's atomicity/uniqueness matters.
+static FINALIZE_CTX_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// The checkout directory name, relative to the pinned run dir. A single
 /// literal component: it is passed to git as a *relative* clone destination
@@ -2644,12 +2655,17 @@ async fn finalize_push_context(workspace: &CwdHandle, branch: &str) -> Result<Fi
         .ok_or_else(|| anyhow::anyhow!("the checkout has no parent run dir"))?
         .to_path_buf();
     let uniq = format!(
-        ".nano-finalize-push-{}-{}",
+        ".nano-finalize-push-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        // Process-local sequence: two concurrent finalizers in this worker can
+        // observe the same clock tick (or a backward-moving clock), so pid+nanos
+        // alone is not unique and the second `create_dir` would spuriously fail,
+        // leaving pushable work retained. The counter makes each name distinct.
+        FINALIZE_CTX_SEQ.fetch_add(1, Ordering::Relaxed)
     );
     let dir = run_dir_path.join(uniq);
     std::fs::create_dir(&dir)

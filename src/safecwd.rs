@@ -346,6 +346,83 @@ impl CwdHandle {
         })
     }
 
+    /// Create (or truncate) a regular file `name` directly beneath this pinned
+    /// directory and write `contents` to it — fd-relative, with create +
+    /// no-follow semantics. Used for small supervisor-owned marker files (e.g.
+    /// the retention marker) that must land in the *pinned* run dir, not in
+    /// whatever a same-UID actor may have swapped the path for afterwards.
+    ///
+    /// `openat` is anchored on this handle's fd, so a rename/replace of the
+    /// directory (or an ancestor) after preparation cannot redirect the write
+    /// outside the pinned inode. `O_NOFOLLOW` refuses a symlink planted at
+    /// `name` (failing with `ELOOP`) instead of truncating the link's target,
+    /// and `O_CREAT|O_WRONLY|O_TRUNC` create-or-replace a regular file. `name`
+    /// must be a single path component (no `/`, not `.`/`..`).
+    #[cfg(unix)]
+    pub(crate) fn write_child_file(
+        &self,
+        name: &std::ffi::OsStr,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.contains(&b'/')
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write_child_file expects a single path component",
+            ));
+        }
+        let c = CString::new(name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(contents)?;
+        // Durable before returning: fsync so a settlement-failure redelivery
+        // that crashes between the write and the next prepare still sees the
+        // marker (the whole point of the marker is cross-redelivery durability).
+        file.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn write_child_file(
+        &self,
+        name: &std::ffi::OsStr,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        // Non-Unix fallback: no fd-relative open, so validate the leaf is not a
+        // symlink and write by path. Best-effort — not a supported daemon host.
+        let path = self.path.join(name);
+        let meta = std::fs::symlink_metadata(&path);
+        if let Ok(m) = meta {
+            if m.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to write through a symlink",
+                ));
+            }
+        }
+        std::fs::write(&path, contents)
+    }
+
     #[cfg(not(unix))]
     pub(crate) fn open_child(&self, name: &std::ffi::OsStr) -> io::Result<CwdHandle> {
         let path = self.path.join(name);

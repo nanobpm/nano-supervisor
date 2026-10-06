@@ -743,38 +743,82 @@ fn prepare_run_dir_pinned(
 ///
 /// Everything is relative to the pinned `root` handle (`renameat`/`fstatat`),
 /// so a same-UID actor swapping an ancestor cannot redirect the check or the
-/// rename outside the runs root. A dir that definitively has no marker
-/// (`NotFound`) is left for the caller's normal wipe — the marker is a
-/// durability hint, never a reason to fail preparing a new attempt. A
-/// symlinked `<name>` is left untouched (the rename would target the link, not
-/// a retained checkout) and handed to the caller's no-follow wipe as usual.
-/// But the marker LOOKUP fails closed: any open/stat error other than
-/// "definitively absent" (a transient I/O or permission failure) is
-/// propagated, so preparation stops rather than risk wiping a possibly-retained
-/// checkout whose marker could not be read.
+/// rename outside the runs root.
+///
+/// TOCTOU-hardened: the check and the wipe are made atomic by renaming FIRST.
+/// A naive "open `<name>`, stat its marker, drop the handle, then let
+/// `prepare_child_dir` wipe `<name>`" sequence leaves a window: after the
+/// pinned child is inspected and dropped, a same-UID actor can replace `<name>`
+/// with a *marked* retained checkout before `prepare_child_dir` runs, and that
+/// checkout is then wiped despite carrying the marker. To close it, `<name>` is
+/// renamed to a unique sibling up front — `renameat` atomically detaches
+/// whatever inode `<name>` currently names — and THAT renamed inode is then
+/// inspected through a pinned handle and either deleted (unmarked) or kept
+/// (marked). The path `<name>` is never touched again, so a swap of `<name>`
+/// after the rename cannot redirect the wipe onto a different, marked checkout.
+///
+/// A dir that definitively has no marker (`NotFound`) is an ordinary stale
+/// attempt and is deleted (it was already renamed aside, so the deletion still
+/// targets the exact inspected inode). A symlinked `<name>` is left untouched
+/// (the rename would target the link, not a retained checkout) and handed to
+/// the caller's no-follow wipe as usual. The marker LOOKUP fails closed: any
+/// open/stat error other than "definitively absent" (a transient I/O or
+/// permission failure) is propagated — with the dir already set aside under its
+/// quarantine name, never wiped — so preparation stops rather than risk
+/// destroying a possibly-retained checkout whose marker could not be read.
 #[cfg(unix)]
 fn quarantine_retained_run_dir(
     root: &crate::saferoot::DirHandle,
     name: &std::ffi::OsStr,
 ) -> std::result::Result<(), crate::saferoot::PinError> {
     use crate::saferoot::PinError;
-    // Does `<name>/<RETENTION_MARKER>` exist? Open the child dir no-follow and
-    // stat the marker within it. FAIL CLOSED: only a definitively-NOT-retained
-    // leaf falls through to the caller's normal wipe — `NotFound` (no such dir
-    // / no marker) or a non-directory `<name>` (a symlink or plain file is not
-    // a retained checkout; the rename would target the link, so it is handed to
-    // the caller's no-follow wipe as usual). Any OTHER open/stat error (a
-    // transient I/O or permission failure) leaves the marker's presence
+    // Rename `<name>` aside to a unique quarantine sibling FIRST. The suffix
+    // mirrors the per-activation fallback-branch uniqueness (`process_rand_token`
+    // + pid + clock + a process-local sequence), so concurrent redeliveries can
+    // never collide on the quarantine name. This is the atomic step that closes
+    // the check-then-wipe race: whatever inode `<name>` names right now is moved
+    // to `quarantine`, and every later step (inspect / delete / keep) acts on
+    // `quarantine`, never on the `<name>` path again.
+    let quarantine = std::ffi::OsString::from(format!(
+        "{}.retained-{}-{}-{}-{}",
+        name.to_string_lossy(),
+        process_rand_token(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    match root.rename_child(name, &quarantine) {
+        Ok(()) => {}
+        // `NotFound`: no `<name>` exists at all — nothing to quarantine or wipe;
+        // the caller's `prepare_child_dir` will simply create it fresh.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // A symlinked or plain-file `<name>` is not a retained checkout (the
+        // rename would target the link itself). Rename it aside too so the
+        // caller starts clean, then fall through to the inspect step below,
+        // which classifies it as "no marker" and deletes it via the pinned
+        // no-follow `remove_tree`. Any OTHER rename error (a transient I/O or
+        // permission failure) is propagated so preparation stops rather than
+        // risk wiping a possibly-retained checkout.
+        Err(e) => return Err(PinError::Io(e)),
+    }
+
+    // `<name>` is now detached; inspect the renamed inode `<quarantine>` through
+    // a pinned no-follow handle. FAIL CLOSED: only a definitively-NOT-retained
+    // leaf is deleted — `NotFound` (no marker) or a non-directory `<quarantine>`
+    // (a symlink or plain file is not a retained checkout). Any OTHER open/stat
+    // error (a transient I/O or permission failure) leaves the marker's presence
     // UNKNOWN, and the dir may hold the only copy of retained unpushed work:
-    // propagate the error so preparation stops WITHOUT deleting it, rather than
-    // collapsing the error to "no marker" and letting `prepare_child_dir` wipe
-    // the retained checkout.
+    // propagate the error so preparation stops WITHOUT deleting it. The dir is
+    // already safely set aside under `quarantine`, so it survives regardless.
     let marker_absent = |e: std::io::Error| -> std::result::Result<bool, PinError> {
-        // The no-follow dir open refuses a symlinked `<name>` with ELOOP (or
-        // ENOTDIR when O_DIRECTORY is checked first, or the portable post-open
-        // check's InvalidInput); a plain-file `<name>` fails it with ENOTDIR.
-        // None of these is a real retained checkout directory, so each falls
-        // through to the caller's no-follow wipe.
+        // The no-follow dir open refuses a symlinked `<quarantine>` with ELOOP
+        // (or ENOTDIR when O_DIRECTORY is checked first, or the portable
+        // post-open check's InvalidInput); a plain-file `<quarantine>` fails it
+        // with ENOTDIR. None of these is a real retained checkout directory, so
+        // each is treated as "no marker" and deleted below.
         let raw = e.raw_os_error();
         let not_a_checkout_dir = e.kind() == std::io::ErrorKind::InvalidInput
             || raw == Some(libc::ELOOP)
@@ -792,7 +836,7 @@ fn quarantine_retained_run_dir(
             )))
         }
     };
-    let marker_present = match root.open_child_dir(name, false) {
+    let marker_present = match root.open_child_dir(&quarantine, false) {
         Ok(child) => match child.symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER)) {
             Ok(m) => !m.is_dir || m.is_symlink, // a regular file / symlink marker
             Err(e) => {
@@ -812,25 +856,15 @@ fn quarantine_retained_run_dir(
         }
     };
     if !marker_present {
+        // An ordinary stale attempt (no retention marker): delete the renamed
+        // inode. This is the same wipe `prepare_child_dir` would have done, but
+        // anchored on the exact inspected inode (`quarantine`), so a post-rename
+        // swap of `<name>` cannot redirect it onto a marked checkout.
+        root.remove_tree(&quarantine).map_err(PinError::Io)?;
         return Ok(());
     }
-    // Rename `<name>` aside to a unique quarantine sibling. The suffix mirrors
-    // the per-activation fallback-branch uniqueness (`process_rand_token` +
-    // pid + clock + a process-local sequence), so concurrent redeliveries can
-    // never collide on the quarantine name. The renamed dir keeps its mtime
-    // and is aged out by `sweep_stale_runs` like any retained run.
-    let quarantine = std::ffi::OsString::from(format!(
-        "{}.retained-{}-{}-{}-{}",
-        name.to_string_lossy(),
-        process_rand_token(),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    root.rename_child(name, &quarantine).map_err(PinError::Io)?;
+    // Retained: keep the renamed dir aside. It keeps its mtime and is aged out
+    // by `sweep_stale_runs` like any retained run.
     log(&format!(
         "run dir {} carries a retention marker — setting it aside as {} instead of wiping, so a \
          settlement-failure redelivery cannot destroy the retained (unpushed) work",
@@ -924,6 +958,83 @@ pub(crate) async fn reap_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf, k
             "job {key}: reap_run_dir blocking task panicked for {}: {join}",
             label.display()
         )),
+    }
+}
+
+/// Fail-closed backstop for the retention marker: when the marker cannot be
+/// durably written into a run dir we have decided to RETAIN (disk-full,
+/// permission, I/O error), set the retained dir aside immediately — rename
+/// `<run_dir>` to a unique quarantine sibling under the runs root — so a
+/// settlement-failure redelivery finds no `<key>` to wipe and starts fresh,
+/// while the only copy of the unpushed work survives for recovery / the
+/// `sweep_stale_runs` cadence. This is the same rename-aside
+/// [`quarantine_retained_run_dir`] performs, done eagerly because the marker
+/// that would normally trigger it could not be written.
+///
+/// Best-effort and pinned no-follow like [`reap_run_dir`]: the rename is
+/// relative to a no-follow pinned handle on the runs root, so a same-UID actor
+/// cannot redirect it. A failure (e.g. the dir was already reaped/renamed, or
+/// the runs root is unavailable) is only logged — the run is still retained in
+/// memory this run, and losing the quarantine is no worse than the pre-fix
+/// best-effort marker behaviour. Non-Unix hosts fall back to a path-based
+/// rename (not a supported daemon host).
+#[cfg(unix)]
+fn quarantine_unmarked_retained_run(runs_dir: &Path, run_dir: &Path, key: &str) {
+    use crate::saferoot::DirHandle;
+    let Some(name) = run_dir.file_name() else {
+        return;
+    };
+    let quarantine = std::ffi::OsString::from(format!(
+        "{}.retained-{}-{}-{}-{}",
+        name.to_string_lossy(),
+        process_rand_token(),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let outcome = DirHandle::open_root_nofollow(runs_dir, false)
+        .map_err(|e| match e {
+            crate::saferoot::PinError::Io(e) => e,
+        })
+        .and_then(|root| root.rename_child(name, &quarantine));
+    match outcome {
+        Ok(()) => log(&format!(
+            "job {key}: set the retained run dir {} aside as {} (its retention marker could not be \
+             written), so a redelivery cannot wipe the only copy of the unpushed work",
+            run_dir.display(),
+            quarantine.to_string_lossy()
+        )),
+        Err(e) => log(&format!(
+            "job {key}: could not quarantine the retained run dir {} after the marker write \
+             failed ({e}); it is retained in memory this run but is not guarded against a \
+             settlement-failure redelivery wipe",
+            run_dir.display()
+        )),
+    }
+}
+
+/// Non-Unix fallback for [`quarantine_unmarked_retained_run`]: no pinned-handle
+/// rename, so rename by path. Best-effort — not a supported daemon host.
+#[cfg(not(unix))]
+fn quarantine_unmarked_retained_run(runs_dir: &Path, run_dir: &Path, key: &str) {
+    let Some(name) = run_dir.file_name() else {
+        return;
+    };
+    let quarantine = runs_dir.join(format!(
+        "{}.retained-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::rename(run_dir, &quarantine) {
+        log(&format!(
+            "job {key}: could not quarantine the retained run dir {} after the marker write \
+             failed ({e})",
+            run_dir.display()
+        ));
     }
 }
 
@@ -2284,16 +2395,33 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // `prepare_run_dir` → wipe this retained checkout, destroying the
             // only copy of the unpushed work. Drop a retention marker so that
             // redelivery's prepare defers the wipe (sets the dir aside) instead
-            // of removing it — see [`RETENTION_MARKER`]. Best-effort: a write
-            // failure only loses the cross-redelivery guard, not this run's
-            // in-memory retention, so it is logged and not fatal.
-            if let Err(e) = std::fs::write(run_dir.join(RETENTION_MARKER), b"retained\n") {
+            // of removing it — see [`RETENTION_MARKER`].
+            //
+            // The marker is written FD-RELATIVE to the pinned run-dir handle
+            // (`prepared.cwd`) with create/no-follow semantics, never by path:
+            // a same-UID actor that renames/replaces `run_dir` (or plants a
+            // symlink at the marker path) after preparation cannot redirect the
+            // write outside the retained inode or trick us into truncating a
+            // symlink target — the write lands in the exact directory
+            // preparation pinned (#35).
+            //
+            // FAIL CLOSED: the marker is the only thing standing between this
+            // retained checkout and a redelivery wipe, so a write failure
+            // (disk-full, permission, I/O) must NOT leave the only unpushed
+            // copy sitting at the wipable job path. If the marker cannot be
+            // durably created, atomically set the retained dir aside
+            // (quarantine) right now — the same rename-aside a redelivery's
+            // prepare would do — so the work survives even without its marker.
+            if let Err(e) = prepared
+                .cwd
+                .write_child_file(std::ffi::OsStr::new(RETENTION_MARKER), b"retained\n")
+            {
                 log(&format!(
-                    "job {key}: could not write the retention marker to {} ({e}); the retained \
-                     checkout is preserved this run but is not guarded against a settlement-failure \
-                     redelivery wipe",
-                    run_dir.display()
+                    "job {key}: could not durably write the retention marker into the pinned run \
+                     dir ({e}); quarantining the retained checkout now so a settlement-failure \
+                     redelivery cannot wipe the only copy of the unpushed work"
                 ));
+                quarantine_unmarked_retained_run(&cfg.runs_dir, &run_dir, &key);
             }
             log(&format!(
                 "job {key}: retaining run dir {} — provisioned checkout holds commits that were \
@@ -3954,15 +4082,34 @@ mod tests {
         let root = crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs, 0o700).unwrap();
         let result = quarantine_retained_run_dir(&root, std::ffi::OsStr::new("43"));
 
-        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).ok();
 
         assert!(
             result.is_err(),
             "a marker lookup error (EACCES) must fail closed, not be misread as 'no marker'"
         );
+        // The retained checkout must SURVIVE the failed lookup. The
+        // TOCTOU-hardened flow renames `43` aside FIRST, so on a fail-closed
+        // error the dir is left under its quarantine sibling (never wiped) —
+        // find it and confirm the marker is still inside.
+        let survivors: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("43.retained-")
+                    || e.file_name().to_string_lossy() == "43"
+            })
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the retained checkout must survive (set aside, never wiped) when its marker cannot be read"
+        );
+        let survivor = survivors[0].path();
+        std::fs::set_permissions(&survivor, std::fs::Permissions::from_mode(0o700)).ok();
         assert!(
-            run.join(RETENTION_MARKER).exists(),
-            "the retained checkout must be left untouched when its marker cannot be read"
+            survivor.join(RETENTION_MARKER).exists(),
+            "the retained checkout must be left intact when its marker cannot be read"
         );
 
         std::fs::remove_dir_all(&runs).ok();
