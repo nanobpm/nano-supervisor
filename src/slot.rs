@@ -2372,8 +2372,10 @@ const PINNED_ENGINE_PROFILE: &str = "pinned";
 /// than by re-resolving `run_dir` by name — so a same-UID sibling can neither
 /// plant `<run dir>/c8ctl` (or a seed file) as a symlink nor swap the whole run
 /// dir for a different ordinary directory to redirect the create/write onto the
-/// operator's config (#35/#46). A pre-5.6 kernel / non-Linux host falls back to
-/// the best-effort path-based seed. The dir is derived from `result_file`
+/// operator's config (#35/#46). Only a non-Linux host falls back to the
+/// best-effort path-based seed; on Linux (including pre-5.6 kernels) the pinned
+/// path stays on fd-relative handles, degrading from `openat2` to the portable
+/// `O_NOFOLLOW` `openat` chain — never to the path-based seed. The dir is derived from `result_file`
 /// (`<run dir>/result.json` → its parent is the run dir) so the env builder's
 /// unit tests stay pure; those tests pass no handle and exercise the path-based
 /// (or reopen) fallback.
@@ -3007,7 +3009,8 @@ mod tests {
     }
 
     /// Issue #41, the planted-session symlink class: the path-based fallback
-    /// (non-Linux / pre-5.6 kernel) must WIPE an existing `c8ctl` leaf before
+    /// (non-Linux; on Linux the pinned path handles pre-5.6 kernels internally)
+    /// must WIPE an existing `c8ctl` leaf before
     /// recreating it, so a child planted in a pre-existing regular directory
     /// cannot survive into the agent — even when there is no profile to
     /// overwrite it. Without the wipe a planted `session.json` would redirect
