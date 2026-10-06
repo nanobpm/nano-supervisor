@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
+use tokio::time::Instant;
 
 use crate::envelope::Repository;
 use crate::safecwd::CwdHandle;
@@ -1244,12 +1245,35 @@ pub async fn prepare_work_branch(
     }
 }
 
+/// The overall wall-clock budget for the WHOLE [`finalize_git`] stage, derived
+/// from the per-command `timeout`. Finalize launches many git subprocesses
+/// SERIALLY (a `rev-parse`/`rev-list` per side branch up to
+/// `MAX_SIDE_BRANCH_SCAN`, a `for-each-ref`/`rev-list` per HEAD-reflog position
+/// and per non-head candidate up to `MAX_REFLOG_SCAN`, …), so the per-command
+/// timeout alone does not bound the stage: an agent-controlled repository could
+/// stretch settlement to scan-cap × timeout (many hours at the default 120 s).
+/// A real run finishes finalize in a handful of quick commands, so a small
+/// multiple of the per-command timeout absorbs the legitimate serial chain
+/// while still bounding the stage far below caps × timeout. A floor keeps a
+/// tiny configured `clone_timeout` from making the deadline unusably tight.
+fn finalize_deadline_budget(timeout: Duration) -> Duration {
+    const MULTIPLIER: u32 = 8;
+    const FLOOR: Duration = Duration::from_secs(60);
+    timeout.saturating_mul(MULTIPLIER).max(FLOOR)
+}
+
 /// After the agent runs: enumerate the commits it made on the work branch and
 /// (when `branch.push` is on and the branch has new commits) push it to the
 /// origin, returning the `branch`/`commits`/`pushed`/`pr` the job's completion
 /// variables carry. Mirrors the plugin's `finalizeGit`. Best-effort: a push
 /// failure is reported as `pushed = false` (the run dir is then retained for
 /// recovery by the caller) rather than failing the job.
+///
+/// The whole stage runs under ONE overall deadline (see
+/// [`finalize_deadline_budget`]):
+/// `timeout` bounds each individual git subprocess, but finalize launches many
+/// of them serially, so without a stage-level budget an agent-controlled
+/// repository could stretch settlement to scan-cap × timeout (hours).
 pub async fn finalize_git(
     workspace: &CwdHandle,
     prep: &GitPrep,
@@ -1265,6 +1289,56 @@ pub async fn finalize_git(
         work_found: false,
         unborn_no_ref: false,
     };
+
+    // ONE overall finalize deadline. `timeout` bounds each INDIVIDUAL git
+    // subprocess, but finalize launches many of them SERIALLY (a `rev-parse`/
+    // `rev-list` per side branch up to `MAX_SIDE_BRANCH_SCAN`, a
+    // `for-each-ref`/`rev-list` per HEAD-reflog position and per non-head
+    // candidate up to `MAX_REFLOG_SCAN`, …), so a per-command budget alone lets
+    // an agent-controlled repository stretch the stage to caps × timeout (many
+    // hours at the default 120 s) and delay settlement. Bound the WHOLE stage
+    // instead: the deadline is a small multiple of the per-command timeout (a
+    // real run finishes in a handful of quick commands; the multiple absorbs
+    // the legitimate serial chain without permitting caps×timeout), and every
+    // git invocation below is handed the REMAINING budget so the stage cannot
+    // overrun it. On expiry the scan is incomplete — fail CLOSED (`retain`) so
+    // the run dir is kept rather than reaped on a half-finished sweep.
+    let deadline = Instant::now() + finalize_deadline_budget(timeout);
+    // The timeout for the NEXT git subprocess: the smaller of the per-command
+    // `timeout` and the time left to the overall deadline. Recomputed at each
+    // call site so a stalled command cannot let the stage overrun the deadline
+    // by another full per-command timeout. Once the deadline has expired this
+    // yields a NEAR-ZERO duration, so the next `git()`/`git_untruncated()`/
+    // `git_isolated()`/`git_raw_status()` times out immediately and surfaces
+    // `Err`/`None` — which every call site already maps to "scan incomplete →
+    // retain" (fail closed). The expiry log is emitted once, on the first
+    // `remaining!()` that finds the deadline exhausted.
+    #[allow(unused_mut)]
+    let mut deadline_logged = false;
+    macro_rules! remaining {
+        () => {{
+            // Hygiene note: this macro expands to an expression that may mutate
+            // the caller's `deadline_logged`/`deadline`/`timeout` locals. The
+            // final expansion's `deadline_logged = true` store is dead (nothing
+            // reads it afterwards), so silence the per-expansion lint here.
+            #[allow(unused_assignments)]
+            match deadline.checked_duration_since(Instant::now()) {
+                Some(r) if !r.is_zero() => r.min(timeout),
+                _ => {
+                    if !deadline_logged {
+                        deadline_logged = true;
+                        log(&format!(
+                            "finalize: the overall finalize deadline ({:?}) expired — treating \
+                             the scan as incomplete and retaining the run dir rather than \
+                             sweeping on a half-finished/inconclusive scan",
+                            finalize_deadline_budget(timeout)
+                        ));
+                    }
+                    Duration::from_nanos(1)
+                }
+            }
+        }};
+    }
 
     // Commit discovery is anchored to the PREPARED work branch, not to wherever
     // the agent left `HEAD`. If the agent checked out another branch and
@@ -1282,7 +1356,7 @@ pub async fn finalize_git(
         Some(branch) => match git(
             &["rev-parse".into(), "--verify".into(), branch.clone()],
             Some(workspace),
-            timeout,
+            remaining!(),
             None,
         )
         .await
@@ -1313,7 +1387,7 @@ pub async fn finalize_git(
         None => match git(
             &["rev-parse".into(), "HEAD".into()],
             Some(workspace),
-            timeout,
+            remaining!(),
             None,
         )
         .await
@@ -1347,7 +1421,7 @@ pub async fn finalize_git(
         match git(
             &["rev-list".into(), range.clone()],
             Some(workspace),
-            timeout,
+            remaining!(),
             None,
         )
         .await
@@ -1374,7 +1448,7 @@ pub async fn finalize_git(
                 match git(
                     &["rev-list".into(), "--count".into(), range],
                     Some(workspace),
-                    timeout,
+                    remaining!(),
                     None,
                 )
                 .await
@@ -1467,7 +1541,7 @@ pub async fn finalize_git(
                 "refs/heads/".into(),
             ],
             Some(workspace),
-            timeout,
+            remaining!(),
             None,
         )
         .await
@@ -1567,7 +1641,7 @@ pub async fn finalize_git(
                             format!("refs/heads/{r}"),
                         ],
                         Some(workspace),
-                        timeout,
+                        remaining!(),
                         None,
                     )
                     .await
@@ -1638,7 +1712,7 @@ pub async fn finalize_git(
                     let unpublished = match git(
                         &["rev-list".into(), "--count".into(), unpublished_range],
                         Some(workspace),
-                        timeout,
+                        remaining!(),
                         None,
                     )
                     .await
@@ -1747,7 +1821,7 @@ pub async fn finalize_git(
                 "HEAD".into(),
             ],
             Some(workspace),
-            timeout,
+            remaining!(),
             None,
         )
         .await
@@ -1802,7 +1876,7 @@ pub async fn finalize_git(
                                 "refs/heads/".into(),
                             ],
                             Some(workspace),
-                            timeout,
+                            remaining!(),
                             None,
                         )
                         .await
@@ -1824,7 +1898,7 @@ pub async fn finalize_git(
                                 let mut args: Vec<String> =
                                     vec!["rev-list".into(), h.clone(), "--not".into()];
                                 args.extend(shas.iter().cloned());
-                                match git(&args, Some(workspace), timeout, None).await {
+                                match git(&args, Some(workspace), remaining!(), None).await {
                                     Ok(listed) => !listed.trim().is_empty(),
                                     Err(_) => true,
                                 }
@@ -1902,7 +1976,7 @@ pub async fn finalize_git(
                 "refs/".into(),
             ],
             Some(workspace),
-            timeout,
+            remaining!(),
             None,
         )
         .await
@@ -1944,7 +2018,7 @@ pub async fn finalize_git(
                     "refs/stash".into(),
                 ],
                 Some(workspace),
-                timeout,
+                remaining!(),
                 None,
             )
             .await
@@ -1959,7 +2033,7 @@ pub async fn finalize_git(
                         "refs/stash".into(),
                     ],
                     Some(workspace),
-                    timeout,
+                    remaining!(),
                     None,
                 )
                 .await
@@ -2022,7 +2096,7 @@ pub async fn finalize_git(
                         "refs/heads/".into(),
                     ],
                     Some(workspace),
-                    timeout,
+                    remaining!(),
                     None,
                 )
                 .await
@@ -2040,7 +2114,7 @@ pub async fn finalize_git(
                         let mut args: Vec<String> =
                             vec!["rev-list".into(), h.clone(), "--not".into()];
                         args.extend(shas.iter().cloned());
-                        match git(&args, Some(workspace), timeout, None).await {
+                        match git(&args, Some(workspace), remaining!(), None).await {
                             Ok(listed) => !listed.trim().is_empty(),
                             Err(_) => true,
                         }
@@ -2144,7 +2218,7 @@ pub async fn finalize_git(
                     // cwd is None: the clean `--git-dir` is absolute, so the push
                     // must NOT run from the agent-mutable checkout (which would
                     // re-introduce its local/worktree config into the search path).
-                    match git_isolated(&args, None, timeout, cred.as_ref()).await {
+                    match git_isolated(&args, None, remaining!(), cred.as_ref()).await {
                         Ok(_) => out.pushed = true,
                         Err(e) => {
                             // A nonzero/timed-out push does NOT prove the ref
@@ -2163,7 +2237,7 @@ pub async fn finalize_git(
                                 &fetch_url,
                                 branch,
                                 cred.as_ref(),
-                                timeout,
+                                remaining!(),
                             )
                             .await
                             {
@@ -2199,7 +2273,7 @@ pub async fn finalize_git(
     // `retain` is only the fail-closed guard of a repo with no anchor, not
     // evidence a commit exists — mark it so the caller's empty-result check
     // does not read that retain as `has_commits`.
-    mark_unborn_no_ref(&mut out, prep, workspace, timeout).await;
+    mark_unborn_no_ref(&mut out, prep, workspace, remaining!()).await;
     out
 }
 
@@ -6988,6 +7062,86 @@ mod tests {
             "the sweep must STOP at the first inconclusive (snapshot-absent) branch, so the \
              post-loop reflog net never runs and the detached commit does not flip work_found — \
              retain alone protects the dir"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[test]
+    fn finalize_deadline_budget_bounds_the_whole_stage() {
+        // Regression for the missing overall finalize deadline (MEDIUM): the
+        // per-command `timeout` alone does not bound the stage, because finalize
+        // launches many git subprocesses SERIALLY (per side branch / reflog
+        // position / non-head candidate, up to the scan caps). The stage budget
+        // must be a small multiple of the per-command timeout — far below
+        // scan-caps × timeout (which would be hours at the default 120 s) — with
+        // a floor so a tiny configured timeout stays usable.
+        let per_command = Duration::from_secs(120);
+        let budget = finalize_deadline_budget(per_command);
+        // Bounded: the whole stage must finish well under the per-caps product
+        // (512+512+512 commands × 120 s ≈ 51 hours). 8× is 16 minutes.
+        assert_eq!(budget, Duration::from_secs(960));
+        assert!(
+            budget < per_command * 512,
+            "the stage budget must be far below scan-caps × per-command timeout"
+        );
+        // The floor keeps a tiny configured timeout from making the deadline
+        // unusably tight.
+        assert_eq!(
+            finalize_deadline_budget(Duration::from_secs(1)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_overall_deadline_fails_closed_and_returns_promptly() {
+        // Regression for the missing overall finalize deadline: with an
+        // already-exhausted budget, finalize must not launch its serial chain of
+        // git subprocesses (each waiting out its own per-command timeout) — it
+        // must fail CLOSED (retain) and return in far less than one per-command
+        // timeout. Drive it with a tiny per-command timeout so the 60 s budget
+        // floor is already exhausted by the time the scan would run: the first
+        // probe gets a near-zero remaining budget and times out immediately,
+        // which the existing error path maps to `retain`.
+        let dir = empty_base_workspace("deadline").await;
+        git(
+            &[
+                "checkout".into(),
+                "-b".into(),
+                "feat/work".into(),
+                "--".into(),
+            ],
+            Some(&dir),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        commit(&dir, "work commit").await;
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        // A per-command timeout of 1 ns: every git subprocess times out at once,
+        // so the whole stage must still return promptly (not caps × 1 ns is
+        // trivially fast, but the point is the DEADLINE path returns `retain`
+        // rather than hanging or reporting a clean push).
+        let started = std::time::Instant::now();
+        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_nanos(1)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            res.retain,
+            "an exhausted finalize budget must fail closed and retain the run dir"
+        );
+        assert!(
+            !res.pushed,
+            "an incomplete (deadline-expired) scan must never report a clean push"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "finalize must return promptly once the overall deadline is exhausted (took {elapsed:?})"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }

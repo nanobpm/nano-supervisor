@@ -2259,9 +2259,23 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // `retain` (finalize's stranded-work/incomplete-scan signal) also forces
     // retention independently of the HEAD compare. Retain such a run (like a
     // failed one) for recovery; `sweep_stale_runs` ages it out on the cadence.
-    if matches!(settle, Settle::Complete(_)) && !cfg.keep_runs {
+    //
+    // The reapability DECISION (and its durable retention marker) runs for EVERY
+    // completed run — `--keep-runs` gates only the actual reap, NOT the marker.
+    // The marker must be written even when `--keep-runs` keeps the dir this
+    // time: if `jobs.complete` then fails or is fenced, the engine redelivers
+    // the SAME job key and the next `execute` runs `prepare_run_dir`, which
+    // wipes an UNMARKED dir — destroying the only copy of the unpushed work
+    // despite both the retention decision and `--keep-runs`. So compute
+    // reapability unconditionally and write the marker whenever the run is
+    // non-reapable; only the destructive reap is skipped under `--keep-runs`.
+    if matches!(settle, Settle::Complete(_)) {
         if may_reap_completed_run(provisioned, has_commits, pushed, retain) {
-            reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
+            // Reapable (nothing durable to lose): delete the dir unless the
+            // operator asked to keep run dirs for post-mortem.
+            if !cfg.keep_runs {
+                reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
+            }
         } else {
             // Make the retention durable BEFORE returning: `execute` hands
             // `Settle::Complete` back and the caller sends `jobs.complete`
@@ -4492,6 +4506,64 @@ mod tests {
         // A non-repository run never holds commits, so it is always reapable.
         assert!(may_reap_completed_run(false, false, false, false));
         assert!(may_reap_completed_run(false, true, false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_marker_is_written_even_when_keep_runs_keeps_the_dir() {
+        // Regression for the retention-marker-vs-`--keep-runs` finding (HIGH):
+        // the reapability DECISION and its durable marker must run for EVERY
+        // completed run — `--keep-runs` gates only the actual reap, NOT the
+        // marker. Otherwise a non-reapable run whose dir `--keep-runs` kept is
+        // left UNMARKED, and if `jobs.complete` then fails or is fenced the
+        // redelivered job key's `prepare_run_dir` wipes the unmarked dir,
+        // destroying the only copy of the unpushed work despite both the
+        // retention decision and `--keep-runs`.
+        //
+        // `execute` is not directly drivable in a unit test, so this pins the
+        // decision boundary the fix relies on: a non-reapable verdict
+        // (`may_reap_completed_run` == false) is reached INDEPENDENTLY of
+        // `keep_runs`, and the marker it must write makes a later redelivery's
+        // prepare DEFER the wipe (quarantine) instead of destroying the work.
+        // The decision is a pure function of (provisioned, has_commits, pushed,
+        // retain) — no `keep_runs` input — so a non-reapable verdict is reached
+        // whether or not `--keep-runs` is set.
+        assert!(
+            !may_reap_completed_run(true, true, false, false),
+            "an unpushed committing run is non-reapable regardless of --keep-runs"
+        );
+        // ... and the marker written on that verdict is what a redelivery's
+        // prepare honours: a dir carrying it is set aside (quarantined), not
+        // wiped, so the retained work survives.
+        let runs = unique_tmp("keepruns-marker");
+        let run = runs.join("77");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RETENTION_MARKER), b"retained\n").unwrap();
+        std::fs::write(run.join("only-copy.txt"), b"unpushed work").unwrap();
+        let root = crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs, 0o700).unwrap();
+        quarantine_retained_run_dir(&root, std::ffi::OsStr::new("77"))
+            .expect("the marker lookup must not error on a readable dir");
+        // The original name is gone (renamed aside) and exactly one quarantine
+        // sibling survives, still holding the retained work.
+        assert!(
+            !run.exists(),
+            "the marker-carrying dir must be renamed aside, not left in place to be wiped"
+        );
+        let quarantine: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("77.retained-"))
+            .collect();
+        assert_eq!(
+            quarantine.len(),
+            1,
+            "the retained checkout must be set aside as exactly one quarantine sibling"
+        );
+        assert!(
+            quarantine[0].path().join("only-copy.txt").exists(),
+            "the retained work must survive redelivery because the marker was written"
+        );
+        std::fs::remove_dir_all(&runs).ok();
     }
 
     #[test]
