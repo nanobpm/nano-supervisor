@@ -391,13 +391,26 @@ impl PinLock {
     fn acquire(state_home: &Path) -> Result<PinLock> {
         #[cfg(unix)]
         {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             use std::os::unix::io::AsRawFd;
             std::fs::create_dir_all(state_home)
                 .with_context(|| format!("creating state home {}", state_home.display()))?;
+            // Force the state home to 0700 regardless of umask. `acquire` runs
+            // BEFORE `write` (which also hardens the dir), so an owner-stripping
+            // umask (e.g. 0o077/0o777) would otherwise create the home as `000`
+            // on first start — and a `000` directory refuses even to create the
+            // lock file below (EACCES), wedging the home before the pin is read.
+            // Setting it here closes that window and keeps the dir 0700 for any
+            // concurrent reader between `acquire` and `write` (issue #41).
+            std::fs::set_permissions(state_home, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting state home {}", state_home.display()))?;
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
+                // Owner-only lock file. Filtered through the umask, so it is
+                // re-forced with `fchmod` on the open fd below.
+                .mode(0o600)
                 // The lock file is a pure lock token — its content is never
                 // read or written, only the flock on its inode matters. State
                 // the truncation intent explicitly (clippy::suspicious_open_options).
@@ -409,6 +422,20 @@ impl PinLock {
                         state_home.display()
                     )
                 })?;
+            // `OpenOptionsExt::mode(0o600)` is filtered through the umask, so a
+            // umask stripping the owner bits (e.g. 0o077/0o777) can create the
+            // lock as `000`. A persistent `000` lock file cannot be reopened by
+            // a LATER startup (EACCES), wedging the home permanently. `fchmod`
+            // the open fd — umask-immune — so the persisted lock is owner-rw
+            // regardless of umask, mirroring the state-file writer.
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "chmod 0600 the connection-pin lock in {}",
+                        state_home.display()
+                    )
+                });
+            }
             // LOCK_EX blocks until every other holder releases; the fd's Drop
             // (or process exit) releases it, so a crash can never wedge the
             // home. This is an advisory lock — it serializes only the processes
@@ -1233,6 +1260,75 @@ mod tests {
             .status()
             .expect("spawn umask-write child");
         assert!(status.success(), "the umask-write child process must pass");
+    }
+
+    /// Red-first regression (PR #46): `PinLock::acquire` runs BEFORE `write`, so
+    /// it — not `write` — is the first code to create a fresh state home and the
+    /// `.pin.lock` token. Before the fix it created both under the bare umask:
+    /// an owner-stripping umask (here 0o777) made the home `000` (so even
+    /// creating the lock fails, EACCES) and, where the lock was created, left it
+    /// `000` so a LATER startup could not reopen it — wedging the home before
+    /// the pin is ever read. `acquire` must force the dir to 0700 and `fchmod`
+    /// the lock fd to 0600, umask-immune, so first AND subsequent starts work.
+    ///
+    /// The umask is process-global, so run the hostile umask in a re-invoked
+    /// child (gated by an env var), exactly as the write-atomic test above does,
+    /// so the parent's umask and every sibling test are never touched.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_hardens_dir_and_lock_even_under_an_owner_stripping_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ENV: &str = "NANO_PIN_UMASK_ACQUIRE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Child alone in its own process: tightening the process-global
+            // umask here cannot leak into a sibling test. Pick a home path that
+            // does NOT yet exist so `acquire` is the creator of both the dir and
+            // the lock under the hostile umask — the real first-start scenario.
+            let home = temp_home("hostile-umask-acquire").join("fresh");
+            assert!(!home.exists(), "home must not pre-exist");
+            // Strip ALL owner bits via the umask; without the dir/lock fchmod
+            // hardening the home lands 000 and the lock cannot be created or
+            // (if created) reopened.
+            unsafe { libc::umask(0o777) };
+            let lock = PinLock::acquire(&home)
+                .expect("first acquire must succeed under a hostile umask");
+            // The directory must be 0700 regardless of umask, so a concurrent
+            // reader between acquire and write sees an owner-only home.
+            let dir_mode = std::fs::metadata(&home).unwrap().permissions().mode();
+            assert_eq!(
+                dir_mode & 0o777,
+                0o700,
+                "state home must be 0700 regardless of umask, got {:o}",
+                dir_mode & 0o777
+            );
+            // The persistent lock file must be 0600 so a later startup can
+            // reopen it.
+            let lock_mode = std::fs::metadata(home.join(".pin.lock"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                lock_mode & 0o777,
+                0o600,
+                ".pin.lock must be 0600 regardless of umask, got {:o}",
+                lock_mode & 0o777
+            );
+            drop(lock);
+            // A SECOND acquire must reopen the persistent 0600 lock (this is the
+            // step that failed with a 000 lock), still under the hostile umask.
+            PinLock::acquire(&home).expect("second acquire must reopen the persistent lock");
+            let _ = std::fs::remove_dir_all(home.parent().unwrap());
+            return;
+        }
+        let exe = std::env::current_exe().expect("current test binary");
+        let status = std::process::Command::new(exe)
+            .arg("pin::tests::acquire_hardens_dir_and_lock_even_under_an_owner_stripping_umask")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn umask-acquire child");
+        assert!(status.success(), "the umask-acquire child process must pass");
     }
 
     #[test]
