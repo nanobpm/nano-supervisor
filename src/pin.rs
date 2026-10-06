@@ -644,6 +644,26 @@ fn drift_warnings(decision: &PinDecision) -> Vec<String> {
                 state_file_display(decision)
             ));
         }
+        // An ENV-ONLY pin (`pin.profile` is None — pinned via
+        // `CAMUNDA_REST_ADDRESS`/`ZEEBE_REST_ADDRESS`/`--base-url`, no c8ctl
+        // profile) whose session has GAINED an active profile since pinning is
+        // drift too — the mirror image of the `(Some, None)` unset case above,
+        // and the exact fingerprint of an agent's `c8 use profile` creating an
+        // operator session the fleet must keep ignoring. Without this arm the
+        // `_ =>` below silently swallows it, so the promised session-drift
+        // signal never fires on the env-only path. Only an *existing* pin being
+        // followed can drift: a freshly created env pin (`created`) is being
+        // established from the current state now, so it must not warn.
+        (None, Some(active)) if !decision.created => {
+            out.push(format!(
+                "WARNING: the pinned connection is env-only (CAMUNDA_REST_ADDRESS/\
+                 ZEEBE_REST_ADDRESS, no c8ctl profile) but c8ctl now has active profile \
+                 {active:?} — this supervisor keeps following the PINNED engine URL; the newly \
+                 active profile is IGNORED (an agent's `c8 use profile` cannot retarget this \
+                 fleet). Restart with --profile to re-pin, or edit {}",
+                state_file_display(decision)
+            ));
+        }
         _ => {}
     }
     // The baseUrl drift check compares the fingerprint recorded on disk THEN
@@ -1276,6 +1296,68 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("NO active profile")),
             "a freshly created pin must not warn about an unset active profile"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The env-only mirror of `named_pin_warns_when_active_profile_unset`: an
+    /// existing ENV-only pin (no c8ctl profile) whose session has GAINED an
+    /// active profile since pinning must warn — that new active profile is the
+    /// exact evidence an agent ran `c8 use profile`, and the fleet keeps
+    /// following the env URL and says so.
+    #[test]
+    fn env_pin_warns_when_active_profile_appears() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("envactiveprofileappears");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
+        // First start: no session, so the pin is env-only (profile None).
+        let first = resolve_or_pin(&home, None).expect("first start pins env-only");
+        assert!(first.created);
+        assert_eq!(first.pin.profile, None);
+        // A profile becomes active (an agent's `c8 use profile`, or the operator).
+        std::fs::write(
+            c8ctl.join("profiles.json"),
+            r#"{"profiles":[{"name":"merlin","baseUrl":"http://engine-b:8080"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(c8ctl.join("session.json"), r#"{"activeProfile":"merlin"}"#).unwrap();
+        let second = resolve_or_pin(&home, None).expect("second start follows the env pin");
+        assert!(!second.created);
+        assert_eq!(second.pin.profile, None);
+        assert_eq!(second.active_profile.as_deref(), Some("merlin"));
+        let warnings = drift_warnings(&second);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("env-only") && w.contains("merlin")),
+            "an active profile appearing under an env-only pin must warn: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The sibling of the case above: a FRESH env-only pin created while a
+    /// profile is already active must NOT warn — a pin being established now
+    /// has nothing to drift from. (A created pin with an active profile is
+    /// normally a NAMED pin, so this guards the `created` gate on the new arm.)
+    #[test]
+    fn fresh_env_pin_does_not_warn_on_first_start() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = temp_home("freshenvpin");
+        let c8ctl = home.join("c8ctl-config");
+        std::fs::create_dir_all(&c8ctl).unwrap();
+        let _cfg = EnvGuard::set("C8CTL_DATA_DIR", &c8ctl.to_string_lossy());
+        let _addr = EnvGuard::set("CAMUNDA_REST_ADDRESS", "http://engine-a:8080");
+        let first = resolve_or_pin(&home, None).expect("first start pins env-only");
+        assert!(first.created);
+        assert!(
+            !drift_warnings(&first)
+                .iter()
+                .any(|w| w.contains("env-only")),
+            "a freshly created env pin must not warn: {:?}",
+            drift_warnings(&first)
         );
         let _ = std::fs::remove_dir_all(&home);
     }

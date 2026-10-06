@@ -466,6 +466,17 @@ impl CwdHandle {
         // SAFETY: `new` is a fresh, owned fd just returned by `fcntl`.
         Ok(unsafe { OwnedFd::from_raw_fd(new) })
     }
+
+    /// A close-on-exec dup of the pinned directory fd, for a consumer that
+    /// needs to operate *relative to this exact validated inode* through a
+    /// different fd-relative API (e.g. wrapping it in a
+    /// [`crate::saferoot::DirHandle`] via `DirHandle::from_fd` to seed children
+    /// without reopening the run dir by path (#35/#46)). The dup shares the
+    /// inode, not the file position, and is owned by the caller.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_clone_fd(&self) -> io::Result<std::os::unix::io::OwnedFd> {
+        self.dup_fd()
+    }
 }
 
 /// Install a `pre_exec` hook that `fchdir`s into `fd` (consumed by the closure,

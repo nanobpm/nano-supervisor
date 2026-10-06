@@ -1749,7 +1749,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     };
 
     let result_file = run_dir.join("result.json");
-    let agent_env = build_agent_env(&cfg, &key, &job, &result_file, &run_dir)?;
+    let agent_env = build_agent_env(
+        &cfg,
+        &key,
+        &job,
+        &result_file,
+        &run_dir,
+        Some(prepared.agent_cwd()),
+    )?;
     let payload = build_agent_payload(&cfg, &job, &env);
     let acp = cfg.hire.protocol == Protocol::Acp;
 
@@ -2242,6 +2249,7 @@ fn build_agent_env(
     job: &ActivatedJobResult,
     result_file: &std::path::Path,
     run_dir: &std::path::Path,
+    run_dir_handle: Option<&crate::safecwd::CwdHandle>,
 ) -> Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = Vec::new();
     // #283: a headless agent has no interactive terminal, so any git command that
@@ -2310,7 +2318,7 @@ fn build_agent_env(
     // nano plugin, and we deliberately do NOT symlink the operator's plugins
     // dir into this fail-closed no-follow root. Isolating session/profiles
     // without relocating the plugins dir is tracked in #51.
-    let dir = seed_agent_c8ctl_dir(cfg, result_file)?;
+    let dir = seed_agent_c8ctl_dir(cfg, result_file, run_dir_handle)?;
     env.push(("C8CTL_DATA_DIR".into(), dir.to_string_lossy().into_owned()));
     Ok(env)
 }
@@ -2343,14 +2351,22 @@ const PINNED_ENGINE_PROFILE: &str = "pinned";
 /// caller fails the job on any error here rather than skipping the override.
 ///
 /// Symlink-race-hardened like the run-directory provisioning
-/// ([`prepare_run_dir`]): the dir and its files are created through pinned
-/// no-follow handles on Linux (`openat2(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)`),
-/// so a same-UID sibling that plants `<run dir>/c8ctl` (or a seed file) as a
-/// symlink cannot redirect the create/write onto the operator's config. A
-/// pre-5.6 kernel / non-Linux host falls back to the best-effort path-based
-/// seed. The dir is derived from `result_file` (`<run dir>/result.json` → its
-/// parent is the run dir) so the env builder's unit tests stay pure.
-fn seed_agent_c8ctl_dir(cfg: &SlotConfig, result_file: &std::path::Path) -> Result<PathBuf> {
+/// ([`prepare_run_dir`]): on Linux the dir and its files are created through
+/// pinned no-follow handles, *anchored on the retained run-directory capability*
+/// (`run_dir_handle`, the pinned fd `execute` carries in `PreparedRun`) rather
+/// than by re-resolving `run_dir` by name — so a same-UID sibling can neither
+/// plant `<run dir>/c8ctl` (or a seed file) as a symlink nor swap the whole run
+/// dir for a different ordinary directory to redirect the create/write onto the
+/// operator's config (#35/#46). A pre-5.6 kernel / non-Linux host falls back to
+/// the best-effort path-based seed. The dir is derived from `result_file`
+/// (`<run dir>/result.json` → its parent is the run dir) so the env builder's
+/// unit tests stay pure; those tests pass no handle and exercise the path-based
+/// (or reopen) fallback.
+fn seed_agent_c8ctl_dir(
+    cfg: &SlotConfig,
+    result_file: &std::path::Path,
+    run_dir_handle: Option<&crate::safecwd::CwdHandle>,
+) -> Result<PathBuf> {
     let run_dir = result_file
         .parent()
         .context("the agent result file has no parent run dir")?
@@ -2404,54 +2420,89 @@ fn seed_agent_c8ctl_dir(cfg: &SlotConfig, result_file: &std::path::Path) -> Resu
                     ..Default::default()
                 })
         });
-    create_agent_c8ctl_dir(&run_dir, profile.as_ref())
+    create_agent_c8ctl_dir(&run_dir, profile.as_ref(), run_dir_handle)
 }
 
 /// Create `<run dir>/c8ctl` (wiping any stale/planted entry), restrict it to
 /// `0700`, and write the seed files — dispatching to the pinned no-follow
 /// implementation on Linux and the path-based fallback elsewhere. Returns the
 /// created dir.
+///
+/// `run_dir_handle` is the EXACT pinned run-directory capability `execute`
+/// retained (`PreparedRun`) — when present (production), the Linux path seeds
+/// *relative to that fd* instead of reopening `run_dir` by name, so a same-UID
+/// actor that swaps `run_dir` for a different ordinary directory between
+/// preparation and here cannot redirect the wipe/seed onto an inode that was
+/// never prepared or secured (#35/#46). `None` (the unit tests, which hold no
+/// handle) falls back to the path-based reopen.
 fn create_agent_c8ctl_dir(
     run_dir: &Path,
     profile: Option<&crate::profile::Profile>,
+    run_dir_handle: Option<&crate::safecwd::CwdHandle>,
 ) -> Result<PathBuf> {
     let dir = run_dir.join("c8ctl");
     #[cfg(target_os = "linux")]
     {
-        use crate::saferoot::PinError;
-        match create_agent_c8ctl_dir_pinned(run_dir, profile) {
-            Ok(()) => Ok(dir),
-            // A refused symlinked component (ELOOP) or any other I/O error is a
-            // real, security-relevant outcome — surface it, never retry the
-            // weaker path-based create that would follow the very link refused.
-            Err(PinError::Io(e)) => Err(anyhow::Error::new(e).context(format!(
-                "seeding the agent's isolated c8ctl config dir {}",
-                dir.display()
-            ))),
-        }
+        use crate::saferoot::{DirHandle, PinError};
+        // Prefer the retained run-dir capability; only reopen by path when no
+        // handle was threaded (unit tests). Either way we seed through a
+        // DirHandle pinned to the run-dir inode.
+        let seeded = match run_dir_handle {
+            Some(handle) => {
+                let fd = handle
+                    .try_clone_fd()
+                    .map_err(PinError::Io)
+                    .map_err(|e| anyhow_from_pin(e, &dir))?;
+                seed_agent_c8ctl_pinned(&DirHandle::from_fd(fd), profile)
+            }
+            None => {
+                let root = DirHandle::open_root_nofollow(run_dir, false)
+                    .map_err(|e| anyhow_from_pin(e, &dir))?;
+                seed_agent_c8ctl_pinned(&root, profile)
+            }
+        };
+        // A refused symlinked component (ELOOP) or any other I/O error is a
+        // real, security-relevant outcome — surface it, never retry the
+        // weaker path-based create that would follow the very link refused.
+        seeded.map_err(|e| anyhow_from_pin(e, &dir))?;
+        Ok(dir)
     }
     // Non-Linux: the strict no-follow chain would refuse legitimate platform
     // symlinks in the run path (macOS `/var` -> `/private/var`), so seed via the
     // path-based fallback, which still fails closed on a symlinked `c8ctl` leaf.
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = run_dir_handle;
         create_agent_c8ctl_dir_path_based(run_dir, &dir, profile)?;
         Ok(dir)
     }
 }
 
-/// Linux: build `<run dir>/c8ctl` and its seed files through pinned no-follow
-/// handles. The run dir was just prepared through no-follow handles too, so a
-/// same-UID sibling cannot swap a component between prepare and here.
+/// Map a `PinError` from the pinned c8ctl seed onto a job error that names the
+/// config dir. Every variant is a real, security-relevant failure to surface —
+/// the caller fails the job rather than launching the agent unisolated.
 #[cfg(target_os = "linux")]
-fn create_agent_c8ctl_dir_pinned(
-    run_dir: &Path,
+fn anyhow_from_pin(e: crate::saferoot::PinError, dir: &Path) -> anyhow::Error {
+    match e {
+        crate::saferoot::PinError::Io(e) => anyhow::Error::new(e).context(format!(
+            "seeding the agent's isolated c8ctl config dir {}",
+            dir.display()
+        )),
+    }
+}
+
+/// Seed `<pinned run dir>/c8ctl` relative to an already-pinned run-directory
+/// handle: wipe any stale/planted `c8ctl`, recreate it 0700, and write each
+/// seed file through `O_CREAT | O_EXCL` no-follow handles. Every step is
+/// anchored on `root`'s fd, so nothing is resolved by path and a planted
+/// symlink (or a swapped run dir) cannot redirect the create/write.
+#[cfg(target_os = "linux")]
+fn seed_agent_c8ctl_pinned(
+    root: &crate::saferoot::DirHandle,
     profile: Option<&crate::profile::Profile>,
 ) -> std::result::Result<(), crate::saferoot::PinError> {
-    use crate::saferoot::{DirHandle, PinError};
+    use crate::saferoot::PinError;
     use std::ffi::OsStr;
-    // Pin the run dir (no-follow); refuse if any component is a symlink.
-    let root = DirHandle::open_root_nofollow(run_dir, false)?;
     // Wipe any stale/planted `c8ctl` entry and recreate it 0700, relative to the
     // pinned run-dir handle — `prepare_child_dir` fails closed on a planted
     // symlink rather than following it.
@@ -2699,7 +2750,7 @@ mod tests {
         };
         let run = tmp_run("reserved");
         let rf = run.join("result.json");
-        let env = build_agent_env(&cfg(), "42", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run, None).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("NANO_AGENTIC"), Some("off"));
         assert_eq!(get("NANO_JOB_KEY"), Some("42"));
@@ -2720,10 +2771,13 @@ mod tests {
         let job = ActivatedJobResult::default();
         let run = tmp_run("agent-run");
         let rf = run.join("result.json");
-        let env = build_agent_env(&cfg(), "42", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run, None).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("NANO_AGENT_RUN"), Some("42"));
-        assert_eq!(get("NANO_AGENT_RUN_DIR"), Some(run.to_string_lossy().as_ref()));
+        assert_eq!(
+            get("NANO_AGENT_RUN_DIR"),
+            Some(run.to_string_lossy().as_ref())
+        );
         let _ = std::fs::remove_dir_all(&run);
     }
 
@@ -2735,7 +2789,7 @@ mod tests {
         };
         let run = tmp_run("editor");
         let rf = run.join("result.json");
-        let env = build_agent_env(&cfg(), "42", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&cfg(), "42", &job, &rf, &run, None).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         // #283: every editor git might spawn points at the `:` no-op so a headless
         // agent's `git commit`/`rebase -i` can never block on an interactive editor.
@@ -2758,7 +2812,7 @@ mod tests {
         };
         let run = tmp_run("override");
         let rf = run.join("result.json");
-        let env = build_agent_env(&c, "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         // `.envs()` is last-wins, so the LAST entry for a key is the effective value.
         let last = |k: &str| {
             env.iter()
@@ -2810,7 +2864,7 @@ mod tests {
         }
         let job = ActivatedJobResult::default();
         let run = tmp_run("secrets");
-        let env = build_agent_env(&cfg(), "1", &job, &run.join("result.json"), &run).unwrap();
+        let env = build_agent_env(&cfg(), "1", &job, &run.join("result.json"), &run, None).unwrap();
         for (k, _) in &env {
             assert!(
                 !SENSITIVE_DAEMON_ENV.contains(&k.as_str()),
@@ -2826,7 +2880,7 @@ mod tests {
         c.hire.env.insert("NANO_AGENTIC".into(), "on".into());
         let job = ActivatedJobResult::default();
         let run = tmp_run("shadow");
-        let env = build_agent_env(&c, "1", &job, &run.join("result.json"), &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &run.join("result.json"), &run, None).unwrap();
         // The reserved value is pushed AFTER the hire env, so it wins for any
         // consumer that reads the last occurrence (as a child process does).
         let last = env
@@ -2858,7 +2912,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let rf = run.join("result.json");
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         let dir = env
             .iter()
             .find(|(k, _)| k == "C8CTL_DATA_DIR")
@@ -2913,7 +2967,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let rf = run.join("result.json");
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         let dir = env
             .iter()
             .find(|(k, _)| k == "C8CTL_DATA_DIR")
@@ -2998,7 +3052,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Issue #41, hard-link defence: `seed_c8ctl_dir` creates each seed file
+    /// Issue #46 (review 5423119368), the "reopen retained run dir by path"
+    /// class: the Linux pinned seeder must write *relative to the retained
+    /// run-directory capability* (`PreparedRun`'s pinned fd), never by
+    /// re-resolving `run_dir` by name. A same-UID sibling can swap the run-dir
+    /// path for a DIFFERENT ordinary directory (not a symlink, so a no-follow
+    /// path reopen would accept it) between preparation and seeding; threading
+    /// the handle makes the swap irrelevant — the seed lands in the exact inode
+    /// preparation secured, not the swapped path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_seed_writes_through_the_retained_handle_not_the_path() {
+        use crate::safecwd::CwdHandle;
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-pinhandle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // The real, prepared run dir — pinned by inode, as `execute` retains it.
+        let real = base.join("real-run");
+        std::fs::create_dir_all(&real).unwrap();
+        let handle = CwdHandle::open(&real).expect("pin the real run dir by inode");
+        // The attacker-controlled path the seeder is *told* to use: a different
+        // ordinary directory (no symlink, so a path reopen's no-follow check
+        // would pass and seed the wrong inode).
+        let swapped = base.join("swapped-run");
+        std::fs::create_dir_all(&swapped).unwrap();
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+        let dir = create_agent_c8ctl_dir(&swapped, Some(&profile), Some(&handle))
+            .expect("seed through the pinned handle");
+        // The seed landed in the PINNED inode, not the swapped path.
+        assert!(
+            real.join("c8ctl").join("session.json").is_file(),
+            "seed must be written relative to the retained run-dir handle"
+        );
+        assert!(
+            !swapped.join("c8ctl").exists(),
+            "seed must NOT be written to the swapped run-dir path"
+        );
+        assert_eq!(dir, swapped.join("c8ctl"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
     /// EXCLUSIVELY (`O_CREAT | O_EXCL`), so a same-UID sibling who plants a
     /// hard link (or any regular file) at the seed path — a case `reject_symlink`
     /// does NOT catch — cannot have the operator's real file silently
@@ -3044,10 +3140,8 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_some() {
             // Child: running alone in its own process, so a restrictive umask is
             // safe here. Seed under 0o777 and exit 0 only if both files are 0600.
-            let dir = std::env::temp_dir().join(format!(
-                "nano-slot-test-umask-child-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("nano-slot-test-umask-child-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let profile = crate::profile::Profile {
@@ -3093,7 +3187,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let rf = run.join("result.json");
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&cfg(), "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&cfg(), "1", &job, &rf, &run, None).unwrap();
         let dir = env
             .iter()
             .find(|(k, _)| k == "C8CTL_DATA_DIR")
@@ -3133,7 +3227,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let rf = run.join("result.json");
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         let dir = env
             .iter()
             .find(|(k, _)| k == "C8CTL_DATA_DIR")
@@ -3177,7 +3271,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let rf = run.join("result.json");
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         let dir = env
             .iter()
             .find(|(k, _)| k == "C8CTL_DATA_DIR")
@@ -3220,7 +3314,7 @@ mod tests {
         std::fs::create_dir_all(&run).unwrap();
         let rf = run.join("result.json");
         let job = ActivatedJobResult::default();
-        let env = build_agent_env(&c, "1", &job, &rf, &run).unwrap();
+        let env = build_agent_env(&c, "1", &job, &rf, &run, None).unwrap();
         let dir = env
             .iter()
             .find(|(k, _)| k == "C8CTL_DATA_DIR")

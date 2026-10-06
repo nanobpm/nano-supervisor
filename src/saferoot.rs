@@ -757,6 +757,18 @@ impl DirHandle {
         self.fd
     }
 
+    /// Wrap an already-pinned, no-follow directory fd as a `DirHandle`, without
+    /// re-resolving any path. The inverse of [`into_fd`]: lets a consumer that
+    /// retained the exact validated run-dir inode (as a [`crate::safecwd::CwdHandle`])
+    /// seed children *relative to that capability* instead of reopening the run
+    /// dir by name — which a same-UID actor could swap for an ordinary tree in
+    /// between (#35/#46). The caller owns the fd's no-follow provenance; this
+    /// only rebinds it to the handle-relative mkdir/openat helpers.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_fd(fd: OwnedFd) -> DirHandle {
+        DirHandle { fd }
+    }
+
     /// Ensure a direct child directory `name` exists under this pinned handle,
     /// creating it (mode `mode`, umask-subject) when missing, and return it
     /// pinned no-follow. Every step is relative to this handle's fd, so the
