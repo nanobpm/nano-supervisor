@@ -2482,11 +2482,11 @@ async fn mark_unborn_no_ref(
 ///
 /// The walk is fd-relative and no-follow through the pinned checkout handle:
 /// `.git` and `logs` are opened as directories with `O_NOFOLLOW`, and the leaf
-/// `HEAD` is matched by name from `logs`'s own `getdents` — so a symlinked
-/// component or a swapped ancestor yields an open/read error (→ `false`),
-/// never a redirect outside the validated tree.
+/// `HEAD` is probed by `fstatat(AT_SYMLINK_NOFOLLOW)` anchored on `logs`'s own
+/// pinned descriptor — never by recovering `logs`'s pathname and re-resolving
+/// it — so a symlinked component or a swapped ancestor yields an open/stat
+/// error (→ `false`), never a redirect outside the validated tree.
 fn head_reflog_is_absent(workspace: &CwdHandle) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     // `.git` must exist in a provisioned checkout; a missing/unopenable `.git`
     // is anomalous, so fail closed (false — "may hold work").
     let git = match workspace.open_child(std::ffi::OsStr::new(".git")) {
@@ -2501,20 +2501,18 @@ fn head_reflog_is_absent(workspace: &CwdHandle) -> bool {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
         Err(_) => return false,
     };
-    let logs_path = match logs.path() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let entries = match std::fs::read_dir(&logs_path) {
-        Ok(rd) => rd,
-        Err(_) => return false,
-    };
-    for e in entries.flatten() {
-        if e.file_name().as_bytes() == b"HEAD" {
-            return false; // a reflog exists — a commit was written
-        }
+    // Probe `HEAD` FD-RELATIVE through the pinned `logs` descriptor
+    // (`fstatat`), NOT by recovering `logs`'s pathname and re-resolving it:
+    // `logs.path()` + `std::fs::read_dir` would re-walk the path from the root,
+    // so a same-UID actor could swap `logs` for an empty directory between the
+    // two resolutions and make a repo that DOES hold a reflog look absent —
+    // letting `mark_unborn_no_ref` reap an orphaned commit's only copy. Anchored
+    // on the pinned fd, the swap cannot redirect the probe.
+    match logs.child_exists_nofollow(std::ffi::OsStr::new("HEAD")) {
+        Ok(true) => false, // a reflog exists — a commit was written
+        Ok(false) => true, // no HEAD reflog — the genuine no-op
+        Err(_) => false,   // unreadable — conservative "may hold work"
     }
-    true
 }
 
 /// Run git and return its RAW exit code (`Some(0)`/`Some(1)`/…), or `None` on
@@ -3267,9 +3265,11 @@ const GIT_STDERR_TAIL: usize = 8 * 1024;
 /// Read `reader` to EOF, retaining only its last `cap` bytes. Always consumes the
 /// whole stream (so the writer never blocks on a full pipe) while bounding memory
 /// to `cap` regardless of how much a job-controlled process emits. The returned
-/// `bool` is `true` when the stream exceeded `cap` and leading bytes were
-/// DROPPED — a security scrub that must see the COMPLETE listing uses it to fail
-/// closed rather than act on a silently truncated tail.
+/// `bool` is `true` when the stream could NOT be proven complete — either it
+/// exceeded `cap` and leading bytes were DROPPED, **or** a read error cut it
+/// short (a partial buffer we must not trust as the whole stream). A security
+/// scrub that must see the COMPLETE listing uses it to fail closed rather than
+/// act on a silently truncated — or silently short-read — tail.
 async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -3280,7 +3280,18 @@ where
     let mut truncated = false;
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // A read error is NOT a clean EOF: the stream is cut short with an
+            // unknown amount of data still unread, so the buffer is partial. If
+            // we returned it as complete (`truncated == false`), a completeness-
+            // sensitive caller (`git_untruncated`) would trust an incomplete ref
+            // listing as the whole set and could reap a commit that survives on a
+            // ref the short read never saw. Mark it truncated so those callers
+            // fail closed, exactly as they do on cap overflow.
+            Err(_) => {
+                truncated = true;
+                break;
+            }
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > cap {
@@ -5271,6 +5282,51 @@ mod tests {
         let (out, trunc) = drain_capped(&b"abcdefghijk"[..], 10).await;
         assert_eq!(out, b"bcdefghijk", "only the last `cap` bytes are retained");
         assert!(trunc, "a stream over the cap reports truncation");
+    }
+
+    #[tokio::test]
+    async fn drain_capped_reports_truncation_on_read_error() {
+        // A read error mid-stream is NOT a clean EOF: the buffer is partial with
+        // an unknown amount unread, so it must report `truncated` just like cap
+        // overflow — otherwise a completeness-sensitive caller would trust an
+        // incomplete ref listing as the whole set and could reap a live commit.
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct ErrAfter {
+            remaining: usize,
+        }
+        impl AsyncRead for ErrAfter {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.remaining > 0 {
+                    let n = self.remaining.min(buf.remaining()).min(4);
+                    let zeros = vec![b'x'; n];
+                    buf.put_slice(&zeros);
+                    self.remaining -= n;
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "simulated mid-stream read failure",
+                    )))
+                }
+            }
+        }
+
+        let (out, trunc) = drain_capped(ErrAfter { remaining: 8 }, 1024).await;
+        assert!(
+            out.len() <= 8,
+            "only the bytes read before the error are retained"
+        );
+        assert!(
+            trunc,
+            "a read error must report truncation so callers fail closed"
+        );
     }
 
     #[tokio::test]

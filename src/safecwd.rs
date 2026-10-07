@@ -346,6 +346,54 @@ impl CwdHandle {
         })
     }
 
+    /// Probe whether a single-component child `name` EXISTS directly beneath
+    /// this pinned directory, resolved FD-RELATIVE and no-follow: `fstatat` is
+    /// anchored on this handle's descriptor, so a same-UID actor swapping the
+    /// directory's *path* for another inode between operations cannot redirect
+    /// the check — the classic TOCTOU that recovering a pathname and re-opening
+    /// it (`self.path()` + `std::fs`) would reintroduce. `Ok(true)` = present,
+    /// `Ok(false)` = definitively absent (`ENOENT`); any other error is returned
+    /// so the caller can fail closed. A symlink at `name` counts as PRESENT
+    /// (`AT_SYMLINK_NOFOLLOW` stats the link itself, never following it).
+    /// `name` must be a single path component.
+    #[cfg(unix)]
+    pub(crate) fn child_exists_nofollow(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.contains(&b'/')
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child_exists_nofollow expects a single path component",
+            ));
+        }
+        let c = CString::new(name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    }
+
     /// Create a NEW regular file `name` directly beneath this pinned directory
     /// and write `contents` to it — fd-relative, with exclusive-create +
     /// no-follow semantics. Used for small supervisor-owned marker files (e.g.
@@ -486,6 +534,18 @@ impl CwdHandle {
             ));
         }
         Ok(CwdHandle { path })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn child_exists_nofollow(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
+        // Non-Unix fallback: no fd-relative probe, so stat by path (no-follow).
+        // Best-effort — not a supported daemon host.
+        let path = self.path.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The absolute path of the pinned directory *right now*, recovered through
@@ -1143,6 +1203,50 @@ mod tests {
             std::fs::read(dir.join("marker")).unwrap(),
             b"retained",
             "the marker contents must round-trip through the pinned dir"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn child_exists_nofollow_probes_fd_relative() {
+        let dir = scratch("child-exists");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        // Absent -> Ok(false), the definitive "not there" answer.
+        assert!(
+            !handle
+                .child_exists_nofollow(std::ffi::OsStr::new("HEAD"))
+                .expect("probe absent child"),
+            "a missing child is definitively absent"
+        );
+        // A regular file -> Ok(true).
+        std::fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new("HEAD"))
+                .expect("probe present child"),
+            "a present child is detected"
+        );
+        // A symlink counts as PRESENT (AT_SYMLINK_NOFOLLOW stats the link, never
+        // following it) — so a dangling symlink does not read as "absent".
+        std::os::unix::fs::symlink("/nonexistent/target", dir.join("link")).unwrap();
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new("link"))
+                .expect("probe symlink child"),
+            "a (dangling) symlink is present, never followed"
+        );
+        // A multi-component / traversal name is rejected rather than resolved.
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new("a/b"))
+                .is_err(),
+            "a non-single-component name is rejected"
+        );
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new(".."))
+                .is_err(),
+            "a parent traversal is rejected"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
