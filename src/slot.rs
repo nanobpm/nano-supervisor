@@ -4301,7 +4301,15 @@ mod tests {
         // A run with no git context (unprovisioned / failed) carries NO git
         // fields at all — identical to the host-without-git shape.
         let bare = build_result_envelope(&run, "none", None, None);
-        for k in ["repository", "branch", "baseSha", "headSha", "commits", "pushed", "pr"] {
+        for k in [
+            "repository",
+            "branch",
+            "baseSha",
+            "headSha",
+            "commits",
+            "pushed",
+            "pr",
+        ] {
             assert!(
                 bare.get(k).is_none(),
                 "unexpected git field {k} on a git-less envelope"
