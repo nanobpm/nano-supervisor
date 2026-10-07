@@ -846,6 +846,23 @@ pub struct GitResult {
     /// contract). Reaping is unaffected: `retain` still keeps the dir, and the
     /// stale-run sweep ages it out.
     pub unborn_no_ref: bool,
+    /// Set when a safety-net enumeration could NOT be proven complete — a ref
+    /// listing overflowed the capture cap, a per-ref probe failed, or the
+    /// candidate/reflog set exceeded its scan cap — so finalize examined only a
+    /// TRUNCATED view in which an agent commit could still be hiding beyond
+    /// what it saw. Distinct from the fail-closed `retain` an unborn base
+    /// ALWAYS carries (its HEAD has no anchor, so `rev-parse HEAD`/the HEAD
+    /// reflog net fail closed even on a genuine no-op): those expected
+    /// anchor-absent failures are NOT inconclusive scans and must NOT set this
+    /// flag, or a legitimate no-op would never be recognised. `unborn_no_ref`
+    /// requires this flag CLEAR: proving "no commit anywhere" demands that
+    /// every net that could surface a parked/stranded commit actually ran to
+    /// completion — a capped non-head-ref or reflog sweep (e.g. an agent that
+    /// `commit-tree`s work, parks it under a non-HEAD ref, and pads the ref set
+    /// past the cap) leaves `retain=true, work_found=false, commits=[]` yet is
+    /// NOT a proven-empty repo, so it must not be marked unborn and failed as
+    /// an empty run.
+    pub scan_incomplete: bool,
 }
 
 /// Longest segment `sanitize_branch_segment` leaves in a composed fallback ref.
@@ -1327,6 +1344,7 @@ async fn finalize_git_with_deadline(
         retain: false,
         work_found: false,
         unborn_no_ref: false,
+        scan_incomplete: false,
     };
 
     // The timeout for the NEXT git subprocess: the smaller of the per-command
@@ -1879,6 +1897,10 @@ async fn finalize_git_with_deadline(
                          the run dir rather than sweeping an agent-controlled reflog"
                     ));
                     out.retain = true;
+                    // Truncated view: a detached commit could hide past the cap,
+                    // so this scan is NOT proof of "no work" — block any unborn
+                    // verdict (see `GitResult::scan_incomplete`).
+                    out.scan_incomplete = true;
                 } else if let Some(start) = &prep.start_sha {
                     if !seen.contains(start.as_str()) {
                         log(&format!(
@@ -1887,6 +1909,7 @@ async fn finalize_git_with_deadline(
                              incomplete and retaining the run dir"
                         ));
                         out.retain = true;
+                        out.scan_incomplete = true;
                     }
                 }
                 if !out.retain {
@@ -2029,6 +2052,10 @@ async fn finalize_git_with_deadline(
                      cap — {e}; treating the scan as incomplete and retaining the run dir"
                 ));
                 out.retain = true;
+                // A parked commit could hide in the refs this truncated/failed
+                // listing did not surface — not proof of "no work" (see
+                // `GitResult::scan_incomplete`).
+                out.scan_incomplete = true;
             }
         }
         // A stash stacks MULTIPLE entries in `refs/stash`'s reflog; the
@@ -2079,6 +2106,7 @@ async fn finalize_git_with_deadline(
                              cap — {e}; treating the scan as incomplete and retaining the run dir"
                         ));
                         out.retain = true;
+                        out.scan_incomplete = true;
                     }
                 }
             }
@@ -2091,6 +2119,24 @@ async fn finalize_git_with_deadline(
                 candidates.len()
             ));
             out.retain = true;
+            // The exact attack the unborn verdict must survive: an agent parks a
+            // `commit-tree` commit under a non-HEAD ref and pads the ref set past
+            // the cap. The sweep is truncated, so this is NOT proof of "no work".
+            out.scan_incomplete = true;
+        }
+        // The classification loop below is gated on `!out.retain` (once the dir
+        // is being retained there is no need to keep classifying FOR RETENTION).
+        // But on an unborn base an earlier fail-closed net ALWAYS sets `retain`
+        // (the HEAD-reflog net cannot enumerate an unborn HEAD's log), so that
+        // short-circuit leaves these non-head candidates UNEXAMINED — and a
+        // candidate here is a commit parked outside `refs/heads` (a tag, the
+        // stash, a remote-tracking or arbitrary ref) that the agent may have
+        // created. Unexamined parked candidates mean the "no commit anywhere"
+        // scan is NOT conclusive, so block the unborn verdict (a genuine no-op
+        // unborn base has ZERO non-head refs, so `candidates` is empty there and
+        // this does not fire). See `GitResult::scan_incomplete`.
+        if out.retain && !candidates.is_empty() {
+            out.scan_incomplete = true;
         }
         if !out.retain {
             for h in &candidates {
@@ -2340,6 +2386,17 @@ async fn mark_unborn_no_ref(
     timeout: Duration,
 ) {
     if !(prep.start_sha.is_none() && !out.work_found && out.commits.is_empty()) {
+        return;
+    }
+    // A TRUNCATED/capped/failed safety-net enumeration (see
+    // `GitResult::scan_incomplete`) means finalize examined only a partial view
+    // of the repo's refs/reflog, in which an agent commit could still be hiding
+    // beyond what it saw. `commits`/`work_found` being empty then proves
+    // nothing — the scan never reached the parked commit. Marking the run as
+    // proven-unborn here would let the caller fail it as empty and wipe the run
+    // dir holding that commit's only copy, so require every net to have run to
+    // completion before claiming "no commit anywhere".
+    if out.scan_incomplete {
         return;
     }
     // `git rev-parse --verify --quiet HEAD` exits 0 with the SHA when HEAD
@@ -5793,6 +5850,152 @@ mod tests {
         assert!(
             !res.pushed,
             "nothing publishable: the only branch was deleted"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_mark_unborn_no_ref_when_nonhead_ref_listing_overflows() {
+        // Regression for the inconclusive-scan bypass (scan_incomplete): an agent
+        // on an UNBORN base can `commit-tree` work, park it under a NON-head ref
+        // (never moving HEAD, so no HEAD reflog), and pad the ref set until the
+        // non-head `for-each-ref refs/` listing overflows the capture cap. That
+        // leaves `retain=true, work_found=false, commits=[]` with an unborn HEAD
+        // and ABSENT HEAD reflog — the exact shape the unborn verdict keyed on —
+        // yet the parked commit's only copy is in the run dir. Finalize must NOT
+        // mark `unborn_no_ref` (which would let the caller fail the run as empty
+        // and wipe it); the truncated scan is not proof of "no work".
+        let dir = empty_base_workspace("unborn-nonhead-overflow").await;
+        let t = Duration::from_secs(30);
+        // The empty tree is always valid, so `commit-tree` yields a parked commit
+        // on the unborn base without touching HEAD or any branch.
+        let sha = git(
+            &[
+                "-c".into(),
+                "user.email=t@t".into(),
+                "-c".into(),
+                "user.name=t".into(),
+                "commit-tree".into(),
+                "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                "-m".into(),
+                "parked work".into(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        // Park it under enough long-named NON-head refs to drive the
+        // `for-each-ref refs/` listing past the 1 MiB capture cap. Writing
+        // packed-refs directly keeps the fixture fast.
+        let packed = dir_path(&dir).join(".git").join("packed-refs");
+        let pad = "a".repeat(220);
+        let mut blob = String::new();
+        if !packed.exists() {
+            blob.push_str("# pack-refs with: peeled fully-peeled\n");
+        }
+        for i in 0..6000 {
+            blob.push_str(&format!("{sha} refs/tags/zpad/{pad}/{i:05}\n"));
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&packed)
+                .unwrap();
+            f.write_all(blob.as_bytes()).unwrap();
+        }
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        assert!(
+            !res.unborn_no_ref,
+            "an overflowing non-head-ref scan is inconclusive, so the run must NOT be marked \
+             unborn_no_ref (retain={}, work_found={}, commits={:?})",
+            res.retain, res.work_found, res.commits
+        );
+        assert!(
+            res.retain,
+            "the overflowing non-head-ref scan fails closed (retain keeps the run dir)"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_mark_unborn_no_ref_when_nonhead_candidates_exceed_cap() {
+        // Companion variant: the non-head-ref candidate set can exceed
+        // `MAX_REFLOG_SCAN` even when the listing itself does NOT overflow the
+        // capture cap — the agent parks MANY distinct commits under short-named
+        // non-head refs. The capped sweep is still truncated, so a parked commit
+        // beyond the cap could be missed; finalize must NOT mark `unborn_no_ref`.
+        let dir = empty_base_workspace("unborn-nonhead-cap").await;
+        let t = Duration::from_secs(30);
+        // `MAX_REFLOG_SCAN + 1` DISTINCT parked commits (distinct messages →
+        // distinct SHAs over the same empty tree), each under its own short
+        // non-head ref so the listing stays well under the capture cap and the
+        // sweep reaches the candidate-count cap.
+        let mut blob = String::new();
+        let packed = dir_path(&dir).join(".git").join("packed-refs");
+        if !packed.exists() {
+            blob.push_str("# pack-refs with: peeled fully-peeled\n");
+        }
+        for i in 0..(MAX_REFLOG_SCAN + 1) {
+            let sha = git(
+                &[
+                    "-c".into(),
+                    "user.email=t@t".into(),
+                    "-c".into(),
+                    "user.name=t".into(),
+                    "commit-tree".into(),
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                    "-m".into(),
+                    format!("parked {i}"),
+                ],
+                Some(&dir),
+                t,
+                None,
+            )
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+            blob.push_str(&format!("{sha} refs/custom/{i:05}\n"));
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&packed)
+                .unwrap();
+            f.write_all(blob.as_bytes()).unwrap();
+        }
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        assert!(
+            !res.unborn_no_ref,
+            "an over-cap non-head-ref candidate set is inconclusive, so the run must NOT be \
+             marked unborn_no_ref (retain={}, work_found={}, commits={:?})",
+            res.retain, res.work_found, res.commits
+        );
+        assert!(
+            res.retain,
+            "the over-cap non-head-ref scan fails closed (retain keeps the run dir)"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }

@@ -4217,6 +4217,7 @@ mod tests {
             retain: false,
             work_found: true,
             unborn_no_ref: false,
+            scan_incomplete: false,
         };
         let env = build_result_envelope(
             &run,

@@ -346,18 +346,26 @@ impl CwdHandle {
         })
     }
 
-    /// Create (or truncate) a regular file `name` directly beneath this pinned
-    /// directory and write `contents` to it — fd-relative, with create +
+    /// Create a NEW regular file `name` directly beneath this pinned directory
+    /// and write `contents` to it — fd-relative, with exclusive-create +
     /// no-follow semantics. Used for small supervisor-owned marker files (e.g.
     /// the retention marker) that must land in the *pinned* run dir, not in
     /// whatever a same-UID actor may have swapped the path for afterwards.
     ///
     /// `openat` is anchored on this handle's fd, so a rename/replace of the
     /// directory (or an ancestor) after preparation cannot redirect the write
-    /// outside the pinned inode. `O_NOFOLLOW` refuses a symlink planted at
-    /// `name` (failing with `ELOOP`) instead of truncating the link's target,
-    /// and `O_CREAT|O_WRONLY|O_TRUNC` create-or-replace a regular file. `name`
-    /// must be a single path component (no `/`, not `.`/`..`).
+    /// outside the pinned inode. The open is EXCLUSIVE (`O_CREAT | O_EXCL`), so
+    /// it never truncates or opens an EXISTING inode: a plain `O_TRUNC` would
+    /// truncate the open target DURING `openat` — before any metadata check —
+    /// and `O_NOFOLLOW` only refuses a *symlink*, not a HARD link, so a same-UID
+    /// actor could plant `name` as a hard link to another same-filesystem file
+    /// and have this write erase that file's contents (the same threat the
+    /// c8ctl seed writer guards with `create_new` at `src/slot.rs`). `O_EXCL`
+    /// fails closed with `EEXIST` on ANY pre-existing entry (symlink, hard link,
+    /// FIFO/device, or a stale regular file) so the target is always a freshly
+    /// created, empty regular file — the caller treats that `EEXIST`/any write
+    /// failure as a marker-write failure and quarantines. `name` must be a
+    /// single path component (no `/`, not `.`/`..`).
     #[cfg(unix)]
     pub(crate) fn write_child_file(
         &self,
@@ -381,22 +389,24 @@ impl CwdHandle {
         }
         let c = CString::new(name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
-        // `O_NOFOLLOW` refuses a symlink planted at `name`, but a same-UID agent
-        // can instead pre-create `name` as a FIFO (or device): opening such a
-        // special file for write BLOCKS until a reader appears, hanging
-        // `execute` synchronously before settlement instead of taking the
-        // quarantine-on-write-error path. Open `O_NONBLOCK` so a FIFO open fails
-        // with `ENXIO` rather than blocking, then `fstat` the opened fd and
-        // reject anything that is not a regular file — the marker is always a
-        // regular file, so a FIFO/device/unix-socket at `name` is an attack (or
-        // corruption) and must fail closed, never be truncated or written.
+        // `O_NOFOLLOW` refuses a symlink planted at `name`, and the EXCLUSIVE
+        // `O_CREAT | O_EXCL` below refuses EVERY pre-existing entry (`EEXIST`) —
+        // a hard link whose target `O_TRUNC` would erase, a FIFO/device whose
+        // open would block, or a stale regular file — so the open always yields
+        // a freshly created, empty regular file and never truncates or blocks on
+        // an attacker-planted inode. `O_NONBLOCK` is retained as belt-and-braces
+        // (it makes any special-file open return `ENXIO` rather than block even
+        // if the exclusive-create invariant is ever weakened); the `fstat`
+        // regular-file check below is likewise a redundant backstop. A same-UID
+        // actor racing a hard/soft link into place loses to `O_EXCL`'s atomic
+        // create-or-fail.
         let fd = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
                 c.as_ptr(),
                 libc::O_WRONLY
                     | libc::O_CREAT
-                    | libc::O_TRUNC
+                    | libc::O_EXCL
                     | libc::O_CLOEXEC
                     | libc::O_NOFOLLOW
                     | libc::O_NONBLOCK,
@@ -1072,11 +1082,48 @@ mod tests {
         let err = handle
             .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
             .expect_err("writing the marker over a FIFO must fail, not block");
-        // Either the O_NONBLOCK open failed (ENXIO) or the fstat rejected the
-        // non-regular file — both fail closed without blocking.
+        // The exclusive `O_CREAT | O_EXCL` open refuses the pre-existing FIFO
+        // with `EEXIST` before `O_NONBLOCK`/`fstat` ever matter; the older
+        // truncating open instead reached them (`ENXIO` or a non-regular-file
+        // refusal). Accept any of the three — all fail closed without blocking.
         assert!(
-            err.raw_os_error() == Some(libc::ENXIO) || err.kind() == io::ErrorKind::InvalidInput,
-            "expected ENXIO or a non-regular-file refusal, got {err:?}"
+            err.raw_os_error() == Some(libc::EEXIST)
+                || err.raw_os_error() == Some(libc::ENXIO)
+                || err.kind() == io::ErrorKind::InvalidInput,
+            "expected EEXIST, ENXIO, or a non-regular-file refusal, got {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A same-UID actor can plant the marker path as a HARD link to another
+    /// same-filesystem file. `O_NOFOLLOW` does NOT catch a hard link, and a
+    /// truncating open would erase the linked target's contents DURING the
+    /// `openat` — before any metadata check. The exclusive `O_CREAT | O_EXCL`
+    /// open must instead fail closed (`EEXIST`) and leave the victim file's
+    /// contents fully intact.
+    #[cfg(unix)]
+    #[test]
+    fn write_child_file_refuses_a_hard_link_and_preserves_the_target() {
+        let dir = scratch("marker-hardlink");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        // The victim lives in the SAME directory (same filesystem) so a hard
+        // link to it is possible.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").expect("seed victim");
+        let marker = dir.join("marker");
+        std::fs::hard_link(&victim, &marker).expect("plant hard link");
+        let err = handle
+            .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
+            .expect_err("writing the marker over a hard link must fail closed");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EEXIST),
+            "the exclusive create must refuse the pre-existing hard link, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the hard-link target's contents must be untouched (never truncated)"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
