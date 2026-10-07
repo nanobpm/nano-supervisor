@@ -998,6 +998,60 @@ pub(crate) async fn reap_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf, k
     }
 }
 
+/// Write the retention marker into a RETAINED run dir, dispatched to the
+/// blocking pool. The marker write performs a file `fsync` *and* a directory
+/// `fsync` (durability: a redelivery must observe the marker, see
+/// [`crate::safecwd::CwdHandle::write_child_file`]), and the fail-closed
+/// fallback renames the retained dir aside. Both are synchronous filesystem
+/// operations; run inline on a Tokio worker thread immediately before job
+/// settlement they can block the executor on a slow/unhealthy filesystem long
+/// enough to starve the lease refresher and lose this job's lease — the same
+/// failure mode [`reap_run_dir_blocking`] avoids. Dispatch them off the worker
+/// thread instead.
+///
+/// FAIL CLOSED is preserved end to end: a marker-write failure still
+/// quarantines the retained dir (on the blocking pool), and if the blocking
+/// task itself panics — leaving neither the marker nor its in-task quarantine
+/// guaranteed — the dir is quarantined from here as a last resort, so a
+/// settlement-failure redelivery can never wipe the only copy of the unpushed
+/// work.
+async fn write_retention_marker_blocking(
+    cwd: crate::safecwd::CwdHandle,
+    runs_dir: PathBuf,
+    run_dir: PathBuf,
+    key: &str,
+) {
+    let k = key.to_string();
+    let task_runs_dir = runs_dir.clone();
+    let task_run_dir = run_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        if let Err(e) = cwd.write_child_file(std::ffi::OsStr::new(RETENTION_MARKER), b"retained\n")
+        {
+            log(&format!(
+                "job {k}: could not durably write the retention marker into the pinned run dir \
+                 ({e}); quarantining the retained checkout now so a settlement-failure \
+                 redelivery cannot wipe the only copy of the unpushed work"
+            ));
+            quarantine_unmarked_retained_run(&task_runs_dir, &task_run_dir, &k);
+        }
+    })
+    .await;
+    if let Err(join) = outcome {
+        // The blocking task panicked: neither the marker write nor its in-task
+        // fallback quarantine is guaranteed to have run, so fail closed by
+        // quarantining the retained dir from here. This backstop rename is
+        // cheap (no `fsync`) and only reached on a panic, so running it inline
+        // does not meaningfully risk starving the lease refresher.
+        log(&format!(
+            "job {key}: retention-marker blocking task panicked for {} ({join}); quarantining the \
+             retained checkout as a fail-closed backstop so a redelivery cannot wipe the only \
+             copy of the unpushed work",
+            run_dir.display()
+        ));
+        quarantine_unmarked_retained_run(&runs_dir, &run_dir, key);
+    }
+}
+
 /// Fail-closed backstop for the retention marker: when the marker cannot be
 /// durably written into a run dir we have decided to RETAIN (disk-full,
 /// permission, I/O error), set the retained dir aside immediately — rename
@@ -2472,17 +2526,21 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // durably created, atomically set the retained dir aside
             // (quarantine) right now — the same rename-aside a redelivery's
             // prepare would do — so the work survives even without its marker.
-            if let Err(e) = prepared
-                .cwd
-                .write_child_file(std::ffi::OsStr::new(RETENTION_MARKER), b"retained\n")
-            {
-                log(&format!(
-                    "job {key}: could not durably write the retention marker into the pinned run \
-                     dir ({e}); quarantining the retained checkout now so a settlement-failure \
-                     redelivery cannot wipe the only copy of the unpushed work"
-                ));
-                quarantine_unmarked_retained_run(&cfg.runs_dir, &run_dir, &key);
-            }
+            //
+            // The marker write (file + directory `fsync`) and that fallback
+            // quarantine are dispatched to the blocking pool, NOT run inline on
+            // this Tokio worker thread: like the reap above, a slow/unhealthy
+            // filesystem could otherwise block the executor here — right before
+            // settlement — long enough to starve the lease refresher and lose
+            // this job's lease. Fail-closed behaviour is retained (see
+            // `write_retention_marker_blocking`).
+            write_retention_marker_blocking(
+                prepared.cwd,
+                cfg.runs_dir.clone(),
+                run_dir.clone(),
+                &key,
+            )
+            .await;
             log(&format!(
                 "job {key}: retaining run dir {} — provisioned checkout holds commits that were \
                  not pushed (or finalize flagged stranded/incomplete work), so they are not \
@@ -5206,6 +5264,80 @@ mod tests {
         assert!(
             survivor.join(RETENTION_MARKER).exists(),
             "the retained checkout must be left intact when its marker cannot be read"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_retention_marker_blocking_writes_the_marker() {
+        // The happy path: the marker write (file + directory fsync) is
+        // dispatched to the blocking pool, but still lands durably in the pinned
+        // run dir so a settlement-failure redelivery sees it and defers the wipe.
+        let runs = unique_tmp("marker-blocking-ok");
+        let run = runs.join("77");
+        let cwd = prepare_run_dir(&runs, &run).unwrap();
+
+        write_retention_marker_blocking(cwd, runs.clone(), run.clone(), "77").await;
+
+        assert!(
+            run.join(RETENTION_MARKER).exists(),
+            "the retention marker must be written into the run dir off the worker thread"
+        );
+        // The dir keeps its original name (no fallback quarantine on success).
+        assert!(
+            run.exists(),
+            "a successful marker write must leave the run dir in place"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_retention_marker_blocking_fails_closed_by_quarantining() {
+        // Fail-closed invariant preserved after moving off the worker thread:
+        // if the marker write fails, the retained dir is still set aside
+        // (renamed to a quarantine sibling) so a settlement-failure redelivery
+        // cannot wipe the only copy of the unpushed work. Make the run dir
+        // read-only (0o444): the pinned `openat(O_CREAT)` for the marker fails
+        // EACCES (no write/search bit), driving the fallback quarantine.
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses the directory permission check");
+            return;
+        }
+        let runs = unique_tmp("marker-blocking-failclosed");
+        let run = runs.join("78");
+        let cwd = prepare_run_dir(&runs, &run).unwrap();
+        std::fs::write(run.join("only-copy.txt"), b"unpushed work").unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        write_retention_marker_blocking(cwd, runs.clone(), run.clone(), "78").await;
+
+        // The original `78` path must be gone (renamed aside) so a redelivery's
+        // prepare finds no `78` to wipe, and the checkout must survive under its
+        // quarantine sibling with its unpushed work intact.
+        let quarantined: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("78.retained-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "a failed marker write must quarantine the retained dir (fail closed), not drop it"
+        );
+        assert!(
+            !run.exists(),
+            "the retained dir must be renamed off the wipable job path when the marker cannot be written"
+        );
+        let survivor = quarantined[0].path();
+        std::fs::set_permissions(&survivor, std::fs::Permissions::from_mode(0o700)).ok();
+        assert!(
+            survivor.join("only-copy.txt").exists(),
+            "the only copy of the unpushed work must survive inside the quarantined dir"
         );
 
         std::fs::remove_dir_all(&runs).ok();
