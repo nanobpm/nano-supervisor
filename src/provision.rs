@@ -1656,6 +1656,10 @@ async fn finalize_git_with_deadline(
                         refs.len()
                     ));
                     out.retain = true;
+                    // Unbounded == inconclusive: also flag `scan_incomplete` for
+                    // the uniform invariant (see the `Err` arm below), independent
+                    // of this early `return`.
+                    out.scan_incomplete = true;
                     return out;
                 }
                 for r in refs {
@@ -1696,6 +1700,11 @@ async fn finalize_git_with_deadline(
                                  treating the scan as incomplete and retaining the run dir"
                             ));
                             out.retain = true;
+                            // Uniform invariant: an INCONCLUSIVE side-branch scan always
+                            // also flags `scan_incomplete`, so no reordering or later
+                            // removal of this early `return` can leave a fall-through to
+                            // the unborn verdict unguarded (see the `Err` arm below).
+                            out.scan_incomplete = true;
                             // STOP on the first INCONCLUSIVE branch: `retain` is
                             // now set, so no push can happen regardless of the
                             // remaining branches, and continuing would relaunch a
@@ -1731,6 +1740,10 @@ async fn finalize_git_with_deadline(
                                  failed); cannot prove side branches pre-existed, so treating the \
                                  scan as incomplete and retaining the run dir");
                             out.retain = true;
+                            // Uniform invariant: an inconclusive side-branch scan
+                            // also flags `scan_incomplete` (see the `Err` arm
+                            // below), independent of this early `return`.
+                            out.scan_incomplete = true;
                             // The snapshot is a WHOLE-SCAN condition (absent for
                             // every branch), so no later branch can clear it —
                             // stop now rather than re-log and re-probe the entire
@@ -1769,8 +1782,11 @@ async fn finalize_git_with_deadline(
                                      the run dir"
                                 ));
                                 out.retain = true;
-                                // Inconclusive: stop the scan (see above) rather
-                                // than keep probing the rest of the list.
+                                // Inconclusive: also flag `scan_incomplete` for
+                                // the uniform invariant (see the `Err` arm below),
+                                // then stop the scan (see above) rather than keep
+                                // probing the rest of the list.
+                                out.scan_incomplete = true;
                                 return out;
                             }
                         },
@@ -1781,9 +1797,12 @@ async fn finalize_git_with_deadline(
                                  run dir"
                             ));
                             out.retain = true;
-                            // Inconclusive (a failed/stalled `rev-list`): stop the
-                            // scan rather than let a stalling graph multiply the
-                            // per-command timeout across every remaining branch.
+                            // Inconclusive (a failed/stalled `rev-list`): also
+                            // flag `scan_incomplete` for the uniform invariant
+                            // (see the `Err` arm below), then stop the scan rather
+                            // than let a stalling graph multiply the per-command
+                            // timeout across every remaining branch.
+                            out.scan_incomplete = true;
                             return out;
                         }
                     };
@@ -1817,6 +1836,17 @@ async fn finalize_git_with_deadline(
                      — {e}; treating the scan as incomplete and retaining the run dir"
                 ));
                 out.retain = true;
+                // This arm FALLS THROUGH to the end-of-function unborn verdict
+                // (it does not `return`, unlike the inner per-branch failures
+                // above). A commit the agent `commit-tree`d and parked only
+                // under `refs/heads/...` (HEAD never moved, so its reflog is
+                // absent) has exactly the shape `mark_unborn_no_ref` keys on;
+                // if this `refs/heads/` listing failed/overflowed, that commit
+                // was never examined, so the empty `commits`/`work_found` is NOT
+                // proof of "no work". Block the unborn verdict directly here —
+                // just as the non-head-ref and reflog failure paths do — rather
+                // than leaning on a downstream net to re-set the flag.
+                out.scan_incomplete = true;
             }
         }
     }
@@ -7189,8 +7219,99 @@ mod tests {
             "an over-cap side-branch set must fail closed and retain the run dir"
         );
         assert!(
+            res.scan_incomplete,
+            "an unbounded (over-cap) side-branch scan is inconclusive, so it must flag \
+             scan_incomplete — leaving it clear would let a later unborn verdict read the empty \
+             scan as proof of no work"
+        );
+        assert!(
             !res.pushed,
             "the push is refused when the side-branch scan is unbounded"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_mark_unborn_no_ref_when_side_branch_listing_overflows() {
+        // Regression for the inconclusive-scan bypass on the SIDE-BRANCH net
+        // (scan_incomplete): an agent on an UNBORN base can `commit-tree` work
+        // and park it ONLY under `refs/heads/...` without ever moving HEAD (so
+        // the HEAD reflog stays absent), then pad `refs/heads/` until the
+        // side-branch `for-each-ref refs/heads/` listing overflows the 1 MiB
+        // capture cap. That `Err` arm sets `retain` but — before the fix — left
+        // `scan_incomplete` clear and FELL THROUGH to the end-of-function unborn
+        // verdict, which (start_sha None, work_found false, commits empty, HEAD
+        // unborn, HEAD reflog absent) would mark the run proven-empty and let the
+        // retry wipe the parked commit's only copy. The side-branch failure path
+        // must flag the scan incomplete, exactly as the non-head-ref path does.
+        let dir = empty_base_workspace("unborn-sidebranch-overflow").await;
+        let t = Duration::from_secs(30);
+        // `commit-tree` the empty tree: a parked commit on the unborn base with
+        // no HEAD movement and no HEAD reflog.
+        let sha = git(
+            &[
+                "-c".into(),
+                "user.email=t@t".into(),
+                "-c".into(),
+                "user.name=t".into(),
+                "commit-tree".into(),
+                "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                "-m".into(),
+                "parked work".into(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        // Park it under one real head and pad `refs/heads/` past the 1 MiB
+        // capture cap (each `refname:short` line is ~230 bytes). Writing
+        // packed-refs directly keeps the fixture fast.
+        let packed = dir_path(&dir).join(".git").join("packed-refs");
+        let pad = "a".repeat(220);
+        let mut blob = String::new();
+        if !packed.exists() {
+            blob.push_str("# pack-refs with: peeled fully-peeled\n");
+        }
+        blob.push_str(&format!("{sha} refs/heads/feat/work\n"));
+        for i in 0..6000 {
+            blob.push_str(&format!("{sha} refs/heads/zpad/{pad}/{i:05}\n"));
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&packed)
+                .unwrap();
+            f.write_all(blob.as_bytes()).unwrap();
+        }
+        let prep = GitPrep {
+            working_branch: Some("feat/work".into()),
+            want_push: true,
+            start_sha: None,
+            provision_tips: Some(std::collections::BTreeMap::new()),
+            provision_shas: Some(std::collections::BTreeSet::new()),
+        };
+        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        assert!(
+            res.scan_incomplete,
+            "an overflowing side-branch listing is inconclusive, so it must flag scan_incomplete \
+             (retain={}, work_found={})",
+            res.retain, res.work_found
+        );
+        assert!(
+            !res.unborn_no_ref,
+            "an overflowing side-branch listing on an unborn base is NOT proof of no work, so the \
+             run must NOT be marked unborn_no_ref (retain={}, work_found={}, commits={:?})",
+            res.retain, res.work_found, res.commits
+        );
+        assert!(
+            res.retain,
+            "the overflowing side-branch scan fails closed (retain keeps the run dir)"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
