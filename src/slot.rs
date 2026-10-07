@@ -2253,9 +2253,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             .and_then(crate::acp::outcome_result_vars),
     ]);
     let _ = std::fs::remove_file(&result_file);
-    let envelope = build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref());
     let name = &cfg.hire.name;
-    let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
 
     // Git finalize: enumerate the agent's commits on the work branch and push
     // it to the fallback `nano/agent-work/...` branch (the agent opened no PR of
@@ -2330,6 +2328,24 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             )
         }
     };
+
+    // Build the audit envelope AFTER finalization so the canonical
+    // `io.nanobpm.agentResult` record carries the git outcome too — NOT only the
+    // flat `branch`/`commits`/`pushed`/`pullRequest` completion variables set
+    // below. Mirrors the Node plugin's single `buildResultEnvelope(result, {
+    // …, git })` call: a consumer reading the versioned envelope must see the
+    // same git result as one reading the top-level vars (thread parity). `git`
+    // is `None` for an unprovisioned run or a failed run (finalize was skipped),
+    // so the envelope then carries no git fields — exactly as before.
+    let git_envelope = git_result.as_ref().map(|g| GitEnvelope {
+        git: g,
+        remote: env.repository.as_ref().map(|r| redact_url(&r.url)),
+        base_sha: start_head.as_deref(),
+        head_sha: end_head.as_deref(),
+    });
+    let envelope =
+        build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref(), git_envelope);
+    let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
 
     let settle = if !run.ok {
         let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {
@@ -2629,12 +2645,30 @@ fn nudge_payload(payload: &Value, nudge: &str) -> Value {
     p
 }
 
+/// The git-finalize outcome threaded into [`build_result_envelope`] so the
+/// canonical `io.nanobpm.agentResult` record carries the same git result as the
+/// flat completion variables. Mirrors the `git` option of the Node plugin's
+/// `buildResultEnvelope`: `remote` is the credential-scrubbed clone URL,
+/// `base_sha`/`head_sha` are the pre-/post-run HEADs, and the rest come from the
+/// finalize [`GitResult`].
+struct GitEnvelope<'a> {
+    git: &'a crate::provision::GitResult,
+    remote: Option<String>,
+    base_sha: Option<&'a str>,
+    head_sha: Option<&'a str>,
+}
+
 /// The audit envelope stored under `io.nanobpm.agentResult` — the Node plugin's
-/// `buildResultEnvelope` for a host (`sandbox: none`) run without git.
+/// `buildResultEnvelope`. When `git` is `Some` (a provisioned run that reached
+/// finalization), its outcome is embedded here too, so the versioned envelope
+/// and the flat `branch`/`commits`/`pushed`/`pullRequest` completion variables
+/// agree; a `None` git (unprovisioned or failed run) leaves the envelope
+/// git-free, matching the host (`sandbox: none`) run without git.
 fn build_result_envelope(
     run: &RunResult,
     sandbox: &str,
     agent_result: Option<&Map<String, Value>>,
+    git: Option<GitEnvelope>,
 ) -> Value {
     let status = if run.ok {
         "completed"
@@ -2665,6 +2699,30 @@ fn build_result_envelope(
     // it in `result`, and never carrying the synthesized `question`.
     if let Some(outcome) = &run.acp_outcome {
         env["outcome"] = Value::Object(outcome.clone());
+    }
+    // Embed the git-finalize outcome so a consumer reading the versioned
+    // envelope sees the same result as one reading the flat completion
+    // variables. Mirrors the Node plugin's `if (git) { … }` block
+    // (`repository`/`branch`/`baseSha`/`headSha`/`commits`/`pushed`/`pr`). The
+    // Rust `GitResult` does not track the push-failure detail fields
+    // (`pushError`/`pushFailed`/`strandedCommits`/`scanError`/`branchMismatch`),
+    // so those are omitted here as they are from the flat vars; `pr` is emitted
+    // only when populated, exactly as Node's `if (git.pr)`.
+    if let Some(g) = git {
+        env["repository"] = g.remote.map(Value::String).unwrap_or(Value::Null);
+        env["branch"] = g
+            .git
+            .branch
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        env["baseSha"] = g.base_sha.map(|s| json!(s)).unwrap_or(Value::Null);
+        env["headSha"] = g.head_sha.map(|s| json!(s)).unwrap_or(Value::Null);
+        env["commits"] = json!(g.git.commits);
+        env["pushed"] = json!(g.git.pushed);
+        if let Some(pr) = &g.git.pr {
+            env["pr"] = pr.clone();
+        }
     }
     env
 }
@@ -4096,7 +4154,7 @@ mod tests {
         };
         let mut r = Map::new();
         r.insert("status".into(), json!("done"));
-        let env = build_result_envelope(&run, "none", Some(&r));
+        let env = build_result_envelope(&run, "none", Some(&r), None);
         assert_eq!(
             env,
             json!({
@@ -4111,9 +4169,62 @@ mod tests {
             ..RunResult::default()
         };
         assert_eq!(
-            build_result_envelope(&failed, "none", None)["status"],
+            build_result_envelope(&failed, "none", None, None)["status"],
             "timedOut"
         );
+    }
+
+    #[test]
+    fn result_envelope_embeds_the_git_outcome() {
+        // Thread parity: a provisioned run's finalize outcome must appear in the
+        // canonical `io.nanobpm.agentResult` envelope too, not only the flat
+        // `branch`/`commits`/`pushed`/`pullRequest` completion variables —
+        // mirroring the Node plugin's `buildResultEnvelope(result, { …, git })`.
+        let run = RunResult {
+            ok: true,
+            stdout: "out".into(),
+            exit_code: Some(0),
+            ..RunResult::default()
+        };
+        let git = crate::provision::GitResult {
+            branch: Some("nano/agent-work/feat".into()),
+            commits: vec!["bbb".into(), "ccc".into()],
+            pushed: true,
+            pr: None,
+            retain: false,
+            work_found: true,
+            unborn_no_ref: false,
+        };
+        let env = build_result_envelope(
+            &run,
+            "none",
+            None,
+            Some(GitEnvelope {
+                git: &git,
+                remote: Some("https://github.com/o/r.git".into()),
+                base_sha: Some("aaa"),
+                head_sha: Some("ccc"),
+            }),
+        );
+        assert_eq!(env["repository"], json!("https://github.com/o/r.git"));
+        assert_eq!(env["branch"], json!("nano/agent-work/feat"));
+        assert_eq!(env["baseSha"], json!("aaa"));
+        assert_eq!(env["headSha"], json!("ccc"));
+        assert_eq!(env["commits"], json!(["bbb", "ccc"]));
+        assert_eq!(env["pushed"], json!(true));
+        // `pr` is unpopulated (PR detection unimplemented), so like Node's
+        // `if (git.pr)` the key is omitted rather than emitted as null.
+        assert!(env.get("pr").is_none());
+
+        // A run with no git context (unprovisioned / failed) carries NO git
+        // fields at all — identical to the host-without-git shape.
+        let bare = build_result_envelope(&run, "none", None, None);
+        for k in ["repository", "branch", "baseSha", "headSha", "commits", "pushed", "pr"] {
+            assert!(
+                bare.get(k).is_none(),
+                "unexpected git field {k} on a git-less envelope"
+            );
+        }
     }
 
     #[test]
@@ -4133,7 +4244,7 @@ mod tests {
             acp_outcome: Some(outcome.clone()),
             ..RunResult::default()
         };
-        let env = build_result_envelope(&run, "none", Some(&file_result));
+        let env = build_result_envelope(&run, "none", Some(&file_result), None);
         // The selected result is the file result…
         assert_eq!(env["result"], json!({ "status": "done" }));
         // …while the canonical outcome is recorded separately, without the
@@ -4151,7 +4262,7 @@ mod tests {
             exit_code: Some(0),
             ..RunResult::default()
         };
-        let env = build_result_envelope(&plain, "none", Some(&file_result));
+        let env = build_result_envelope(&plain, "none", Some(&file_result), None);
         assert!(env.get("outcome").is_none());
     }
 
