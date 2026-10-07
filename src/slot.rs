@@ -850,17 +850,28 @@ fn quarantine_retained_run_dir(
             )))
         }
     };
+    // Keep the pinned handle we inspect through: the "no marker" wipe below must
+    // delete the EXACT inode we validated here, not a replacement a same-UID
+    // actor could rename onto `<quarantine>` after the inspected handle is
+    // dropped. `None` means `<quarantine>` is not a real directory (a symlink or
+    // plain file, or already gone) — there is no inode to pin, so it is unlinked
+    // as a non-directory entry instead.
+    let mut inspected: Option<crate::saferoot::DirHandle> = None;
     let marker_present = match root.open_child_dir(&quarantine, false) {
-        Ok(child) => match child.symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER)) {
-            Ok(m) => !m.is_dir || m.is_symlink, // a regular file / symlink marker
-            Err(e) => {
-                if marker_absent(e)? {
-                    false
-                } else {
-                    unreachable!("marker_absent returns Ok(true) or Err")
+        Ok(child) => {
+            let present = match child.symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER)) {
+                Ok(m) => !m.is_dir || m.is_symlink, // a regular file / symlink marker
+                Err(e) => {
+                    if marker_absent(e)? {
+                        false
+                    } else {
+                        unreachable!("marker_absent returns Ok(true) or Err")
+                    }
                 }
-            }
-        },
+            };
+            inspected = Some(child);
+            present
+        }
         Err(e) => {
             if marker_absent(e)? {
                 false
@@ -871,10 +882,22 @@ fn quarantine_retained_run_dir(
     };
     if !marker_present {
         // An ordinary stale attempt (no retention marker): delete the renamed
-        // inode. This is the same wipe `prepare_child_dir` would have done, but
-        // anchored on the exact inspected inode (`quarantine`), so a post-rename
-        // swap of `<name>` cannot redirect it onto a marked checkout.
-        root.remove_tree(&quarantine).map_err(PinError::Io)?;
+        // inode. Delete through the EXACT inode we just inspected — never a
+        // by-name re-resolution — so a same-UID actor who renames
+        // `<quarantine>` aside and drops a marked retained checkout at that name
+        // in the window after inspection cannot trick this into wiping the
+        // replacement (check-then-wipe TOCTOU). `remove_inspected_dir` empties
+        // through the pinned handle and removes only an empty entry
+        // (`AT_REMOVEDIR`), so a non-empty swapped-in checkout fails closed.
+        match inspected {
+            Some(child) => root
+                .remove_inspected_dir(&quarantine, &child)
+                .map_err(PinError::Io)?,
+            // Not a directory (symlink / plain file): unlink the entry itself.
+            // `remove_nondir` fails `EISDIR` if it was swapped for a directory,
+            // so a replacement checkout is never descended into or wiped.
+            None => root.remove_nondir(&quarantine).map_err(PinError::Io)?,
+        }
         return Ok(());
     }
     // Retained: keep the renamed dir aside. It keeps its mtime and is aged out
