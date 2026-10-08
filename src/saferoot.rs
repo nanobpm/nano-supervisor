@@ -711,6 +711,91 @@ impl DirHandle {
         Ok(())
     }
 
+    /// Delete the directory `name` under this handle, but ONLY the exact inode
+    /// `inspected` names — never a replacement swapped in after a prior check.
+    ///
+    /// `remove_tree` re-resolves `name` by path and recursively empties
+    /// *whatever* it now resolves to, so a same-UID actor who renames the
+    /// inspected directory aside and drops a different tree at `name` between
+    /// the check and the wipe gets that replacement recursively destroyed
+    /// (a check-then-wipe TOCTOU). This closes it: the contents are emptied
+    /// through `inspected`'s OWN pinned fd (so every unlink is anchored on the
+    /// validated inode, not a by-name re-resolution), and the now-empty entry
+    /// is removed with `AT_REMOVEDIR`, which unlinks only an EMPTY directory —
+    /// a non-empty replacement (e.g. a marked retained checkout) fails
+    /// `ENOTEMPTY` and survives untouched, and a non-directory replacement
+    /// fails `ENOTDIR`. `inspected` must have been opened from this handle as
+    /// `name` (so `name` and the pinned inode refer to the same entry at
+    /// inspection time).
+    pub(crate) fn remove_inspected_dir(
+        &self,
+        name: &OsStr,
+        inspected: &DirHandle,
+    ) -> io::Result<()> {
+        // Empty the inspected inode through its own pinned fd: `entry_names` /
+        // `remove_tree` here descend from `inspected`, never from `name`, so a
+        // post-inspection swap of `name` cannot redirect which inode is emptied.
+        for entry in inspected.entry_names()? {
+            inspected.remove_tree(&entry)?;
+        }
+        // Remove the (now-empty) directory entry. `AT_REMOVEDIR` refuses a
+        // non-empty directory, so if `name` was swapped for a non-empty
+        // replacement the unlink fails rather than wiping it.
+        let c = cstr(name)?;
+        self.unlink_at(&c, libc::AT_REMOVEDIR)
+    }
+
+    /// Unlink the *non-directory* entry `name` (a symlink or plain file) under
+    /// this handle. `unlinkat` without `AT_REMOVEDIR` fails `EISDIR` on a
+    /// directory, so if `name` was swapped for a directory (e.g. a marked
+    /// retained checkout) after it was inspected as a non-directory, this
+    /// refuses rather than descending into and wiping the replacement. A
+    /// symlink entry is removed as the link itself, never its target.
+    pub(crate) fn remove_nondir(&self, name: &OsStr) -> io::Result<()> {
+        let c = cstr(name)?;
+        self.unlink_at(&c, 0)
+    }
+
+    /// Rename a direct child `from` to `to`, both relative to this handle, via
+    /// `renameat`. Both names stay under the pinned parent inode, so a same-UID
+    /// actor swapping an ancestor cannot redirect either side outside the
+    /// workspace. `renameat` does not follow a symlink at the *source* leaf (it
+    /// renames the link itself), and `to`/`from` are single components, so the
+    /// operation is anchored on the pinned fd exactly like `remove_tree`. Used
+    /// to set a retained run dir aside (quarantine) instead of wiping it.
+    ///
+    /// The rename is made crash-durable before returning: `renameat` dirties
+    /// the parent directory, but the kernel can lose that new dirent on a crash
+    /// unless the directory is `fsync`ed. Without it, a settlement-failure
+    /// redelivery that crashes just after a quarantine rename could recover the
+    /// old job-key name and wipe the only copy of the retained work, so the
+    /// parent fd is `fsync`ed here exactly like `write_child_file` does for the
+    /// retention marker's dirent.
+    pub(crate) fn rename_child(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let from_c = cstr(from)?;
+        let to_c = cstr(to)?;
+        let r = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                from_c.as_ptr(),
+                self.fd.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Persist the rename's dirent before reporting success. `from` and `to`
+        // share this one pinned parent inode, so a single fsync of `self.fd`
+        // commits both the removal of `from` and the creation of `to`.
+        // SAFETY: `self.fd` is a valid open directory descriptor; `fsync` on a
+        // directory fd is the standard way to durably commit a dirent change.
+        if unsafe { libc::fsync(self.fd.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Restrict this directory to `mode` via `fchmod` on the pinned fd (no path
     /// re-resolution, so no swapped component can redirect the chmod).
     pub(crate) fn restrict_mode(&self, mode: u32) -> io::Result<()> {
@@ -964,6 +1049,91 @@ mod tests {
         handle.remove_tree(OsStr::new("ccc")).unwrap();
         assert!(handle.entry_names().unwrap().is_empty());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // `remove_inspected_dir` must delete only the EXACT inode it was handed,
+    // never a replacement swapped onto the same name after inspection. Happy
+    // path: the inspected directory (and its contents) is removed.
+    #[test]
+    fn remove_inspected_dir_wipes_the_inspected_inode() {
+        let root = scratch_root("rid-happy");
+        std::fs::create_dir_all(root.join("victim/sub")).unwrap();
+        std::fs::write(root.join("victim/sub/f"), b"x").unwrap();
+        let handle = DirHandle::open_root_nofollow(&root, false).expect("pin root");
+        let child = handle
+            .open_child_dir(OsStr::new("victim"), false)
+            .expect("pin victim");
+        handle
+            .remove_inspected_dir(OsStr::new("victim"), &child)
+            .expect("remove inspected");
+        assert!(
+            !root.join("victim").exists(),
+            "the inspected directory must be fully removed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // The TOCTOU the primitive exists to close: after the inspected inode is
+    // pinned, a same-UID actor renames it aside and drops a *non-empty*
+    // replacement (think: a marked retained checkout) at the same name. The
+    // wipe must NOT recursively destroy that replacement — it empties only the
+    // pinned inode and then `AT_REMOVEDIR` fails `ENOTEMPTY` on the non-empty
+    // replacement, which therefore survives intact.
+    #[test]
+    fn remove_inspected_dir_spares_a_swapped_in_replacement() {
+        let root = scratch_root("rid-swap");
+        std::fs::create_dir_all(root.join("q/old")).unwrap();
+        std::fs::write(root.join("q/old/stale"), b"stale").unwrap();
+        let handle = DirHandle::open_root_nofollow(&root, false).expect("pin root");
+        // Pin the inode we inspected as `q`.
+        let inspected = handle
+            .open_child_dir(OsStr::new("q"), false)
+            .expect("pin q");
+
+        // Attacker swaps `q` aside and plants a non-empty replacement holding
+        // the only copy of retained work.
+        std::fs::rename(root.join("q"), root.join("q.moved")).unwrap();
+        std::fs::create_dir_all(root.join("q/work")).unwrap();
+        std::fs::write(root.join("q/work/only-copy"), b"keep me").unwrap();
+
+        let r = handle.remove_inspected_dir(OsStr::new("q"), &inspected);
+        assert!(
+            r.is_err(),
+            "removing a non-empty swapped-in replacement must fail, not wipe it"
+        );
+        assert!(
+            root.join("q/work/only-copy").exists(),
+            "the swapped-in replacement's work must survive untouched"
+        );
+        // The pinned inode's own contents were emptied through its fd (the stale
+        // work it actually held is gone), confirming we acted on the right inode.
+        assert!(
+            !root.join("q.moved/stale").exists(),
+            "the inspected inode's own contents must be emptied through its pinned fd"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // `remove_nondir` unlinks a non-directory entry but must REFUSE a directory
+    // (EISDIR), so a dir swapped onto a name inspected as a plain file / symlink
+    // is never descended into or wiped.
+    #[test]
+    fn remove_nondir_unlinks_a_file_but_refuses_a_directory() {
+        let root = scratch_root("rnd");
+        std::fs::write(root.join("f"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("d/sub")).unwrap();
+        let handle = DirHandle::open_root_nofollow(&root, false).expect("pin root");
+
+        handle.remove_nondir(OsStr::new("f")).expect("unlink file");
+        assert!(!root.join("f").exists(), "a plain file must be unlinked");
+
+        let r = handle.remove_nondir(OsStr::new("d"));
+        assert!(r.is_err(), "remove_nondir must refuse a directory (EISDIR)");
+        assert!(
+            root.join("d/sub").exists(),
+            "a directory swapped onto the name must survive untouched"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

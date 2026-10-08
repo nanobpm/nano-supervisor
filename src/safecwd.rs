@@ -346,6 +346,183 @@ impl CwdHandle {
         })
     }
 
+    /// Probe whether a single-component child `name` EXISTS directly beneath
+    /// this pinned directory, resolved FD-RELATIVE and no-follow: `fstatat` is
+    /// anchored on this handle's descriptor, so a same-UID actor swapping the
+    /// directory's *path* for another inode between operations cannot redirect
+    /// the check — the classic TOCTOU that recovering a pathname and re-opening
+    /// it (`self.path()` + `std::fs`) would reintroduce. `Ok(true)` = present,
+    /// `Ok(false)` = definitively absent (`ENOENT`); any other error is returned
+    /// so the caller can fail closed. A symlink at `name` counts as PRESENT
+    /// (`AT_SYMLINK_NOFOLLOW` stats the link itself, never following it).
+    /// `name` must be a single path component.
+    #[cfg(unix)]
+    pub(crate) fn child_exists_nofollow(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.contains(&b'/')
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child_exists_nofollow expects a single path component",
+            ));
+        }
+        let c = CString::new(name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    }
+
+    /// Create a NEW regular file `name` directly beneath this pinned directory
+    /// and write `contents` to it — fd-relative, with exclusive-create +
+    /// no-follow semantics. Used for small supervisor-owned marker files (e.g.
+    /// the retention marker) that must land in the *pinned* run dir, not in
+    /// whatever a same-UID actor may have swapped the path for afterwards.
+    ///
+    /// `openat` is anchored on this handle's fd, so a rename/replace of the
+    /// directory (or an ancestor) after preparation cannot redirect the write
+    /// outside the pinned inode. The open is EXCLUSIVE (`O_CREAT | O_EXCL`), so
+    /// it never truncates or opens an EXISTING inode: a plain `O_TRUNC` would
+    /// truncate the open target DURING `openat` — before any metadata check —
+    /// and `O_NOFOLLOW` only refuses a *symlink*, not a HARD link, so a same-UID
+    /// actor could plant `name` as a hard link to another same-filesystem file
+    /// and have this write erase that file's contents (the same threat the
+    /// c8ctl seed writer guards with `create_new` at `src/slot.rs`). `O_EXCL`
+    /// fails closed with `EEXIST` on ANY pre-existing entry (symlink, hard link,
+    /// FIFO/device, or a stale regular file) so the target is always a freshly
+    /// created, empty regular file — the caller treats that `EEXIST`/any write
+    /// failure as a marker-write failure and quarantines. `name` must be a
+    /// single path component (no `/`, not `.`/`..`).
+    #[cfg(unix)]
+    pub(crate) fn write_child_file(
+        &self,
+        name: &std::ffi::OsStr,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.contains(&b'/')
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write_child_file expects a single path component",
+            ));
+        }
+        let c = CString::new(name_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component has NUL"))?;
+        // `O_NOFOLLOW` refuses a symlink planted at `name`, and the EXCLUSIVE
+        // `O_CREAT | O_EXCL` below refuses EVERY pre-existing entry (`EEXIST`) —
+        // a hard link whose target `O_TRUNC` would erase, a FIFO/device whose
+        // open would block, or a stale regular file — so the open always yields
+        // a freshly created, empty regular file and never truncates or blocks on
+        // an attacker-planted inode. `O_NONBLOCK` is retained as belt-and-braces
+        // (it makes any special-file open return `ENXIO` rather than block even
+        // if the exclusive-create invariant is ever weakened); the `fstat`
+        // regular-file check below is likewise a redundant backstop. A same-UID
+        // actor racing a hard/soft link into place loses to `O_EXCL`'s atomic
+        // create-or-fail.
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh, owned descriptor just returned by `openat`.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        // `O_NONBLOCK` was only needed to make the *open* non-blocking; clear it
+        // so the subsequent write/fsync use normal blocking semantics.
+        // SAFETY: `fd` (now `file`) is a valid open descriptor; F_SETFL with the
+        // current flags minus O_NONBLOCK cannot fail for a valid fd.
+        unsafe {
+            let cur = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+            if cur >= 0 {
+                libc::fcntl(file.as_raw_fd(), libc::F_SETFL, cur & !libc::O_NONBLOCK);
+            }
+        }
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to write the marker over a non-regular file (FIFO/device/socket)",
+            ));
+        }
+        file.write_all(contents)?;
+        // Durable before returning: fsync the file so a settlement-failure
+        // redelivery that crashes between the write and the next prepare still
+        // sees the marker (the whole point of the marker is cross-redelivery
+        // durability).
+        file.sync_all()?;
+        // `fsync` on the file makes its *contents* durable but NOT the new
+        // directory *entry* that names it: on a crash the entry can be lost even
+        // after a successful return, and redelivery would then treat the
+        // checkout as unmarked and wipe it. `fsync` the pinned directory fd too
+        // so the marker's name is durable before reporting success.
+        // SAFETY: `self.fd` is a valid open directory descriptor; `fsync` on a
+        // directory fd is the standard way to durably commit a dirent.
+        if unsafe { libc::fsync(self.fd.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn write_child_file(
+        &self,
+        name: &std::ffi::OsStr,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        // Non-Unix fallback: no fd-relative open, so validate the leaf is not a
+        // symlink and write by path. Best-effort — not a supported daemon host.
+        let path = self.path.join(name);
+        let meta = std::fs::symlink_metadata(&path);
+        if let Ok(m) = meta {
+            if m.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to write through a symlink",
+                ));
+            }
+        }
+        std::fs::write(&path, contents)
+    }
+
     #[cfg(not(unix))]
     pub(crate) fn open_child(&self, name: &std::ffi::OsStr) -> io::Result<CwdHandle> {
         let path = self.path.join(name);
@@ -357,6 +534,18 @@ impl CwdHandle {
             ));
         }
         Ok(CwdHandle { path })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn child_exists_nofollow(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
+        // Non-Unix fallback: no fd-relative probe, so stat by path (no-follow).
+        // Best-effort — not a supported daemon host.
+        let path = self.path.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The absolute path of the pinned directory *right now*, recovered through
@@ -928,6 +1117,136 @@ mod tests {
             std::fs::canonicalize(child_cwd(&a)).unwrap(),
             std::fs::canonicalize(child_cwd(&b)).unwrap(),
             "clone and try_clone must bind the same pinned inode"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The retention marker is always a regular file. A same-UID agent can
+    /// pre-plant a FIFO at the marker path so the supervisor's marker open
+    /// BLOCKS waiting for a reader (hanging `execute` before settlement).
+    /// `write_child_file` must instead fail fast: open `O_NONBLOCK` (a FIFO
+    /// open then fails with `ENXIO` instead of blocking) and reject any
+    /// non-regular file that still opens. This test must return promptly — if
+    /// the open blocked, the test would hang and time out the whole suite.
+    #[cfg(unix)]
+    #[test]
+    fn write_child_file_refuses_a_planted_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("marker-fifo");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        let fifo = dir.join("marker");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path; mkfifo creates a FIFO.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
+        let err = handle
+            .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
+            .expect_err("writing the marker over a FIFO must fail, not block");
+        // The exclusive `O_CREAT | O_EXCL` open refuses the pre-existing FIFO
+        // with `EEXIST` before `O_NONBLOCK`/`fstat` ever matter; the older
+        // truncating open instead reached them (`ENXIO` or a non-regular-file
+        // refusal). Accept any of the three — all fail closed without blocking.
+        assert!(
+            err.raw_os_error() == Some(libc::EEXIST)
+                || err.raw_os_error() == Some(libc::ENXIO)
+                || err.kind() == io::ErrorKind::InvalidInput,
+            "expected EEXIST, ENXIO, or a non-regular-file refusal, got {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A same-UID actor can plant the marker path as a HARD link to another
+    /// same-filesystem file. `O_NOFOLLOW` does NOT catch a hard link, and a
+    /// truncating open would erase the linked target's contents DURING the
+    /// `openat` — before any metadata check. The exclusive `O_CREAT | O_EXCL`
+    /// open must instead fail closed (`EEXIST`) and leave the victim file's
+    /// contents fully intact.
+    #[cfg(unix)]
+    #[test]
+    fn write_child_file_refuses_a_hard_link_and_preserves_the_target() {
+        let dir = scratch("marker-hardlink");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        // The victim lives in the SAME directory (same filesystem) so a hard
+        // link to it is possible.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").expect("seed victim");
+        let marker = dir.join("marker");
+        std::fs::hard_link(&victim, &marker).expect("plant hard link");
+        let err = handle
+            .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
+            .expect_err("writing the marker over a hard link must fail closed");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EEXIST),
+            "the exclusive create must refuse the pre-existing hard link, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the hard-link target's contents must be untouched (never truncated)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A normal marker write must succeed, land in the pinned directory, and be
+    /// readable back — the durability fsyncs (file + directory) must not break
+    /// the happy path or corrupt the contents.
+    #[cfg(unix)]
+    #[test]
+    fn write_child_file_writes_and_reads_back() {
+        let dir = scratch("marker-write");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        handle
+            .write_child_file(std::ffi::OsStr::new("marker"), b"retained")
+            .expect("write the marker");
+        assert_eq!(
+            std::fs::read(dir.join("marker")).unwrap(),
+            b"retained",
+            "the marker contents must round-trip through the pinned dir"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn child_exists_nofollow_probes_fd_relative() {
+        let dir = scratch("child-exists");
+        let handle = CwdHandle::open(&dir).expect("open dir");
+        // Absent -> Ok(false), the definitive "not there" answer.
+        assert!(
+            !handle
+                .child_exists_nofollow(std::ffi::OsStr::new("HEAD"))
+                .expect("probe absent child"),
+            "a missing child is definitively absent"
+        );
+        // A regular file -> Ok(true).
+        std::fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new("HEAD"))
+                .expect("probe present child"),
+            "a present child is detected"
+        );
+        // A symlink counts as PRESENT (AT_SYMLINK_NOFOLLOW stats the link, never
+        // following it) — so a dangling symlink does not read as "absent".
+        std::os::unix::fs::symlink("/nonexistent/target", dir.join("link")).unwrap();
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new("link"))
+                .expect("probe symlink child"),
+            "a (dangling) symlink is present, never followed"
+        );
+        // A multi-component / traversal name is rejected rather than resolved.
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new("a/b"))
+                .is_err(),
+            "a non-single-component name is rejected"
+        );
+        assert!(
+            handle
+                .child_exists_nofollow(std::ffi::OsStr::new(".."))
+                .is_err(),
+            "a parent traversal is rejected"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

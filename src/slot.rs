@@ -729,11 +729,186 @@ fn prepare_run_dir_pinned(
     // step's pinned inode, and an existing or swapped-in symlinked component is
     // refused by the no-follow open rather than followed.
     let root = DirHandle::open_or_create_root_nofollow(runs_dir, 0o700)?;
+    // DEFER THE WIPE for a retained checkout. `prepare_child_dir` below wipes
+    // `<name>` unconditionally — correct for an ordinary retry, but WRONG when
+    // the prior attempt was RETAINED (a completed run whose unpushed commits
+    // live only in `<name>`) and then redelivered after a failed/fenced
+    // `jobs.complete`: that wipe would destroy the only copy of the work. When
+    // `<name>/<RETENTION_MARKER>` is present, set the retained dir aside
+    // (rename it to a unique quarantine sibling) instead of wiping it, so the
+    // redelivery gets a fresh `<name>` while the retained work survives for
+    // recovery / the `sweep_stale_runs` cadence. See [`RETENTION_MARKER`].
+    quarantine_retained_run_dir(&root, name)?;
     let child = root.prepare_child_dir(name, 0o700).map_err(PinError::Io)?;
     // Carry the EXACT pinned child inode preparation just created and secured
     // into the launch — never reopen `run_dir` by path, which a same-UID actor
     // could have swapped for an ordinary (unwiped, unsecured) tree in between.
     Ok(crate::safecwd::CwdHandle::from_fd(child.into_fd()))
+}
+
+/// Defer the wipe of a RETAINED run dir on redelivery. When `<name>` carries a
+/// [`RETENTION_MARKER`] file, the prior attempt was a completed-but-unpushed run
+/// whose only copy of the agent's work lives in `<name>`; wiping it (the
+/// `prepare_child_dir` the caller is about to do) would destroy that work if
+/// this activation is a redelivery after a failed/fenced `jobs.complete`. Set
+/// the retained dir aside — rename `<name>` to a unique quarantine sibling —
+/// so the caller can prepare a fresh `<name>` while the retained work survives
+/// for recovery and the `sweep_stale_runs` cadence.
+///
+/// Everything is relative to the pinned `root` handle (`renameat`/`fstatat`),
+/// so a same-UID actor swapping an ancestor cannot redirect the check or the
+/// rename outside the runs root.
+///
+/// TOCTOU-hardened: the check and the wipe are made atomic by renaming FIRST.
+/// A naive "open `<name>`, stat its marker, drop the handle, then let
+/// `prepare_child_dir` wipe `<name>`" sequence leaves a window: after the
+/// pinned child is inspected and dropped, a same-UID actor can replace `<name>`
+/// with a *marked* retained checkout before `prepare_child_dir` runs, and that
+/// checkout is then wiped despite carrying the marker. To close it, `<name>` is
+/// renamed to a unique sibling up front — `renameat` atomically detaches
+/// whatever inode `<name>` currently names — and THAT renamed inode is then
+/// inspected through a pinned handle and either deleted (unmarked) or kept
+/// (marked). The path `<name>` is never touched again, so a swap of `<name>`
+/// after the rename cannot redirect the wipe onto a different, marked checkout.
+///
+/// A dir that definitively has no marker (`NotFound`) is an ordinary stale
+/// attempt and is deleted (it was already renamed aside, so the deletion still
+/// targets the exact inspected inode). A symlinked `<name>` is left untouched
+/// (the rename would target the link, not a retained checkout) and handed to
+/// the caller's no-follow wipe as usual. The marker LOOKUP fails closed: any
+/// open/stat error other than "definitively absent" (a transient I/O or
+/// permission failure) is propagated — with the dir already set aside under its
+/// quarantine name, never wiped — so preparation stops rather than risk
+/// destroying a possibly-retained checkout whose marker could not be read.
+#[cfg(unix)]
+fn quarantine_retained_run_dir(
+    root: &crate::saferoot::DirHandle,
+    name: &std::ffi::OsStr,
+) -> std::result::Result<(), crate::saferoot::PinError> {
+    use crate::saferoot::PinError;
+    // Rename `<name>` aside to a unique quarantine sibling FIRST. The suffix
+    // mirrors the per-activation fallback-branch uniqueness (`process_rand_token`
+    // + pid + clock + a process-local sequence), so concurrent redeliveries can
+    // never collide on the quarantine name. This is the atomic step that closes
+    // the check-then-wipe race: whatever inode `<name>` names right now is moved
+    // to `quarantine`, and every later step (inspect / delete / keep) acts on
+    // `quarantine`, never on the `<name>` path again.
+    let quarantine = std::ffi::OsString::from(format!(
+        "{}.retained-{}-{}-{}-{}",
+        name.to_string_lossy(),
+        process_rand_token(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    match root.rename_child(name, &quarantine) {
+        Ok(()) => {}
+        // `NotFound`: no `<name>` exists at all — nothing to quarantine or wipe;
+        // the caller's `prepare_child_dir` will simply create it fresh.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // A symlinked or plain-file `<name>` is not a retained checkout (the
+        // rename would target the link itself). Rename it aside too so the
+        // caller starts clean, then fall through to the inspect step below,
+        // which classifies it as "no marker" and deletes it via the pinned
+        // no-follow `remove_tree`. Any OTHER rename error (a transient I/O or
+        // permission failure) is propagated so preparation stops rather than
+        // risk wiping a possibly-retained checkout.
+        Err(e) => return Err(PinError::Io(e)),
+    }
+
+    // `<name>` is now detached; inspect the renamed inode `<quarantine>` through
+    // a pinned no-follow handle. FAIL CLOSED: only a definitively-NOT-retained
+    // leaf is deleted — `NotFound` (no marker) or a non-directory `<quarantine>`
+    // (a symlink or plain file is not a retained checkout). Any OTHER open/stat
+    // error (a transient I/O or permission failure) leaves the marker's presence
+    // UNKNOWN, and the dir may hold the only copy of retained unpushed work:
+    // propagate the error so preparation stops WITHOUT deleting it. The dir is
+    // already safely set aside under `quarantine`, so it survives regardless.
+    let marker_absent = |e: std::io::Error| -> std::result::Result<bool, PinError> {
+        // The no-follow dir open refuses a symlinked `<quarantine>` with ELOOP
+        // (or ENOTDIR when O_DIRECTORY is checked first, or the portable
+        // post-open check's InvalidInput); a plain-file `<quarantine>` fails it
+        // with ENOTDIR. None of these is a real retained checkout directory, so
+        // each is treated as "no marker" and deleted below.
+        let raw = e.raw_os_error();
+        let not_a_checkout_dir = e.kind() == std::io::ErrorKind::InvalidInput
+            || raw == Some(libc::ELOOP)
+            || raw == Some(libc::ENOTDIR);
+        if e.kind() == std::io::ErrorKind::NotFound || not_a_checkout_dir {
+            Ok(true)
+        } else {
+            Err(PinError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "could not determine whether run dir {} carries a retention marker; \
+                     refusing to wipe a possibly-retained checkout",
+                    name.to_string_lossy()
+                ),
+            )))
+        }
+    };
+    // Keep the pinned handle we inspect through: the "no marker" wipe below must
+    // delete the EXACT inode we validated here, not a replacement a same-UID
+    // actor could rename onto `<quarantine>` after the inspected handle is
+    // dropped. `None` means `<quarantine>` is not a real directory (a symlink or
+    // plain file, or already gone) — there is no inode to pin, so it is unlinked
+    // as a non-directory entry instead.
+    let mut inspected: Option<crate::saferoot::DirHandle> = None;
+    let marker_present = match root.open_child_dir(&quarantine, false) {
+        Ok(child) => {
+            let present = match child.symlink_metadata(std::ffi::OsStr::new(RETENTION_MARKER)) {
+                Ok(m) => !m.is_dir || m.is_symlink, // a regular file / symlink marker
+                Err(e) => {
+                    if marker_absent(e)? {
+                        false
+                    } else {
+                        unreachable!("marker_absent returns Ok(true) or Err")
+                    }
+                }
+            };
+            inspected = Some(child);
+            present
+        }
+        Err(e) => {
+            if marker_absent(e)? {
+                false
+            } else {
+                unreachable!("marker_absent returns Ok(true) or Err")
+            }
+        }
+    };
+    if !marker_present {
+        // An ordinary stale attempt (no retention marker): delete the renamed
+        // inode. Delete through the EXACT inode we just inspected — never a
+        // by-name re-resolution — so a same-UID actor who renames
+        // `<quarantine>` aside and drops a marked retained checkout at that name
+        // in the window after inspection cannot trick this into wiping the
+        // replacement (check-then-wipe TOCTOU). `remove_inspected_dir` empties
+        // through the pinned handle and removes only an empty entry
+        // (`AT_REMOVEDIR`), so a non-empty swapped-in checkout fails closed.
+        match inspected {
+            Some(child) => root
+                .remove_inspected_dir(&quarantine, &child)
+                .map_err(PinError::Io)?,
+            // Not a directory (symlink / plain file): unlink the entry itself.
+            // `remove_nondir` fails `EISDIR` if it was swapped for a directory,
+            // so a replacement checkout is never descended into or wiped.
+            None => root.remove_nondir(&quarantine).map_err(PinError::Io)?,
+        }
+        return Ok(());
+    }
+    // Retained: keep the renamed dir aside. It keeps its mtime and is aged out
+    // by `sweep_stale_runs` like any retained run.
+    log(&format!(
+        "run dir {} carries a retention marker — setting it aside as {} instead of wiping, so a \
+         settlement-failure redelivery cannot destroy the retained (unpushed) work",
+        name.to_string_lossy(),
+        quarantine.to_string_lossy()
+    ));
+    Ok(())
 }
 
 /// Path-based `prepare_run_dir`: the non-Unix fallback (no `openat`/`fchmod`
@@ -823,6 +998,137 @@ pub(crate) async fn reap_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf, k
     }
 }
 
+/// Write the retention marker into a RETAINED run dir, dispatched to the
+/// blocking pool. The marker write performs a file `fsync` *and* a directory
+/// `fsync` (durability: a redelivery must observe the marker, see
+/// [`crate::safecwd::CwdHandle::write_child_file`]), and the fail-closed
+/// fallback renames the retained dir aside. Both are synchronous filesystem
+/// operations; run inline on a Tokio worker thread immediately before job
+/// settlement they can block the executor on a slow/unhealthy filesystem long
+/// enough to starve the lease refresher and lose this job's lease — the same
+/// failure mode [`reap_run_dir_blocking`] avoids. Dispatch them off the worker
+/// thread instead.
+///
+/// FAIL CLOSED is preserved end to end: a marker-write failure still
+/// quarantines the retained dir (on the blocking pool), and if the blocking
+/// task itself panics — leaving neither the marker nor its in-task quarantine
+/// guaranteed — the dir is quarantined from here as a last resort, so a
+/// settlement-failure redelivery can never wipe the only copy of the unpushed
+/// work.
+async fn write_retention_marker_blocking(
+    cwd: crate::safecwd::CwdHandle,
+    runs_dir: PathBuf,
+    run_dir: PathBuf,
+    key: &str,
+) {
+    let k = key.to_string();
+    let task_runs_dir = runs_dir.clone();
+    let task_run_dir = run_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        if let Err(e) = cwd.write_child_file(std::ffi::OsStr::new(RETENTION_MARKER), b"retained\n")
+        {
+            log(&format!(
+                "job {k}: could not durably write the retention marker into the pinned run dir \
+                 ({e}); quarantining the retained checkout now so a settlement-failure \
+                 redelivery cannot wipe the only copy of the unpushed work"
+            ));
+            quarantine_unmarked_retained_run(&task_runs_dir, &task_run_dir, &k);
+        }
+    })
+    .await;
+    if let Err(join) = outcome {
+        // The blocking task panicked: neither the marker write nor its in-task
+        // fallback quarantine is guaranteed to have run, so fail closed by
+        // quarantining the retained dir from here. This backstop rename is
+        // cheap (no `fsync`) and only reached on a panic, so running it inline
+        // does not meaningfully risk starving the lease refresher.
+        log(&format!(
+            "job {key}: retention-marker blocking task panicked for {} ({join}); quarantining the \
+             retained checkout as a fail-closed backstop so a redelivery cannot wipe the only \
+             copy of the unpushed work",
+            run_dir.display()
+        ));
+        quarantine_unmarked_retained_run(&runs_dir, &run_dir, key);
+    }
+}
+
+/// Fail-closed backstop for the retention marker: when the marker cannot be
+/// durably written into a run dir we have decided to RETAIN (disk-full,
+/// permission, I/O error), set the retained dir aside immediately — rename
+/// `<run_dir>` to a unique quarantine sibling under the runs root — so a
+/// settlement-failure redelivery finds no `<key>` to wipe and starts fresh,
+/// while the only copy of the unpushed work survives for recovery / the
+/// `sweep_stale_runs` cadence. This is the same rename-aside
+/// [`quarantine_retained_run_dir`] performs, done eagerly because the marker
+/// that would normally trigger it could not be written.
+///
+/// Best-effort and pinned no-follow like [`reap_run_dir`]: the rename is
+/// relative to a no-follow pinned handle on the runs root, so a same-UID actor
+/// cannot redirect it. A failure (e.g. the dir was already reaped/renamed, or
+/// the runs root is unavailable) is only logged — the run is still retained in
+/// memory this run, and losing the quarantine is no worse than the pre-fix
+/// best-effort marker behaviour. Non-Unix hosts fall back to a path-based
+/// rename (not a supported daemon host).
+#[cfg(unix)]
+fn quarantine_unmarked_retained_run(runs_dir: &Path, run_dir: &Path, key: &str) {
+    use crate::saferoot::DirHandle;
+    let Some(name) = run_dir.file_name() else {
+        return;
+    };
+    let quarantine = std::ffi::OsString::from(format!(
+        "{}.retained-{}-{}-{}-{}",
+        name.to_string_lossy(),
+        process_rand_token(),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let outcome = DirHandle::open_root_nofollow(runs_dir, false)
+        .map_err(|e| match e {
+            crate::saferoot::PinError::Io(e) => e,
+        })
+        .and_then(|root| root.rename_child(name, &quarantine));
+    match outcome {
+        Ok(()) => log(&format!(
+            "job {key}: set the retained run dir {} aside as {} (its retention marker could not be \
+             written), so a redelivery cannot wipe the only copy of the unpushed work",
+            run_dir.display(),
+            quarantine.to_string_lossy()
+        )),
+        Err(e) => log(&format!(
+            "job {key}: could not quarantine the retained run dir {} after the marker write \
+             failed ({e}); it is retained in memory this run but is not guarded against a \
+             settlement-failure redelivery wipe",
+            run_dir.display()
+        )),
+    }
+}
+
+/// Non-Unix fallback for [`quarantine_unmarked_retained_run`]: no pinned-handle
+/// rename, so rename by path. Best-effort — not a supported daemon host.
+#[cfg(not(unix))]
+fn quarantine_unmarked_retained_run(runs_dir: &Path, run_dir: &Path, key: &str) {
+    let Some(name) = run_dir.file_name() else {
+        return;
+    };
+    let quarantine = runs_dir.join(format!(
+        "{}.retained-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::rename(run_dir, &quarantine) {
+        log(&format!(
+            "job {key}: could not quarantine the retained run dir {} after the marker write \
+             failed ({e})",
+            run_dir.display()
+        ));
+    }
+}
+
 /// How long a *failed* run directory is retained under `runs_dir` for
 /// post-mortem inspection before it is swept. Successful runs are reaped
 /// immediately on completion (see [`execute`]); only failed runs — which bail
@@ -830,6 +1136,27 @@ pub(crate) async fn reap_run_dir_blocking(runs_dir: PathBuf, run_dir: PathBuf, k
 /// daemon that retention is otherwise unbounded, so leftover failed runs are
 /// deleted once they age past this window (3 days).
 pub(crate) const FAILED_RUN_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Name of the retention marker file written into a run dir when [`execute`]
+/// decides to RETAIN it (a completed run whose provisioned commits were not
+/// pushed, or that finalize flagged for stranded/incomplete work). The marker
+/// makes that retention decision durable across a settlement failure: `execute`
+/// returns `Settle::Complete` and the caller sends `jobs.complete` *afterward*,
+/// so if that completion fails or is fenced the engine redelivers the SAME job
+/// key and the next `execute` would otherwise `prepare_run_dir` → wipe the
+/// retained checkout, destroying the only copy of the unpushed work. While the
+/// marker is present, [`prepare_run_dir`] defers the wipe — it sets the retained
+/// dir aside (quarantine) instead of removing it — so a redelivery cannot
+/// destroy retained work before settlement durability is confirmed. The
+/// quarantined dir is aged out by `sweep_stale_runs` like any retained run.
+///
+/// The marker is a durability HINT, not a security boundary: it is written after
+/// the agent has finished, inside the `0700` run dir. A same-UID agent could
+/// plant or remove it, but that only ever steers the wipe in the *conservative*
+/// direction (preserve rather than delete) or reverts to the pre-marker
+/// behaviour — it can never cause work to be deleted that would otherwise be
+/// kept, nor keep a dir the sweep would not already retain.
+pub(crate) const RETENTION_MARKER: &str = ".nano-retain-unpushed";
 
 /// Process-global set of run directories currently being serviced by a slot.
 ///
@@ -988,6 +1315,49 @@ type RemovePauseHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 static REMOVE_IF_INACTIVE_PAUSE: Mutex<Option<(std::path::PathBuf, RemovePauseHook)>> =
     Mutex::new(None);
+
+/// Process-local monotonically increasing sequence folded into the per-activation
+/// fallback-branch suffix (`nano/agent-work/<base>-<rand>-<pid>-<nanos>-<seq>`).
+/// All slots share the worker PID and can observe the same wall-clock tick, so
+/// the timestamp alone is not unique; this counter guarantees two activations in
+/// one process never mint the same suffix. `Relaxed` ordering suffices — only the
+/// fetch_add's atomicity/uniqueness matters, not any happens-before edge.
+static ACTIVATION_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A per-process random token folded into every fallback-branch suffix so the
+/// suffix is unique ACROSS worker processes, not merely across slots in one
+/// process. `pid`+`nanos`+`seq` is only process-local: two *separate* workers
+/// can share a PID (PID 1 is common in containers), both start `ACTIVATION_SEQ`
+/// at 0, and observe the same wall-clock tick — then they cut the identical
+/// fallback ref and one activation's push is rejected non-fast-forward. The
+/// fallback contract requires uniqueness per activation across the whole fleet,
+/// so we mix in a token drawn once from the OS CSPRNG (matching the mirrored
+/// worker's per-run UUID). Generated lazily and cached for the process's life.
+fn process_rand_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut buf = [0u8; 8];
+        // Prefer the OS CSPRNG. Never panic if it is unavailable — a weaker
+        // token still beats cutting no branch at all, so fall back to stirring
+        // together pid, a high-res timestamp, and a live stack address (ASLR).
+        let have_os_entropy = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| {
+                use std::io::Read;
+                f.read_exact(&mut buf)
+            })
+            .is_ok();
+        if !have_os_entropy {
+            let seed = (std::process::id() as u128)
+                ^ ((&buf as *const _ as usize) as u128)
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+            buf = (seed as u64).to_le_bytes();
+        }
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
 
 /// Atomically check `path` against [`active_runs`] and, when it is not
 /// registered, remove it — all while holding the active-runs mutex. This closes
@@ -1633,14 +2003,61 @@ fn detect_commits(before: Option<&str>, after: Option<&str>, provisioned: bool) 
     }
 }
 
+/// Fallback "the run dir holds agent work" decision when finalize reported no
+/// enumerated `commits`. `retain` (finalize's incomplete/failed-scan signal) and
+/// `work_found` (stranded work the enumeration deliberately cleared) EACH mean
+/// the job-keyed run dir may hold the ONLY copy of agent work even though the
+/// checkout HEAD never moved (`head_has_commits` false). Either one must make the
+/// run count as having commits, so a retained/stranded result is never misread as
+/// empty and failed — a failure retries the job and the retry wipes the run dir,
+/// destroying the very work `retain`/`work_found` was protecting (e.g. finalize
+/// returns `retain=true, commits=[], work_found=false` after an inconclusive
+/// branch/reflog scan).
+///
+/// EXCEPTION — `unborn_no_ref`: finalize PROVED the repository is still in the
+/// unborn/no-ref state it was provisioned in (no commit on any ref), so the
+/// run dir holds no agent work and the `retain` it carries is only the
+/// fail-closed "cannot prove completeness" guard of a repo with no anchor —
+/// not evidence a commit exists. Letting that retain count as commits would
+/// turn a quiet no-op agent on an empty base into `has_commits = true` and
+/// bypass the empty-result failure contract, so the unborn verdict disregards
+/// `retain` here. Reaping is unaffected (`retain` still keeps the dir; the
+/// stale-run sweep ages it out).
+fn retained_result_counts_as_commits(
+    retain: bool,
+    work_found: bool,
+    unborn_no_ref: bool,
+    head_has_commits: bool,
+) -> bool {
+    if unborn_no_ref {
+        return head_has_commits;
+    }
+    retain || work_found || head_has_commits
+}
+
 /// Whether a successfully-completed run's directory may be reaped. A provisioned
-/// checkout that advanced HEAD (`has_commits`) holds commits that — absent a
-/// finalize/push stage — live ONLY in the run dir, so reaping would destroy the
-/// single copy of work the job just reported successful. Retain those (they are
-/// aged out later by `sweep_stale_runs`); reap everything else (non-repository
-/// runs and provisioned runs that made no commit).
-fn may_reap_completed_run(provisioned: bool, has_commits: bool) -> bool {
-    !(provisioned && has_commits)
+/// checkout that advanced HEAD (`has_commits`) whose commits were NOT pushed
+/// (`!pushed`) holds work that lives ONLY in the run dir, so reaping would
+/// destroy the single copy of work the job just reported successful. Retain
+/// those (they are aged out later by `sweep_stale_runs`); reap everything else —
+/// non-repository runs, provisioned runs that made no commit, and provisioned
+/// runs whose commits finalize PUSHED to the origin (durable off-box).
+///
+/// `retained` is finalize's explicit stranded-work/incomplete-scan signal
+/// ([`crate::provision::GitResult::retain`]). It forces retention INDEPENDENTLY
+/// of the HEAD compare: a side-branch/detached commit that is then abandoned
+/// leaves the final HEAD unchanged (so `has_commits` reads false) while the only
+/// copy of that work sits in the run dir — the HEAD compare alone would reap it.
+fn may_reap_completed_run(
+    provisioned: bool,
+    has_commits: bool,
+    pushed: bool,
+    retained: bool,
+) -> bool {
+    if retained {
+        return false;
+    }
+    !(provisioned && has_commits && !pushed)
 }
 
 async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
@@ -1706,7 +2123,22 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     let prepared = PreparedRun {
         cwd: prepare_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone()).await?,
     };
-    let agent_cwd = match &env.repository {
+    // The `branch` envelope's base/create/push selection, parsed once so the
+    // pre-agent work-branch cut and the post-agent finalize agree on it.
+    let branch_cfg = env.normalized.get("branch").and_then(|v| v.as_object());
+    let branch_base = branch_cfg
+        .and_then(|b| b.get("base"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let branch_create = branch_cfg
+        .and_then(|b| b.get("create"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let branch_push = branch_cfg
+        .and_then(|b| b.get("push"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let (agent_cwd, git_prep) = match &env.repository {
         Some(repo) => {
             log(&format!(
                 "job {key}: cloning {} ({})",
@@ -1717,28 +2149,74 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             // git step; carry THAT exact inode into the agent/HEAD launches
             // rather than reopening `repo` by name (which a same-UID actor could
             // swap between the opens) (#35).
-            crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
+            let cwd = crate::provision::provision(repo, prepared.agent_cwd(), cfg.clone_timeout)
                 .await
-                .context("provisioning repository")?
+                .context("provisioning repository")?;
+            // Cut the work branch the agent commits onto BEFORE it runs, so
+            // finalize has a pushable branch (never the shared base).
+            //
+            // The fallback-branch suffix must be unique PER ACTIVATION, not per
+            // job: the job `key` is stable across redelivery, so if this push
+            // lands but the lease is lost before completion, the retry
+            // wipes/reclones, regenerates the SAME fallback name from the base,
+            // and its later push is rejected non-fast-forward against the first
+            // attempt's branch. A fresh per-activation id makes each attempt's
+            // fallback distinct. `key` stays the job/run-directory identity.
+            //
+            // Uniqueness: `pid` + wall-clock nanos alone is NOT enough — every
+            // slot shares the worker PID, and two concurrent slots can observe
+            // the SAME clock tick (or the clock can move backward), recreating
+            // the very collision the suffix exists to prevent. Fold in a
+            // process-local monotonically increasing sequence so two activations
+            // can never mint the same suffix even on an identical timestamp, AND
+            // a per-process random token (`process_rand_token`) so the suffix is
+            // unique across SEPARATE workers too — they can share a PID (PID 1 in
+            // containers), both start the sequence at 0, and observe the same
+            // tick, which `pid`+`nanos`+`seq` alone would not disambiguate.
+            let activation = format!(
+                "{}-{}-{}-{}",
+                process_rand_token(),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                ACTIVATION_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let prep = crate::provision::prepare_work_branch(
+                &cwd,
+                repo,
+                branch_base.as_deref(),
+                branch_create.as_deref(),
+                branch_push,
+                &activation,
+                cfg.clone_timeout,
+            )
+            .await;
+            (cwd, Some(prep))
         }
         None => {
             // No repository: the agent and HEAD probes run in the run dir
             // itself. Dup the pinned handle fallibly — a dup failure (e.g.
             // descriptor exhaustion, EMFILE) must surface as a normal job
             // error here, not a worker-crashing panic from `Clone`.
-            prepared
+            let cwd = prepared
                 .agent_cwd()
                 .try_clone()
-                .context("dup the pinned run-dir handle")?
+                .context("dup the pinned run-dir handle")?;
+            (cwd, None)
         }
     };
     // Baseline HEAD of the agent's checkout, captured BEFORE the agent runs so
     // the empty-job detector can tell whether the agent committed anything.
     // Node feeds `gitResult.commits`/`pushed` into `detectEmptyAgentJob`; the
-    // Rust worker has no `finalizeGit` push stage yet, so it derives the
-    // "commits" signal from a pre/post `rev-parse` of this HEAD (any advance =
-    // a commit) and reports no push. `None` for a non-git run dir (no
-    // repository) or when HEAD can't be read — treated as "no commits".
+    // Rust worker's `finalize_git` stage enumerates and pushes the agent's
+    // commits, but its enumeration is authoritative ONLY when it finds commits —
+    // a rev-list failure (or a >1 MiB stdout-tail truncation inside `git()`)
+    // also reads as an empty list. This pre/post `rev-parse` of HEAD is the
+    // best-effort fallback for that case (any advance = a commit); `None` for a
+    // non-git run dir (no repository) or when HEAD can't be read — treated as
+    // "no commits".
     // Dup the pinned handle FALLIBLY: this probe is best-effort (a failure is
     // already `None` = "HEAD unreadable"), so a dup failure (descriptor
     // exhaustion, EMFILE) must yield `None` here, never a worker-crashing
@@ -1852,24 +2330,52 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
             .and_then(crate::acp::outcome_result_vars),
     ]);
     let _ = std::fs::remove_file(&result_file);
-    let envelope = build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref());
     let name = &cfg.hire.name;
-    let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
+
+    // Git finalize: enumerate the agent's commits on the work branch and push
+    // it to the fallback `nano/agent-work/...` branch (the agent opened no PR of
+    // its own). Only on a clean agent run — a failed run is retried, so its
+    // partial work must not be published. `None` for an unprovisioned run (no
+    // `gitResult`, so no branch/commits/pushed completion variables).
+    let git_result = match (env.repository.as_ref(), git_prep.as_ref()) {
+        (Some(repo), Some(prep)) if run.ok => {
+            Some(crate::provision::finalize_git(&agent_cwd, prep, repo, cfg.clone_timeout).await)
+        }
+        _ => None,
+    };
 
     // Node's `gitResult.commits.length > 0` / `pushed === true` empty-detection
     // signals. A repository agent that advanced the checkout HEAD committed
     // real work, so it is NOT empty even with no stdout/result; failing it
-    // would burn a retry. No `finalizeGit` push stage exists yet, so
-    // `pushed` is always false here. A newly PROVISIONED repository starts
-    // with no baseline HEAD (`start_head` is `None`), so the agent's FIRST
-    // commit yields `(None, Some(after))` — treat that appearance of HEAD as
-    // a commit too (Node's non-empty `gitResult.commits`), or a quiet pipe
-    // agent that made its first commit would be misread as empty and
-    // retried. A NON-repository run dir (no checkout) reads `None`/`None`
-    // and stays "no commits". Computed once here: it both drives empty-detection
-    // AND gates reaping (a provisioned checkout that advanced HEAD holds commits
-    // that, absent a push stage, exist ONLY in the run dir).
+    // would burn a retry. When finalize ran, its commit enumeration is
+    // authoritative ONLY when it found commits: a rev-list failure (or a
+    // >1 MiB stdout-tail truncation inside `git()`) also reads as an empty
+    // list, so an empty enumeration falls back to the pre/post HEAD compare
+    // rather than condemning a quiet committing agent as an empty run. A
+    // NON-repository run dir reads "no commits".
     let provisioned = env.repository.is_some();
+    let pushed = git_result.as_ref().is_some_and(|g| g.pushed);
+    // Finalize's explicit stranded-work / incomplete-scan signal. When set, the
+    // run dir may hold the only copy of agent work (a side-branch/detached
+    // commit, or a scan that failed open), so it must be retained regardless of
+    // what the pre/post HEAD compare concludes about `has_commits`.
+    let retain = git_result.as_ref().is_some_and(|g| g.retain);
+    // Finalize's "real work exists" signal, DISTINCT from `retain` (incomplete
+    // scan) and from `commits` (which the stranded-work paths deliberately
+    // clear). A quiet commit-only run that strands work on a side branch or a
+    // detached HEAD leaves the final HEAD unchanged AND `commits` empty, so
+    // neither the enumeration nor the pre/post HEAD compare would see it — and
+    // the empty-job detector would fail the run as "empty", its retry wiping the
+    // job-keyed dir that holds the only copy. Treat `work_found` as commits.
+    let work_found = git_result.as_ref().is_some_and(|g| g.work_found);
+    // Finalize's PROVEN-unborn verdict: the repo is still in the empty/no-ref
+    // state it was provisioned in, so the run dir holds no agent work and the
+    // `retain` accompanying it is only the fail-closed "cannot prove
+    // completeness" guard of a repo with no anchor — not evidence a commit
+    // exists. The empty-result check must disregard that retain (a quiet no-op
+    // agent on an unborn base must still fail as empty); reaping still honours
+    // `retain` itself below.
+    let unborn_no_ref = git_result.as_ref().is_some_and(|g| g.unborn_no_ref);
     // The post-run HEAD probe is best-effort too: dup the pinned handle
     // fallibly so a dup failure (EMFILE) reads as `None` ("HEAD unreadable"),
     // not a `Clone` panic — mirroring `start_head` above.
@@ -1877,7 +2383,46 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Ok(cwd) => git_head_blocking(cwd).await,
         Err(_) => None,
     };
-    let has_commits = detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned);
+    let has_commits = match &git_result {
+        Some(g) if !g.commits.is_empty() => true,
+        _ => {
+            // `retain` (an incomplete/failed scan) and `work_found` (stranded
+            // work the enumeration deliberately cleared) each mean the run dir
+            // may hold the ONLY copy of agent work, even with `commits` empty and
+            // the checkout HEAD unchanged. Treat BOTH as "has commits" so a
+            // retained result cannot fall through to the empty-result path below:
+            // failing it there would retry the job, and the retry wipes the
+            // job-keyed run dir — destroying the very work `retain` was protecting
+            // (e.g. finalize returns `retain=true, commits=[], work_found=false`
+            // after a branch/reflog scan failed inconclusively). The exception is
+            // `unborn_no_ref`: finalize PROVED the repo still has no commit
+            // anywhere, so its retain is no evidence of work (see the helper).
+            retained_result_counts_as_commits(
+                retain,
+                work_found,
+                unborn_no_ref,
+                detect_commits(start_head.as_deref(), end_head.as_deref(), provisioned),
+            )
+        }
+    };
+
+    // Build the audit envelope AFTER finalization so the canonical
+    // `io.nanobpm.agentResult` record carries the git outcome too — NOT only the
+    // flat `branch`/`commits`/`pushed`/`pullRequest` completion variables set
+    // below. Mirrors the Node plugin's single `buildResultEnvelope(result, {
+    // …, git })` call: a consumer reading the versioned envelope must see the
+    // same git result as one reading the top-level vars (thread parity). `git`
+    // is `None` for an unprovisioned run or a failed run (finalize was skipped),
+    // so the envelope then carries no git fields — exactly as before.
+    let git_envelope = git_result.as_ref().map(|g| GitEnvelope {
+        git: g,
+        remote: env.repository.as_ref().map(|r| redact_url(&r.url)),
+        base_sha: start_head.as_deref(),
+        head_sha: end_head.as_deref(),
+    });
+    let envelope =
+        build_result_envelope(&run, &cfg.hire.sandbox, raw_result.as_ref(), git_envelope);
+    let envelope_vars = || HashMap::from([(AGENT_RESULT_KEY.to_string(), envelope.clone())]);
 
     let settle = if !run.ok {
         let detail = run.error.clone().unwrap_or_else(|| match run.exit_code {
@@ -1893,7 +2438,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         &run.stdout,
         run.has_turns,
         has_commits,
-        false,
+        pushed,
         run.acp_outcome.is_some(),
     ) {
         Settle::Fail {
@@ -1916,6 +2461,14 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         vars.insert("exitCode".into(), json!(0));
         vars.insert("agent".into(), json!(name));
         vars.insert("truncated".into(), json!(run.truncated));
+        // Surface the finalize outcome (`gitResult`) as completion variables,
+        // mirroring the Node plugin's `branch`/`commits`/`pushed`/`pullRequest`.
+        if let Some(g) = &git_result {
+            vars.insert("branch".into(), json!(g.branch));
+            vars.insert("commits".into(), json!(g.commits));
+            vars.insert("pushed".into(), json!(g.pushed));
+            vars.insert("pullRequest".into(), g.pr.clone().unwrap_or(Value::Null));
+        }
         Settle::Complete(vars)
     };
 
@@ -1925,19 +2478,73 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // dispatched to the blocking pool so a large checkout removal cannot stall
     // the executor and starve the lease refresher before `complete_job` lands.
     //
-    // DO NOT reap a provisioned checkout that advanced HEAD: with no
-    // finalize/push stage those commits are not durable — they live ONLY in this
-    // run dir, so deleting it would destroy the single copy of work the job just
-    // reported successful. Retain such a run (like a failed one) for recovery;
-    // `sweep_stale_runs` ages it out later on the normal cadence.
-    if matches!(settle, Settle::Complete(_)) && !cfg.keep_runs {
-        if may_reap_completed_run(provisioned, has_commits) {
-            reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
+    // DO NOT reap a provisioned checkout whose commits were not pushed: those
+    // commits are not durable — they live ONLY in this run dir, so deleting it
+    // would destroy the single copy of work the job just reported successful.
+    // `retain` (finalize's stranded-work/incomplete-scan signal) also forces
+    // retention independently of the HEAD compare. Retain such a run (like a
+    // failed one) for recovery; `sweep_stale_runs` ages it out on the cadence.
+    //
+    // The reapability DECISION (and its durable retention marker) runs for EVERY
+    // completed run — `--keep-runs` gates only the actual reap, NOT the marker.
+    // The marker must be written even when `--keep-runs` keeps the dir this
+    // time: if `jobs.complete` then fails or is fenced, the engine redelivers
+    // the SAME job key and the next `execute` runs `prepare_run_dir`, which
+    // wipes an UNMARKED dir — destroying the only copy of the unpushed work
+    // despite both the retention decision and `--keep-runs`. So compute
+    // reapability unconditionally and write the marker whenever the run is
+    // non-reapable; only the destructive reap is skipped under `--keep-runs`.
+    if matches!(settle, Settle::Complete(_)) {
+        if may_reap_completed_run(provisioned, has_commits, pushed, retain) {
+            // Reapable (nothing durable to lose): delete the dir unless the
+            // operator asked to keep run dirs for post-mortem.
+            if !cfg.keep_runs {
+                reap_run_dir_blocking(cfg.runs_dir.clone(), run_dir.clone(), &key).await;
+            }
         } else {
+            // Make the retention durable BEFORE returning: `execute` hands
+            // `Settle::Complete` back and the caller sends `jobs.complete`
+            // *afterward*, so if that completion fails or is fenced the engine
+            // redelivers the SAME job key and the next `execute` would
+            // `prepare_run_dir` → wipe this retained checkout, destroying the
+            // only copy of the unpushed work. Drop a retention marker so that
+            // redelivery's prepare defers the wipe (sets the dir aside) instead
+            // of removing it — see [`RETENTION_MARKER`].
+            //
+            // The marker is written FD-RELATIVE to the pinned run-dir handle
+            // (`prepared.cwd`) with create/no-follow semantics, never by path:
+            // a same-UID actor that renames/replaces `run_dir` (or plants a
+            // symlink at the marker path) after preparation cannot redirect the
+            // write outside the retained inode or trick us into truncating a
+            // symlink target — the write lands in the exact directory
+            // preparation pinned (#35).
+            //
+            // FAIL CLOSED: the marker is the only thing standing between this
+            // retained checkout and a redelivery wipe, so a write failure
+            // (disk-full, permission, I/O) must NOT leave the only unpushed
+            // copy sitting at the wipable job path. If the marker cannot be
+            // durably created, atomically set the retained dir aside
+            // (quarantine) right now — the same rename-aside a redelivery's
+            // prepare would do — so the work survives even without its marker.
+            //
+            // The marker write (file + directory `fsync`) and that fallback
+            // quarantine are dispatched to the blocking pool, NOT run inline on
+            // this Tokio worker thread: like the reap above, a slow/unhealthy
+            // filesystem could otherwise block the executor here — right before
+            // settlement — long enough to starve the lease refresher and lose
+            // this job's lease. Fail-closed behaviour is retained (see
+            // `write_retention_marker_blocking`).
+            write_retention_marker_blocking(
+                prepared.cwd,
+                cfg.runs_dir.clone(),
+                run_dir.clone(),
+                &key,
+            )
+            .await;
             log(&format!(
-                "job {key}: retaining run dir {} — provisioned checkout advanced HEAD but the \
-                 worker has no finalize/push stage, so its commits are not durable; reaping would \
-                 delete their only copy (aged out later by sweep_stale_runs)",
+                "job {key}: retaining run dir {} — provisioned checkout holds commits that were \
+                 not pushed (or finalize flagged stranded/incomplete work), so they are not \
+                 durable; reaping would delete their only copy (aged out later by sweep_stale_runs)",
                 run_dir.display()
             ));
         }
@@ -2119,12 +2726,30 @@ fn nudge_payload(payload: &Value, nudge: &str) -> Value {
     p
 }
 
+/// The git-finalize outcome threaded into [`build_result_envelope`] so the
+/// canonical `io.nanobpm.agentResult` record carries the same git result as the
+/// flat completion variables. Mirrors the `git` option of the Node plugin's
+/// `buildResultEnvelope`: `remote` is the credential-scrubbed clone URL,
+/// `base_sha`/`head_sha` are the pre-/post-run HEADs, and the rest come from the
+/// finalize [`GitResult`].
+struct GitEnvelope<'a> {
+    git: &'a crate::provision::GitResult,
+    remote: Option<String>,
+    base_sha: Option<&'a str>,
+    head_sha: Option<&'a str>,
+}
+
 /// The audit envelope stored under `io.nanobpm.agentResult` — the Node plugin's
-/// `buildResultEnvelope` for a host (`sandbox: none`) run without git.
+/// `buildResultEnvelope`. When `git` is `Some` (a provisioned run that reached
+/// finalization), its outcome is embedded here too, so the versioned envelope
+/// and the flat `branch`/`commits`/`pushed`/`pullRequest` completion variables
+/// agree; a `None` git (unprovisioned or failed run) leaves the envelope
+/// git-free, matching the host (`sandbox: none`) run without git.
 fn build_result_envelope(
     run: &RunResult,
     sandbox: &str,
     agent_result: Option<&Map<String, Value>>,
+    git: Option<GitEnvelope>,
 ) -> Value {
     let status = if run.ok {
         "completed"
@@ -2155,6 +2780,30 @@ fn build_result_envelope(
     // it in `result`, and never carrying the synthesized `question`.
     if let Some(outcome) = &run.acp_outcome {
         env["outcome"] = Value::Object(outcome.clone());
+    }
+    // Embed the git-finalize outcome so a consumer reading the versioned
+    // envelope sees the same result as one reading the flat completion
+    // variables. Mirrors the Node plugin's `if (git) { … }` block
+    // (`repository`/`branch`/`baseSha`/`headSha`/`commits`/`pushed`/`pr`). The
+    // Rust `GitResult` does not track the push-failure detail fields
+    // (`pushError`/`pushFailed`/`strandedCommits`/`scanError`/`branchMismatch`),
+    // so those are omitted here as they are from the flat vars; `pr` is emitted
+    // only when populated, exactly as Node's `if (git.pr)`.
+    if let Some(g) = git {
+        env["repository"] = g.remote.map(Value::String).unwrap_or(Value::Null);
+        env["branch"] = g
+            .git
+            .branch
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        env["baseSha"] = g.base_sha.map(|s| json!(s)).unwrap_or(Value::Null);
+        env["headSha"] = g.head_sha.map(|s| json!(s)).unwrap_or(Value::Null);
+        env["commits"] = json!(g.git.commits);
+        env["pushed"] = json!(g.git.pushed);
+        if let Some(pr) = &g.git.pr {
+            env["pr"] = pr.clone();
+        }
     }
     env
 }
@@ -2700,6 +3349,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_rand_token_is_stable_hex_and_feeds_the_suffix() {
+        // Regression for the cross-worker fallback-branch collision class: the
+        // token must be stable within a process (so a retry inside ONE process
+        // is driven by the sequence/time, not a re-roll) yet high-entropy hex so
+        // SEPARATE workers sharing a PID + clock tick + seq=0 still mint
+        // distinct suffixes.
+        let a = process_rand_token();
+        let b = process_rand_token();
+        assert_eq!(a, b, "token must be cached for the life of the process");
+        assert_eq!(a.len(), 16, "8 random bytes rendered as hex");
+        assert!(
+            a.bytes().all(|c| c.is_ascii_hexdigit()),
+            "token must be ref-safe hex, got {a:?}"
+        );
+    }
 
     fn hire() -> Hire {
         Hire {
@@ -3569,7 +4235,7 @@ mod tests {
         };
         let mut r = Map::new();
         r.insert("status".into(), json!("done"));
-        let env = build_result_envelope(&run, "none", Some(&r));
+        let env = build_result_envelope(&run, "none", Some(&r), None);
         assert_eq!(
             env,
             json!({
@@ -3584,9 +4250,71 @@ mod tests {
             ..RunResult::default()
         };
         assert_eq!(
-            build_result_envelope(&failed, "none", None)["status"],
+            build_result_envelope(&failed, "none", None, None)["status"],
             "timedOut"
         );
+    }
+
+    #[test]
+    fn result_envelope_embeds_the_git_outcome() {
+        // Thread parity: a provisioned run's finalize outcome must appear in the
+        // canonical `io.nanobpm.agentResult` envelope too, not only the flat
+        // `branch`/`commits`/`pushed`/`pullRequest` completion variables —
+        // mirroring the Node plugin's `buildResultEnvelope(result, { …, git })`.
+        let run = RunResult {
+            ok: true,
+            stdout: "out".into(),
+            exit_code: Some(0),
+            ..RunResult::default()
+        };
+        let git = crate::provision::GitResult {
+            branch: Some("nano/agent-work/feat".into()),
+            commits: vec!["bbb".into(), "ccc".into()],
+            pushed: true,
+            pr: None,
+            retain: false,
+            work_found: true,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        let env = build_result_envelope(
+            &run,
+            "none",
+            None,
+            Some(GitEnvelope {
+                git: &git,
+                remote: Some("https://github.com/o/r.git".into()),
+                base_sha: Some("aaa"),
+                head_sha: Some("ccc"),
+            }),
+        );
+        assert_eq!(env["repository"], json!("https://github.com/o/r.git"));
+        assert_eq!(env["branch"], json!("nano/agent-work/feat"));
+        assert_eq!(env["baseSha"], json!("aaa"));
+        assert_eq!(env["headSha"], json!("ccc"));
+        assert_eq!(env["commits"], json!(["bbb", "ccc"]));
+        assert_eq!(env["pushed"], json!(true));
+        // `pr` is unpopulated (PR detection unimplemented), so like Node's
+        // `if (git.pr)` the key is omitted rather than emitted as null.
+        assert!(env.get("pr").is_none());
+
+        // A run with no git context (unprovisioned / failed) carries NO git
+        // fields at all — identical to the host-without-git shape.
+        let bare = build_result_envelope(&run, "none", None, None);
+        for k in [
+            "repository",
+            "branch",
+            "baseSha",
+            "headSha",
+            "commits",
+            "pushed",
+            "pr",
+        ] {
+            assert!(
+                bare.get(k).is_none(),
+                "unexpected git field {k} on a git-less envelope"
+            );
+        }
     }
 
     #[test]
@@ -3606,7 +4334,7 @@ mod tests {
             acp_outcome: Some(outcome.clone()),
             ..RunResult::default()
         };
-        let env = build_result_envelope(&run, "none", Some(&file_result));
+        let env = build_result_envelope(&run, "none", Some(&file_result), None);
         // The selected result is the file result…
         assert_eq!(env["result"], json!({ "status": "done" }));
         // …while the canonical outcome is recorded separately, without the
@@ -3624,7 +4352,7 @@ mod tests {
             exit_code: Some(0),
             ..RunResult::default()
         };
-        let env = build_result_envelope(&plain, "none", Some(&file_result));
+        let env = build_result_envelope(&plain, "none", Some(&file_result), None);
         assert!(env.get("outcome").is_none());
     }
 
@@ -4437,6 +5165,257 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn prepare_run_dir_defers_the_wipe_for_a_retained_checkout() {
+        // Regression for the retention-vs-settlement finding (HIGH): a run dir
+        // RETAINED because its provisioned commits were not pushed carries a
+        // RETENTION_MARKER. When the SAME job key is redelivered (a failed /
+        // fenced `jobs.complete`), `prepare_run_dir` must NOT wipe that
+        // retained checkout — it must set it aside (quarantine) and prepare a
+        // fresh run dir, so the only copy of the unpushed work survives.
+        let runs = unique_tmp("prep-retained");
+        let run = runs.join("42");
+
+        // The prior attempt's retained checkout: a marker plus the only copy of
+        // the work (a stand-in file).
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RETENTION_MARKER), b"retained\n").unwrap();
+        std::fs::write(run.join("unpushed-work.txt"), b"the only copy").unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        // A fresh run dir is prepared at <key>, and it must NOT contain the
+        // retained work (the redelivery starts from a clean slate).
+        assert!(run.is_dir(), "a fresh run dir must be prepared");
+        assert!(
+            !run.join("unpushed-work.txt").exists(),
+            "the fresh run dir must not contain the prior attempt's files"
+        );
+        // The retained checkout must SURVIVE as a quarantine sibling, still
+        // holding the only copy of the work and its marker.
+        let quarantined: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("42.retained-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the retained checkout must be set aside as exactly one quarantine sibling"
+        );
+        let qpath = quarantined[0].path();
+        assert!(
+            qpath.join("unpushed-work.txt").exists(),
+            "the quarantined dir must still hold the retained (unpushed) work"
+        );
+        assert!(
+            qpath.join(RETENTION_MARKER).exists(),
+            "the quarantined dir must still carry its retention marker"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_fails_closed_when_the_marker_lookup_errors() {
+        // Regression for the fail-open retention-marker finding (HIGH), unit
+        // style: drive `quarantine_retained_run_dir` directly so the assertion
+        // isolates the marker DECISION from `prepare_child_dir`'s wipe (which
+        // cannot read a searchless dir either, and so would mask the bug).
+        // Make the retained run dir readable-but-not-executable (0o444): the
+        // no-follow open (O_RDONLY) SUCCEEDS, but stating the marker within it
+        // fails with EACCES (no search bit). The fail-open code collapsed that
+        // EACCES to "no marker" and returned Ok — telling the caller the dir is
+        // UNMARKED and safe to wipe (RED). The fail-closed code propagates the
+        // lookup error, so preparation stops without the retained checkout
+        // being treated as unmarked (GREEN).
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses the directory permission check");
+            return;
+        }
+        let runs = unique_tmp("quar-marker-failclosed");
+        let run = runs.join("43");
+
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RETENTION_MARKER), b"retained\n").unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let root = crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs, 0o700).unwrap();
+        let result = quarantine_retained_run_dir(&root, std::ffi::OsStr::new("43"));
+
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).ok();
+
+        assert!(
+            result.is_err(),
+            "a marker lookup error (EACCES) must fail closed, not be misread as 'no marker'"
+        );
+        // The retained checkout must SURVIVE the failed lookup. The
+        // TOCTOU-hardened flow renames `43` aside FIRST, so on a fail-closed
+        // error the dir is left under its quarantine sibling (never wiped) —
+        // find it and confirm the marker is still inside.
+        let survivors: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("43.retained-")
+                    || e.file_name().to_string_lossy() == "43"
+            })
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the retained checkout must survive (set aside, never wiped) when its marker cannot be read"
+        );
+        let survivor = survivors[0].path();
+        std::fs::set_permissions(&survivor, std::fs::Permissions::from_mode(0o700)).ok();
+        assert!(
+            survivor.join(RETENTION_MARKER).exists(),
+            "the retained checkout must be left intact when its marker cannot be read"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_retention_marker_blocking_writes_the_marker() {
+        // The happy path: the marker write (file + directory fsync) is
+        // dispatched to the blocking pool, but still lands durably in the pinned
+        // run dir so a settlement-failure redelivery sees it and defers the wipe.
+        let runs = unique_tmp("marker-blocking-ok");
+        let run = runs.join("77");
+        let cwd = prepare_run_dir(&runs, &run).unwrap();
+
+        write_retention_marker_blocking(cwd, runs.clone(), run.clone(), "77").await;
+
+        assert!(
+            run.join(RETENTION_MARKER).exists(),
+            "the retention marker must be written into the run dir off the worker thread"
+        );
+        // The dir keeps its original name (no fallback quarantine on success).
+        assert!(
+            run.exists(),
+            "a successful marker write must leave the run dir in place"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_retention_marker_blocking_fails_closed_by_quarantining() {
+        // Fail-closed invariant preserved after moving off the worker thread:
+        // if the marker write fails, the retained dir is still set aside
+        // (renamed to a quarantine sibling) so a settlement-failure redelivery
+        // cannot wipe the only copy of the unpushed work. Make the run dir
+        // read-only (0o444): the pinned `openat(O_CREAT)` for the marker fails
+        // EACCES (no write/search bit), driving the fallback quarantine.
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses the directory permission check");
+            return;
+        }
+        let runs = unique_tmp("marker-blocking-failclosed");
+        let run = runs.join("78");
+        let cwd = prepare_run_dir(&runs, &run).unwrap();
+        std::fs::write(run.join("only-copy.txt"), b"unpushed work").unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        write_retention_marker_blocking(cwd, runs.clone(), run.clone(), "78").await;
+
+        // The original `78` path must be gone (renamed aside) so a redelivery's
+        // prepare finds no `78` to wipe, and the checkout must survive under its
+        // quarantine sibling with its unpushed work intact.
+        let quarantined: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("78.retained-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "a failed marker write must quarantine the retained dir (fail closed), not drop it"
+        );
+        assert!(
+            !run.exists(),
+            "the retained dir must be renamed off the wipable job path when the marker cannot be written"
+        );
+        let survivor = quarantined[0].path();
+        std::fs::set_permissions(&survivor, std::fs::Permissions::from_mode(0o700)).ok();
+        assert!(
+            survivor.join("only-copy.txt").exists(),
+            "the only copy of the unpushed work must survive inside the quarantined dir"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_wipes_a_symlinked_run_dir_leaf() {
+        // Guard the fail-closed classification: a SYMLINKED `<name>` is NOT a
+        // retained checkout, so the no-follow open refuses it (ELOOP/ENOTDIR)
+        // and it must fall through to the caller's normal wipe — the symlink
+        // itself is removed and a fresh real run dir is prepared — while the
+        // link's TARGET is never touched. This must NOT be misread as a marker
+        // lookup error and fail closed.
+        let runs = unique_tmp("prep-symlink-leaf");
+        let outside = unique_tmp("prep-symlink-target");
+        std::fs::write(outside.join("keep.txt"), b"not ours").unwrap();
+        let run = runs.join("43");
+        std::os::unix::fs::symlink(&outside, &run).unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "a fresh run dir must be prepared");
+        assert!(
+            !run.symlink_metadata().unwrap().file_type().is_symlink(),
+            "the symlinked leaf must be replaced by a real directory"
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "the symlink target must never be touched by the wipe"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_run_dir_wipes_an_unmarked_prior_attempt() {
+        // The ordinary retry path is unchanged: a prior attempt with NO
+        // retention marker is wiped (not quarantined), so a normal retry starts
+        // from a clean slate and no quarantine sibling is left behind.
+        let runs = unique_tmp("prep-unmarked");
+        let run = runs.join("7");
+
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("stale.json"), b"old").unwrap();
+
+        prepare_run_dir(&runs, &run).unwrap();
+
+        assert!(run.is_dir(), "run dir must exist after prepare");
+        assert!(
+            !run.join("stale.json").exists(),
+            "an unmarked prior attempt must be wiped"
+        );
+        let siblings: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("7.retained-"))
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "an unmarked prior attempt must NOT be quarantined"
+        );
+
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn prepare_run_dir_pinned_refuses_symlinked_root() {
         // A symlinked runs root must be refused by the pinned open (ELOOP),
         // surfaced as an error — never silently followed to prepare a job dir
@@ -4861,16 +5840,126 @@ mod tests {
     }
 
     #[test]
+    fn retained_or_stranded_result_counts_as_commits() {
+        // The HEAD compare says "no commit" (checkout unchanged) and finalize
+        // enumerated no pushable commits — but an inconclusive/incomplete scan
+        // (`retain`) or stranded work the enumeration cleared (`work_found`) each
+        // mean the run dir may hold the ONLY copy of agent work. Either flag alone
+        // MUST make the run count as having commits so it is never failed as empty
+        // and retried (the retry wipes the job-keyed run dir).
+        assert!(retained_result_counts_as_commits(true, false, false, false));
+        assert!(retained_result_counts_as_commits(false, true, false, false));
+        // A genuinely empty run — no retain, no stranded work, HEAD unmoved — is
+        // still correctly "no commits" so the empty detector can fail it.
+        assert!(!retained_result_counts_as_commits(
+            false, false, false, false
+        ));
+        // A moved HEAD counts regardless of the finalize flags.
+        assert!(retained_result_counts_as_commits(false, false, false, true));
+    }
+
+    #[test]
+    fn unborn_no_ref_retain_does_not_count_as_commits() {
+        // Regression for the unborn-repo bypass: on an empty/unborn base the
+        // empty-scan guards set `retain` (fail closed — they cannot PROVE
+        // completeness with no anchor), but finalize also PROVED no commit
+        // exists anywhere (`unborn_no_ref`). That retain is not evidence of
+        // work, so a quiet no-op agent must NOT count as having commits — it
+        // would otherwise bypass the empty-result failure contract.
+        assert!(!retained_result_counts_as_commits(true, false, true, false));
+        // The unborn verdict disregards only `retain`: a moved HEAD (the agent
+        // DID commit) still counts.
+        assert!(retained_result_counts_as_commits(true, false, true, true));
+        // Without the unborn verdict the same retain still counts (the scan was
+        // merely inconclusive, so the dir may hold the only copy of work).
+        assert!(retained_result_counts_as_commits(true, false, false, false));
+    }
+
+    #[test]
     fn provisioned_commits_are_retained_not_reaped() {
-        // A provisioned checkout that advanced HEAD holds commits that — with no
-        // finalize/push stage — live ONLY in the run dir, so a successful run
-        // must NOT reap it (that would destroy the sole copy).
-        assert!(!may_reap_completed_run(true, true));
+        // A provisioned checkout that advanced HEAD whose commits were NOT pushed
+        // lives ONLY in the run dir, so a successful run must NOT reap it (that
+        // would destroy the sole copy).
+        assert!(!may_reap_completed_run(true, true, false, false));
+        // Once finalize PUSHED those commits they are durable off-box, so the run
+        // dir reaps normally.
+        assert!(may_reap_completed_run(true, true, true, false));
         // A provisioned run that made no commit has nothing durable to lose.
-        assert!(may_reap_completed_run(true, false));
+        assert!(may_reap_completed_run(true, false, false, false));
         // A non-repository run never holds commits, so it is always reapable.
-        assert!(may_reap_completed_run(false, false));
-        assert!(may_reap_completed_run(false, true));
+        assert!(may_reap_completed_run(false, false, false, false));
+        assert!(may_reap_completed_run(false, true, false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_marker_is_written_even_when_keep_runs_keeps_the_dir() {
+        // Regression for the retention-marker-vs-`--keep-runs` finding (HIGH):
+        // the reapability DECISION and its durable marker must run for EVERY
+        // completed run — `--keep-runs` gates only the actual reap, NOT the
+        // marker. Otherwise a non-reapable run whose dir `--keep-runs` kept is
+        // left UNMARKED, and if `jobs.complete` then fails or is fenced the
+        // redelivered job key's `prepare_run_dir` wipes the unmarked dir,
+        // destroying the only copy of the unpushed work despite both the
+        // retention decision and `--keep-runs`.
+        //
+        // `execute` is not directly drivable in a unit test, so this pins the
+        // decision boundary the fix relies on: a non-reapable verdict
+        // (`may_reap_completed_run` == false) is reached INDEPENDENTLY of
+        // `keep_runs`, and the marker it must write makes a later redelivery's
+        // prepare DEFER the wipe (quarantine) instead of destroying the work.
+        // The decision is a pure function of (provisioned, has_commits, pushed,
+        // retain) — no `keep_runs` input — so a non-reapable verdict is reached
+        // whether or not `--keep-runs` is set.
+        assert!(
+            !may_reap_completed_run(true, true, false, false),
+            "an unpushed committing run is non-reapable regardless of --keep-runs"
+        );
+        // ... and the marker written on that verdict is what a redelivery's
+        // prepare honours: a dir carrying it is set aside (quarantined), not
+        // wiped, so the retained work survives.
+        let runs = unique_tmp("keepruns-marker");
+        let run = runs.join("77");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RETENTION_MARKER), b"retained\n").unwrap();
+        std::fs::write(run.join("only-copy.txt"), b"unpushed work").unwrap();
+        let root = crate::saferoot::DirHandle::open_or_create_root_nofollow(&runs, 0o700).unwrap();
+        quarantine_retained_run_dir(&root, std::ffi::OsStr::new("77"))
+            .expect("the marker lookup must not error on a readable dir");
+        // The original name is gone (renamed aside) and exactly one quarantine
+        // sibling survives, still holding the retained work.
+        assert!(
+            !run.exists(),
+            "the marker-carrying dir must be renamed aside, not left in place to be wiped"
+        );
+        let quarantine: Vec<_> = std::fs::read_dir(&runs)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("77.retained-"))
+            .collect();
+        assert_eq!(
+            quarantine.len(),
+            1,
+            "the retained checkout must be set aside as exactly one quarantine sibling"
+        );
+        assert!(
+            quarantine[0].path().join("only-copy.txt").exists(),
+            "the retained work must survive redelivery because the marker was written"
+        );
+        std::fs::remove_dir_all(&runs).ok();
+    }
+
+    #[test]
+    fn finalize_retain_flag_forces_retention() {
+        // `retain` is finalize's stranded-work / incomplete-scan signal. It must
+        // force retention INDEPENDENTLY of the HEAD compare: a side-branch or
+        // detached commit that is then abandoned leaves the final HEAD unchanged
+        // (so `has_commits` reads false) while the only copy of that work sits in
+        // the run dir — the HEAD compare alone would reap it.
+        assert!(!may_reap_completed_run(true, false, false, true));
+        assert!(!may_reap_completed_run(true, true, false, true));
+        // Even a pushed run is retained when finalize flagged an incomplete scan.
+        assert!(!may_reap_completed_run(true, true, true, true));
     }
 
     #[cfg(unix)]

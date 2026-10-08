@@ -83,22 +83,15 @@ fn unprovisioned_run_creates_no_fallback_branch() {
 /// The positive git-finalize contract: a job whose envelope provisions a
 /// repository AND whose agent commits to it is finalized by the worker — the
 /// commits are detected and pushed to the fallback `nano/agent-work/...` branch
-/// (the agent opened no PR), which the completion variables report.
-///
-/// The Rust worker has no finalize/push stage yet (its commits live only in the
-/// reaped run dir; see `src/slot.rs`), so the pushed-fallback-branch contract is
-/// pinned for the Node target until the Rust worker grows `finalizeGit`.
+/// (the agent opened no PR), which the completion variables report. Exercised
+/// against both targets: the Rust worker's `finalize_git` (src/provision.rs)
+/// now mirrors the Node plugin's `finalizeGit`.
 #[test]
 fn provisioned_repo_finalize_pushes_a_fallback_branch() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    if target == contract_tests::Target::Rust {
-        // The gap this contract pins: the Rust worker has no finalizeGit push
-        // stage yet, so its commits live only in the reaped run dir.
-        skip!("the Rust worker has no finalize/push stage yet (src/slot.rs)");
-    }
     // Seed a pushable bare origin the agent's clone can commit + push back to.
     let origin_dir = tempfile::tempdir().expect("origin tempdir");
     let origin = origin_dir.path().join("origin.git");
