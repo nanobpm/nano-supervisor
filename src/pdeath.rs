@@ -735,8 +735,15 @@ impl Drop for GroupGuard {
 /// signalling the entire process group once the daemon exits.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn watch(agent_pid: u32) {
+    let _ = spawn_watchdog(agent_pid);
+}
+
+/// Spawn the parent-death watchdog for `agent_pid` (see [`watch`]) and return
+/// its pid, or `None` if it could not be spawned.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_watchdog(agent_pid: u32) -> Option<u32> {
     let Ok(exe) = std::env::current_exe() else {
-        return;
+        return None;
     };
     let parent = std::process::id();
     // Capture the daemon's start time here, while the daemon is *guaranteed*
@@ -789,15 +796,30 @@ pub fn watch(agent_pid: u32) {
     // after a daemon `kill -9` is diagnosable instead of mysterious (on macOS,
     // where this watchdog is the only parent-death mechanism, that log is the
     // sole signal the gap opened).
-    if let Err(e) = cmd
+    match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        crate::runtime::log(&format!(
-            "warning: parent-death watchdog failed to spawn for pid {agent_pid}: {e}"
-        ));
+        Ok(mut child) => {
+            // The watchdog is our child: reap it when it exits, or it lingers
+            // as a zombie of the daemon (one leaked process slot per watched
+            // spawn until `fork` hits EAGAIN — issue #52). It can live as long
+            // as the watched group, so wait on a detached thread rather than
+            // block the caller.
+            let pid = child.id();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Some(pid)
+        }
+        Err(e) => {
+            crate::runtime::log(&format!(
+                "warning: parent-death watchdog failed to spawn for pid {agent_pid}: {e}"
+            ));
+            None
+        }
     }
 }
 
@@ -1081,6 +1103,32 @@ pub fn reap_watchdog(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    /// Regression (issue #52): the watchdog is our child, so when it exits it
+    /// must be reaped. An unreaped watchdog stays a zombie of the daemon for
+    /// its whole lifetime — one leaked process slot per agent/git spawn until
+    /// `fork` fails with EAGAIN. Under `cargo test` the "watchdog" is the test
+    /// binary, which exits at once on the unknown `__reap-watchdog` argument,
+    /// so it must disappear from the process table rather than linger as `Z`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn exited_watchdog_is_reaped_not_left_a_zombie() {
+        let pid = spawn_watchdog(std::process::id()).expect("watchdog spawns");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps runs");
+            last = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if last.is_empty() {
+                return; // exited and reaped
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("watchdog pid {pid} was never reaped (ps stat {last:?})");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
