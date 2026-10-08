@@ -6016,20 +6016,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
 
-    /// Serializes the handful of cap tests that each manufacture a cap-sized
-    /// (~512) fixture by spawning ONE short-lived `git` subprocess per object
-    /// (commit-tree / commit+reset / branch). Each such `git` invocation also
-    /// spawns a parent-death watchdog that can linger ~200 ms on macOS, so
-    /// letting several of these tests run concurrently (the default test
-    /// harness fans out across CPUs) stacks thousands of live processes and
-    /// exhausts the per-user process table (`os error 35`). Holding this lock
-    /// caps the pressure to one such test at a time. A `tokio::sync::Mutex`
-    /// because the guard is held across `.await`.
-    static PROCESS_HEAVY_GIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
     async fn finalize_does_not_mark_unborn_no_ref_when_nonhead_candidates_exceed_cap() {
-        let _serial = PROCESS_HEAVY_GIT_LOCK.lock().await;
         // Companion variant: the non-head-ref candidate set can exceed
         // `MAX_REFLOG_SCAN` even when the listing itself does NOT overflow the
         // capture cap — the agent parks MANY distinct commits under short-named
@@ -6100,7 +6088,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_reflog_scan_breaks_at_cap_without_quadratic_dedup() {
-        let _serial = PROCESS_HEAVY_GIT_LOCK.lock().await;
         // Regression for the quadratic de-dup: the HEAD-reflog net must stop
         // de-duplicating as soon as the distinct count exceeds
         // `MAX_REFLOG_SCAN` (O(1) HashSet membership, early break), failing
@@ -7253,7 +7240,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_retains_when_side_branches_exceed_scan_cap() {
-        let _serial = PROCESS_HEAVY_GIT_LOCK.lock().await;
         // Even a COMPLETE branch listing is bounded: more than
         // `MAX_SIDE_BRANCH_SCAN` side branches would each cost serial
         // `rev-parse`/`rev-list` processes and let an agent stall finalize past
