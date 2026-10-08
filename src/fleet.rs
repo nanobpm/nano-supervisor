@@ -661,8 +661,7 @@ fn passwd_home_dir() -> Option<PathBuf> {
         // `bufsize` bytes long. On success `result` is either null ("no entry
         // for this UID") or points at `pwd`, whose `pw_dir` borrows from `buf`
         // — we copy it out before `buf` is dropped.
-        let rc =
-            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), bufsize, &mut result) };
+        let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), bufsize, &mut result) };
         if rc == libc::ERANGE && bufsize < (1usize << 20) {
             // Entry larger than the buffer; grow (bounded) and retry.
             bufsize *= 2;
@@ -2325,7 +2324,11 @@ mod tests {
         let _cfg = TempCfg::new();
         let home = home_dir().unwrap();
         let outside = home.join("outside-secret.json");
-        std::fs::write(&outside, serde_json::json!({"hires": {"leaked": {}}}).to_string()).unwrap();
+        std::fs::write(
+            &outside,
+            serde_json::json!({"hires": {"leaked": {}}}).to_string(),
+        )
+        .unwrap();
         // A symlinked `config.json` pointing outside must be refused, not read.
         std::os::unix::fs::symlink(&outside, home.join("config.json")).unwrap();
 
@@ -2429,7 +2432,11 @@ mod tests {
         std::fs::remove_dir(&dir).unwrap();
         let made = fleet_lock_dir_in(&base).unwrap();
         assert_eq!(made, dir);
-        let mode = std::fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o700, "lock dir must be owner-only");
 
         std::fs::remove_dir_all(&base).ok();
