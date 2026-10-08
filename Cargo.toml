@@ -29,6 +29,11 @@ clap = { version = "4", features = ["derive"] }
 shlex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Derive the supervisor control-socket path exactly like the Node plugin
+# (`join(tmpdir(), "c8ctl-nano-sup-<sha1(home)[:8]>.sock")`) so `supervisor
+# status` / `workforce status` can probe a running daemon. Already in the
+# workspace lockfile via the contract-tests crate.
+sha1 = "0.10"
 # Shortest-round-trip f64 digit generation for the ECMAScript `Number::toString`
 # used by the envelope normalizer (src/envelope.rs): serde_json renders a float
 # with ryu's shortest digits but formats them the JSON way (trailing `.0`,
@@ -37,6 +42,13 @@ serde_json = "1"
 # ECMAScript way. Already serde_json's own transitive dep, so no new code is
 # pulled in.
 ryu = "1"
+# (Cross-process serialization of `config.json` / workforce-manifest
+# read-modify-write cycles uses an advisory `flock` on a temp-dir lock file in
+# `fleet::StateLock`. An OS-released lock — the kernel drops it the instant a
+# holder dies, so there is no abandoned marker to reclaim by guessing (an
+# age-based reclaim could steal the lock from a merely-slow owner and break
+# mutual exclusion) and the lock file never persists under the state home.)
+fs2 = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).

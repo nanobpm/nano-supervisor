@@ -55,41 +55,48 @@ fn config_exit(msg: &str) -> ! {
 }
 
 pub async fn run(opts: WorkOptions) -> Result<()> {
-    // Issue #41: resolve & pin the connection BEFORE any validation, run-root
-    // creation, or the stale-run sweep so the worker's VERY FIRST startup line
-    // names the engine it is about to serve — exactly as `daemon` does (the
-    // incident's only clue was buried deep in the log, after hire validation
-    // and sweep output). Resolve the profile ONCE (explicit `--profile`, else
-    // the pin this state home recorded, else the current active profile) and
-    // persist the choice in `connection.json`, so a later `c8 use profile` —
-    // by an agent or an operator — can never silently retarget this worker on
-    // its next start. The engine client itself is constructed later, once
+    // Issue #41: resolve & pin the connection BEFORE any run-root creation or
+    // the stale-run sweep so the worker's VERY FIRST startup line names the
+    // engine it is about to serve — exactly as `daemon` does (the incident's
+    // only clue was buried deep in the log, after hire validation and sweep
+    // output). Resolve the profile ONCE (explicit `--profile`, else the pin
+    // this state home recorded, else the current active profile) and persist
+    // the choice in `connection.json`, so a later `c8 use profile` — by an
+    // agent or an operator — can never silently retarget this worker on its
+    // next start. The engine client itself is constructed later, once
     // `job_types` is known, from this same pinned snapshot.
     let state_home = state::state_home().unwrap_or_else(|| {
         config_exit("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
     });
-    let decision = match pin::resolve_or_pin(&state_home, opts.profile.as_deref()) {
-        Ok(d) => d,
-        Err(e) => config_exit(&format!("cannot resolve the pinned connection: {e:#}")),
-    };
-    let engine_desc = decision.pin.describe();
-    // The banner leads worker startup output with the engine it is about to
-    // serve, so it must precede every other startup line — including the
-    // `--min-free-mb` notice and any stale-run sweep removals/failures below.
-    log(&format!("engine: {engine_desc}"));
-    if decision.created {
-        log(&format!(
-            "pinned the connection in {}: engine: {engine_desc}",
-            pin::state_file(&state_home).display()
-        ));
+    // A pin-resolution FAILURE (e.g. no engine base URL could be resolved) is
+    // DEFERRED rather than fatal here: an unknown or invalid hire is a more
+    // fundamental, non-restartable config error that needs no engine at all, so
+    // "No hire named X" (EX_CONFIG) must be reported even when nothing can be
+    // pinned. When the pin DOES resolve, its banner is emitted now so it still
+    // LEADS startup output (issue #41) — the silent hire resolution below adds
+    // no earlier line. Only once the hire is known to be runnable (and thus
+    // genuinely needs the engine) is a deferred resolution failure surfaced.
+    let pin_result = pin::resolve_or_pin(&state_home, opts.profile.as_deref());
+    if let Ok(decision) = &pin_result {
+        let engine_desc = decision.pin.describe();
+        // The banner leads worker startup output with the engine it is about to
+        // serve, so it must precede every other startup line — including the
+        // `--min-free-mb` notice and any stale-run sweep removals/failures below.
+        log(&format!("engine: {engine_desc}"));
+        if decision.created {
+            log(&format!(
+                "pinned the connection in {}: engine: {engine_desc}",
+                pin::state_file(&state_home).display()
+            ));
+        }
+        pin::warn_if_drifted(decision);
+        // Non-fatal pin-write warnings (e.g. a failed best-effort directory
+        // fsync) were carried back in the decision rather than logged inside
+        // `resolve_or_pin`, precisely so they land HERE — after the banner — and
+        // a first start on a filesystem that rejects directory fsync still opens
+        // with `engine: ...` (issue #41).
+        pin::emit_deferred_warnings(decision);
     }
-    pin::warn_if_drifted(&decision);
-    // Non-fatal pin-write warnings (e.g. a failed best-effort directory fsync)
-    // were carried back in the decision rather than logged inside
-    // `resolve_or_pin`, precisely so they land HERE — after the banner — and a
-    // first start on a filesystem that rejects directory fsync still opens
-    // with `engine: ...` (issue #41).
-    pin::emit_deferred_warnings(&decision);
 
     let config_path = match opts.config_path.clone() {
         Some(p) => p,
@@ -118,6 +125,15 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     if let Err(reason) = validate(&hire) {
         config_exit(&format!("hire \"{}\" cannot run: {reason:#}", hire.name));
     }
+
+    // The hire is runnable, so a pin-resolution failure deferred above is now
+    // fatal: this worker genuinely needs the engine it could not resolve.
+    let decision = match pin_result {
+        Ok(d) => d,
+        Err(e) => config_exit(&format!("cannot resolve the pinned connection: {e:#}")),
+    };
+    let engine_desc = decision.pin.describe();
+
     if let Some(mb) = opts.min_free_mb {
         log(&format!(
             "--min-free-mb {mb} applies to container sandboxes only; hire \"{}\" runs on the host",
@@ -303,9 +319,9 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         })
     };
 
-    // Issue #41: the connection was resolved, pinned, and bannered at the very
-    // top of `run` (before validation, run-root creation, and the stale-run
-    // sweep) so the first startup line names the engine. A worker that
+    // Issue #41: the connection was resolved, pinned, and bannered near the
+    // top of `run` (before hire validation, run-root creation, and the
+    // stale-run sweep) so the first startup line names the engine. A worker that
     // re-resolved c8ctl's *mutable* active profile on every start is the
     // incident's vector: one agent's `c8 use profile` moved the session, and
     // the next-started workers silently followed it onto a stray test engine.

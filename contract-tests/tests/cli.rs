@@ -2,7 +2,7 @@
 //! golden `--json` and `hire --list` output (compared exactly after redaction).
 //! Human-readable output is asserted by fields and facts, not byte-for-byte.
 //!
-//! Written against the Node plugin (`c8ctl-plugin-nano` 1.69.2) first, so the
+//! Written against the Node plugin (`c8ctl-plugin-nano` 1.70.1) first, so the
 //! snapshots describe what users rely on today; the same tests run against the
 //! Rust target with `NS_TARGET=rust`.
 
@@ -213,7 +213,7 @@ fn supervisor_add_unknown_profile_reports_error() {
     // non-zero (exit 1), like `work` on an unknown profile and an invalid
     // `hire --rank`. Asserting only the message would let a build that prints the
     // same error but exits 0 pass, silently dropping the failure contract.
-    // Exit code recorded from the Node reference (c8ctl-plugin-nano 1.69.2).
+    // Exit code recorded from the Node reference (c8ctl-plugin-nano 1.70.1).
     assert_eq!(
         out.code,
         Some(1),

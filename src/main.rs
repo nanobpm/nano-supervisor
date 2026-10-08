@@ -10,6 +10,7 @@ mod acp;
 mod daemon;
 mod engine;
 mod envelope;
+mod fleet;
 mod jobs;
 mod pdeath;
 mod pin;
@@ -36,6 +37,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+/// Serializes unit tests that read or mutate the **process-wide** current
+/// working directory. Rust runs tests in parallel threads and the cwd is a
+/// single process-wide value, so two tests that `set_current_dir` (or that
+/// resolve a relative path against the cwd) can interleave and leave each
+/// other — or a later test — observing the wrong directory. Every test that
+/// touches the cwd must hold this guard for the duration of that access.
+#[cfg(test)]
+pub(crate) fn cwd_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Parser)]
 #[command(
@@ -157,6 +172,74 @@ enum Cmd {
         #[arg(long = "foreground-for-tests", hide = true)]
         foreground_for_tests: bool,
     },
+    /// List hired profiles, or create one in `config.json`.
+    Hire {
+        /// List hires instead of creating one.
+        #[arg(long)]
+        list: bool,
+        /// Emit NDJSON `info` records on the structured (stderr) channel.
+        #[arg(long)]
+        json: bool,
+        /// Profile name (required when creating a hire).
+        #[arg(long)]
+        name: Option<String>,
+        /// Rank: principal, senior, junior or decider.
+        #[arg(long)]
+        rank: Option<String>,
+        /// Agent command to launch.
+        #[arg(long)]
+        command: Option<String>,
+        /// Comma-separated capability list.
+        #[arg(long)]
+        capabilities: Option<String>,
+        /// Model identifier reported to the agent.
+        #[arg(long)]
+        model: Option<String>,
+        /// Transport protocol (`acp` or `pipe`).
+        #[arg(long)]
+        protocol: Option<String>,
+        /// Permission mode passed to the agent.
+        #[arg(long)]
+        permission: Option<String>,
+        /// Sandbox mode (host jobs only run `none`).
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Container image (sandbox jobs only).
+        #[arg(long)]
+        image: Option<String>,
+        /// Terminal relay mode.
+        #[arg(long)]
+        terminal: Option<String>,
+        /// Extra argument appended to the agent command (repeatable). Agent
+        /// arguments are commonly flags themselves (e.g. `--arg --allow-all`),
+        /// so allow hyphen-prefixed values — otherwise clap treats a leading
+        /// `-` token as another option and a valid invocation fails to parse.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Extra `KEY=VALUE` environment entry (repeatable).
+        #[arg(long = "env")]
+        env: Vec<String>,
+    },
+    /// Replace a hire's entire capability set (the supplied list becomes the
+    /// new set, deduplicated and sorted; existing capabilities not listed are
+    /// removed).
+    Assign {
+        /// The hire to reassign.
+        profile: String,
+        /// Comma-separated capabilities that become the hire's entire set,
+        /// replacing (not merged with) any existing capabilities.
+        capabilities: String,
+    },
+    /// Supervisor daemon control.
+    Supervisor {
+        #[command(subcommand)]
+        cmd: SupervisorCmd,
+    },
+    /// Workforce manifests: declare the workers a supervisor should run.
+    Workforce {
+        #[command(subcommand)]
+        cmd: WorkforceCmd,
+    },
     /// Internal: the macOS parent-death watchdog (kills an agent's process group
     /// when the daemon dies). Not for direct use.
     #[command(name = "__reap-watchdog", hide = true)]
@@ -180,6 +263,52 @@ enum Cmd {
         /// The agent group leader's real uid, captured by the daemon at spawn.
         #[arg(long)]
         pgid_uid: Option<u32>,
+    },
+}
+
+/// `supervisor` subcommands implemented on the Rust target.
+#[derive(Subcommand)]
+enum SupervisorCmd {
+    /// Report whether the supervisor daemon is running.
+    Status,
+    /// Add a hired profile to a running supervisor.
+    Add {
+        /// The hire to add.
+        profile: String,
+    },
+}
+
+/// `workforce` subcommands implemented on the Rust target.
+#[derive(Subcommand)]
+enum WorkforceCmd {
+    /// List a workforce manifest's declared workers.
+    List {
+        /// Manifest name.
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
+    /// Declare (or update) a worker in a manifest.
+    Add {
+        /// The hired profile to run.
+        profile: String,
+        /// How many instances to run.
+        #[arg(long, default_value_t = 1)]
+        instances: u32,
+        /// Manifest name.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Role-routing mode for the worker.
+        #[arg(long, default_value = "auto")]
+        roles: String,
+    },
+    /// Report desired vs running workers for a manifest.
+    Status {
+        /// Emit a single JSON status object on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Manifest name.
+        #[arg(long, default_value = "default")]
+        name: String,
     },
 }
 
@@ -397,6 +526,57 @@ async fn main() -> Result<()> {
             .ok();
             Ok(())
         }
+        Cmd::Hire {
+            list,
+            json,
+            name,
+            rank,
+            command,
+            capabilities,
+            model,
+            protocol,
+            permission,
+            sandbox,
+            image,
+            terminal,
+            args,
+            env,
+        } => fleet::hire(fleet::HireArgs {
+            list,
+            json,
+            name,
+            rank,
+            command,
+            capabilities,
+            model,
+            protocol,
+            permission,
+            sandbox,
+            image,
+            terminal,
+            args,
+            env,
+        }),
+        Cmd::Assign {
+            profile,
+            capabilities,
+        } => fleet::assign(&profile, &capabilities),
+        Cmd::Supervisor { cmd } => match cmd {
+            SupervisorCmd::Status => fleet::supervisor(fleet::SupervisorOp::Status),
+            SupervisorCmd::Add { profile } => {
+                fleet::supervisor(fleet::SupervisorOp::Add { profile })
+            }
+        },
+        Cmd::Workforce { cmd } => match cmd {
+            WorkforceCmd::List { name } => fleet::workforce_list(&name),
+            WorkforceCmd::Add {
+                profile,
+                instances,
+                name,
+                roles,
+            } => fleet::workforce_add(&name, &profile, instances, &roles),
+            WorkforceCmd::Status { json, name } => fleet::workforce_status(&name, json),
+        },
     }
 }
 
