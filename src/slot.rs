@@ -262,12 +262,17 @@ pub async fn run(
             // Awaiting `handle` directly would let a drain timeout that aborts the
             // OUTER slot task drop `handle` mid-await — detaching its inner
             // `execute`/agent, which could keep writing under `runs_dir` after
-            // `work::run` tears the namespace down and returns. Aborting this task
-            // drops `handle`, whose inner `execute` handle is wrapped in
-            // `AbortOnDrop` so that drop aborts (never detaches) it; the execute
-            // child processes are `kill_on_drop`, so the whole per-job tree is
-            // torn down and no job outlives the slot.
-            let mut job_task = tokio::spawn(handle(jobs.clone(), cfg.clone(), job));
+            // `work::run` tears the namespace down and returns. Wrap the spawned
+            // per-job task in `AbortOnDrop` so that ANY drop aborts (never
+            // detaches) it: the explicit cancel path below still aborts+joins
+            // through `.0`, but if the OUTER slot task is itself aborted (e.g. the
+            // daemon's drain grace expires and `drain_within_deadline` aborts this
+            // slot's JoinHandle) the guard's drop aborts the job rather than
+            // letting a bare `JoinHandle` drop detach it. Its inner `execute`
+            // handle is likewise `AbortOnDrop`, and the execute child processes
+            // are `kill_on_drop`, so the whole per-job tree is torn down and no
+            // job outlives the slot.
+            let mut job_task = AbortOnDrop(tokio::spawn(handle(jobs.clone(), cfg.clone(), job)));
             loop {
                 tokio::select! {
                     // Bias the drain watch: if a shutdown lands in the same tick
@@ -284,11 +289,11 @@ pub async fn run(
                                 "slot {} draining; aborting in-flight job",
                                 cfg.worker_name
                             ));
-                            job_task.abort();
+                            job_task.0.abort();
                             // Join the aborted task so the execute/agent is fully
                             // torn down before the slot returns (abort err is
                             // expected).
-                            let _ = job_task.await;
+                            let _ = (&mut job_task.0).await;
                             return;
                         }
                         // Graceful drain: stop taking NEW work, but let this job
@@ -301,7 +306,7 @@ pub async fn run(
                         ));
                         continue;
                     }
-                    r = &mut job_task => {
+                    r = &mut job_task.0 => {
                         // Surface a panic in the job task rather than swallowing it.
                         // In standalone `work` mode a swallowed panic would let the
                         // slot return `Ok(())` and the process exit 0 — the
@@ -6311,5 +6316,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // Regression: the OUTER per-job task must be wrapped so that dropping it
+    // ABORTS (never detaches) the spawned job. A bare `tokio::JoinHandle` drop
+    // detaches its task, so if the slot's own task were aborted (e.g. the
+    // daemon's drain grace expired and `drain_within_deadline` aborted this
+    // slot's handle) the in-flight job — and its agent still writing under
+    // `runs_dir` — would keep running after teardown. `AbortOnDrop` is the guard
+    // that prevents that; prove its drop cancels a never-ending task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_on_drop_cancels_the_task_rather_than_detaching_it() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            // Run "forever"; only an abort should end this. If it were merely
+            // detached it would survive the drop and eventually set the flag.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            flag2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let handle = guard.0.abort_handle();
+        assert!(!handle.is_finished(), "task should still be running");
+        drop(guard);
+        // Give the runtime a moment to process the abort.
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            handle.is_finished(),
+            "dropping AbortOnDrop must abort the task, not detach it"
+        );
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted task body must not have run to completion"
+        );
     }
 }

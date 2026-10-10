@@ -1378,15 +1378,25 @@ fn supervisor_running(_home: &std::path::Path) -> bool {
 /// The unlocked connect probe alone cannot serialize startup: two concurrent
 /// `supervisor start`s can both find no socket, then race to unlink each other's
 /// freshly-bound live control socket (nanobpm/nano-supervisor#8). This lock,
-/// keyed on the control-socket path (so it is per-home) and taken from the
-/// owner-private fleet lock dir, makes the later starter observe the lock is
-/// held and bail instead. Because the `flock` is OS-released, a crashed daemon's
-/// lock is already gone, so a legitimate restart is never blocked by a dead
-/// predecessor — and a surviving socket file left by such a crash is therefore
-/// provably stale (its owner no longer holds the lock) and safe to remove.
+/// keyed on the state home (so it is per-home) and taken from the owner-private
+/// fleet lock dir, makes the later starter observe the lock is held and bail
+/// instead. Because the `flock` is OS-released, a crashed daemon's lock is
+/// already gone, so a legitimate restart is never blocked by a dead predecessor
+/// — and a surviving socket file left by such a crash is therefore provably
+/// stale (its owner no longer holds the lock) and safe to remove.
+///
+/// The lock is keyed on the home's **canonical filesystem identity**, NOT on the
+/// derived control-socket path. The socket name hashes the raw home *string* for
+/// byte-for-byte Node compatibility, so two equivalent spellings of the same
+/// home (`/state/home` and `/state/home/.`, a trailing slash, or a symlinked
+/// alias) hash to *different* socket names and would take *different* startup
+/// locks — letting two daemons run slots against the same config and run
+/// directories. `StateLock` keys on a normalized/canonical identity, so locking
+/// on the home itself makes those spellings contend on one lock while the socket
+/// derivation stays unchanged (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
-pub(crate) fn try_lock_supervisor_startup(sock_path: &Path) -> Result<Option<StateLock>> {
-    StateLock::try_acquire(sock_path)
+pub(crate) fn try_lock_supervisor_startup(home: &Path) -> Result<Option<StateLock>> {
+    StateLock::try_acquire(home)
 }
 
 /// `supervisor` subcommands this target implements.
@@ -1712,7 +1722,8 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
     // (nanobpm/nano-supervisor#8).
     kill_and_reap(&mut child);
     bail!(
-        "supervisor daemon (pid {}) did not bind its control socket within 10s",
+        "supervisor daemon (pid {}) did not become responsive on its control socket within 10s \
+         (the socket may have bound but never answered a status probe)",
         child.id()
     );
 }
@@ -3647,5 +3658,70 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
+    }
+
+    // Regression: the supervisor startup lock must key on the state home's
+    // canonical filesystem identity, NOT on the derived socket path. The socket
+    // name hashes the raw home STRING, so equivalent spellings (`/h` and `/h/.`,
+    // a trailing slash) produce different socket names and — before the fix —
+    // different locks, letting two daemons run slots against the same home.
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_contends_across_equivalent_home_spellings() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "c8ctl-nano-startlock-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+
+        // First holder takes the lock on the plain spelling.
+        let held = try_lock_supervisor_startup(&home)
+            .expect("acquire startup lock")
+            .expect("lock should be free initially");
+
+        // An equivalent spelling of the SAME home must observe the lock is held.
+        let dotted = home.join(".");
+        assert!(
+            try_lock_supervisor_startup(&dotted)
+                .expect("try equivalent spelling")
+                .is_none(),
+            "`/h/.` must contend on the same startup lock as `/h`"
+        );
+        let trailing = PathBuf::from(format!("{}/", home.display()));
+        assert!(
+            try_lock_supervisor_startup(&trailing)
+                .expect("try trailing-slash spelling")
+                .is_none(),
+            "a trailing-slash spelling must contend on the same startup lock"
+        );
+
+        // A genuinely different home is independent.
+        let other = std::env::temp_dir().join(format!(
+            "c8ctl-nano-startlock-other-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&other).expect("create other home");
+        assert!(
+            try_lock_supervisor_startup(&other)
+                .expect("acquire other lock")
+                .is_some(),
+            "a different home must not be blocked"
+        );
+
+        // Releasing the holder frees the lock for the equivalent spelling.
+        drop(held);
+        assert!(
+            try_lock_supervisor_startup(&dotted)
+                .expect("re-acquire after release")
+                .is_some(),
+            "releasing the lock must let an equivalent spelling acquire it"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 }

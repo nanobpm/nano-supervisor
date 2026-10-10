@@ -254,7 +254,6 @@ pub fn request_with_timeout(
     timeout: std::time::Duration,
 ) -> std::io::Result<Vec<Value>> {
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
     if timeout.is_zero() {
@@ -290,7 +289,7 @@ pub fn request_with_timeout(
         }
     }
 
-    let stream = UnixStream::connect(socket)?;
+    let stream = connect_within_deadline(socket, deadline)?;
     // Bound the request write by the remaining budget too, so a peer whose
     // receive buffer is full cannot wedge the write past the overall deadline.
     let budget = remaining(deadline)?;
@@ -355,6 +354,195 @@ pub fn request_with_timeout(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Connect to the Unix-domain control socket without letting a blocking
+/// `connect(2)` overrun the caller's overall deadline.
+///
+/// `UnixStream::connect` blocks until the peer accepts, and a *live* daemon
+/// whose listen backlog is full (wedged, not draining its accept queue) can
+/// stall that blocking connect for an unbounded time — before any
+/// `set_read_timeout`/`set_write_timeout` is installed. A readiness probe or
+/// `status`/`stop` call would then hang past its advertised budget. So drive the
+/// connect ourselves on a NON-blocking socket and bound the whole attempt by the
+/// absolute `deadline`:
+///   * an immediate success returns at once;
+///   * a connect left in progress (`EINPROGRESS`) is awaited with `poll(2)` for
+///     only the remaining budget;
+///   * a full-backlog refusal on a *live* peer (`EAGAIN`/`EWOULDBLOCK`, how a
+///     nonblocking AF_UNIX connect reports "try again") is retried with a fresh
+///     socket after a bounded backoff, still only until the deadline;
+///   * a hard failure (`ENOENT`/`ECONNREFUSED`/…, i.e. no live daemon) fails
+///     fast, so "not running" is never turned into a deadline-long wait.
+///
+/// Blocking mode is then restored so the caller's `SO_RCVTIMEO`/`SO_SNDTIMEO`
+/// timeouts govern the rest of the exchange.
+#[cfg(unix)]
+fn connect_within_deadline(
+    socket: &Path,
+    deadline: std::time::Instant,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    use std::time::Instant;
+
+    fn remaining(deadline: Instant) -> std::io::Result<std::time::Duration> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "control request budget exhausted before the daemon accepted the connection",
+            ));
+        }
+        Ok(deadline - now)
+    }
+    // `poll(2)` wants an i32 millisecond timeout; clamp and never hand it 0,
+    // which it treats as "return immediately".
+    fn remaining_ms(deadline: Instant) -> std::io::Result<libc::c_int> {
+        Ok((remaining(deadline)?.as_millis().min(i32::MAX as u128)).max(1) as libc::c_int)
+    }
+
+    let path_bytes = socket.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // Need room for the path plus a terminating NUL within the fixed buffer.
+    if path_bytes.len() >= std::mem::size_of_val(&addr.sun_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "control socket path is too long for sockaddr_un",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &src) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+        *dst = src as libc::c_char;
+    }
+    // Portable sockaddr length: offset of sun_path (handles the BSD `sun_len`
+    // prefix) + path bytes + the trailing NUL.
+    let sun_path_offset =
+        addr.sun_path.as_ptr() as usize - (&addr as *const libc::sockaddr_un as usize);
+    let addr_len = (sun_path_offset + path_bytes.len() + 1) as libc::socklen_t;
+
+    let mut backoff = std::time::Duration::from_millis(2);
+    let backoff_cap = std::time::Duration::from_millis(50);
+    loop {
+        // Fail fast if the budget is already spent, mirroring the read/write paths.
+        remaining(deadline)?;
+
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Own the fd immediately so every early return (and the `?` below) closes
+        // it rather than leaking a descriptor.
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        // Close-on-exec so a concurrently spawned child can never inherit this
+        // client socket (std's own `connect` sets this; our manual socket must too).
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        stream.set_nonblocking(true)?;
+
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                addr_len,
+            )
+        };
+        if rc == 0 {
+            // Restore blocking mode so the caller's read/write timeouts apply.
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Connect started but not yet complete: wait for writability within
+            // the remaining budget, then read the pending socket error.
+            Some(code) if code == libc::EINPROGRESS => {
+                let completed = poll_connect_complete(fd, deadline, remaining_ms)?;
+                if completed {
+                    stream.set_nonblocking(false)?;
+                    return Ok(stream);
+                }
+                // A full backlog can surface as a post-poll ECONNREFUSED on a live
+                // peer; fall through to a bounded retry rather than failing the
+                // whole call on a transient refusal.
+            }
+            // Nonblocking AF_UNIX connect against a full listen backlog: the peer
+            // is alive but cannot enqueue us yet. Retry within the deadline.
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {}
+            // Interrupted before the connect was initiated: retry immediately.
+            Some(code) if code == libc::EINTR => {
+                continue;
+            }
+            // No live daemon (ENOENT/ECONNREFUSED/EACCES/…): fail fast so callers
+            // can detect "not running" without waiting out the whole budget.
+            _ => return Err(err),
+        }
+
+        // Bounded backoff before the next attempt, never past the deadline.
+        drop(stream);
+        let budget = remaining(deadline)?;
+        std::thread::sleep(backoff.min(budget));
+        backoff = (backoff * 2).min(backoff_cap);
+    }
+}
+
+/// Wait for a nonblocking connect on `fd` to finish within `deadline`. Returns
+/// `Ok(true)` when the connection completed cleanly, `Ok(false)` when the peer
+/// refused us (e.g. a transiently full backlog — the caller may retry), and
+/// `Err` on timeout or an unexpected poll/socket failure.
+#[cfg(unix)]
+fn poll_connect_complete(
+    fd: libc::c_int,
+    deadline: std::time::Instant,
+    remaining_ms: fn(std::time::Instant) -> std::io::Result<libc::c_int>,
+) -> std::io::Result<bool> {
+    loop {
+        let timeout_ms = remaining_ms(deadline)?;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "control connect exceeded its overall deadline before the daemon accepted",
+            ));
+        }
+        // Writable: read the pending socket error to distinguish a completed
+        // connect from a refused/failed one.
+        let mut so_error: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let g = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_error as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if g < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return match so_error {
+            0 => Ok(true),
+            // A refused connect on an otherwise-live socket (full backlog) is
+            // retryable; hard failures are surfaced to fail the call fast.
+            code if code == libc::ECONNREFUSED => Ok(false),
+            code => Err(std::io::Error::from_raw_os_error(code)),
+        };
     }
 }
 
@@ -746,6 +934,97 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(2),
                 "the 300ms overall budget must bound the exchange, not the server's ~3s \
                  drip window; took {elapsed:?}"
+            );
+        }
+
+        // The new non-blocking connect must still complete the normal exchange:
+        // a listener that accepts and replies a terminal frame returns Ok. This
+        // guards the connect helper's happy path (socket creation, connect, and
+        // the restore-to-blocking so SO_RCVTIMEO still governs the reads).
+        #[test]
+        fn request_with_timeout_connects_and_completes_normally() {
+            let sock = temp_sock("cok");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::{Read, Write};
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(b"{\"ok\":true,\"final\":true}\n");
+                    let _ = stream.flush();
+                }
+            });
+
+            let frames = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_secs(2),
+            )
+            .expect("a replying daemon must complete the exchange");
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["final"], json!(true));
+        }
+
+        // Regression (blocking connect unbounded by the deadline): a live listener
+        // whose backlog is full can stall a *blocking* `connect(2)` indefinitely,
+        // before any socket timeout is installed. The non-blocking connect + poll
+        // must keep the WHOLE call bounded by the caller's budget regardless of
+        // how the connect resolves. We best-effort fill the backlog; the connect
+        // then either blocks (Linux: EINPROGRESS → poll times out within budget)
+        // or fails fast (macOS: a full Unix backlog yields ECONNREFUSED) — both
+        // are bounded, which is the property under test. Either way the overall
+        // call must return well within the budget rather than hanging.
+        #[test]
+        fn request_with_timeout_bounds_a_backlogged_listener() {
+            use std::os::unix::net::UnixStream as StdUnixStream;
+            let sock = temp_sock("bkl");
+            let _ = std::fs::remove_file(&sock);
+            // A listener that NEVER accepts, so pending connects pile up in the
+            // kernel backlog and are never serviced.
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+
+            // Pile up pending connections to try to saturate the accept backlog.
+            let mut pending = Vec::new();
+            for _ in 0..512 {
+                match StdUnixStream::connect(&sock) {
+                    Ok(s) => pending.push(s),
+                    Err(_) => break,
+                }
+            }
+
+            let start = std::time::Instant::now();
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_millis(300),
+            )
+            .expect_err("a backlogged, never-accepting listener must not complete");
+            let elapsed = start.elapsed();
+
+            drop(pending);
+            drop(listener);
+            let _ = std::fs::remove_file(&sock);
+
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::ConnectionRefused
+                ),
+                "expected a bounded connect failure, got {err:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "the 300ms budget must bound connect+read even with a full backlog; took {elapsed:?}"
             );
         }
 

@@ -182,7 +182,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     //     no orphaned slots left running.
     let sock_path = control::socket_path(&state_home);
     #[cfg(unix)]
-    let _startup_lock = match crate::fleet::try_lock_supervisor_startup(&sock_path)? {
+    let _startup_lock = match crate::fleet::try_lock_supervisor_startup(&state_home)? {
         Some(lock) => lock,
         None => bail!(
             "another nano-supervisor already owns this state home (control socket {}); \
@@ -583,10 +583,30 @@ fn serve_control(
         let descriptor = Arc::new(descriptor);
         let worker_ids = Arc::new(worker_ids);
         let engine = Arc::new(engine);
+        // Transient `accept(2)` failures (EMFILE/ENFILE fd exhaustion, ENOBUFS,
+        // ECONNABORTED, EINTR) must NOT tear down the only control loop: breaking
+        // here would leave the socket bound but make `status`/`stop` unusable,
+        // stranding an unreachable daemon with its worker slots still running.
+        // Back off briefly (so an EMFILE storm cannot busy-spin a core) and keep
+        // serving. Back-to-back transient failures escalate the backoff up to a
+        // 1s cap and reset on the first clean accept.
+        let mut backoff = std::time::Duration::from_millis(10);
+        let backoff_cap = std::time::Duration::from_secs(1);
         loop {
             let stream = match listener.accept().await {
-                Ok((stream, _addr)) => stream,
-                Err(_) => break,
+                Ok((stream, _addr)) => {
+                    backoff = std::time::Duration::from_millis(10);
+                    stream
+                }
+                Err(e) => {
+                    log(&format!(
+                        "control accept failed ({e}); retrying after {}ms",
+                        backoff.as_millis()
+                    ));
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(backoff_cap);
+                    continue;
+                }
             };
             // Reject any peer not owned by this daemon's user before serving it.
             // The socket mode is owner-only, but that is a filesystem check a
