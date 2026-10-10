@@ -329,19 +329,30 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // (via `request_shutdown`) keeps that escalation, so re-read the SETTLED
     // reason after draining rather than trusting the snapshot — otherwise the
     // daemon would exit zero and mask the fatal fencing failure.
-    let forced = reason == slot::Shutdown::Cancel;
     let drain = async {
         for h in handles {
             let _ = h.await;
         }
     };
-    let grace = if forced {
+    // Pick the grace window from the snapshot, but keep watching the shutdown
+    // reason WHILE draining: a plain `Drain` chooses the full 20s window, yet a
+    // second client can escalate it with `stop --force` (`Cancel`), or a slot
+    // can flip it to `Fatal`, mid-drain. Both reasons abort in-flight work, so a
+    // stuck slot must NOT be able to ride the long graceful window — shorten the
+    // active deadline to the forced window the moment the settled reason starts
+    // aborting in-flight work. Freezing the grace from the snapshot (the old bug)
+    // let a mid-drain escalation leave the daemon/socket alive for the full 20s
+    // instead of the promised forced-stop window.
+    let initial_grace = if reason.aborts_inflight() {
         FORCE_DRAIN_GRACE
     } else {
         DRAIN_GRACE
     };
-    if tokio::time::timeout(grace, drain).await.is_err() {
-        if forced {
+    let mut escalation_rx = shutdown_tx.subscribe();
+    let drained =
+        drain_within_deadline(drain, &mut escalation_rx, initial_grace, FORCE_DRAIN_GRACE).await;
+    if !drained {
+        if (*shutdown_tx.borrow()).aborts_inflight() {
             log("forced stop: cancelling in-flight work and reaping remaining agents");
         } else {
             log(&format!(
@@ -580,28 +591,37 @@ async fn handle_control_connection(
         let Some(resp) = control::handle_request(&line, &snapshot) else {
             continue;
         };
-        for frame in &resp.frames {
-            if write_half
-                .write_all(control::encode_frame(frame).as_bytes())
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        let _ = write_half.flush().await;
+        // Publish a parsed `stop` BEFORE writing the reply, not after: the
+        // shutdown is the authoritative side effect of the request and must not
+        // hinge on delivering every response frame. If the client disconnects
+        // after sending `stop` (or an interim frame write fails), gating the
+        // `request_shutdown` on a successful write would `return` early and leave
+        // the daemon running forever. A plain `stop` requests a graceful `Drain`
+        // (let in-flight work finish, exit zero); `stop --force` requests a
+        // `Cancel` (abort in-flight work now). `request_shutdown` publishes it
+        // without ever downgrading a slot's concurrent FATAL flip, so an operator
+        // stop can never mask a fatal shutdown into a clean exit.
         if resp.stop {
-            // A plain `stop` requests a graceful `Drain` (let in-flight work
-            // finish, exit zero); `stop --force` requests a `Cancel` (abort
-            // in-flight work now). `request_shutdown` publishes it without ever
-            // downgrading a slot's concurrent FATAL flip, so an operator stop can
-            // never mask a fatal shutdown into a clean exit.
             let want = if resp.force {
                 slot::Shutdown::Cancel
             } else {
                 slot::Shutdown::Drain
             };
             let _ = slot::request_shutdown(&shutdown_tx, want);
+        }
+        for frame in &resp.frames {
+            if write_half
+                .write_all(control::encode_frame(frame).as_bytes())
+                .await
+                .is_err()
+            {
+                // The shutdown (if any) is already published above, so a failed
+                // write only costs the client its reply — the daemon still drains.
+                return;
+            }
+        }
+        let _ = write_half.flush().await;
+        if resp.stop {
             return;
         }
     }
@@ -1219,6 +1239,57 @@ pub(crate) async fn wait_for_signal(shutdown: &watch::Sender<slot::Shutdown>) ->
         // Defensive: a watch flip that settled back to `Running` is treated as a
         // graceful drain rather than a no-op.
         slot::Shutdown::Drain
+    }
+}
+
+/// Await `drain`, bounded by `initial_grace`, but collapse the deadline to
+/// `forced_grace` the instant the shutdown watch escalates to a reason that
+/// aborts in-flight work (`stop --force`'s `Cancel`, or a slot's `Fatal` flip).
+/// Returns `true` when the drain finished within the (possibly shortened)
+/// window, `false` on timeout.
+///
+/// This exists because the grace window must NOT be frozen from the snapshot
+/// reason: a graceful `Drain` picks the long window, but if a second client then
+/// escalates with `stop --force` a stuck slot could otherwise keep the
+/// daemon/socket alive for the full graceful window instead of the promised
+/// forced-stop window. Watching the live reason while draining fixes the whole
+/// class (any escalation that starts aborting in-flight work shortens the
+/// deadline), not just the one cited `Drain -> Cancel` case.
+pub(crate) async fn drain_within_deadline(
+    drain: impl std::future::Future<Output = ()>,
+    watch_rx: &mut watch::Receiver<slot::Shutdown>,
+    initial_grace: Duration,
+    forced_grace: Duration,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    let mut deadline = start + initial_grace;
+    let mut watching = true;
+    tokio::pin!(drain);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut drain => return true,
+            changed = watch_rx.changed(), if watching => {
+                match changed {
+                    // On an escalation that aborts in-flight work, collapse the
+                    // deadline to the forced window (never lengthen it).
+                    Ok(()) => {
+                        if watch_rx.borrow_and_update().aborts_inflight() {
+                            let forced_deadline = start + forced_grace;
+                            if forced_deadline < deadline {
+                                deadline = forced_deadline;
+                            }
+                        }
+                    }
+                    // The sender was dropped, so no further escalation can
+                    // arrive; stop polling the watch (an errored `changed()`
+                    // is ready immediately and would otherwise busy-loop) and
+                    // just race the drain against the deadline.
+                    Err(_) => watching = false,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => return false,
+        }
     }
 }
 
@@ -2083,5 +2154,91 @@ mod tests {
         let listener = bind_control_socket(&sock).expect("bind over a stale socket");
         drop(listener);
         let _ = std::fs::remove_file(&sock);
+    }
+
+    // A graceful `Drain` that is escalated to `Cancel` (a second `stop --force`)
+    // mid-drain must collapse the active deadline to the forced window: a stuck
+    // slot must not be able to ride the full graceful grace after the operator
+    // demanded a forced stop (nanobpm/nano-supervisor#8). A long `initial_grace`
+    // stands in for `DRAIN_GRACE`: without the shortening the call would block
+    // for the full window, so finishing quickly proves the escalation shortened it.
+    #[tokio::test]
+    async fn forced_escalation_shortens_active_drain_deadline() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
+        let mut rx = tx.subscribe();
+        // A slot that never finishes draining.
+        let drain = std::future::pending::<()>();
+
+        let txc = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = slot::request_shutdown(&txc, slot::Shutdown::Cancel);
+        });
+
+        let start = std::time::Instant::now();
+        let drained = drain_within_deadline(
+            drain,
+            &mut rx,
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(!drained, "a stuck slot never drains");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a forced escalation must collapse the deadline to the forced window rather than \
+             riding the full graceful grace; took {elapsed:?}"
+        );
+    }
+
+    // The complement: a drain that completes before the deadline returns `true`
+    // (drained cleanly), regardless of the window chosen.
+    #[tokio::test]
+    async fn drain_within_deadline_reports_a_clean_drain() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
+        let mut rx = tx.subscribe();
+        let drain = async {};
+        let drained =
+            drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
+        assert!(drained, "an immediately-finished drain must report success");
+    }
+
+    // A parsed `stop` must publish the shutdown BEFORE the reply is written, so a
+    // client that disconnects after sending the request (or a failed interim
+    // frame write) cannot leave the daemon running forever (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_publishes_shutdown_even_when_client_disconnects() {
+        use tokio::io::AsyncWriteExt;
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let descriptor = Arc::new(control::DaemonDescriptor {
+            pid: std::process::id(),
+            started_at: "2026-01-01T00:00:00.000Z".into(),
+            version: "0.0.1".into(),
+            socket: "/tmp/c8ctl-nano-stop-test.sock".into(),
+            log_file: "/tmp/c8ctl-nano-stop-test.log".into(),
+        });
+        let worker_ids = Arc::new(Vec::new());
+        let engine = Arc::new("http://localhost:8080".to_string());
+
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        // Send a graceful stop, then close our end so the daemon's reply writes
+        // fail — the shutdown must still be published.
+        client
+            .write_all(b"{\"op\":\"stop\"}\n")
+            .await
+            .expect("send stop request");
+        client.shutdown().await.ok();
+        drop(client);
+
+        handle_control_connection(server, descriptor, worker_ids, engine, 0, tx.clone()).await;
+
+        assert_eq!(
+            *tx.borrow(),
+            slot::Shutdown::Drain,
+            "a parsed stop must publish shutdown even when the client disconnected before the reply"
+        );
     }
 }

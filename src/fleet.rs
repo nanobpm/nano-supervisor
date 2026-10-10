@@ -350,7 +350,122 @@ fn open_confined_parent(path: &Path) -> Result<RawFdGuard> {
     Ok(dirfd)
 }
 
-/// True if any link in the error chain is an OS `NotFound` (`ENOENT`). Used by
+/// Like [`open_confined_parent`], but CREATES each missing directory in the
+/// tail (e.g. `logs/supervisor`) as it walks, still confined to the trusted
+/// state home: every component is `mkdirat`-ed (ignoring "already exists") and
+/// then re-opened with `O_NOFOLLOW | O_DIRECTORY`, so a planted symlink anywhere
+/// in the operator-controlled tail is refused with `ELOOP`/`ENOTDIR` rather than
+/// followed out of the home. Returns a pinned dirfd for `path`'s parent. Used to
+/// anchor the supervisor daemon log the same way state files are anchored
+/// (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+fn create_confined_parent(path: &Path) -> Result<RawFdGuard> {
+    let parent = path
+        .parent()
+        .context("log path has no parent directory")?;
+    let anchor = home_dir()?;
+    let tail = parent.strip_prefix(&anchor).map_err(|_| {
+        anyhow::anyhow!(
+            "log path {} is not under the trusted state home {}",
+            path.display(),
+            anchor.display()
+        )
+    })?;
+
+    let anchor_c = cstring_from_path(&anchor)?;
+    let anchor_fd = unsafe {
+        libc::open(
+            anchor_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if anchor_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening trusted state home: {}", anchor.display()));
+    }
+    let mut dirfd = RawFdGuard(anchor_fd);
+
+    for component in tail.components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::CurDir => continue,
+            other => bail!(
+                "log path {} escapes the trusted state home via {:?}",
+                path.display(),
+                other
+            ),
+        };
+        let name_c = cstring_from_component(name)?;
+        // Create the directory if absent; an existing entry (dir OR a planted
+        // symlink) makes `mkdirat` fail `EEXIST`, which we ignore here and let
+        // the no-follow `openat` below decide: a real directory opens, a symlink
+        // is refused with `ELOOP`.
+        unsafe {
+            libc::mkdirat(dirfd.0, name_c.as_ptr(), 0o700);
+        }
+        let fd = unsafe {
+            libc::openat(
+                dirfd.0,
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "creating log directory without following symlinks: {}",
+                    parent.display()
+                )
+            });
+        }
+        dirfd = RawFdGuard(fd);
+    }
+
+    Ok(dirfd)
+}
+
+/// Open (creating if absent) an append-mode log file confined to the trusted
+/// state home: its parent tail is created/opened no-follow via
+/// [`create_confined_parent`], and the final component is opened
+/// `O_CREAT | O_APPEND | O_WRONLY | O_NOFOLLOW`, so a planted symlink at the log
+/// path is refused rather than followed to clobber an arbitrary target. The
+/// opened descriptor is verified to be a regular file. Failures are returned,
+/// not suppressed, so the launcher can refuse to spawn rather than silently
+/// discarding the daemon's diagnostics.
+#[cfg(unix)]
+fn open_log_confined(path: &Path) -> Result<std::fs::File> {
+    let file_name = path.file_name().context("log path has no file name")?;
+    let final_c = cstring_from_component(file_name)?;
+    let dirfd = create_confined_parent(path)?;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd.0,
+            final_c.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!("opening log file without following symlinks: {}", path.display())
+        });
+    }
+    let fd = RawFdGuard(fd);
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.0, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statting log file {}", path.display()));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        bail!("log path is not a regular file: {}", path.display());
+    }
+
+    Ok(fd.into_file())
+}
+
+
 /// the confined read to map "the file (or a directory above it) does not exist"
 /// to `None` while still surfacing a symlinked/foreign tail (`ELOOP`/`ENOTDIR`)
 /// as a hard error.
@@ -1501,33 +1616,23 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
     // with its console redirected to the daemon log so it never holds this
     // process's stdio open (which would block the caller) and its output is
     // captured where `supervisor status` reports it.
+    //
+    // The log is opened through a state-home-anchored no-follow helper: a planted
+    // symlink in `logs`, `supervisor`, or `daemon.log` is refused rather than
+    // followed out of the confined tree (the same policy the state-file writer
+    // enforces, `fleet.rs` `write_json_atomic_unix`). Any setup/clone failure is
+    // PROPAGATED, not swallowed into a silent `/dev/null` fallback: the operator
+    // is told to read this log, so a daemon spawned with no diagnostics would be
+    // a debugging dead end.
     let log_file = home.join("logs").join("supervisor").join("daemon.log");
-    if let Some(parent) = log_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let log_out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file);
+    let log_out = open_log_confined(&log_file)
+        .with_context(|| format!("preparing supervisor daemon log {}", log_file.display()))?;
+    let log_err = log_out
+        .try_clone()
+        .with_context(|| format!("duplicating supervisor daemon log {}", log_file.display()))?;
     cmd.stdin(std::process::Stdio::null());
-    match &log_out {
-        Ok(f) => {
-            let (o, e) = (
-                f.try_clone().map(std::process::Stdio::from),
-                f.try_clone().map(std::process::Stdio::from),
-            );
-            if let (Ok(o), Ok(e)) = (o, e) {
-                cmd.stdout(o).stderr(e);
-            } else {
-                cmd.stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-            }
-        }
-        Err(_) => {
-            cmd.stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-        }
-    }
+    cmd.stdout(std::process::Stdio::from(log_out))
+        .stderr(std::process::Stdio::from(log_err));
     unsafe {
         cmd.pre_exec(|| {
             // Detach from the controlling terminal / parent session. An EPERM
@@ -1550,8 +1655,16 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
     // we (a) bail early if our child has already exited, and (b) require the
     // status frame's `daemon.pid` to equal our child's PID before claiming the
     // launch succeeded — a different PID means another start won the race.
+    // Readiness is bounded by ONE overall deadline (10s), not by iteration
+    // count: each `supervisor_daemon_pid` probe is capped by the budget still
+    // remaining. The previous `for _ in 0..100` loop gave each probe the fixed
+    // 5-second `control::request` read timeout, so a child that bound the socket
+    // but never answered could stall startup for ~500s (100 × 5s) before the
+    // "10s" error — the advertised bound was not actually enforced.
     let sock = control::socket_path(home);
-    for _ in 0..100 {
+    let readiness_window = std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + readiness_window;
+    loop {
         if let Some(status) = child.try_wait().ok().flatten() {
             bail!(
                 "supervisor daemon (pid {}) exited during startup (status {}); another start may \
@@ -1560,8 +1673,17 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
                 status
             );
         }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         if sock.exists() {
-            if let Some(pid) = supervisor_daemon_pid(home) {
+            // Cap each probe at a short slice (but never past the remaining
+            // budget) so a daemon that has bound its socket but is briefly slow
+            // to answer still gets several quick retries, while the loop as a
+            // whole can never exceed `readiness_window`.
+            let probe_timeout = remaining.min(std::time::Duration::from_secs(1));
+            if let Some(pid) = supervisor_daemon_pid(home, probe_timeout) {
                 if pid == child.id() {
                     println!("Supervisor started (pid {})", child.id());
                     return Ok(());
@@ -1580,7 +1702,9 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
                 );
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Sleep between probes, but never past the overall deadline.
+        let nap = remaining.min(std::time::Duration::from_millis(100));
+        std::thread::sleep(nap);
     }
     // Startup timed out. Dropping `child` does NOT terminate it, so a slow child
     // could still bind the socket and run indefinitely after the operator was
@@ -1609,9 +1733,11 @@ fn kill_and_reap(child: &mut std::process::Child) {
 /// child this launcher spawned, so a concurrent start's winner is not mistaken
 /// for our own (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
-fn supervisor_daemon_pid(home: &std::path::Path) -> Option<u32> {
+fn supervisor_daemon_pid(home: &std::path::Path, timeout: std::time::Duration) -> Option<u32> {
     let sock = control::socket_path(home);
-    let frames = control::request(&sock, &serde_json::json!({ "op": "status" })).ok()?;
+    let frames =
+        control::request_with_timeout(&sock, &serde_json::json!({ "op": "status" }), timeout)
+            .ok()?;
     let frame = frames
         .iter()
         .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
@@ -2880,6 +3006,64 @@ mod tests {
         assert_eq!(mode, 0o700, "lock dir must be owner-only");
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The supervisor daemon log must be opened through a state-home-anchored
+    // no-follow helper: a planted symlink at the log path is refused rather than
+    // followed to clobber an arbitrary target, and setup failures are propagated
+    // rather than silently swallowed into /dev/null (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[test]
+    fn open_log_confined_refuses_a_symlinked_log_file() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let logs = home.join("logs").join("supervisor");
+        std::fs::create_dir_all(&logs).unwrap();
+        let victim = home.join("victim.log");
+        std::fs::write(&victim, "do not touch").unwrap();
+        std::os::unix::fs::symlink(&victim, logs.join("daemon.log")).unwrap();
+
+        let err = open_log_confined(&logs.join("daemon.log"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without following symlinks"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "a planted symlink must not redirect the daemon log open"
+        );
+    }
+
+    // A symlink planted on an intermediate log directory component (`logs` ->
+    // elsewhere) must also be refused, not walked out of the home.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_confined_refuses_a_symlinked_log_dir() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let real = home.join("real-logs");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, home.join("logs")).unwrap();
+
+        let err = open_log_confined(&home.join("logs").join("supervisor").join("daemon.log"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without following symlinks"), "{err}");
+    }
+
+    // The happy path: with no planted symlinks, the helper creates the tail
+    // directories and returns an appendable regular file.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_confined_creates_and_opens_a_regular_log() {
+        use std::io::Write;
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let log = home.join("logs").join("supervisor").join("daemon.log");
+        let mut f = open_log_confined(&log).expect("open log");
+        f.write_all(b"hello\n").expect("write log");
+        drop(f);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "hello\n");
     }
 
     #[cfg(unix)]

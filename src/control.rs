@@ -235,11 +235,33 @@ pub fn encode_frame(frame: &Value) -> String {
 /// a partial reply for success.
 #[cfg(unix)]
 pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
+    request_with_timeout(socket, req, std::time::Duration::from_secs(5))
+}
+
+/// Like [`request`], but caps the per-reply read wait at `timeout` so a caller
+/// with an overall deadline (e.g. the bounded supervisor-start readiness poll)
+/// can keep each probe within its remaining budget instead of blocking for the
+/// fixed 5-second default. A zero/elapsed budget fails fast as a timeout rather
+/// than being passed to `set_read_timeout`, where `Some(0)` means "block
+/// forever" and would defeat the deadline.
+#[cfg(unix)]
+pub fn request_with_timeout(
+    socket: &Path,
+    req: &Value,
+    timeout: std::time::Duration,
+) -> std::io::Result<Vec<Value>> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
+    if timeout.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "control request budget exhausted before contacting the daemon",
+        ));
+    }
+
     let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
     (&stream).write_all(encode_frame(req).as_bytes())?;
     (&stream).flush()?;
 
@@ -554,6 +576,75 @@ mod tests {
                     // Leave the connection to close, signalling EOF to the client.
                 }
             })
+        }
+
+        // A daemon that has bound the socket but is NOT replying (accepts the
+        // connection, reads the request, then goes silent) must not let a probe
+        // block for the fixed 5-second default: `request_with_timeout` caps the
+        // read wait at the caller's remaining budget, so a bounded readiness poll
+        // (`supervisor_start`) honours its advertised 10s window instead of
+        // stacking 100 × 5s probes into ~500s.
+        #[test]
+        fn request_with_timeout_bounds_a_silent_daemon() {
+            let sock = temp_sock("silent");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Never reply; hold the connection until the client has timed
+                    // out so the silence is what ends the exchange.
+                    let _ = release_rx.recv();
+                }
+            });
+
+            let start = std::time::Instant::now();
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_millis(200),
+            )
+            .expect_err("a silent daemon must time out");
+            let elapsed = start.elapsed();
+
+            let _ = release_tx.send(());
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert!(
+                err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock,
+                "expected a timeout error, got {err:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "the probe must be bounded by the 200ms budget, not the 5s default; took {elapsed:?}"
+            );
+        }
+
+        // A fully-consumed budget must fail fast as a timeout rather than being
+        // handed to `set_read_timeout`, where `Some(0)` means "block forever" and
+        // would defeat the overall readiness deadline.
+        #[test]
+        fn request_with_timeout_zero_budget_fails_fast() {
+            let err = request_with_timeout(
+                Path::new("/nonexistent/c8ctl-nano-zero-budget.sock"),
+                &json!({ "op": "status" }),
+                std::time::Duration::ZERO,
+            )
+            .expect_err("a zero budget must not connect or block");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut,
+                "an exhausted budget must surface as a timeout, got {err:?}"
+            );
         }
 
         #[test]
