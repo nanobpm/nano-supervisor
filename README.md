@@ -4,6 +4,11 @@ Standalone Rust supervisor and job workers for Nano BPM coding agents (replaces 
 - `nano-supervisor daemon` — the MVP daemon: N slots per hire (from `config.json`),
   one shared engine connection, host sandbox, ACP + pipe protocols. See
   [`daemon/README.md`](daemon/README.md).
+- `nano-supervisor supervisor start|status|stop` — start the daemon (detached),
+  query it over the control socket, or drain and stop it. The control socket
+  (`supervisor.sock`) speaks the Node daemon's NDJSON protocol, so a Node client
+  can drive a Rust daemon and vice-versa (`src/control.rs`,
+  [`contract-tests/fixtures/socket-protocol.md`](contract-tests/fixtures/socket-protocol.md)).
 - `nano-supervisor work <hire>` — one worker for a hired profile, the Rust
   `c8 nano work <profile>`. See [`spike/README.md`](spike/README.md).
 
