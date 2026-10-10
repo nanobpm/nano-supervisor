@@ -65,7 +65,10 @@ jobs:
         run: .github/scripts/start-nano-engine.sh "${{ steps.versions.outputs.plugin }}" 8080
       - name: contract tests (Node target)
         id: tests
-        continue-on-error: true
+        # No continue-on-error: a real failure must fail the job (the run goes
+        # red) so drift is visible. The `if: always()` guards on the summarise /
+        # upload steps still preserve report generation after a failure, and
+        # `steps.tests.outcome` records the result for the report.
         run: |
           set -o pipefail
           cargo test -p contract-tests --locked --no-fail-fast 2>&1 | tee test-output.txt
@@ -84,13 +87,19 @@ jobs:
           } > "drift-report/${os}.md"
           if [ "$outcome" != "success" ]; then
             echo "" >> "drift-report/${os}.md"
-            echo "<details><summary>Failing tests (${os})</summary>" >> "drift-report/${os}.md"
-            echo "" >> "drift-report/${os}.md"
-            echo '```' >> "drift-report/${os}.md"
-            # Lines like `test foo::bar ... FAILED` plus the trailing `failures:` block.
-            grep -E ' \.\.\. FAILED$' test-output.txt >> "drift-report/${os}.md" || true
-            echo '```' >> "drift-report/${os}.md"
-            echo "</details>" >> "drift-report/${os}.md"
+            if [ "$outcome" = "skipped" ]; then
+              # Version resolution / install / engine start failed before the
+              # suite ran — there is no test output to quote.
+              echo "Test step never ran (an earlier step failed); treating as drift." >> "drift-report/${os}.md"
+            else
+              echo "<details><summary>Failing tests (${os})</summary>" >> "drift-report/${os}.md"
+              echo "" >> "drift-report/${os}.md"
+              echo '```' >> "drift-report/${os}.md"
+              # Lines like `test foo::bar ... FAILED` plus the trailing `failures:` block.
+              grep -E ' \.\.\. FAILED$' test-output.txt >> "drift-report/${os}.md" || true
+              echo '```' >> "drift-report/${os}.md"
+              echo "</details>" >> "drift-report/${os}.md"
+            fi
           fi
       - name: upload drift report
         if: always()
@@ -125,9 +134,14 @@ jobs:
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-          # Did any matrix leg report a non-success result?
+          # Did any matrix leg report anything other than a green test run?
+          # Fail closed: a `skipped` leg (version resolution / install / engine
+          # start failed, so the suite never ran) or a missing report must NOT
+          # close an active drift issue — only a real `success` may.
           failed=0
-          if grep -rqiE 'result: \*\*(failure|cancelled)\*\*' reports 2>/dev/null; then
+          if grep -rqiE 'result: \*\*(failure|cancelled|skipped)\*\*' reports 2>/dev/null; then
+            failed=1
+          elif ! grep -rqiE 'result: \*\*success\*\*' reports 2>/dev/null; then
             failed=1
           fi
 
