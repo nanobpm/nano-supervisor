@@ -1426,6 +1426,34 @@ fn supervisor_stop(home: &std::path::Path, force: bool) -> Result<()> {
     }
 }
 
+/// Pure nested-supervisor containment decision for `supervisor start` (#40),
+/// split out so it is testable without touching process-global env.
+///
+/// Returns the effective `attach` flag, or an explanatory refusal message.
+/// Inside an agent run (`in_agent_run`) a DETACHED start is never allowed: the
+/// daemon child arms parent-death against this short-lived launcher (killed on
+/// Linux when the launcher exits) or escapes the job's process group via
+/// `setsid` (non-Linux). So we refuse without the opt-in, and FORCE attached
+/// mode with it. Outside an agent run the caller's `attach` passes through.
+fn nested_start_decision(in_agent_run: bool, opted_in: bool, attach: bool) -> Result<bool, String> {
+    if !in_agent_run {
+        return Ok(attach);
+    }
+    if !opted_in {
+        return Err(format!(
+            "refusing to start `nano-supervisor supervisor start` inside an agent run \
+             ({run}=…). A supervisor started by an agent would run as an unintended nested \
+             fleet outside the job's lifecycle. If this IS a contract test, opt in with \
+             `{allow}=1` (runs attached, bound to the invoking process).",
+            run = crate::AGENT_RUN_ENV,
+            allow = crate::ALLOW_NESTED_ENV,
+        ));
+    }
+    // Opted in: force attached so the daemon stays bound to the invoking
+    // process's lifecycle rather than daemonizing out of containment.
+    Ok(true)
+}
+
 /// `supervisor start --worker <p>… [--attach]`: launch the daemon for the named
 /// hires. Without `--attach` the daemon is detached into its own session and
 /// this command returns once the control socket is bound; with `--attach` it
@@ -1438,6 +1466,23 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
         println!("Supervisor already running");
         return Ok(());
     }
+
+    // Nested-supervisor containment (#40): the daemon child this launcher spawns
+    // runs `nano-supervisor daemon`, which — when `NANO_AGENT_RUN` is set and the
+    // opt-in is present — arms parent-death against THIS short-lived launcher. A
+    // DETACHED start would then be killed on Linux the moment this launcher
+    // reports success and exits, and on non-Linux its `setsid` would let it
+    // escape the invoking job's process group entirely. So inside an agent run we
+    // never daemonize: refuse without the opt-in, and with the opt-in FORCE
+    // attached mode (overriding a missing `--attach`) so the daemon stays bound
+    // to the invoking process's lifecycle.
+    let in_agent_run = std::env::var_os(crate::AGENT_RUN_ENV).is_some();
+    let opted_in = std::env::var(crate::ALLOW_NESTED_ENV).ok().as_deref() == Some("1");
+    let attach = match nested_start_decision(in_agent_run, opted_in, attach) {
+        Ok(attach) => attach,
+        Err(msg) => bail!(msg),
+    };
+
     let exe = std::env::current_exe().context("locating the nano-supervisor executable")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("daemon");
@@ -2066,6 +2111,35 @@ mod tests {
         );
         // Empty frame list: nothing to surface.
         assert_eq!(terminal_frame_error(&[]), None);
+    }
+
+    // Nested-supervisor containment (#40): a detached `supervisor start` inside
+    // an agent run is never allowed — the daemon child arms parent-death against
+    // the short-lived launcher (killed on Linux when it exits) or escapes the
+    // job's process group via `setsid` (non-Linux).
+    #[test]
+    fn nested_start_decision_refuses_detached_in_agent_run_without_opt_in() {
+        let result = nested_start_decision(true, false, false);
+        assert!(
+            result.is_err(),
+            "an agent-run start without the opt-in must be refused"
+        );
+    }
+
+    #[test]
+    fn nested_start_decision_forces_attach_in_agent_run_with_opt_in() {
+        // Even without `--attach`, an opted-in nested start must run attached so
+        // the daemon stays bound to the invoking process's lifecycle.
+        assert_eq!(nested_start_decision(true, true, false), Ok(true));
+        assert_eq!(nested_start_decision(true, true, true), Ok(true));
+    }
+
+    #[test]
+    fn nested_start_decision_passes_attach_through_outside_an_agent_run() {
+        assert_eq!(nested_start_decision(false, false, false), Ok(false));
+        assert_eq!(nested_start_decision(false, false, true), Ok(true));
+        // The opt-in is irrelevant outside an agent run.
+        assert_eq!(nested_start_decision(false, true, false), Ok(false));
     }
 
     fn hire_args(name: &str) -> HireArgs {

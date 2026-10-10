@@ -353,9 +353,9 @@ fn daemon_leases(no_lease: bool) -> bool {
 /// Env var the worker stamps on every agent process (`slot::build_agent_env`) to
 /// mark its process tree as belonging to an agent run. Its presence here means
 /// *this* `nano-supervisor` was launched by an agent.
-const AGENT_RUN_ENV: &str = "NANO_AGENT_RUN";
+pub(crate) const AGENT_RUN_ENV: &str = "NANO_AGENT_RUN";
 /// Explicit opt-in letting a supervisor/worker run attached inside an agent run.
-const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
+pub(crate) const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
 
 /// Pure refusal decision for a nested supervisor/worker (#40), split out so it is
 /// testable without touching process-global env. Returns the explanatory error

@@ -304,8 +304,9 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // slot can publish its fatal flip on the same tick a client requests `stop`,
     // so a graceful reason must not mask a concurrent fatal into exit 0.
     let reason = wait_for_signal(&shutdown_tx).await;
-    let fatal = reason == slot::Shutdown::Fatal;
-    if fatal {
+    // Log from the snapshot; the AUTHORITATIVE reason is re-read after the drain
+    // below (a fatal escalation can land mid-drain — see the `settled` re-read).
+    if reason == slot::Shutdown::Fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); draining and exiting non-zero");
     } else {
         log("shutdown signal received; draining slots…");
@@ -321,6 +322,13 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // `stop --force` (`Cancel`) cuts that window short and has the slots abort
     // in-flight work immediately; a graceful `Drain` lets each in-flight job
     // finish within the full grace window.
+    //
+    // `reason` is only the snapshot `wait_for_signal` returned. A slot that
+    // already passed its pre-batch shutdown check can still detect an unleased
+    // activation DURING this drain and escalate the watch to `Fatal`; the watch
+    // (via `request_shutdown`) keeps that escalation, so re-read the SETTLED
+    // reason after draining rather than trusting the snapshot — otherwise the
+    // daemon would exit zero and mask the fatal fencing failure.
     let forced = reason == slot::Shutdown::Cancel;
     let drain = async {
         for h in handles {
@@ -345,6 +353,17 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         log("all slots drained; exiting");
     }
 
+    // Re-read the watch's settled value now that draining has finished: a fatal
+    // escalation that landed mid-drain must decide the exit status (and would
+    // have been masked by the `reason` snapshot above). `request_shutdown`
+    // guarantees the settled value is the highest-precedence reason ever
+    // published, so this is the authoritative shutdown reason.
+    let settled = *shutdown_tx.borrow();
+    let fatal = settled == slot::Shutdown::Fatal;
+    if fatal && reason != slot::Shutdown::Fatal {
+        log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); the fatal escalation arrived during the drain — exiting non-zero");
+    }
+
     // Tear the control socket down: stop accepting, remove the socket file and
     // the `supervisor.json` descriptor so a later `supervisor status` reports
     // "not running" rather than probing a stale socket.
@@ -367,10 +386,18 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 /// Bind the supervisor control socket, failing startup if it cannot be bound.
 ///
 /// Called **before** any slot is spawned and while the per-home startup lock is
-/// held, so (a) a bind failure aborts startup cleanly with no orphaned slots,
-/// and (b) any socket file present here is provably stale — its owner would
-/// still hold the startup lock — so removing it before `bind()` cannot clobber a
-/// live peer.
+/// held, so a bind failure aborts startup cleanly with no orphaned slots.
+///
+/// The startup lock alone does NOT prove a pre-existing socket file is stale:
+/// that lock is a Rust-private `flock`, and a protocol-compatible **Node**
+/// daemon — which binds the SAME derived socket path (see
+/// `control::socket_path`) — never holds it. So a live Node daemon (or a direct
+/// `nano-supervisor daemon` started without the lock) can own the socket while
+/// this Rust starter holds the flock. Unlinking unconditionally would disconnect
+/// that live daemon's control endpoint and leave two fleets running. We
+/// therefore treat the socket as stale only when it is present but REFUSES a
+/// connection (a dead owner's leftover); a socket that still answers a connect
+/// belongs to a live peer and is startup-fatal to clobber.
 #[cfg(unix)]
 fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
     use tokio::net::UnixListener;
@@ -378,7 +405,21 @@ fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
     if let Some(parent) = sock_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::remove_file(sock_path);
+    if sock_path.exists() {
+        // Cross-implementation ownership check: a connect that SUCCEEDS means a
+        // live daemon (Rust or Node) is bound here — refuse to unlink its socket
+        // out from under it. Only a connect that FAILS (ECONNREFUSED / ENOENT
+        // racing a teardown) marks the file as a dead owner's stale leftover that
+        // is safe to remove before binding.
+        if std::os::unix::net::UnixStream::connect(sock_path).is_ok() {
+            bail!(
+                "the supervisor control socket at {} is live — another daemon (Rust or Node) \
+                 already owns this state home; refusing to clobber its control endpoint",
+                sock_path.display()
+            );
+        }
+        let _ = std::fs::remove_file(sock_path);
+    }
     let listener = UnixListener::bind(sock_path).with_context(|| {
         format!(
             "binding the supervisor control socket at {} (startup-fatal: a daemon with no \
@@ -1921,6 +1962,30 @@ mod tests {
         assert_eq!(wait_for_signal(&tx).await, slot::Shutdown::Fatal);
     }
 
+    // The exit-status decision must use the watch's SETTLED value after the
+    // drain, not the snapshot `wait_for_signal` returned: a slot that passed its
+    // pre-batch check can still escalate `Drain` → `Fatal` mid-drain, and the
+    // daemon must exit non-zero rather than mask the fencing failure (#8).
+    #[tokio::test]
+    async fn settled_watch_escalation_to_fatal_is_not_masked() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        // Operator stop arrives first: the snapshot reason is a graceful Drain.
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Drain);
+        let reason = wait_for_signal(&tx).await;
+        assert_eq!(reason, slot::Shutdown::Drain);
+        let _ = slot::request_shutdown(&tx, reason);
+        // Mid-drain, a slot detects an unleased activation and escalates.
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Fatal);
+        // Re-reading the settled watch (as `run` now does after draining) must
+        // surface the fatal escalation, not the Drain snapshot.
+        let settled = *tx.borrow();
+        assert_eq!(
+            settled,
+            slot::Shutdown::Fatal,
+            "a mid-drain Drain->Fatal escalation must decide the exit status"
+        );
+    }
+
     // The control socket must be created owner-only (`rwx------`) regardless of
     // the process umask, so another local user cannot read status or issue
     // `stop` against a socket whose pathname lives in the shared temp dir
@@ -1967,5 +2032,56 @@ mod tests {
         drop(listener);
         let _ = std::fs::remove_file(&sock);
         assert!(accepted, "a same-user peer must be accepted");
+    }
+
+    // Cross-implementation containment (#8): a socket that still ANSWERS a
+    // connect belongs to a live daemon — possibly a protocol-compatible Node
+    // daemon that never holds the Rust-private startup flock — so
+    // `bind_control_socket` must REFUSE to unlink it rather than disconnect the
+    // live peer and leave two fleets running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_control_socket_refuses_a_live_peer_socket() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-live-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        // A live "peer" (standing in for a Node daemon) bound to the path.
+        let peer = tokio::net::UnixListener::bind(&sock).expect("bind peer socket");
+        let result = bind_control_socket(&sock);
+        drop(peer);
+        let _ = std::fs::remove_file(&sock);
+        assert!(
+            result.is_err(),
+            "a live, connectable socket must not be clobbered"
+        );
+    }
+
+    // The complement: a socket file whose owner is DEAD (nothing listening, so a
+    // connect is refused) is a stale leftover and must be removed so the new
+    // daemon can bind — otherwise a crashed daemon's socket would block every
+    // restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_control_socket_removes_a_stale_socket() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-stale-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        // Bind then drop, leaving the socket file with no listener behind it.
+        {
+            let _dead = tokio::net::UnixListener::bind(&sock).expect("bind dead socket");
+        }
+        let listener = bind_control_socket(&sock).expect("bind over a stale socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
     }
 }
