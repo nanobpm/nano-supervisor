@@ -301,13 +301,14 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // a fatal shutdown must surface as a non-zero exit (issue: default leasing is
     // documented to fail LOUDLY — returning `Ok(())` made the daemon look like a
     // clean drain).
-    let mut fatal = wait_for_signal(&shutdown_tx).await;
+    let fatal = wait_for_signal(&shutdown_tx).await;
     // A control-socket `stop` also flips the shutdown watch (via `graceful`), but
     // that is an operator-requested clean drain — never the fatal exit a slot's
-    // own flip signals.
-    if graceful.load(Ordering::SeqCst) {
-        fatal = false;
-    }
+    // own flip signals. The two reasons are kept separate and a fatal reason
+    // WINS the race: a slot can publish its fatal flip on the same tick a client
+    // requests `stop`, so `graceful` being set must not mask a concurrent fatal
+    // shutdown into exit 0 (nanobpm/nano-supervisor#8). `fatal` is therefore
+    // honoured as-is, independent of `graceful`.
     if fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); draining and exiting non-zero");
     } else {
@@ -378,13 +379,68 @@ fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(sock_path);
-    UnixListener::bind(sock_path).with_context(|| {
+    let listener = UnixListener::bind(sock_path).with_context(|| {
         format!(
             "binding the supervisor control socket at {} (startup-fatal: a daemon with no \
              reachable control endpoint cannot be driven by status/stop)",
             sock_path.display()
         )
-    })
+    })?;
+    // The socket lives in the shared system temp dir, so its pathname is
+    // guessable by other local users (the hash is derivable from the home path).
+    // `bind` honours the process umask, which under a common `022` leaves the
+    // socket world-accessible — anyone could then read status or issue `stop`.
+    // Force owner-only read/write regardless of the caller's umask, and fail
+    // startup if that protection cannot be established (nanobpm/nano-supervisor#8).
+    restrict_socket_to_owner(sock_path)?;
+    Ok(listener)
+}
+
+/// Restrict the control socket to its owner (`rwx------`, i.e. no group/other
+/// access), independent of the process umask. Combined with the peer-UID check
+/// in [`handle_control_connection`], this keeps another local user from driving
+/// the daemon. Startup fails if the mode cannot be set, so a daemon is never
+/// left listening on a world-accessible socket.
+#[cfg(unix)]
+fn restrict_socket_to_owner(sock_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "securing the supervisor control socket at {} (refusing to run a world-accessible \
+             control endpoint)",
+            sock_path.display()
+        )
+    })?;
+    // Verify the mode actually took: on a filesystem that silently ignores the
+    // chmod (or races a umask re-application) the socket could still be
+    // group/other-accessible. Fail startup rather than listen on a socket other
+    // local users can drive.
+    let mode = std::fs::metadata(sock_path)
+        .with_context(|| format!("stat the supervisor control socket at {}", sock_path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "the supervisor control socket at {} is not owner-only (mode {mode:o}); refusing to \
+             run a control endpoint other local users could drive",
+            sock_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether the peer at the other end of an accepted control connection is owned
+/// by the same user as this daemon. Defence in depth on top of the owner-only
+/// socket mode: even if a peer somehow opens the socket, a UID mismatch is
+/// rejected before any request is served.
+#[cfg(unix)]
+fn peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == unsafe { libc::geteuid() },
+        // If we cannot determine the peer, fail closed.
+        Err(_) => false,
+    }
 }
 
 /// Serve the supervisor control socket on an already-bound `listener`. Publishes
@@ -429,6 +485,14 @@ fn serve_control(
                 Ok((stream, _addr)) => stream,
                 Err(_) => break,
             };
+            // Reject any peer not owned by this daemon's user before serving it.
+            // The socket mode is owner-only, but that is a filesystem check a
+            // determined local user on a misconfigured system might bypass; the
+            // peer-credential check is kernel-enforced (nanobpm/nano-supervisor#8).
+            if !peer_is_owner(&stream) {
+                log("rejected a control connection from a non-owner peer");
+                continue;
+            }
             let descriptor = descriptor.clone();
             let worker_ids = worker_ids.clone();
             let engine = engine.clone();
@@ -1785,5 +1849,53 @@ mod tests {
             wait_for_signal(&tx).await,
             "a fatal state published during the wait must be reported as fatal"
         );
+    }
+
+    // The control socket must be created owner-only (`rwx------`) regardless of
+    // the process umask, so another local user cannot read status or issue
+    // `stop` against a socket whose pathname lives in the shared temp dir
+    // (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-perm-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = bind_control_socket(&sock).expect("bind control socket");
+        let mode = std::fs::metadata(&sock).expect("stat socket").permissions().mode() & 0o777;
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        assert_eq!(mode, 0o700, "control socket must be owner-only, got {mode:o}");
+    }
+
+    // A self-connection is owned by this process's user, so the peer-credential
+    // check must accept it (we cannot spoof a foreign UID in a test, but this
+    // pins the accept path so a regression that rejects the owner is caught).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn peer_is_owner_accepts_own_connection() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-cred-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = bind_control_socket(&sock).expect("bind control socket");
+        let client = std::os::unix::net::UnixStream::connect(&sock).expect("connect to own socket");
+        let (stream, _) = listener.accept().await.expect("accept own connection");
+        let accepted = peer_is_owner(&stream);
+        drop(client);
+        drop(stream);
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        assert!(accepted, "a same-user peer must be accepted");
     }
 }

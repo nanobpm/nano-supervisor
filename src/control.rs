@@ -222,15 +222,17 @@ pub fn encode_frame(frame: &Value) -> String {
 }
 
 /// A blocking control-socket client: send one request object and read frames
-/// until the first `final:true` (or the peer closes). Mirrors the Node client
-/// and the contract harness's `control_request`.
+/// until the first `final:true`. Mirrors the Node client and the contract
+/// harness's `control_request`.
 ///
 /// Framing is handled byte-accurately: bytes are buffered until a newline and
 /// only a **complete** line is decoded as UTF-8, so a multi-byte code point
 /// split across two socket reads is never corrupted by a per-chunk lossy decode
-/// (nanobpm/nano-supervisor#8). A read timeout is an error unless a terminal
-/// `final:true` frame has already been parsed — a timed-out, partial response is
-/// surfaced rather than reported as a successful empty reply.
+/// (nanobpm/nano-supervisor#8). The exchange is only well-formed when it ends
+/// with a terminal `final:true` frame: a read timeout OR the peer closing the
+/// connection (EOF) before that frame means the daemon crashed or was cut off
+/// mid-reply, so both surface as an error rather than letting a caller mistake
+/// a partial reply for success.
 #[cfg(unix)]
 pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
     use std::io::{BufRead, BufReader, Write};
@@ -247,8 +249,16 @@ pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
-            // Peer closed: return whatever complete frames we parsed.
-            Ok(0) => break,
+            // Peer closed before a terminal `final:true` frame: the reply is
+            // incomplete (the daemon crashed or was cut off mid-response), so
+            // surface it as an error rather than returning partial frames that a
+            // caller could mistake for a successful answer.
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "control socket closed before a final frame (incomplete response)",
+                ));
+            }
             Ok(_) => {
                 // `line` is one whole NDJSON frame (through the newline), so a
                 // UTF-8 code point is never split across reads here.
@@ -264,10 +274,10 @@ pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
                         .unwrap_or(false);
                     frames.push(frame);
                     // The terminal frame ends the exchange immediately, so a
-                    // later read timeout can only ever occur before it — which
-                    // the error arm below correctly surfaces as a failure.
+                    // later read timeout or EOF can only ever occur before it —
+                    // which the arms above correctly surface as a failure.
                     if is_final {
-                        break;
+                        return Ok(frames);
                     }
                 }
             }
@@ -275,7 +285,7 @@ pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // No terminal frame has been parsed (we would have broken out
+                // No terminal frame has been parsed (we would have returned
                 // above otherwise), so the response is incomplete: surface the
                 // timeout rather than letting the caller mistake a partial reply
                 // for success.
@@ -285,7 +295,6 @@ pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
             Err(e) => return Err(e),
         }
     }
-    Ok(frames)
 }
 
 /// Non-Unix stub: the control socket is a Unix-domain transport, so there is no
@@ -631,6 +640,42 @@ mod tests {
             let _ = std::fs::remove_file(&sock);
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0]["final"], json!(true));
+        }
+
+        #[test]
+        fn eof_before_terminal_frame_is_unexpected_eof() {
+            // The server sends a single non-terminal frame then CLOSES the
+            // connection without ever sending `final:true` (a daemon that crashed
+            // or was cut off mid-reply). The client must surface this as an
+            // `UnexpectedEof` error rather than return the partial frame as a
+            // successful response (nanobpm/nano-supervisor#8).
+            let sock = temp_sock("eof");
+            let mut chunk = br#"{"type":"draining","final":false}"#.to_vec();
+            chunk.push(b'\n');
+            // `serve_once` drops the stream after its chunks, producing EOF.
+            let handle = serve_once(&sock, vec![chunk]);
+
+            let err = request(&sock, &json!({ "op": "stop" })).expect_err("EOF is an error");
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "expected UnexpectedEof, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn eof_with_no_frames_is_unexpected_eof() {
+            // The peer accepts then immediately closes without writing anything:
+            // an empty reply is still incomplete (no `final:true`), so it errors.
+            let sock = temp_sock("eof-empty");
+            let handle = serve_once(&sock, vec![]);
+
+            let err = request(&sock, &json!({ "op": "status" })).expect_err("EOF is an error");
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         }
     }
 }

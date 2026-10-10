@@ -1425,15 +1425,44 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
             Ok(())
         });
     }
-    let child = cmd.spawn().context("spawning the supervisor daemon")?;
+    let mut child = cmd.spawn().context("spawning the supervisor daemon")?;
 
     // Wait (bounded) for the daemon to bind its control socket so a follow-up
     // `status`/`add` sees it, then return.
+    //
+    // Readiness must be attributed to THIS child, not to any daemon answering at
+    // the derived socket. During concurrent `supervisor start`s both launchers
+    // spawn children; the per-home startup lock rejects the loser, but that
+    // loser's launcher would otherwise see the WINNER's socket and report success
+    // against its own already-failed child's PID (nanobpm/nano-supervisor#8). So
+    // we (a) bail early if our child has already exited, and (b) require the
+    // status frame's `daemon.pid` to equal our child's PID before claiming the
+    // launch succeeded — a different PID means another start won the race.
     let sock = control::socket_path(home);
     for _ in 0..100 {
-        if sock.exists() && supervisor_running(home) {
-            println!("Supervisor started (pid {})", child.id());
-            return Ok(());
+        if let Some(status) = child.try_wait().ok().flatten() {
+            bail!(
+                "supervisor daemon (pid {}) exited during startup (status {}); another start may \
+                 already own this state home, or the daemon failed — see the daemon log",
+                child.id(),
+                status
+            );
+        }
+        if sock.exists() {
+            if let Some(pid) = supervisor_daemon_pid(home) {
+                if pid == child.id() {
+                    println!("Supervisor started (pid {})", child.id());
+                    return Ok(());
+                }
+                // A daemon is answering but it is not the child we launched:
+                // another start won the startup race.
+                bail!(
+                    "another supervisor daemon (pid {}) already owns this state home; \
+                     this start (pid {}) lost the race",
+                    pid,
+                    child.id()
+                );
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -1441,6 +1470,22 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
         "supervisor daemon (pid {}) did not bind its control socket within 10s",
         child.id()
     );
+}
+
+/// The PID of the daemon answering this home's control socket, taken from the
+/// `daemon.pid` field of its `status` reply. `None` when no daemon is bound or
+/// the reply carries no PID. Used to attribute a readiness probe to the exact
+/// child this launcher spawned, so a concurrent start's winner is not mistaken
+/// for our own (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+fn supervisor_daemon_pid(home: &std::path::Path) -> Option<u32> {
+    let sock = control::socket_path(home);
+    let frames = control::request(&sock, &serde_json::json!({ "op": "status" })).ok()?;
+    let frame = frames
+        .iter()
+        .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
+        .or_else(|| frames.last());
+    frame?["daemon"]["pid"].as_u64().map(|p| p as u32)
 }
 
 #[cfg(not(unix))]
