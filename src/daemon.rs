@@ -9,7 +9,6 @@
 //! daemon ([`crate::pdeath`]), so even a `kill -9` leaves no orphans.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,7 +157,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         pinned_base_url.as_deref(),
     )?;
     let host = short_hostname();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
 
     // A `--slots 0` daemon would run no slots at all; reject it here, before we
     // claim the control socket, so startup never binds a socket only to bail out
@@ -253,13 +252,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     // --- control socket (nanobpm/nano-supervisor#8) -------------------------
     // The socket was already bound above (before the slots); here we publish the
-    // live descriptor and spawn its accept loop. A graceful `stop` op flips
-    // `graceful` before the shutdown watch so the exit is a clean drain, not the
-    // FATAL path a slot's watch flip signals; `force` additionally marks a
-    // `stop --force` so the drain is cut short rather than waiting the full
-    // grace window.
-    let graceful = Arc::new(AtomicBool::new(false));
-    let force = Arc::new(AtomicBool::new(false));
+    // live descriptor and spawn its accept loop. A control `stop` op requests a
+    // `Drain` (or `Cancel` for `stop --force`) on the shutdown watch; the watch's
+    // precedence (Fatal > Cancel > Drain > Running) keeps a slot's concurrent
+    // fatal flip from being masked into a clean exit, and keeps a plain stop from
+    // clobbering a force already in flight (see `slot::request_shutdown`).
     let log_file = state_home
         .join("logs")
         .join("supervisor")
@@ -274,6 +271,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let engine_for_workers = pinned_base_url
         .clone()
         .unwrap_or_else(|| engine_desc.clone());
+    // Publishing `supervisor.json` is startup-fatal if it cannot be written
+    // confined (no-follow, atomic): a daemon that silently overwrote a planted
+    // symlink or served with a stale/missing descriptor would mislead every
+    // `supervisor status` client, so a failure here aborts startup rather than
+    // serving the socket (nanobpm/nano-supervisor#8).
     #[cfg(unix)]
     let control_handle = Some(serve_control(
         control_listener,
@@ -283,9 +285,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         engine_for_workers,
         control::epoch_millis(),
         shutdown_tx.clone(),
-        graceful.clone(),
-        force.clone(),
-    ));
+    )?);
     #[cfg(not(unix))]
     let control_handle: Option<tokio::task::JoinHandle<()>> = {
         // No Unix-domain control socket off-Unix; the daemon still runs its
@@ -295,33 +295,33 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         None
     };
 
-    // `wait_for_signal` reports whether a slot flipped the watch for a FATAL
-    // misconfiguration (an unleased activation while leasing is enabled — the
-    // default) versus an operator Ctrl-C/SIGTERM. We still drain either way, but
-    // a fatal shutdown must surface as a non-zero exit (issue: default leasing is
-    // documented to fail LOUDLY — returning `Ok(())` made the daemon look like a
-    // clean drain).
-    let fatal = wait_for_signal(&shutdown_tx).await;
-    // A control-socket `stop` also flips the shutdown watch (via `graceful`), but
-    // that is an operator-requested clean drain — never the fatal exit a slot's
-    // own flip signals. The two reasons are kept separate and a fatal reason
-    // WINS the race: a slot can publish its fatal flip on the same tick a client
-    // requests `stop`, so `graceful` being set must not mask a concurrent fatal
-    // shutdown into exit 0 (nanobpm/nano-supervisor#8). `fatal` is therefore
-    // honoured as-is, independent of `graceful`.
+    // `wait_for_signal` reports the shutdown REASON (a `slot::Shutdown`): a slot's
+    // FATAL misconfiguration (an unleased activation while leasing is enabled —
+    // the default), an operator Ctrl-C/SIGTERM `Drain`, or a control `stop`'s
+    // `Drain`/`Cancel`. We drain either way, but a fatal shutdown must surface as
+    // a non-zero exit (default leasing is documented to fail LOUDLY — returning
+    // `Ok(())` made the daemon look like a clean drain). Fatal WINS the race: a
+    // slot can publish its fatal flip on the same tick a client requests `stop`,
+    // so a graceful reason must not mask a concurrent fatal into exit 0.
+    let reason = wait_for_signal(&shutdown_tx).await;
+    let fatal = reason == slot::Shutdown::Fatal;
     if fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); draining and exiting non-zero");
     } else {
         log("shutdown signal received; draining slots…");
     }
-    let _ = shutdown_tx.send(true);
+    // Publish the reason to the slots. An OS signal does not write the watch, so
+    // this is what lets the slots observe a Ctrl-C/SIGTERM drain; `request_shutdown`
+    // never downgrades a higher-precedence reason already settled (e.g. a fatal
+    // flip), so this cannot mask a fatal shutdown.
+    let _ = slot::request_shutdown(&shutdown_tx, reason);
 
     // Give slots a bounded window to finish in-flight work; then exit (dropping
     // any stragglers — their agents die via kill_on_drop + parent-death). A
-    // `stop --force` cuts that window short: the operator asked for immediate
-    // cancellation, so we only let slots observe the shutdown signal briefly
-    // rather than waiting out the full graceful drain.
-    let forced = force.load(Ordering::SeqCst);
+    // `stop --force` (`Cancel`) cuts that window short and has the slots abort
+    // in-flight work immediately; a graceful `Drain` lets each in-flight job
+    // finish within the full grace window.
+    let forced = reason == slot::Shutdown::Cancel;
     let drain = async {
         for h in handles {
             let _ = h.await;
@@ -447,6 +447,14 @@ fn peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
 /// the live `supervisor.json` descriptor and spawns the accept loop, returning
 /// its task handle (aborted on daemon exit). The socket is bound earlier by
 /// [`bind_control_socket`] so a bind failure is startup-fatal.
+///
+/// Publishing the descriptor is itself fallible and startup-fatal: it is written
+/// through the SAME confined, no-follow atomic writer every other state file uses
+/// (`fleet::write_json_atomic`), so a pre-planted `supervisor.json` symlink
+/// cannot redirect the write out of the state home and a write failure is
+/// propagated rather than suppressed — a daemon serving with a stale or missing
+/// descriptor would mislead every `supervisor status` client
+/// (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn serve_control(
@@ -456,13 +464,13 @@ fn serve_control(
     worker_ids: Vec<(String, String)>,
     engine: String,
     started_at_ms: u64,
-    shutdown_tx: watch::Sender<bool>,
-    graceful: Arc<AtomicBool>,
-    force: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+    shutdown_tx: watch::Sender<slot::Shutdown>,
+) -> Result<tokio::task::JoinHandle<()>> {
     // Record the descriptor so clients that prefer `supervisor.json` (and
     // `supervisor status`) find the socket + pid without re-deriving them.
-    let _ = std::fs::create_dir_all(&state_home);
+    // Written through the confined no-follow atomic writer (not a bare
+    // `std::fs::write`, which follows a planted symlink and swallows errors):
+    // failure aborts startup BEFORE the accept loop serves the socket.
     let sup_json = serde_json::json!({
         "pid": descriptor.pid,
         "startedAt": descriptor.started_at,
@@ -471,12 +479,11 @@ fn serve_control(
         "logFile": descriptor.log_file,
         "pluginVersion": descriptor.version,
     });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&sup_json) {
-        let _ = std::fs::write(state_home.join("supervisor.json"), bytes);
-    }
+    crate::fleet::write_json_atomic_confined(&state_home.join("supervisor.json"), &sup_json)
+        .context("publishing the supervisor.json descriptor")?;
     log(&format!("control socket listening at {}", descriptor.socket));
 
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         let descriptor = Arc::new(descriptor);
         let worker_ids = Arc::new(worker_ids);
         let engine = Arc::new(engine);
@@ -497,8 +504,6 @@ fn serve_control(
             let worker_ids = worker_ids.clone();
             let engine = engine.clone();
             let shutdown_tx = shutdown_tx.clone();
-            let graceful = graceful.clone();
-            let force = force.clone();
             tokio::spawn(async move {
                 handle_control_connection(
                     stream,
@@ -507,28 +512,23 @@ fn serve_control(
                     engine,
                     started_at_ms,
                     shutdown_tx,
-                    graceful,
-                    force,
                 )
                 .await;
             });
         }
-    })
+    }))
 }
 
 /// Serve one control connection: read NDJSON request lines, reply with frames,
 /// and begin a graceful shutdown when a `stop` op is dispatched.
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_control_connection(
     stream: tokio::net::UnixStream,
     descriptor: Arc<control::DaemonDescriptor>,
     worker_ids: Arc<Vec<(String, String)>>,
     engine: Arc<String>,
     started_at_ms: u64,
-    shutdown_tx: watch::Sender<bool>,
-    graceful: Arc<AtomicBool>,
-    force: Arc<AtomicBool>,
+    shutdown_tx: watch::Sender<slot::Shutdown>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -550,13 +550,17 @@ async fn handle_control_connection(
         }
         let _ = write_half.flush().await;
         if resp.stop {
-            // A forced stop must be recorded BEFORE flipping the shutdown watch,
-            // so the drain loop in `run` sees the forced flag when it wakes.
-            if resp.force {
-                force.store(true, Ordering::SeqCst);
-            }
-            graceful.store(true, Ordering::SeqCst);
-            let _ = shutdown_tx.send(true);
+            // A plain `stop` requests a graceful `Drain` (let in-flight work
+            // finish, exit zero); `stop --force` requests a `Cancel` (abort
+            // in-flight work now). `request_shutdown` publishes it without ever
+            // downgrading a slot's concurrent FATAL flip, so an operator stop can
+            // never mask a fatal shutdown into a clean exit.
+            let want = if resp.force {
+                slot::Shutdown::Cancel
+            } else {
+                slot::Shutdown::Drain
+            };
+            let _ = slot::request_shutdown(&shutdown_tx, want);
             return;
         }
     }
@@ -1109,51 +1113,72 @@ pub(crate) fn short_hostname() -> String {
         .to_ascii_lowercase()
 }
 
-/// Block until a shutdown trigger fires. Returns `true` when a slot flipped the
-/// `fatal` watch — an unrecoverable misconfiguration (e.g. an unleased
-/// activation while leasing is enabled, the default) that must exit loudly — and
-/// `false` for an operator Ctrl-C/SIGTERM drain. The caller distinguishes the two
-/// so a fatal shutdown surfaces as a non-zero exit rather than a clean `Ok(())`.
-pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) -> bool {
-    // Also wake if a slot flips the shutdown watch (a fatal misconfiguration,
-    // e.g. an unleased activation while leasing is enabled), so the daemon exits
-    // loudly rather than lingering with the offending slot stopped.
-    let mut fatal_rx = fatal.subscribe();
-    // A second subscription used only to re-read the watch's *final* value after
-    // the wait returns — `select!` reports whichever arm fired, not the channel's
-    // settled state, so a fatal flip published in the same tick an operator
+/// Block until a shutdown trigger fires, returning the shutdown REASON (a
+/// [`slot::Shutdown`]):
+///   * [`slot::Shutdown::Fatal`] when a slot published a fatal misconfiguration
+///     (e.g. an unleased activation while leasing is enabled, the default) — the
+///     daemon must exit loudly (non-zero);
+///   * the settled watch value ([`slot::Shutdown::Drain`] or
+///     [`slot::Shutdown::Cancel`]) when a control `stop` flipped it;
+///   * [`slot::Shutdown::Drain`] for an operator Ctrl-C/SIGTERM (an OS signal
+///     does not write the watch, so the caller publishes the drain afterwards).
+///
+/// Fatal always WINS: a slot can publish a fatal flip in the same tick a signal
+/// or a control `stop` arrives, so the settled watch value is re-read and a fatal
+/// reason is surfaced regardless of which `select!` arm woke us.
+pub(crate) async fn wait_for_signal(shutdown: &watch::Sender<slot::Shutdown>) -> slot::Shutdown {
+    // Wake on any watch flip (a slot's fatal misconfiguration, or a control
+    // `stop`'s drain/cancel), so the daemon reacts rather than lingering.
+    let mut watch_rx = shutdown.subscribe();
+    // A second subscription used only to re-read the watch's *settled* value
+    // after the wait returns — `select!` reports whichever arm fired, not the
+    // channel's final state, so a flip published in the same tick an operator
     // Ctrl-C/SIGTERM arrives could otherwise be masked by the signal arm winning.
-    let recheck_rx = fatal.subscribe();
-    let slot_requested = async {
-        let _ = fatal_rx.wait_for(|stop| *stop).await;
+    let recheck_rx = shutdown.subscribe();
+    let watch_flipped = async {
+        let _ = watch_rx.wait_for(|s| s.is_shutdown()).await;
     };
-    let signal_was_fatal = {
+    let via_signal = {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
             match signal(SignalKind::terminate()) {
                 Ok(mut term) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => false,
-                    _ = term.recv() => false,
-                    _ = slot_requested => true,
+                    _ = tokio::signal::ctrl_c() => true,
+                    _ = term.recv() => true,
+                    _ = watch_flipped => false,
                 },
                 Err(_) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => false,
-                    _ = slot_requested => true,
+                    _ = tokio::signal::ctrl_c() => true,
+                    _ = watch_flipped => false,
                 },
             }
         }
         #[cfg(not(unix))]
         {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => false,
-                _ = slot_requested => true,
+                _ = tokio::signal::ctrl_c() => true,
+                _ = watch_flipped => false,
             }
         }
     };
-    // Fatal always wins: if a slot has published a fatal state by now, surface it
-    // even when an operator signal was the arm that woke us.
-    signal_was_fatal || *recheck_rx.borrow()
+    let settled = *recheck_rx.borrow();
+    // Fatal always wins: surface it even when a signal or a non-fatal stop was
+    // the arm that woke us.
+    if settled == slot::Shutdown::Fatal {
+        return slot::Shutdown::Fatal;
+    }
+    if via_signal {
+        // An OS signal is an operator-requested graceful drain.
+        slot::Shutdown::Drain
+    } else if settled.is_shutdown() {
+        // Woken by a control `stop`: honour its reason (Drain or Cancel).
+        settled
+    } else {
+        // Defensive: a watch flip that settled back to `Running` is treated as a
+        // graceful drain rather than a no-op.
+        slot::Shutdown::Drain
+    }
 }
 
 #[cfg(test)]
@@ -1820,16 +1845,17 @@ mod tests {
         ));
     }
 
-    // A slot that flips the fatal watch (an unleased activation while leasing is
-    // enabled, the default) must be reported as fatal so `run` exits non-zero
-    // rather than returning a clean drain `Ok(())`.
+    // A slot that flips the watch to `Fatal` (an unleased activation while
+    // leasing is enabled, the default) must be reported as `Fatal` so `run`
+    // exits non-zero rather than returning a clean drain `Ok(())`.
     #[tokio::test]
     async fn wait_for_signal_reports_slot_requested_fatal() {
-        let (tx, _rx) = watch::channel(false);
-        tx.send(true).expect("flip fatal watch");
-        assert!(
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Fatal);
+        assert_eq!(
             wait_for_signal(&tx).await,
-            "a slot-flipped watch must be reported as a fatal shutdown"
+            slot::Shutdown::Fatal,
+            "a slot-flipped Fatal watch must be reported as a fatal shutdown"
         );
     }
 
@@ -1839,16 +1865,60 @@ mod tests {
     // guards that a fatal flip is never masked by the signal arm winning.
     #[tokio::test]
     async fn wait_for_signal_reports_fatal_flipped_during_wait() {
-        let (tx, _rx) = watch::channel(false);
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
         let flipper = tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            let _ = flipper.send(true);
+            let _ = slot::request_shutdown(&flipper, slot::Shutdown::Fatal);
         });
-        assert!(
+        assert_eq!(
             wait_for_signal(&tx).await,
+            slot::Shutdown::Fatal,
             "a fatal state published during the wait must be reported as fatal"
         );
+    }
+
+    // A control `stop`'s graceful `Drain` must be reported AS a drain, not
+    // escalated to the fatal non-zero path: the single-bool watch used to make
+    // every flip look fatal, so a normal `stop` exited non-zero
+    // (nanobpm/nano-supervisor#8).
+    #[tokio::test]
+    async fn wait_for_signal_reports_control_stop_as_drain_not_fatal() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Drain);
+        assert_eq!(
+            wait_for_signal(&tx).await,
+            slot::Shutdown::Drain,
+            "a graceful control stop must drain (exit zero), not take the fatal path"
+        );
+    }
+
+    // A `stop --force` (`Cancel`) must be reported as a cancel so `run` uses the
+    // short grace window — but still exit zero (only `Fatal` is non-zero).
+    #[tokio::test]
+    async fn wait_for_signal_reports_force_stop_as_cancel() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Cancel);
+        assert_eq!(
+            wait_for_signal(&tx).await,
+            slot::Shutdown::Cancel,
+            "a forced stop must be reported as a cancel"
+        );
+    }
+
+    // Fatal outranks a concurrent operator `stop`: if a slot has already
+    // published `Fatal`, a later graceful `stop` must NOT downgrade the settled
+    // reason into a clean exit (`request_shutdown` precedence).
+    #[tokio::test]
+    async fn fatal_is_not_downgraded_by_a_concurrent_stop() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        assert!(slot::request_shutdown(&tx, slot::Shutdown::Fatal));
+        assert!(
+            !slot::request_shutdown(&tx, slot::Shutdown::Drain),
+            "a graceful drain must not downgrade a settled Fatal"
+        );
+        assert_eq!(*tx.borrow(), slot::Shutdown::Fatal);
+        assert_eq!(wait_for_signal(&tx).await, slot::Shutdown::Fatal);
     }
 
     // The control socket must be created owner-only (`rwx------`) regardless of

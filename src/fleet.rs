@@ -222,6 +222,17 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     }
 }
 
+/// Publish a JSON value to `path` through the confined, no-follow atomic writer
+/// every state file uses. `path` MUST lie under the trusted state home; a
+/// planted symlink anywhere in the operator-controlled tail (including on the
+/// final component) is refused rather than followed, and any write failure is
+/// returned rather than suppressed. Exposed for the supervisor daemon, which
+/// publishes `supervisor.json` with the same guarantees as `config.json`
+/// (nanobpm/nano-supervisor#8).
+pub(crate) fn write_json_atomic_confined(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_atomic(path, value)
+}
+
 #[cfg(unix)]
 struct RawFdGuard(libc::c_int);
 
@@ -1304,6 +1315,12 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
     let sock = control::socket_path(home);
     match control::request(&sock, &serde_json::json!({ "op": "status" })) {
         Ok(frames) => {
+            // A protocol-level error frame (`{ok:false,error,…,final:true}`, e.g.
+            // a Node daemon rejecting the op) must be surfaced, not reported as a
+            // healthy daemon (nanobpm/nano-supervisor#8).
+            if let Some(err) = terminal_frame_error(&frames) {
+                bail!("supervisor status failed: {err}");
+            }
             let frame = frames
                 .iter()
                 .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
@@ -1331,12 +1348,51 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
             }
             Ok(())
         }
-        // Socket vanished between the probe and the request (a race with
-        // shutdown): report the honest "not running" rather than an error.
-        Err(_) => {
+        // The socket vanished between the probe and the request (a genuine race
+        // with shutdown): report the honest "not running". But ONLY for a
+        // connection-absence error — a timeout, `UnexpectedEof`, or other
+        // transport failure means a live-but-unhealthy daemon, which must be
+        // propagated rather than hidden behind an exit-0 "not running"
+        // (nanobpm/nano-supervisor#8).
+        Err(e) if is_daemon_absent(&e) => {
             println!("Supervisor not running");
             Ok(())
         }
+        Err(e) => Err(e).context("querying the supervisor control socket"),
+    }
+}
+
+/// Whether a control-socket transport error means "no daemon is listening" (the
+/// honest "not running" answer during a shutdown race) rather than a
+/// live-but-unhealthy daemon. ONLY a connect-time absence qualifies; a read
+/// timeout, `UnexpectedEof` (a daemon cut off mid-reply), or any other transport
+/// failure is a real operational error that must be propagated, not mapped to an
+/// exit-0 "not running" that hides an unresponsive daemon or a failed/incomplete
+/// stop (nanobpm/nano-supervisor#8).
+fn is_daemon_absent(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    matches!(err.kind(), NotFound | ConnectionRefused)
+}
+
+/// Extract a protocol-level error from a control reply's terminal frame. The
+/// daemon ends every exchange with a `final:true` frame; a `{ok:false,error}`
+/// there is a protocol error (e.g. a Node daemon rejecting the op) that callers
+/// must surface rather than treat as success (nanobpm/nano-supervisor#8).
+fn terminal_frame_error(frames: &[serde_json::Value]) -> Option<String> {
+    let frame = frames
+        .iter()
+        .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
+        .or_else(|| frames.last())?;
+    if frame.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        Some(
+            frame
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("control request failed")
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -1348,14 +1404,25 @@ fn supervisor_stop(home: &std::path::Path, force: bool) -> Result<()> {
     }
     let sock = control::socket_path(home);
     match control::request(&sock, &serde_json::json!({ "op": "stop", "force": force })) {
-        Ok(_) => {
+        Ok(frames) => {
+            // Inspect the terminal frame: a daemon that rejected the stop
+            // (`{ok:false,error,…}`) must not be reported as "stopping"
+            // (nanobpm/nano-supervisor#8).
+            if let Some(err) = terminal_frame_error(&frames) {
+                bail!("supervisor stop failed: {err}");
+            }
             println!("Supervisor stopping");
             Ok(())
         }
-        Err(_) => {
+        // Only a connection-absence error is the honest shutdown-race "not
+        // running"; a timeout or `UnexpectedEof` after the daemon accepted the
+        // request (a failed/incomplete stop) must be propagated, not hidden
+        // behind exit-0 "not running" (nanobpm/nano-supervisor#8).
+        Err(e) if is_daemon_absent(&e) => {
             println!("Supervisor not running");
             Ok(())
         }
+        Err(e) => Err(e).context("sending stop to the supervisor control socket"),
     }
 }
 
@@ -1455,7 +1522,11 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
                     return Ok(());
                 }
                 // A daemon is answering but it is not the child we launched:
-                // another start won the startup race.
+                // another start won the startup race. Our child lost the per-home
+                // startup lock and must die — terminate and reap it so dropping
+                // `std::process::Child` cannot leave a detached daemon that later
+                // binds the socket and runs on (nanobpm/nano-supervisor#8).
+                kill_and_reap(&mut child);
                 bail!(
                     "another supervisor daemon (pid {}) already owns this state home; \
                      this start (pid {}) lost the race",
@@ -1466,10 +1537,25 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // Startup timed out. Dropping `child` does NOT terminate it, so a slow child
+    // could still bind the socket and run indefinitely after the operator was
+    // told startup failed. Terminate and reap it before returning the error
+    // (nanobpm/nano-supervisor#8).
+    kill_and_reap(&mut child);
     bail!(
         "supervisor daemon (pid {}) did not bind its control socket within 10s",
         child.id()
     );
+}
+
+/// Terminate and reap a spawned child so it cannot outlive a failed
+/// `supervisor start`. `std::process::Child` does not kill on drop, so every
+/// error path after a successful spawn must call this: send SIGKILL (best
+/// effort; the child may already be gone) and `wait` to reap the zombie.
+#[cfg(unix)]
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The PID of the daemon answering this home's control socket, taken from the
@@ -1939,6 +2025,48 @@ pub fn workforce_status(name: &str, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_absent_only_for_connection_absence() {
+        use std::io::{Error, ErrorKind};
+        // Connect-time absence IS the honest shutdown-race "not running".
+        assert!(is_daemon_absent(&Error::from(ErrorKind::NotFound)));
+        assert!(is_daemon_absent(&Error::from(ErrorKind::ConnectionRefused)));
+        // Live-but-unhealthy daemon errors MUST propagate, not read as "not
+        // running" (nanobpm/nano-supervisor#8).
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::UnexpectedEof)));
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::BrokenPipe)));
+    }
+
+    #[test]
+    fn terminal_frame_error_surfaces_protocol_failures() {
+        use serde_json::json;
+        // A clean terminal frame carries no error.
+        let ok = vec![json!({"ok": true, "type": "status", "final": true})];
+        assert_eq!(terminal_frame_error(&ok), None);
+        // A `{ok:false,…,final:true}` frame is a protocol error to surface.
+        let err = vec![json!({"ok": false, "error": "boom", "final": true})];
+        assert_eq!(terminal_frame_error(&err).as_deref(), Some("boom"));
+        // Interim frames before a failing terminal frame are ignored.
+        let streamed = vec![
+            json!({"type": "draining", "final": false}),
+            json!({"ok": false, "error": "stop refused", "final": true}),
+        ];
+        assert_eq!(
+            terminal_frame_error(&streamed).as_deref(),
+            Some("stop refused")
+        );
+        // An `ok:false` with no message still reports a generic error.
+        let bare = vec![json!({"ok": false, "final": true})];
+        assert_eq!(
+            terminal_frame_error(&bare).as_deref(),
+            Some("control request failed")
+        );
+        // Empty frame list: nothing to surface.
+        assert_eq!(terminal_frame_error(&[]), None);
+    }
 
     fn hire_args(name: &str) -> HireArgs {
         HireArgs {
