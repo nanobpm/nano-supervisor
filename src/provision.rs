@@ -3017,14 +3017,15 @@ async fn git_with_env(
 /// environment.
 ///
 /// Behaviour: emit the credential only for a `get` on the matching host, and
-/// ignore `store`/`erase` (draining their stdin request). The FD read uses an
-/// `eval`'d indirection (`eval "p=\$(cat <&$NANO_GIT_CRED_FD)"`) so the helper
-/// reads whatever descriptor `NANO_GIT_CRED_FD` names: a strict POSIX `/bin/sh`
-/// (dash/busybox) rejects a descriptor above 9 in a *literal* redirection
-/// (`<&10`), but expanding the number through `eval` first accepts any
-/// inherited FD. That is what lets the secret travel on the pipe's own
-/// dynamically-allocated descriptor (see [`apply_git_credential`]) rather than
-/// a fixed one the parent must reserve. A repeated invocation hits EOF on the
+/// ignore `store`/`erase` (draining their stdin request). The FD read is a
+/// *literal* redirection (`cat <&$NANO_GIT_CRED_FD`, with the number already
+/// substituted into the snippet) because the descriptor is always the fixed
+/// single-digit [`CRED_FD`]: a strict POSIX `/bin/sh` (dash) rejects a
+/// descriptor above 9 in a redirection (`<&10` → `Bad fd number`), and — unlike
+/// busybox `ash` — dash rejects it *even through* an `eval`'d indirection, so
+/// the helper can never rely on a dynamically-allocated high descriptor. The
+/// child's `pre_exec` therefore `dup2`s the pipe onto [`CRED_FD`] (see
+/// [`apply_git_credential`]). A repeated invocation hits EOF on the
 /// already-drained, write-closed pipe and emits an empty password, so git fails
 /// closed rather than hanging on a retry.
 const GIT_CRED_HELPER: &str = "!f() { \
@@ -3032,18 +3033,27 @@ const GIT_CRED_HELPER: &str = "!f() { \
     h=; \
     while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
     test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
-    eval \"p=\\$(cat <&$NANO_GIT_CRED_FD)\"; \
+    p=$(cat <&3); \
     printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$p\"; \
 }; f";
 
+/// The fixed descriptor the credential pipe's read end is remapped onto in the
+/// child's `pre_exec` (and that `NANO_GIT_CRED_FD` names). It must be a single
+/// digit (3–9): a strict POSIX `/bin/sh` (dash) refuses a multi-digit
+/// descriptor in a redirection, so a dynamically-allocated high fd would make
+/// the helper's `cat <&N` fail with `Bad fd number` under dash. 3 is the lowest
+/// non-standard descriptor; the `dup2` in `pre_exec` runs after the child's
+/// `Stdio` setup has already bound 0/1/2, so it can never clobber stdio.
+const CRED_FD: i32 = 3;
+
 /// Owns the parent's copy of the credential pipe's read end. The caller keeps
 /// it alive until *just after* `spawn` so the inherited FD stays valid through
-/// the fork, then drops it immediately: the child has already cleared the FD's
-/// CLOEXEC in its `pre_exec` (and the write end is closed inside
-/// [`apply_git_credential`]), so once the child is spawned the parent holds no
-/// copy and the pipe reaches EOF for the reader. Dropping it right after
-/// `spawn` — rather than at the end of the command — means the daemon does not
-/// keep a readable copy of the secret-bearing pipe exposed under
+/// the fork, then drops it immediately: the child has already `dup2`'d its own
+/// copy onto [`CRED_FD`] (clear of CLOEXEC) in its `pre_exec` (and the write end
+/// is closed inside [`apply_git_credential`]), so once the child is spawned the
+/// parent holds no copy and the pipe reaches EOF for the reader. Dropping it
+/// right after `spawn` — rather than at the end of the command — means the
+/// daemon does not keep a readable copy of the secret-bearing pipe exposed under
 /// `/proc/<daemon-pid>/fd` for the lifetime of the git command.
 struct CredPipe {
     _read: std::os::unix::io::OwnedFd,
@@ -3196,15 +3206,17 @@ impl CredCommand for std::process::Command {
 ///   buffer would make the pre-spawn `write_all` block forever with no reader,
 ///   wedging the worker before the command timeout could recover, so it fails
 ///   cleanly instead.
-/// - Registers a `pre_exec` hook that clears the inherited read end's CLOEXEC
-///   so it survives `exec` into git (and the credential helper git spawns). The
-///   secret travels on the pipe's own dynamically-allocated descriptor — never
-///   a fixed, process-global one — so command construction performs no
-///   check-then-`dup2` reservation that could race (or silently close) an
-///   unrelated descriptor in this multi-threaded daemon. The helper reads the
-///   number from `NANO_GIT_CRED_FD` through an `eval`'d indirection, which a
-///   strict POSIX sh (dash/busybox) accepts for any descriptor (unlike a
-///   literal `<&N`, which dash rejects above 9).
+/// - Registers a `pre_exec` hook that `dup2`s the inherited read end onto the
+///   fixed single-digit [`CRED_FD`] and clears CLOEXEC, so it survives `exec`
+///   into git (and the credential helper git spawns) at a descriptor a strict
+///   POSIX sh can name. The secret must travel on a *single-digit* descriptor:
+///   dash rejects a multi-digit fd in a redirection (`<&10` → `Bad fd number`)
+///   even through `eval`, so the pipe's dynamically-allocated high number is
+///   remapped to [`CRED_FD`] before `exec`. The `dup2` runs in the forked child
+///   *after* the `Stdio` setup has bound 0/1/2, so it cannot clobber stdio, and
+///   it targets a fixed number rather than reserving a process-global fd at
+///   construction time (which could race an unrelated `open` in this
+///   multi-threaded daemon).
 /// - Injects the reset + our helper via `-c`, and sets only the non-secret
 ///   `NANO_GIT_CRED_HOST`/`_USER`/`_FD` in the environment.
 ///
@@ -3261,15 +3273,28 @@ fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Resul
             .context("writing credential to pipe")?;
     }
 
-    // In the forked child, before exec: clear the inherited read end's CLOEXEC
-    // so git — and the credential helper git spawns — can read it after exec.
-    // The descriptor is the pipe's own dynamic number (named by
-    // `NANO_GIT_CRED_FD`), so no fixed-fd remap is needed and nothing here can
-    // clobber an unrelated descriptor. Only async-signal-safe libc calls here.
-    // SAFETY: fcntl on an inherited fd in the pre-exec child; touches no Rust
-    // allocator state and shares nothing with the parent beyond `read_raw`.
+    // In the forked child, before exec: remap the inherited read end onto the
+    // fixed single-digit CRED_FD and clear CLOEXEC so git — and the credential
+    // helper git spawns — can read it after exec. The remap is required because
+    // the pipe's dynamically-allocated number can exceed 9, which a strict
+    // POSIX sh (dash) cannot name in a redirection. `dup2` runs after the
+    // child's `Stdio` setup has bound 0/1/2, so it never clobbers stdio, and it
+    // atomically replaces whatever (if anything) sat on CRED_FD. Only
+    // async-signal-safe libc calls here.
+    // SAFETY: dup2/fcntl on an inherited fd in the pre-exec child; touches no
+    // Rust allocator state and shares nothing with the parent beyond `read_raw`.
     unsafe {
         cmd.cred_pre_exec(move || {
+            if read_raw != CRED_FD {
+                if libc::dup2(read_raw, CRED_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // CRED_FD is a fresh dup2 target, so it already has CLOEXEC
+                // clear; the original high descriptor keeps its CLOEXEC and is
+                // closed by the impending exec. Nothing more to do.
+                return Ok(());
+            }
+            // read_raw already == CRED_FD: just clear its CLOEXEC so it survives.
             let flags = libc::fcntl(read_raw, libc::F_GETFD);
             if flags < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -3287,7 +3312,7 @@ fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Resul
     cmd.arg(format!("credential.helper={GIT_CRED_HELPER}"));
     cmd.env("NANO_GIT_CRED_HOST", &c.host);
     cmd.env("NANO_GIT_CRED_USER", &c.username);
-    cmd.env("NANO_GIT_CRED_FD", read_raw.to_string());
+    cmd.env("NANO_GIT_CRED_FD", CRED_FD.to_string());
     Ok(CredPipe { _read: read_fd })
 }
 
@@ -8174,12 +8199,11 @@ mod tests {
     }
 
     /// The secret must be delivered on the descriptor `NANO_GIT_CRED_FD` names —
-    /// the pipe's own dynamically-allocated FD, with no fixed-fd remap or parent
-    /// reservation (which could race / close an unrelated descriptor in this
-    /// multi-threaded daemon). Drives the real `apply_git_credential` + helper
-    /// end-to-end and asserts the child reads the secret over the fd
-    /// `NANO_GIT_CRED_FD` reports, and that the helper's `eval`'d read works for
-    /// whatever (possibly >9) descriptor the pipe was handed.
+    /// the fixed single-digit [`CRED_FD`] the child's `pre_exec` `dup2`s the pipe
+    /// onto, so a strict POSIX sh (dash) can name it in a redirection (dash
+    /// rejects a multi-digit fd even through `eval`). Drives the real
+    /// `apply_git_credential` + helper end-to-end and asserts the child reads the
+    /// secret over the fd `NANO_GIT_CRED_FD` reports.
     #[test]
     fn credential_is_delivered_on_dynamic_fd_in_child() {
         let password = format!("s3cr3t-{}-DYNFD", std::process::id());
@@ -8194,7 +8218,7 @@ mod tests {
         let base = cred_scratch_base("dynfd");
         let out1 = base.with_extension("out");
         // The helper reads the secret via `NANO_GIT_CRED_FD`; also record the FD
-        // number the child saw so we can assert it matches a live pipe read.
+        // number the child saw so we can assert it is the fixed single-digit one.
         let script = format!(
             "printf 'protocol=https\\nhost=example.test\\n\\n' | sh -c \"$TEST_HELPER get\" > '{o}'; \
              echo \"fd=$NANO_GIT_CRED_FD\" >> '{o}';",
@@ -8210,16 +8234,108 @@ mod tests {
         let out = std::fs::read_to_string(&out1).expect("helper output");
         assert!(
             out.contains(&format!("password={password}")),
-            "the secret must be readable over the dynamic fd NANO_GIT_CRED_FD names: {out}"
+            "the secret must be readable over the fd NANO_GIT_CRED_FD names: {out}"
         );
         let delivered: i32 = out
             .lines()
             .find_map(|l| l.strip_prefix("fd="))
             .and_then(|s| s.trim().parse().ok())
             .expect("child reports the delivered fd");
+        assert_eq!(
+            delivered, CRED_FD,
+            "the delivered FD must be the fixed single-digit descriptor a POSIX sh can name: {out}"
+        );
+        let _ = std::fs::remove_file(&out1);
+    }
+
+    /// Regression test for the "Previously missed" advisory on #62: a strict
+    /// POSIX `/bin/sh` (dash) rejects a multi-digit descriptor in a redirection
+    /// (`cat <&25` → `Bad fd number`) *even through* an `eval`'d indirection, so
+    /// the helper can never read the pipe's dynamically-allocated high fd
+    /// directly. The child's `pre_exec` must `dup2` it onto the single-digit
+    /// [`CRED_FD`]. Force the pipe onto a descriptor above 9 (by holding fds 3..
+    /// open so `pipe` is handed a high number), run the real
+    /// `apply_git_credential` + helper, and assert the secret is still delivered
+    /// over `NANO_GIT_CRED_FD` == [`CRED_FD`]. Without the remap this fails:
+    /// `/bin/sh` cannot open the high descriptor.
+    #[test]
+    fn credential_is_remapped_to_a_single_digit_fd_for_posix_sh() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        let password = format!("s3cr3t-{}-HIGHFD", std::process::id());
+        let cred = GitCredential {
+            host: "example.test".into(),
+            username: "x-access-token".into(),
+            password: password.clone(),
+        };
+        let helper_body = GIT_CRED_HELPER
+            .strip_prefix('!')
+            .expect("helper snippet starts with git's '!' marker");
+        let base = cred_scratch_base("highfd");
+        let out1 = base.with_extension("out");
+
+        // Hold descriptors open so the credential pipe is allocated a number
+        // above 9 — the case dash cannot read literally. Seed with a `/dev/null`
+        // open (which takes the lowest free fd, 3) then keep dup-ing from 3 until
+        // we hold a descriptor above 9, so fds 3..=9 are all occupied when
+        // `apply_git_credential` builds the pipe. Keep the holders alive until
+        // after the pipe is created.
+        // SAFETY: O_RDONLY opens /dev/null; the c-literal is NUL-terminated.
+        let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(
-            delivered > 2,
-            "the delivered FD must be a real pipe descriptor (above stdin/stdout/stderr): {out}"
+            devnull >= 0,
+            "open /dev/null: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: devnull is a fresh, owned descriptor from open.
+        let mut holders: Vec<OwnedFd> = vec![unsafe { OwnedFd::from_raw_fd(devnull) }];
+        loop {
+            // SAFETY: devnull is open; F_DUPFD returns a fresh owned fd >= 3.
+            let d = unsafe { libc::fcntl(devnull, libc::F_DUPFD, 3) };
+            if d < 0 {
+                break;
+            }
+            // SAFETY: d is a fresh, owned descriptor from fcntl.
+            let owned = unsafe { OwnedFd::from_raw_fd(d) };
+            let past_nine = owned.as_raw_fd() > 9;
+            holders.push(owned);
+            if past_nine {
+                break;
+            }
+        }
+        let highest = holders.last().map(|f| f.as_raw_fd()).unwrap_or(0);
+        assert!(
+            highest > 9,
+            "test setup must hold fds up past 9, got {highest}"
+        );
+
+        let script = format!(
+            "printf 'protocol=https\\nhost=example.test\\n\\n' | sh -c \"$TEST_HELPER get\" > '{o}'; \
+             echo \"fd=$NANO_GIT_CRED_FD\" >> '{o}';",
+            o = out1.display(),
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(&script);
+        cmd.env("TEST_HELPER", helper_body);
+        let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
+        // The pipe's own read end was allocated above 9 (holders forced it).
+        let pipe_raw = guard._read.as_raw_fd();
+        let status = cmd.status().expect("run sh helper");
+        drop(guard);
+        drop(holders);
+        assert!(status.success(), "helper script exited non-zero");
+        let out = std::fs::read_to_string(&out1).expect("helper output");
+        assert!(
+            out.contains(&format!("password={password}")),
+            "secret must be delivered even when the pipe's own fd is high ({pipe_raw}): {out}"
+        );
+        let delivered: i32 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("fd="))
+            .and_then(|s| s.trim().parse().ok())
+            .expect("child reports the delivered fd");
+        assert_eq!(
+            delivered, CRED_FD,
+            "a high pipe fd ({pipe_raw}) must be remapped to the single-digit CRED_FD for POSIX sh: {out}"
         );
         let _ = std::fs::remove_file(&out1);
     }
