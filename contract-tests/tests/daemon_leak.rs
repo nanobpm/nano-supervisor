@@ -4,13 +4,22 @@
 //! run when the test process dies without unwinding: a SIGKILL, a timeout kill,
 //! Ctrl-C, or `panic=abort`. The fix ties each test daemon's lifetime to the
 //! *owning test process* (`C8CTL_NANO_TEST_OWNER_PID`): a detached
-//! `__owner-watchdog` reaps the daemon's process group the moment the owner is
-//! gone (or its `C8CTL_NANO_HOME` disappears), so no daemon outlives its test.
+//! `__owner-watchdog` reaps the daemon the moment the owner is gone (or its
+//! `C8CTL_NANO_HOME` disappears), so no daemon outlives its test.
+//!
+//! The daemon is reaped **by pid**, not by process group: the real
+//! `nano-supervisor daemon` started through `TempHome::cmd` does not
+//! `setsid`/`setpgid`, so it is not its own group leader — it inherits the test
+//! runner's group (issue #54 review). These tests therefore stand the daemon in
+//! as a `sleep` that is a *non-leader member* of another group (pid != pgid),
+//! exercising that real launch path: a group-targeted kill would miss it (and
+//! must never be aimed at the shared runner group), so only a correct pid kill
+//! reaps it.
 //!
 //! These tests are **engine-free** and drive the real binary's hidden
 //! `__owner-watchdog` subcommand directly, exactly as `pdeath_guard.rs` drives
 //! `__reap-watchdog`. They are **Rust-pinned** (the owner watchdog is the Rust
-//! port's mechanism) and **unix-only** (the reaper signals a process group).
+//! port's mechanism) and **unix-only** (the reaper signals a process).
 
 mod common;
 
@@ -28,11 +37,11 @@ fn bin() -> String {
     std::env::var("NS_BIN").unwrap_or_else(|_| "target/debug/nano-supervisor".to_string())
 }
 
-/// Spawn a long-lived stand-in for the daemon, in its OWN process group
-/// (pid == pgid), the way the daemon runs. Returns (child, pid). The child is
-/// killed+reaped by the caller on every path.
+/// Spawn a long-lived `sleep` in its OWN process group (pid == pgid), used only
+/// as the *group host* for the daemon stand-in below — never as the daemon
+/// itself. Returns (child, pgid). Killed+reaped by the caller.
 #[cfg(unix)]
-fn spawn_daemon() -> (std::process::Child, u32) {
+fn spawn_group_host() -> (std::process::Child, u32) {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("sleep");
     cmd.arg("60")
@@ -40,6 +49,28 @@ fn spawn_daemon() -> (std::process::Child, u32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.process_group(0);
+    let child = cmd.spawn().expect("spawn group host");
+    let pid = child.id();
+    (child, pid)
+}
+
+/// Spawn a long-lived stand-in for the daemon as a **non-leader member** of
+/// `pgid`'s group (pid != pgid), mirroring the real daemon that inherits the
+/// test runner's group rather than leading its own (issue #54 review). Returns
+/// (child, pid). A group-targeted `kill(-pid)` would miss this process; only a
+/// pid-targeted kill reaps it — which is exactly what the watchdog must do. The
+/// child is killed+reaped by the caller on every path.
+#[cfg(unix)]
+fn spawn_daemon_in_group(pgid: u32) -> (std::process::Child, u32) {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new("sleep");
+    cmd.arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Join the host's group instead of leading our own: pid != pgid, the real
+    // daemon's situation.
+    cmd.process_group(pgid as i32);
     let child = cmd.spawn().expect("spawn daemon stand-in");
     let pid = child.id();
     (child, pid)
@@ -83,9 +114,10 @@ fn eventually<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
 
 /// The core regression: a daemon whose owning test process is SIGKILLed (no
 /// unwinding, so `Drop` never runs) must be reaped by the owner watchdog. We
-/// stand in for the daemon with a `sleep` in its own process group and for the
-/// test with a short-lived child we SIGKILL; the watchdog must then SIGKILL the
-/// daemon's group even though nothing unwound.
+/// stand in for the daemon with a `sleep` that is a *non-leader member* of
+/// another group (pid != pgid — the real daemon's situation) and for the test
+/// with a short-lived child we SIGKILL; the watchdog must then SIGKILL the daemon
+/// *by pid* even though nothing unwound and the daemon leads no group of its own.
 #[cfg(unix)]
 #[test]
 fn daemon_is_reaped_when_the_owning_test_is_killed() {
@@ -96,7 +128,8 @@ fn daemon_is_reaped_when_the_owning_test_is_killed() {
         skip!("Rust binary not available (set NS_BIN)");
     }
 
-    let (mut daemon, daemon_pid) = spawn_daemon();
+    let (mut host, host_pgid) = spawn_group_host();
+    let (mut daemon, daemon_pid) = spawn_daemon_in_group(host_pgid);
     let (mut owner, owner_pid) = spawn_owner();
     // A live home dir stands in for the test's `C8CTL_NANO_HOME`; the watchdog
     // also fires if it disappears, but here it stays put so only the owner-death
@@ -123,9 +156,9 @@ fn daemon_is_reaped_when_the_owning_test_is_killed() {
     unsafe { libc::kill(owner_pid as libc::pid_t, libc::SIGKILL) };
     let _ = owner.wait();
 
-    // The watchdog must now reap the daemon's process group. Reap the daemon on
-    // every poll: once SIGKILLed it is this process's zombie, and an unreaped
-    // zombie still answers `kill(pid, 0)`, which would mask the kill.
+    // The watchdog must now reap the daemon by pid. Reap the daemon on every
+    // poll: once SIGKILLed it is this process's zombie, and an unreaped zombie
+    // still answers `kill(pid, 0)`, which would mask the kill.
     let reaped = eventually(Duration::from_secs(5), || {
         let _ = daemon.try_wait();
         !pid_alive(daemon_pid)
@@ -137,6 +170,8 @@ fn daemon_is_reaped_when_the_owning_test_is_killed() {
     let _ = watchdog.wait();
     let _ = daemon.kill();
     let _ = daemon.wait();
+    let _ = host.kill();
+    let _ = host.wait();
 }
 
 /// The watchdog must also fire when the test's `C8CTL_NANO_HOME` disappears out
@@ -152,7 +187,8 @@ fn daemon_is_reaped_when_its_home_disappears() {
         skip!("Rust binary not available (set NS_BIN)");
     }
 
-    let (mut daemon, daemon_pid) = spawn_daemon();
+    let (mut host, host_pgid) = spawn_group_host();
+    let (mut daemon, daemon_pid) = spawn_daemon_in_group(host_pgid);
     // The owner stays ALIVE for the whole test; only the home is removed.
     let (mut owner, owner_pid) = spawn_owner();
     let home = tempfile::tempdir().expect("temp home");
@@ -190,6 +226,8 @@ fn daemon_is_reaped_when_its_home_disappears() {
     let _ = daemon.wait();
     let _ = owner.kill();
     let _ = owner.wait();
+    let _ = host.kill();
+    let _ = host.wait();
 }
 
 /// The watchdog must NOT fire while the owner is alive and the home exists — a
@@ -205,7 +243,8 @@ fn live_owner_daemon_is_left_alone() {
         skip!("Rust binary not available (set NS_BIN)");
     }
 
-    let (mut daemon, daemon_pid) = spawn_daemon();
+    let (mut host, host_pgid) = spawn_group_host();
+    let (mut daemon, daemon_pid) = spawn_daemon_in_group(host_pgid);
     let (mut owner, owner_pid) = spawn_owner();
     let home = tempfile::tempdir().expect("temp home");
 
@@ -246,4 +285,6 @@ fn live_owner_daemon_is_left_alone() {
     );
     let _ = owner.kill();
     let _ = owner.wait();
+    let _ = host.kill();
+    let _ = host.wait();
 }

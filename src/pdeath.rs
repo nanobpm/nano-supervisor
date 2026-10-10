@@ -122,6 +122,29 @@ pub(crate) fn sigkill_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn sigkill_group(_pid: u32) {}
 
+/// `SIGKILL` a single process by pid (`kill(pid, SIGKILL)`, not the group).
+///
+/// Used by the owner watchdog to reap an orphaned contract-test daemon/worker.
+/// Unlike an agent — which is spawned with `process_group(0)` and so leads a
+/// group named by its pid — the supervisor started by `TempHome::cmd`/the
+/// daemon entrypoint does **not** call `setsid`/`setpgid`, so it is *not* its
+/// own process-group leader (it stays in the invoking test's group). Signalling
+/// `kill(-self_pid)` there targets a nonexistent group named by the daemon's pid
+/// and the daemon survives; worse, `self_pid`'s real group is the *shared* test
+/// group, so a group kill would be aimed at the harness and its siblings. The
+/// orphan #54 is about is the supervisor process itself, and its own children
+/// (agents, each in its own `process_group(0)` group with a parent-death binding
+/// or reap watchdog) are reaped by the existing machinery when it dies — so the
+/// correct, group-agnostic target is the pid. Harmless if already gone (`ESRCH`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn sigkill_pid(pid: u32) {
+    // SAFETY: a plain libc kill of a single pid; no Rust state is touched and an
+    // already-dead (or zombie) pid simply yields ESRCH / a harmless no-op.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
 /// `SIGTERM` a process group by its leader pid, via a direct libc `kill(2)`.
 /// Preferred over spawning an external `kill(1)`: a spawned process would
 /// inherit the daemon's environment (including `CAMUNDA_*`/`ZEEBE_*` credentials)
@@ -263,10 +286,14 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
     //   apart from the real owner (issue #54 review): a bare pid answers
     //   `kill(_, 0)` for whatever unrelated process reused the number, so a
     //   start-time mismatch — not just liveness — is what proves the owner died.
-    // - **Our own group's identity** (`self_pid` is the leader of its process
-    //   group) gates the watchdog's SIGKILL, so a daemon that already exited and
-    //   had its pid/pgid recycled by an unrelated group is never signalled
-    //   (the same recycled-PGID race issue #27 closes for the agent watchdog).
+    // - **Our own pid's identity** gates the watchdog's SIGKILL, so a daemon
+    //   that already exited and had its pid recycled by an unrelated process is
+    //   never signalled (the same recycled-identity race issue #27 closes for
+    //   the agent watchdog, here on the supervisor's pid rather than its group —
+    //   the supervisor is not its own group leader, so the watchdog reaps it by
+    //   pid; see `owner_watchdog`). `leader_identity` reads `/proc/<self_pid>`
+    //   (start+uid), which is the daemon's own incarnation whether or not it
+    //   leads a group.
     let owner_start = owner_start_time(owner);
     let self_identity = leader_identity(self_pid);
     let mut cmd = std::process::Command::new(exe);
@@ -322,10 +349,10 @@ fn spawn_owner_watchdog(_owner: u32, _home: std::path::PathBuf) -> Option<u32> {
 
 /// The owner-watchdog loop (the `__owner-watchdog` subcommand): poll until the
 /// owning test process is gone OR the watched home directory has disappeared,
-/// then SIGKILL the supervised daemon's process group. Returns without firing
-/// when the supervised process has already exited on its own (a normal drain),
-/// so the watchdog does not linger. This is the guaranteed reaper for a daemon
-/// whose owning test died without unwinding (issue #54).
+/// then SIGKILL the supervised daemon **by pid**. Returns without firing when the
+/// supervised process has already exited on its own (a normal drain), so the
+/// watchdog does not linger. This is the guaranteed reaper for a daemon whose
+/// owning test died without unwinding (issue #54).
 ///
 /// Both decisions are incarnation-aware, not bare-pid (issue #54 review):
 ///
@@ -335,11 +362,15 @@ fn spawn_owner_watchdog(_owner: u32, _home: std::path::PathBuf) -> Option<u32> {
 ///   unrelated reuser, but it is no longer the owning test, so the daemon must
 ///   be reaped rather than orphaned indefinitely. With no token (`None`,
 ///   e.g. off Linux) the watchdog degrades to liveness-plus-home alone.
-/// - **The SIGKILL** is gated on `group_identity_matches(self_pid, …)`, the
-///   same identity check the agent watchdog uses (issue #27): the daemon's
-///   `self_pid` is also its process-group id, and if the daemon already exited
-///   and an unrelated group recycled the number, an unguarded `kill(-pid)`
-///   would SIGKILL that group. The captured identity refuses the signal then.
+/// - **The SIGKILL targets the daemon's pid, not its group** — the supervisor
+///   started by `TempHome::cmd`/the daemon entrypoint does not `setsid`/`setpgid`
+///   (unlike an agent, which is spawned with `process_group(0)`), so it is *not*
+///   its own process-group leader: `kill(-self_pid)` would miss it entirely, and
+///   its real group is the shared test group a group kill must never touch (issue
+///   #54 review). The signal is gated on `pid_identity_matches(self_pid, …)` —
+///   the same incarnation check the agent watchdog applies to a group, here on
+///   the pid — so a daemon that already exited and had its pid recycled by an
+///   unrelated process is never signalled. The captured identity refuses it then.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn owner_watchdog(
     owner_pid: u32,
@@ -349,7 +380,7 @@ pub fn owner_watchdog(
     self_start: Option<u64>,
     self_uid: Option<u32>,
 ) {
-    // Rebuild the identity token the daemon captured for its own group at arm
+    // Rebuild the identity token the daemon captured for its own pid at arm
     // (issue #27). Both halves are required; if either is missing the watchdog
     // has no identity and falls back to the numeric liveness probe alone.
     let self_identity = self_start
@@ -364,13 +395,13 @@ pub fn owner_watchdog(
         // owner pid RECYCLED (the start time moved off the captured token), or
         // home removed (TempDir deleted under a live daemon): fire.
         let owner_gone = !pid_alive(owner_pid)
-            || owner_start.is_some_and(|start| parent_start_time(owner_pid) != Some(start));
+            || owner_start.is_some_and(|start| owner_start_time(owner_pid) != Some(start));
         if owner_gone || !home.exists() {
-            // Re-verify the group's identity immediately before signalling: the
-            // daemon may have exited and its pid/pgid been recycled by an
-            // unrelated group in the window since the liveness check above.
-            if group_identity_matches(self_pid, self_identity) {
-                sigkill_group(self_pid);
+            // Re-verify the pid's identity immediately before signalling: the
+            // daemon may have exited and its pid been recycled by an unrelated
+            // process in the window since the liveness check above.
+            if pid_identity_matches(self_pid, self_identity) {
+                sigkill_pid(self_pid);
             }
             return;
         }
@@ -1237,7 +1268,25 @@ fn group_identity_matches(pgid: u32, expected: Option<GroupIdentity>) -> bool {
     }
 }
 
-/// Read the parent's start time (field 22 of `/proc/<pid>/stat`) so the Linux
+/// Like [`group_identity_matches`] but for a **single pid** that is *not* a
+/// process-group leader — the supervisor the owner watchdog reaps (see
+/// [`sigkill_pid`]). `group_identity_matches` first calls `group_alive(pid)`
+/// (`kill(-pid, 0)`), which answers `ESRCH` for a non-leader pid whose real
+/// group is named by some other leader, so it would wrongly report the live
+/// daemon as gone and skip the kill. This probes the pid directly: alive *and*
+/// the same incarnation (`/proc/<pid>` start+uid) as the token captured at arm.
+/// A vanished or recycled pid (`Absent`/`Changed`) fails closed — the original
+/// process is gone, so there is nothing of ours to signal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pid_identity_matches(pid: u32, expected: Option<GroupIdentity>) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    match expected {
+        Some(id) => matches!(probe_leader(pid), LeaderProbe::Present(cur) if cur == id),
+        None => true,
+    }
+}
 /// watchdog can detect PID reuse. After the daemon exits its numeric pid can be
 /// recycled (e.g. `Restart=on-failure`); the start time is unique per pid
 /// incarnation, so a later mismatch means the original parent is gone even when
@@ -1722,6 +1771,77 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn pid_identity_matches_reaps_a_non_group_leader() {
+        // The owner-watchdog scenario (issue #54 review): the supervised daemon
+        // is NOT its own process-group leader — it inherits the invoking test's
+        // group (no `setsid`/`setpgid`), unlike an agent spawned with
+        // `process_group(0)`. So its pid does not name a process group, and the
+        // group-based check (`group_alive` → `kill(-pid, 0)`) wrongly reports it
+        // gone and skips the reap. The pid-based check must verify it as ours.
+        let (mut leader, pgid) = spawn_group_leader();
+        let mut member = spawn_group_member(pgid);
+        let member_pid = member.id();
+        assert_ne!(
+            member_pid, pgid,
+            "the member shares the leader's group, so its pid is not a pgid"
+        );
+        let id = leader_identity(member_pid).expect("live member identity");
+        // The bug: a group probe of a non-leader pid finds no group and fails.
+        assert!(
+            !group_identity_matches(member_pid, Some(id)),
+            "group_identity_matches wrongly reports a live non-leader pid as gone"
+        );
+        // The fix: the pid probe verifies the live incarnation, so the reap fires.
+        assert!(
+            pid_identity_matches(member_pid, Some(id)),
+            "pid_identity_matches must verify a live non-leader pid as ours"
+        );
+        let _ = member.kill();
+        let _ = member.wait();
+        let _ = leader.kill();
+        let _ = leader.wait();
+    }
+
+    #[test]
+    fn pid_identity_matches_refuses_recycle_and_degrades_without_token() {
+        // The pid-level analogue of `pgid_guard_refuses_a_recycled_identity`: a
+        // live pid whose captured start/uid no longer matches is a recycled pid —
+        // fail closed. With no token the check degrades to the liveness probe.
+        let (mut child, pid) = spawn_group_leader();
+        let real = leader_identity(pid).expect("live identity");
+        let recycled = GroupIdentity {
+            start: real.start.wrapping_add(1),
+            uid: real.uid,
+        };
+        assert!(
+            !pid_identity_matches(pid, Some(recycled)),
+            "a mismatched start time must refuse the kill on a live pid"
+        );
+        let wrong_uid = GroupIdentity {
+            start: real.start,
+            uid: real.uid.wrapping_add(1),
+        };
+        assert!(
+            !pid_identity_matches(pid, Some(wrong_uid)),
+            "a mismatched uid must refuse the kill on a live pid"
+        );
+        assert!(
+            pid_identity_matches(pid, Some(real)),
+            "the matching identity passes"
+        );
+        assert!(
+            pid_identity_matches(pid, None),
+            "no token degrades to the numeric liveness probe"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !pid_identity_matches(pid, None),
+            "a dead pid fails the liveness probe"
+        );
     }
 
     #[test]
