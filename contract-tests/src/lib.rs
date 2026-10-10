@@ -100,6 +100,13 @@ fn apply_hermetic_env(c: &mut Command, home: &Path, target: Target) {
     }
     c.env("C8CTL_NANO_NO_LAUNCHD", "1")
         .env("NANO_NO_UPDATE_NOTIFIER", "1");
+    // Issue #54: bind any daemon/worker this command starts to THIS test process.
+    // The daemon watches the owner pid (and its `C8CTL_NANO_HOME`) and
+    // self-terminates when the owner is gone, so a test killed without unwinding
+    // (SIGKILL, a timeout kill, `panic=abort`) can never orphan a live daemon —
+    // the `Drop for TempHome` cleanup does not run in those cases. Stamping the
+    // harness's own pid here means every spawned target inherits the binding.
+    c.env("C8CTL_NANO_TEST_OWNER_PID", std::process::id().to_string());
 }
 
 /// Which implementation the suite exercises, chosen by `NS_TARGET` (default
@@ -243,6 +250,13 @@ impl TempHome {
 
     /// Create a new isolated home for a specific target.
     pub fn with_target(target: Target) -> TempHome {
+        // Issue #54: before this test runs, sweep any daemon orphaned by an
+        // EARLIER crashed/killed test — one whose `ct-home-*` no live test owns
+        // (its owner pid is gone) or whose home directory already vanished.
+        // `Drop` covers the unwind path; this covers the leftovers from runs
+        // where even the owner-death self-termination could not help (e.g. an
+        // older binary, or a daemon killed before it bound its owner).
+        sweep_orphaned_daemons();
         let dir = tempfile::Builder::new()
             .prefix("ct-home-")
             .tempdir()
@@ -336,12 +350,37 @@ impl Drop for TempHome {
         // dropped home never orphans a background process. Ignore every error —
         // the common case is that no daemon was ever started.
         let sock = self.socket_path();
-        if sock.exists() {
-            let _ = control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }));
-            let _ = std::fs::remove_file(&sock);
+        if !sock.exists() {
+            return;
         }
+        let _ = control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }));
+        // Issue #54: don't fire-and-forget. After the force-stop, give the daemon
+        // a bounded window to release its control socket (the daemon removes it as
+        // it exits), so a still-live daemon is given the chance to stop cleanly
+        // before this home's `TempDir` is deleted. A daemon that ignores the stop
+        // is still reaped: it watches its `C8CTL_NANO_TEST_OWNER_PID` and this
+        // home, and the owner watchdog SIGKILLs its process group once the owner
+        // is gone or — once the `TempDir` below deletes this home — the home
+        // disappears. So no daemon outlives its test even when `Drop` is the only
+        // cleanup that ran.
+        let deadline = Instant::now() + DROP_STOP_GRACE;
+        while Instant::now() < deadline {
+            // The socket is removed by the daemon as it exits; once it no longer
+            // answers a connect the daemon is gone (or never was).
+            if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Remove the (now-stale) socket file so a later test's startup sweep does
+        // not mistake it for a live daemon.
+        let _ = std::fs::remove_file(&sock);
     }
 }
+
+/// How long `Drop for TempHome` waits for a force-stopped daemon to release its
+/// control socket before giving up and removing the (now-stale) socket file.
+const DROP_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Derive the plugin's control-socket path for a given home directory. Mirrors
 /// the Node plugin exactly: `join(tmpdir(), "c8ctl-nano-sup-<sha1(home)[:8]>.sock")`.
@@ -351,6 +390,90 @@ pub fn supervisor_socket_path(home: &Path) -> PathBuf {
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     std::env::temp_dir().join(format!("c8ctl-nano-sup-{}.sock", &hex[..8]))
+}
+
+/// Issue #54 startup sweep: stop any supervisor daemon orphaned by an EARLIER
+/// contract-test run that died without unwinding. Runs at the top of every new
+/// [`TempHome`] so leftovers from a crashed/killed `cargo test` are reclaimed
+/// before this test starts, rather than accumulating on a fleet machine.
+///
+/// A leftover is recognised by its `ct-home-*` state home in the system temp
+/// dir. To avoid disturbing a *concurrently-running* test's live daemon (every
+/// test in one `cargo test` process shares the same owner pid), a home is only
+/// treated as orphaned when its recorded owner pid (`ct-owner.pid`, written by
+/// the daemon when it armed its owner watchdog) is **gone** — or when there is
+/// no owner marker at all (an older binary that never wrote one). For each
+/// orphaned home whose daemon still answers its control socket we force-stop it.
+/// The daemon's own owner watchdog is the primary reaper; this sweep is the
+/// backstop for a daemon started by an older binary or one that never bound its
+/// owner. Best-effort and cheap: it never touches a home that is not a
+/// `ct-home-*` test dir, so it can never disturb a real fleet.
+fn sweep_orphaned_daemons() {
+    let tmp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&tmp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only ever look at contract-test homes — never a real fleet's home.
+        if !name.starts_with("ct-home-") {
+            continue;
+        }
+        let home = entry.path();
+        // Skip a home whose owning test is still alive: that daemon belongs to a
+        // concurrently-running test and must not be stopped from under it.
+        if owner_still_alive(&home) {
+            continue;
+        }
+        let sock = supervisor_socket_path(&home);
+        if !sock.exists() {
+            continue;
+        }
+        // A daemon still answers this orphaned home's socket: force-stop it, then
+        // give it a bounded moment to exit before removing the (soon-stale)
+        // socket file. Its owner watchdog will SIGKILL it regardless once it
+        // notices the dead owner; this just hurries a clean stop along.
+        if control_request(&sock, &serde_json::json!({ "op": "stop", "force": true })).is_ok() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline
+                && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let _ = std::fs::remove_file(&sock);
+    }
+}
+
+/// Whether the owning test process recorded in `<home>/ct-owner.pid` is still
+/// alive. `true` (leave the daemon alone) when the marker names a live process;
+/// `false` (the home is orphaned) when the marker is absent, unreadable, or names
+/// a dead process. The pid is the shared `cargo test` process id, so a live
+/// marker means a *concurrently-running* test owns this daemon.
+#[cfg(unix)]
+fn owner_still_alive(home: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(home.join("ct-owner.pid")) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // `kill(pid, 0)`: 0 => alive; EPERM => alive but not ours; ESRCH => gone.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Non-unix fallback: with no liveness probe, assume the owner is alive so the
+/// sweep never stops a daemon it cannot prove is orphaned.
+#[cfg(not(unix))]
+fn owner_still_alive(_home: &Path) -> bool {
+    true
 }
 
 /// The reason an engine-dependent test cannot run. Print it and return early —

@@ -68,6 +68,11 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     let state_home = state::state_home().unwrap_or_else(|| {
         config_exit("cannot locate the c8ctl-nano state home (set HOME or C8CTL_NANO_HOME)")
     });
+    // Issue #54: when the hermetic contract-test harness started us (it stamps
+    // `C8CTL_NANO_TEST_OWNER_PID`), arm the owner watchdog so a test killed
+    // without unwinding (SIGKILL/timeout/panic=abort) can never orphan this
+    // worker. A no-op for a real fleet worker (no owner binding).
+    crate::pdeath::arm_owner_watchdog();
     // A pin-resolution FAILURE (e.g. no engine base URL could be resolved) is
     // DEFERRED rather than fatal here: an unknown or invalid hire is a more
     // fundamental, non-restartable config error that needs no engine at all, so

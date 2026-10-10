@@ -158,6 +158,154 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
     false
 }
 
+/// Whether `pid` names a live process. Best-effort; a reused PID can read as
+/// alive, which only ever *delays* the owner-death reaction below — never a
+/// wrongful exit, so the fail-open direction is the safe one here.
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // `kill(pid, 0)` sends no signal: 0 => alive; EPERM => alive but not ours;
+    // ESRCH => no such process.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pid_alive(_pid: u32) -> bool {
+    // With no liveness probe we cannot tell a dead owner from a live one, so
+    // assume alive: the watchdog then never fires spuriously on a platform that
+    // cannot support it (the hermetic contract tests are unix-only anyway).
+    true
+}
+
+/// The owning test process a contract-test daemon/worker is bound to, read from
+/// the hermetic environment the harness stamps (`C8CTL_NANO_TEST_OWNER_PID`).
+/// `Some(pid)` only when the variable holds a parseable non-zero pid; any other
+/// state (unset, empty, garbage) means "no owner binding" and disables the
+/// watchdog, so a real fleet daemon is never affected.
+pub fn test_owner_pid() -> Option<u32> {
+    std::env::var("C8CTL_NANO_TEST_OWNER_PID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Arm the contract-test owner watchdog (issue #54). When this daemon/worker was
+/// started by the hermetic test harness (a parseable `C8CTL_NANO_TEST_OWNER_PID`
+/// is present), spawn a detached `__owner-watchdog` process that SIGKILLs THIS
+/// process's group the moment the owning test process is gone — covering the
+/// cases `Drop for TempHome` cannot: a SIGKILL, a timeout kill, Ctrl-C, or
+/// `panic=abort`, none of which unwind. The watchdog also fires when the test's
+/// `C8CTL_NANO_HOME` directory disappears (the `TempDir` was removed from under
+/// a still-running daemon), which covers a recycled owner pid.
+///
+/// A no-op when there is no owner binding (a real fleet daemon/worker), so
+/// production processes are untouched. Best-effort: a spawn failure is logged,
+/// never fatal — the in-process `Drop` path still covers the unwind case.
+pub fn arm_owner_watchdog() {
+    let Some(owner) = test_owner_pid() else {
+        return;
+    };
+    let Some(home) = crate::state::state_home() else {
+        return;
+    };
+    // Record the owner binding where the contract-test startup sweep can read it
+    // (`<home>/ct-owner.pid`), so the sweep can tell an orphaned daemon (its
+    // owning test process is gone) apart from a concurrently-running test's live
+    // daemon (same shared `cargo test` pid, still alive) and only reap the former.
+    // Best-effort: a write failure just means the sweep falls back to leaving the
+    // daemon to its own watchdog.
+    let _ = std::fs::write(home.join(OWNER_PID_FILE), owner.to_string());
+    let _ = spawn_owner_watchdog(owner, home);
+}
+
+/// The file (under the test's `C8CTL_NANO_HOME`) recording the owning test
+/// process's pid, written by [`arm_owner_watchdog`]. The contract-test startup
+/// sweep reads it to decide whether a `ct-home-*` daemon is orphaned (owner
+/// dead) or merely belongs to a concurrently-running test (owner alive).
+pub const OWNER_PID_FILE: &str = "ct-owner.pid";
+
+/// Spawn the detached owner watchdog for `owner`, watching `home`. Returns its
+/// pid, or `None` if it could not be spawned. Split from [`arm_owner_watchdog`]
+/// so the regression test can drive the real subcommand directly.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
+    let Ok(exe) = std::env::current_exe() else {
+        return None;
+    };
+    let self_pid = std::process::id();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__owner-watchdog")
+        .arg("--owner-pid")
+        .arg(owner.to_string())
+        .arg("--self-pid")
+        .arg(self_pid.to_string())
+        .arg("--home")
+        .arg(&home);
+    // Scrub the environment: the watchdog needs nothing but its own executable
+    // and the CLI args above, and inheriting the daemon's environment would
+    // expose the engine/OAuth secrets to a same-user reader of
+    // `/proc/<watchdog-pid>/environ` (the same hardening `spawn_watchdog` uses).
+    cmd.env_clear();
+    match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap the watchdog when it exits so it never lingers as a zombie of
+            // the daemon (the same fix issue #52 applied to the agent watchdog).
+            let pid = child.id();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Some(pid)
+        }
+        Err(e) => {
+            crate::runtime::log(&format!(
+                "warning: owner watchdog failed to spawn for owner {owner}: {e}"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn spawn_owner_watchdog(_owner: u32, _home: std::path::PathBuf) -> Option<u32> {
+    None
+}
+
+/// The owner-watchdog loop (the `__owner-watchdog` subcommand): poll until the
+/// owning test process is gone OR the watched home directory has disappeared,
+/// then SIGKILL the supervised daemon's process group. Returns without firing
+/// when the supervised process has already exited on its own (a normal drain),
+/// so the watchdog does not linger. This is the guaranteed reaper for a daemon
+/// whose owning test died without unwinding (issue #54).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn owner_watchdog(owner_pid: u32, self_pid: u32, home: std::path::PathBuf) {
+    loop {
+        // The supervised daemon already exited on its own: nothing to reap.
+        if !pid_alive(self_pid) {
+            return;
+        }
+        // Owner gone (SIGKILL / timeout / panic=abort — no unwinding, no Drop) or
+        // home removed (TempDir deleted under a live daemon): fire.
+        if !pid_alive(owner_pid) || !home.exists() {
+            sigkill_group(self_pid);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn owner_watchdog(_owner_pid: u32, _self_pid: u32, _home: std::path::PathBuf) {}
+
 /// The identity of a process group, captured at spawn so a later cleanup can
 /// tell *the agent's* group apart from an unrelated group that recycled the
 /// numeric pgid (issue #27).

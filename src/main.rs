@@ -264,6 +264,21 @@ enum Cmd {
         #[arg(long)]
         pgid_uid: Option<u32>,
     },
+    /// Internal: the contract-test owner watchdog (kills this daemon's process
+    /// group when the owning test process dies without unwinding, issue #54).
+    /// Not for direct use.
+    #[command(name = "__owner-watchdog", hide = true)]
+    OwnerWatchdog {
+        /// The owning test process the harness stamped (`C8CTL_NANO_TEST_OWNER_PID`).
+        #[arg(long)]
+        owner_pid: u32,
+        /// The daemon/worker process to reap once the owner is gone.
+        #[arg(long)]
+        self_pid: u32,
+        /// The test's `C8CTL_NANO_HOME`; its disappearance also trips the watchdog.
+        #[arg(long)]
+        home: PathBuf,
+    },
 }
 
 /// `supervisor` subcommands implemented on the Rust target.
@@ -524,6 +539,16 @@ async fn main() -> Result<()> {
             })
             .await
             .ok();
+            Ok(())
+        }
+        Cmd::OwnerWatchdog {
+            owner_pid,
+            self_pid,
+            home,
+        } => {
+            tokio::task::spawn_blocking(move || pdeath::owner_watchdog(owner_pid, self_pid, home))
+                .await
+                .ok();
             Ok(())
         }
         Cmd::Hire {
