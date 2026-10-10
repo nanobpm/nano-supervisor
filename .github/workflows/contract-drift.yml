@@ -175,15 +175,24 @@ jobs:
             --description "Nightly JS drift detected against the latest plugin/CLI" \
             --force >/dev/null 2>&1 || true
 
+          # Look up the open tracking issue. Do NOT suppress failures here: an
+          # empty result (no open issue) already exits 0, so a non-zero exit is a
+          # genuine API/auth/outage failure. Swallowing it (|| true) would make an
+          # outage indistinguishable from "no open issue" — opening a duplicate on
+          # a red run, or silently leaving the drift issue open on a green run.
+          # Let a real lookup failure abort the job (set -e) so it is retried/visible.
           existing="$(gh issue list --label "$LABEL" --state open \
-            --json number --jq '.[0].number' 2>/dev/null || true)"
+            --json number --jq '.[0].number')"
 
           if [ "$failed" -eq 0 ]; then
             echo "No drift detected."
             if [ -n "${existing:-}" ]; then
+              # Green-path close: do NOT suppress failures. If commenting/closing
+              # fails (API outage) we must not report success while leaving the
+              # drift issue open — let the failure abort the job.
               gh issue comment "$existing" --body \
-                "✅ Nightly contract drift run is green again ([run](${run_url})). Closing." || true
-              gh issue close "$existing" --reason completed || true
+                "✅ Nightly contract drift run is green again ([run](${run_url})). Closing."
+              gh issue close "$existing" --reason completed
             fi
             exit 0
           fi
