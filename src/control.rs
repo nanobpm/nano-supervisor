@@ -546,6 +546,38 @@ fn poll_connect_complete(
     }
 }
 
+/// Probe whether a live daemon is accepting on `socket`, bounded by `timeout`.
+///
+/// Returns `Ok(())` once the connect handshake completes (the peer is alive and
+/// dequeued us), and `Err` otherwise: fast (`ECONNREFUSED`/`ENOENT`) when no live
+/// daemon owns the socket, or `TimedOut` when the budget is exhausted against a
+/// live-but-backlogged peer. Unlike a raw blocking `UnixStream::connect`, the
+/// connect is nonblocking and deadline-bounded, so a live daemon that has stopped
+/// accepting (full listen backlog) cannot wedge the caller indefinitely — the
+/// property `supervisor_running` / startup liveness probes rely on
+/// (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+pub(crate) fn probe_within_deadline(
+    socket: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    if timeout.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "control probe budget exhausted before contacting the daemon",
+        ));
+    }
+    let deadline = std::time::Instant::now().checked_add(timeout).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "control probe timeout overflows the monotonic clock",
+        )
+    })?;
+    // Completing the handshake is enough to prove a live, accepting peer; drop
+    // the stream without reading so we do not consume the daemon's accept queue.
+    connect_within_deadline(socket, deadline).map(|_| ())
+}
+
 /// Non-Unix stub: the control socket is a Unix-domain transport, so there is no
 /// client to offer off-Unix. Returns `Unsupported` rather than failing to
 /// compile, mirroring the daemon's `cfg(not(unix))` fallbacks.
@@ -984,7 +1016,6 @@ mod tests {
         // call must return well within the budget rather than hanging.
         #[test]
         fn request_with_timeout_bounds_a_backlogged_listener() {
-            use std::os::unix::net::UnixStream as StdUnixStream;
             let sock = temp_sock("bkl");
             let _ = std::fs::remove_file(&sock);
             // A listener that NEVER accepts, so pending connects pile up in the
@@ -992,9 +1023,19 @@ mod tests {
             let listener = UnixListener::bind(&sock).expect("bind test socket");
 
             // Pile up pending connections to try to saturate the accept backlog.
+            // Use the SAME deadline-aware nonblocking connect the production path
+            // uses, never a raw blocking `UnixStream::connect`: once the backlog
+            // is full, a blocking connect waits for queue space and would hang the
+            // test itself (a 128-entry listener stalls a blocking fill loop around
+            // iteration 129) before the bounded assertion below is ever reached.
+            // Each fill probe gets a small budget; a full backlog makes it time
+            // out, which is the signal to stop filling.
             let mut pending = Vec::new();
             for _ in 0..512 {
-                match StdUnixStream::connect(&sock) {
+                match connect_within_deadline(
+                    &sock,
+                    std::time::Instant::now() + std::time::Duration::from_millis(50),
+                ) {
                     Ok(s) => pending.push(s),
                     Err(_) => break,
                 }

@@ -354,7 +354,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             let _ = h.await;
         }
     };
-    // Pick the grace window from the snapshot, but keep watching the shutdown
+    // Pick the grace window from the LIVE reason, and keep watching the shutdown
     // reason WHILE draining: a plain `Drain` chooses the full 20s window, yet a
     // second client can escalate it with `stop --force` (`Cancel`), or a slot
     // can flip it to `Fatal`, mid-drain. Both reasons abort in-flight work, so a
@@ -363,12 +363,19 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // aborting in-flight work. Freezing the grace from the snapshot (the old bug)
     // let a mid-drain escalation leave the daemon/socket alive for the full 20s
     // instead of the promised forced-stop window.
-    let initial_grace = if reason.aborts_inflight() {
+    // Subscribe BEFORE choosing the initial grace, then seed the grace from the
+    // receiver's CURRENT settled value — not the stale `reason` snapshot
+    // `wait_for_signal` returned. A `watch::Receiver` considers the value present
+    // at `subscribe()` as already-seen, so a `Cancel`/`Fatal` that lands between
+    // the snapshot and `subscribe()` would never fire `changed()`; seeding from
+    // the receiver picks that escalation up so a stuck slot cannot ride the full
+    // graceful window (nanobpm/nano-supervisor#8).
+    let mut escalation_rx = shutdown_tx.subscribe();
+    let initial_grace = if escalation_rx.borrow_and_update().aborts_inflight() {
         FORCE_DRAIN_GRACE
     } else {
         DRAIN_GRACE
     };
-    let mut escalation_rx = shutdown_tx.subscribe();
     let drained =
         drain_within_deadline(drain, &mut escalation_rx, initial_grace, FORCE_DRAIN_GRACE).await;
     if !drained {
@@ -465,8 +472,12 @@ fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
         // live daemon (Rust or Node) is bound here — refuse to unlink its socket
         // out from under it. Only a connect that FAILS (ECONNREFUSED / ENOENT
         // racing a teardown) marks the file as a dead owner's stale leftover that
-        // is safe to remove before binding.
-        if std::os::unix::net::UnixStream::connect(sock_path).is_ok() {
+        // is safe to remove before binding. The probe is nonblocking and
+        // deadline-bounded: a live peer whose listen backlog is full would
+        // otherwise stall a blocking `connect` (and with it direct/detached
+        // startup) indefinitely before `bind` is attempted
+        // (nanobpm/nano-supervisor#8).
+        if control::probe_within_deadline(sock_path, std::time::Duration::from_secs(2)).is_ok() {
             bail!(
                 "the supervisor control socket at {} is live — another daemon (Rust or Node) \
                  already owns this state home; refusing to clobber its control endpoint",
@@ -2254,6 +2265,44 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "a forced escalation must collapse the deadline to the forced window rather than \
              riding the full graceful grace; took {elapsed:?}"
+        );
+    }
+
+    // Regression (stale snapshot): the initial grace must be seeded from the
+    // receiver's CURRENT settled value, not the snapshot `wait_for_signal`
+    // returned. A `watch::Receiver` treats the value present at `subscribe()` as
+    // already-seen, so a `Cancel` published BEFORE `subscribe()` never fires
+    // `changed()`; if the grace were seeded from the stale snapshot the stuck
+    // drain would ride the full graceful window. Seeding from
+    // `borrow_and_update()` (the production pattern at the drain site) picks the
+    // already-settled `Cancel` up and chooses the forced window immediately
+    // (nanobpm/nano-supervisor#8).
+    #[tokio::test]
+    async fn grace_seeded_from_receiver_not_stale_snapshot() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Running);
+        // The escalation lands BEFORE the drain site subscribes, so `changed()`
+        // would never report it to a receiver created afterwards.
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Cancel);
+
+        // Mirror the production drain site: subscribe, then seed the grace from
+        // the receiver's settled value.
+        let mut rx = tx.subscribe();
+        let initial_grace = if rx.borrow_and_update().aborts_inflight() {
+            Duration::from_millis(100) // FORCE_DRAIN_GRACE analogue
+        } else {
+            Duration::from_secs(30) // DRAIN_GRACE analogue
+        };
+        let drain = std::future::pending::<()>(); // a slot that never finishes
+
+        let start = std::time::Instant::now();
+        let drained = drain_within_deadline(drain, &mut rx, initial_grace, Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+
+        assert!(!drained, "a stuck slot never drains");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "seeding from the receiver's settled value must choose the forced window even when the \
+             escalation predates subscribe(); took {elapsed:?}"
         );
     }
 

@@ -1360,10 +1360,18 @@ pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
 /// Whether a supervisor daemon is listening on this home's control socket.
 /// Mirrors the Node derivation (`<tmp>/c8ctl-nano-sup-<sha1(home)[:8]>.sock`)
 /// and treats a successful connect as "running".
+///
+/// The probe is nonblocking and deadline-bounded, not a raw blocking
+/// `UnixStream::connect`: a live daemon that has stopped accepting (full listen
+/// backlog) would otherwise hang `supervisor status`/`stop`/`start` here before
+/// they ever reach the deadline-aware control client. A bounded probe keeps the
+/// absent-vs-unresponsive distinction (absent fails fast with
+/// `ECONNREFUSED`/`ENOENT`; unresponsive surfaces as `TimedOut`) without wedging
+/// the caller (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
 fn supervisor_running(home: &std::path::Path) -> bool {
     let sock = control::socket_path(home);
-    std::os::unix::net::UnixStream::connect(sock).is_ok()
+    control::probe_within_deadline(&sock, std::time::Duration::from_millis(500)).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -1645,10 +1653,20 @@ fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) ->
         .stderr(std::process::Stdio::from(log_err));
     unsafe {
         cmd.pre_exec(|| {
-            // Detach from the controlling terminal / parent session. An EPERM
-            // because we are already a session leader is fine; the detach intent
-            // still holds, so any error here is deliberately non-fatal.
-            libc::setsid();
+            // Detach from the controlling terminal / parent session. Tolerate
+            // EPERM: it means the child is ALREADY a session or process-group
+            // leader, so it is not in the launcher's session and the detach
+            // intent still holds. Any OTHER error means detachment could not be
+            // established — the child would remain in the launcher's session and
+            // later receive its terminal/session signals — so fail the spawn
+            // rather than report a detached daemon that is not actually detached
+            // (nanobpm/nano-supervisor#8).
+            if libc::setsid() == -1 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EPERM) {
+                    return Err(e);
+                }
+            }
             Ok(())
         });
     }
