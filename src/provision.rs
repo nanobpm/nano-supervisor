@@ -584,9 +584,11 @@ fn is_hex_sha(s: &str) -> bool {
 /// world-readable on a default Linux host, so any local process can read the
 /// PAT for the lifetime of the clone/fetch — scrubbing the on-disk
 /// `origin`/`FETCH_HEAD` afterward does not close that live exposure. Supplying
-/// the secret through git's credential-helper protocol keeps it in the child's
-/// environment (`/proc/<pid>/environ`, readable only by the owning user)
-/// instead.
+/// the secret through git's credential-helper protocol keeps it out of argv;
+/// the password is further handed to the helper over an inherited pipe FD
+/// (see [`apply_git_credential`]) rather than an environment variable, so it
+/// never appears in the git process's `/proc/<pid>/environ` (which a same-UID
+/// process could otherwise read for the duration of the clone/fetch — #24).
 struct GitCredential {
     /// Host (without port) the credential is scoped to, so the helper never
     /// hands the token to a differently-hosted submodule remote.
@@ -2259,8 +2261,11 @@ async fn finalize_git_with_deadline(
                 // checkout, so it must not trust agent-mutable state:
                 //  - `core.hooksPath=/dev/null` disables any `.git/hooks/pre-push`
                 //    (or a redirected hooksPath) the agent planted — a hook would
-                //    otherwise run with `git()`'s env, which carries
-                //    `NANO_GIT_CRED_PASS` for the credential helper.
+                //    otherwise run with `git()`'s env. That env no longer carries
+                //    the credential password (it is piped to the helper over an
+                //    inherited FD), but it still carries `NANO_GIT_CRED_FD`, and a
+                //    hook racing the helper could read the pipe, so the hook stays
+                //    disabled.
                 //  - push to the TRUSTED `fetch_url` (the credential-free form of
                 //    the configured `repo.url`), never the agent-rewritable
                 //    `origin` remote in `.git/config` — so the push goes to the
@@ -3004,6 +3009,117 @@ async fn git_with_env(
         .map(|(out, _truncated)| out)
 }
 
+/// Shell credential helper that reads the password from an inherited file
+/// descriptor — whose number is passed in the non-secret `NANO_GIT_CRED_FD`
+/// env var — rather than from an environment variable, so the secret never
+/// lands in the git process's `/proc/<pid>/environ` (readable by any process
+/// under the same UID). Host and username are not secret and remain in the
+/// environment.
+///
+/// Behaviour: emit the credential only for a `get` on the matching host, and
+/// ignore `store`/`erase` (draining their stdin request). The FD read uses an
+/// `eval`'d literal redirection (`<&N`) so it is portable to a strict POSIX
+/// `/bin/sh` (dash/busybox) that does not accept a variable after `<&`. A
+/// repeated invocation hits EOF on the already-drained, write-closed pipe and
+/// emits an empty password, so git fails closed rather than hanging on a retry.
+const GIT_CRED_HELPER: &str = "!f() { \
+    test \"$1\" = get || exit 0; \
+    h=; \
+    while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
+    test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
+    eval \"p=\\$(cat <&$NANO_GIT_CRED_FD)\"; \
+    printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$p\"; \
+}; f";
+
+/// Owns the parent's read end of the credential pipe. Kept alive by the caller
+/// until *after* `spawn` so the inherited FD number stays valid (and reserved)
+/// through the fork; dropped afterwards, closing the parent's copy. The write
+/// end is already closed inside [`apply_git_credential`].
+struct CredPipe {
+    _read: std::os::unix::io::OwnedFd,
+}
+
+/// Configure out-of-band credential delivery on `cmd` so the password reaches
+/// git's credential helper over an inherited pipe FD instead of an environment
+/// variable (closing the same-UID `/proc/<pid>/environ` read; see #24).
+///
+/// - Creates a `CLOEXEC` pipe, writes the password into it, and closes the
+///   write end so the helper reads the secret followed by a clean EOF (a
+///   repeated helper call drains empty and fails rather than hangs).
+/// - Registers a `pre_exec` hook that clears `CLOEXEC` on the child's inherited
+///   read end so it survives `exec` into git (and the helper git spawns).
+/// - Injects the reset + our helper via `-c`, and sets only the non-secret
+///   `NANO_GIT_CRED_HOST`/`_USER`/`_FD` in the environment.
+///
+/// Returns a [`CredPipe`] guard the caller MUST keep alive until after `spawn`.
+fn apply_git_credential(cmd: &mut Command, c: &GitCredential) -> Result<CredPipe> {
+    use std::io::Write;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    // A `CLOEXEC` pipe: neither end leaks into an unrelated child, and the write
+    // end never survives into git (only the parent writes it). `pipe` + explicit
+    // `FD_CLOEXEC` is used instead of Linux-only `pipe2(O_CLOEXEC)` for unix
+    // portability; the brief window before the flags are set is single-threaded
+    // here and no other child is spawned in it.
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid 2-element array for pipe to populate.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating credential pipe");
+    }
+    // SAFETY: pipe just handed us two fresh, owned descriptors.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    for fd in [read_fd.as_raw_fd(), write_fd.as_raw_fd()] {
+        // SAFETY: both fds are owned and open; set FD_CLOEXEC on each.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error()).context("reading credential pipe flags");
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("setting CLOEXEC on credential pipe");
+        }
+    }
+
+    // Buffer the secret, then drop (close) the write end so the reader sees the
+    // password followed by EOF. A git token is far smaller than the pipe buffer
+    // (>= 4 KiB, 64 KiB on Linux), so this write never blocks before a reader
+    // exists.
+    {
+        let mut w = std::fs::File::from(write_fd);
+        w.write_all(c.password.as_bytes())
+            .context("writing credential to pipe")?;
+    }
+
+    let read_raw = read_fd.as_raw_fd();
+    // Clear `CLOEXEC` on the child's inherited read end (in the forked child,
+    // before exec) so git — and the credential helper git spawns — can still
+    // read FD `read_raw` after exec. Only async-signal-safe libc calls here.
+    // SAFETY: fcntl on an inherited fd in the pre-exec child; touches no Rust
+    // allocator state and shares nothing with the parent beyond `read_raw`.
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            let flags = libc::fcntl(read_raw, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(read_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    cmd.arg("-c").arg("credential.helper=");
+    cmd.arg("-c")
+        .arg(format!("credential.helper={GIT_CRED_HELPER}"));
+    cmd.env("NANO_GIT_CRED_HOST", &c.host);
+    cmd.env("NANO_GIT_CRED_USER", &c.username);
+    cmd.env("NANO_GIT_CRED_FD", read_raw.to_string());
+    Ok(CredPipe { _read: read_fd })
+}
+
 /// Core git runner. Returns `(stdout_tail, stdout_truncated)`; `stdout_truncated`
 /// is `true` when git emitted more than `GIT_STDOUT_TAIL` and leading bytes were
 /// dropped. Most callers go through [`git`]/[`git_with_env`] and ignore the
@@ -3020,27 +3136,19 @@ async fn git_with_env_capture(
     let mut cmd = Command::new("git");
     // A credential is delivered out of band via git's credential-helper
     // protocol so the secret never reaches argv (world-readable
-    // `/proc/<pid>/cmdline`). The helper snippet itself is not secret — it only
-    // names env vars — and is host-scoped so a `--recurse-submodules` fetch to a
-    // different host is never handed this repo's token. The empty
-    // `credential.helper=` first resets any host/global helper so ours is the
-    // only one consulted. These `-c` flags must precede the git subcommand.
-    if let Some(c) = cred {
-        // Read the request on stdin (draining it), emit the credential only for
-        // a `get` on the matching host, and ignore `store`/`erase`.
-        let helper = "!f() { \
-            test \"$1\" = get || exit 0; \
-            h=; \
-            while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
-            test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
-            printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$NANO_GIT_CRED_PASS\"; \
-        }; f";
-        cmd.arg("-c").arg("credential.helper=");
-        cmd.arg("-c").arg(format!("credential.helper={helper}"));
-        cmd.env("NANO_GIT_CRED_HOST", &c.host);
-        cmd.env("NANO_GIT_CRED_USER", &c.username);
-        cmd.env("NANO_GIT_CRED_PASS", &c.password);
-    }
+    // `/proc/<pid>/cmdline`) NOR the stable `/proc/<pid>/environ` (readable by
+    // any same-UID process — e.g. another slot's agent in host mode). The
+    // password travels over an inherited pipe FD; only non-secret fields (host,
+    // username, FD number) go in the environment. The helper snippet itself is
+    // not secret and is host-scoped so a `--recurse-submodules` fetch to a
+    // different host is never handed this repo's token. `apply_git_credential`
+    // injects the empty `credential.helper=` (resetting any host/global helper)
+    // and ours via the `-c` flags that must precede the git subcommand; the
+    // returned guard owns the parent's end of the pipe and MUST outlive `spawn`.
+    let _cred_pipe = match cred {
+        Some(c) => Some(apply_git_credential(&mut cmd, c)?),
+        None => None,
+    };
     cmd.args(args);
     // Kill (and reap) the git child if this future is dropped — e.g. when the
     // timeout below fires — so a timed-out clone/fetch can't keep running and
@@ -7676,5 +7784,161 @@ mod tests {
             "an incomplete (timed-out) scan must never report a clean push"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    /// A unique temp path base for credential-handshake test scratch files.
+    fn cred_scratch_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nano-cred-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Integration test for the FD-delivered credential handshake (#24): drive a
+    /// REAL `git credential fill` through [`apply_git_credential`] and assert git
+    /// invokes our helper, which reads the password from the inherited pipe FD
+    /// (not an env var) and hands it back. This exercises the exact `get`
+    /// handshake a clone/fetch performs against an authenticated remote.
+    #[tokio::test]
+    async fn credential_handshake_delivers_password_over_fd() {
+        // Build the secret at runtime so no credential-like literal is stored.
+        let password = format!("s3cr3t-{}-PAT", std::process::id());
+        let cred = GitCredential {
+            host: "example.test".into(),
+            username: "x-access-token".into(),
+            password: password.clone(),
+        };
+        let mut cmd = Command::new("git");
+        // Isolate from the developer's real git config so only OUR injected
+        // helper is consulted (mirrors `git_isolated`).
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        cmd.env("GIT_CONFIG_SYSTEM", "/dev/null");
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        // `apply_git_credential` injects the `-c credential.helper=` reset + our
+        // helper (which must precede the subcommand) and sets up the pipe FD.
+        let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
+        cmd.arg("credential").arg("fill");
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn git credential fill");
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().expect("git stdin");
+            stdin
+                .write_all(b"protocol=https\nhost=example.test\n\n")
+                .await
+                .expect("write credential request");
+            stdin.shutdown().await.expect("close git stdin");
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .expect("await git credential fill");
+        drop(guard);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "git credential fill failed: {}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            stdout
+        );
+        assert!(
+            stdout.contains("username=x-access-token"),
+            "username missing from filled credential: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("password={password}")),
+            "password (delivered over the inherited FD) missing from filled \
+             credential: {stdout}"
+        );
+    }
+
+    /// Integration test for the acceptance criteria of #24: the password is NOT
+    /// present in the git process's environment (so never in
+    /// `/proc/<pid>/environ`), yet is readable over the inherited FD; and a
+    /// repeated helper invocation drains EOF cleanly instead of hanging.
+    #[tokio::test]
+    async fn credential_password_absent_from_environ_and_retry_drains() {
+        let password = format!("s3cr3t-{}-ENVCHK", std::process::id());
+        let cred = GitCredential {
+            host: "example.test".into(),
+            username: "x-access-token".into(),
+            password: password.clone(),
+        };
+        // Invoke the PRODUCTION helper snippet directly via `sh`, stripping the
+        // leading `!` that is git's "run as shell command" marker.
+        let helper_body = GIT_CRED_HELPER
+            .strip_prefix('!')
+            .expect("helper snippet starts with git's '!' marker");
+        let base = cred_scratch_base("environ");
+        let out1 = base.with_extension("1");
+        let out2 = base.with_extension("2");
+        let env_dump = base.with_extension("env");
+        // On Linux, dump our own environ (NUL-delimited) to prove the secret is
+        // absent. Elsewhere `/proc` does not exist (and the exposure does not),
+        // so skip that half and only exercise the FD read + retry drain.
+        let dump = if cfg!(target_os = "linux") {
+            format!(
+                "tr '\\0' '\\n' < /proc/$$/environ > '{}';",
+                env_dump.display()
+            )
+        } else {
+            String::from(":;")
+        };
+        // Feed the helper a `get` request twice over the SAME inherited FD. The
+        // first read drains the password; the second must hit EOF and emit an
+        // empty password rather than block.
+        let req = "printf 'protocol=https\\nhost=example.test\\n\\n'";
+        let script = format!(
+            "{dump} {req} | sh -c \"$TEST_HELPER get\" > '{o1}'; \
+             {req} | sh -c \"$TEST_HELPER get\" > '{o2}';",
+            o1 = out1.display(),
+            o2 = out2.display(),
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&script);
+        cmd.env("TEST_HELPER", helper_body);
+        // Configure the pipe FD + non-secret env (host/user/FD number). The git
+        // `-c` args it also appends become inert positional params to `sh -c`.
+        let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
+        let status = tokio::time::timeout(Duration::from_secs(20), cmd.status())
+            .await
+            .expect("helper handshake must not hang (retry drains at EOF)")
+            .expect("run sh helper");
+        drop(guard);
+        assert!(status.success(), "helper script exited non-zero");
+
+        let first = std::fs::read_to_string(&out1).expect("first helper output");
+        assert!(
+            first.contains("username=x-access-token")
+                && first.contains(&format!("password={password}")),
+            "first helper invocation must deliver the credential from the FD: {first}"
+        );
+        let second = std::fs::read_to_string(&out2).unwrap_or_default();
+        assert!(
+            !second.contains(&format!("password={password}")),
+            "a repeated helper invocation must NOT re-deliver the drained secret: {second}"
+        );
+
+        if cfg!(target_os = "linux") {
+            let environ = std::fs::read_to_string(&env_dump).expect("environ dump");
+            assert!(
+                !environ.contains(&password),
+                "credential password must never appear in the process environ"
+            );
+            assert!(
+                environ.lines().any(|l| l.starts_with("NANO_GIT_CRED_FD=")),
+                "only the FD number (not the secret) is carried in the environment"
+            );
+        }
+
+        let _ = std::fs::remove_file(&out1);
+        let _ = std::fs::remove_file(&out2);
+        let _ = std::fs::remove_file(&env_dump);
     }
 }
