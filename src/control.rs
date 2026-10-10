@@ -238,12 +238,15 @@ pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
     request_with_timeout(socket, req, std::time::Duration::from_secs(5))
 }
 
-/// Like [`request`], but caps the per-reply read wait at `timeout` so a caller
-/// with an overall deadline (e.g. the bounded supervisor-start readiness poll)
-/// can keep each probe within its remaining budget instead of blocking for the
-/// fixed 5-second default. A zero/elapsed budget fails fast as a timeout rather
-/// than being passed to `set_read_timeout`, where `Some(0)` means "block
-/// forever" and would defeat the deadline.
+/// Like [`request`], but bounds the WHOLE exchange by an absolute `timeout`
+/// deadline so a caller with an overall budget (e.g. the bounded
+/// supervisor-start readiness poll) keeps each probe within its remaining time
+/// instead of blocking for the fixed 5-second default. The deadline is enforced
+/// across every blocking step (write + each read), so a peer dripping blank or
+/// non-final lines cannot reset a per-read clock and hang the call. A
+/// zero/elapsed budget fails fast as a timeout rather than being passed to
+/// `set_read_timeout`, where `Some(0)` means "block forever" and would defeat
+/// the deadline.
 #[cfg(unix)]
 pub fn request_with_timeout(
     socket: &Path,
@@ -252,6 +255,7 @@ pub fn request_with_timeout(
 ) -> std::io::Result<Vec<Value>> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
+    use std::time::Instant;
 
     if timeout.is_zero() {
         return Err(std::io::Error::new(
@@ -260,8 +264,38 @@ pub fn request_with_timeout(
         ));
     }
 
+    // Enforce ONE absolute deadline across the whole exchange. `set_read_timeout`
+    // bounds a SINGLE blocking read, so re-arming it with the full `timeout`
+    // before every `read_until` would reset the clock on each read: a peer that
+    // drips a blank or non-final line just before each timeout fires could keep
+    // this call blocked indefinitely, defeating the caller's overall budget (e.g.
+    // the bounded supervisor-start readiness poll). Instead, pin a fixed deadline
+    // and hand each blocking step only the budget still remaining, failing fast
+    // once it is exhausted.
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "control request timeout overflows the monotonic clock",
+        )
+    })?;
+    fn remaining(deadline: Instant) -> std::io::Result<std::time::Duration> {
+        let now = Instant::now();
+        if now >= deadline {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "control request exceeded its overall deadline before a final frame",
+            ))
+        } else {
+            Ok(deadline - now)
+        }
+    }
+
     let stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(timeout))?;
+    // Bound the request write by the remaining budget too, so a peer whose
+    // receive buffer is full cannot wedge the write past the overall deadline.
+    let budget = remaining(deadline)?;
+    stream.set_write_timeout(Some(budget))?;
+    stream.set_read_timeout(Some(budget))?;
     (&stream).write_all(encode_frame(req).as_bytes())?;
     (&stream).flush()?;
 
@@ -269,6 +303,11 @@ pub fn request_with_timeout(
     let mut frames = Vec::new();
     let mut line: Vec<u8> = Vec::new();
     loop {
+        // Re-arm the read timeout with only the budget still left on the fixed
+        // deadline, so total blocking time cannot exceed `timeout` no matter how
+        // many partial/blank frames the peer emits.
+        let budget = remaining(deadline)?;
+        stream.set_read_timeout(Some(budget))?;
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             // Peer closed before a terminal `final:true` frame: the reply is
@@ -644,6 +683,69 @@ mod tests {
                 err.kind(),
                 std::io::ErrorKind::TimedOut,
                 "an exhausted budget must surface as a timeout, got {err:?}"
+            );
+        }
+
+        // A peer that drip-feeds blank/non-final lines just before each per-read
+        // timeout must NOT be able to hold the call open past the caller's overall
+        // budget. Re-arming the full `timeout` on every `read_until` (the bug)
+        // would reset the clock per line and let this block for the server's whole
+        // send window; one absolute deadline bounds the exchange regardless.
+        #[test]
+        fn request_with_timeout_bounds_a_drip_feeding_daemon() {
+            let sock = temp_sock("drip");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Emit a blank line every 50ms for ~3s but never a terminal
+                    // frame: each line keeps a per-read timer from firing, so only
+                    // an absolute deadline can end the exchange.
+                    for _ in 0..60 {
+                        if stream.write_all(b"\n").is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                        if release_rx
+                            .recv_timeout(std::time::Duration::from_millis(50))
+                            .is_ok()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let start = std::time::Instant::now();
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_millis(300),
+            )
+            .expect_err("a drip-feeding daemon must still hit the overall deadline");
+            let elapsed = start.elapsed();
+
+            let _ = release_tx.send(());
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert!(
+                err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock,
+                "the overall deadline must surface as a timeout, got {err:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "the 300ms overall budget must bound the exchange, not the server's ~3s \
+                 drip window; took {elapsed:?}"
             );
         }
 

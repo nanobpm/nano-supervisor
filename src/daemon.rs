@@ -277,7 +277,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // `supervisor status` client, so a failure here aborts startup rather than
     // serving the socket (nanobpm/nano-supervisor#8).
     #[cfg(unix)]
-    let control_handle = Some(serve_control(
+    let control_handle = Some(match serve_control(
         control_listener,
         state_home.clone(),
         descriptor,
@@ -285,7 +285,27 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         engine_for_workers,
         control::epoch_millis(),
         shutdown_tx.clone(),
-    )?);
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // Control setup is startup-fatal, but the slots were already spawned
+            // and the socket already bound above. Returning `?` here would merely
+            // DROP the `JoinHandle`s — detaching the slots (each still holding a
+            // shutdown sender and possibly already activating work) rather than
+            // stopping them — and leave the bound socket file behind as a stale
+            // leftover. Fail closed instead: tell the slots to abort in-flight
+            // work, join them, and remove the socket + any descriptor before
+            // surfacing the error.
+            abort_slots_and_cleanup(
+                handles,
+                &shutdown_tx,
+                &sock_path,
+                &state_home.join("supervisor.json"),
+            )
+            .await;
+            return Err(e);
+        }
+    });
     #[cfg(not(unix))]
     let control_handle: Option<tokio::task::JoinHandle<()>> = {
         // No Unix-domain control socket off-Unix; the daemon still runs its
@@ -392,6 +412,30 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Fail-closed teardown for a startup step that fails AFTER the slots have been
+/// spawned and the control socket bound. At that point simply returning the
+/// error would drop the slot `JoinHandle`s — which only *detaches* the slots
+/// (each still holds a shutdown sender and may already be activating work) —
+/// and leave the bound socket pathname and any published descriptor behind as
+/// stale leftovers. Instead, tell the slots to abort in-flight work, join every
+/// one, and remove the socket + descriptor, so a half-started daemon never
+/// orphans live slots or a stale socket file.
+#[cfg(unix)]
+async fn abort_slots_and_cleanup(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_tx: &watch::Sender<slot::Shutdown>,
+    sock_path: &Path,
+    descriptor_path: &Path,
+) {
+    let _ = slot::request_shutdown(shutdown_tx, slot::Shutdown::Cancel);
+    for h in handles {
+        h.abort();
+        let _ = h.await;
+    }
+    let _ = std::fs::remove_file(sock_path);
+    let _ = std::fs::remove_file(descriptor_path);
 }
 
 /// Bind the supervisor control socket, failing startup if it cannot be bound.
@@ -2240,5 +2284,61 @@ mod tests {
             slot::Shutdown::Drain,
             "a parsed stop must publish shutdown even when the client disconnected before the reply"
         );
+    }
+
+    // When a startup step fails AFTER the slots are spawned, the fail-closed
+    // teardown must STOP the slots (not merely detach them) and remove the bound
+    // socket + published descriptor, rather than leaking live slots and a stale
+    // socket file (nanobpm/nano-supervisor#8, "setup failure detaches slots").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_slots_and_cleanup_stops_slots_and_removes_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "c8ctl-nano-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock_path = dir.join("supervisor.sock");
+        let descriptor_path = dir.join("supervisor.json");
+        std::fs::write(&sock_path, b"").expect("bound socket stand-in");
+        std::fs::write(&descriptor_path, b"{}").expect("descriptor stand-in");
+
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        // Two slots that would run forever unless aborted; if the teardown merely
+        // dropped their handles they would keep running (detached).
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..2)
+            .map(|_| {
+                tokio::spawn(async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                })
+            })
+            .collect();
+        let probes: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+
+        abort_slots_and_cleanup(handles, &tx, &sock_path, &descriptor_path).await;
+
+        for p in &probes {
+            assert!(p.is_finished(), "every slot must be stopped, not detached");
+        }
+        assert!(
+            !sock_path.exists(),
+            "the bound socket file must be removed on the error path"
+        );
+        assert!(
+            !descriptor_path.exists(),
+            "the published descriptor must be removed on the error path"
+        );
+        assert_eq!(
+            *tx.borrow(),
+            slot::Shutdown::Cancel,
+            "slots must be told to abort in-flight work before being joined"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
