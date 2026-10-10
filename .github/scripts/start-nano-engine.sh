@@ -3,12 +3,24 @@
 # c8ctl-plugin-nano ships per platform) on localhost:$PORT for the contract
 # tests, and wait until its REST API answers.
 #
-#   start-nano-engine.sh <version> [port]
+#   start-nano-engine.sh [version] [port]
+#
+# `version` defaults to PLUGIN_VERSION from `.github/reference-versions.env` —
+# the single source of truth (issue #58) — so callers that want the pin can omit
+# it; the nightly drift job passes the *latest* release explicitly.
 #
 # The engine is local-only; the harness refuses any non-localhost URL.
 set -euo pipefail
 
-version="${1:?usage: start-nano-engine.sh <version> [port]}"
+version="${1:-}"
+if [[ -z "$version" ]]; then
+  env_file="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/reference-versions.env"
+  if [[ -f "$env_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$env_file"
+  fi
+  version="${PLUGIN_VERSION:?no version arg given and PLUGIN_VERSION unset (looked in $env_file)}"
+fi
 port="${2:-8080}"
 
 case "$(uname -s)-$(uname -m)" in

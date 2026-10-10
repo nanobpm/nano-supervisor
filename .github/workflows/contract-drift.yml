@@ -1,0 +1,224 @@
+name: contract drift (nightly)
+
+# Nightly JS-drift detector (issue #58). Runs the Node-target contract suite
+# against the *latest* c8ctl-plugin-nano release and the *latest* @camunda8/cli
+# alpha, instead of the pinned reference versions. A failure means "JS behaviour
+# moved away from the pin". It never blocks PRs — it opens or updates a tracking
+# issue listing the failing tests so a human can decide whether to bump the pin
+# (see `.github/reference-versions.env`).
+on:
+  schedule:
+    # ~06:27 UTC daily (off the hour to dodge the cron rush).
+    - cron: "27 6 * * *"
+  workflow_dispatch:
+
+# Least privilege: the workflow default is read-only. The `drift` matrix job
+# installs and runs the *latest unpinned* npm packages, so it must NOT hold an
+# issue-write token (a compromised lifecycle script could otherwise recover it
+# from the checkout). Only the `report` job — which opens/closes the tracking
+# issue — grants itself `issues: write`.
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-drift
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  drift:
+    name: Node contract drift (${{ matrix.os }})
+    # Read-only + no persisted token: this job installs/executes the latest
+    # unpinned npm packages, so it must not carry an issue-write credential.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      NS_TARGET: node
+      NS_ENGINE_URL: http://localhost:8080
+      NANO_NO_UPDATE_NOTIFIER: "1"
+      C8CTL_NANO_NO_LAUNCHD: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Do not persist the job token in the checkout: a compromised package
+          # lifecycle script could otherwise recover it.
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: resolve latest fleet versions
+        id: versions
+        # Latest published plugin release + latest @camunda8/cli alpha — the real
+        # JS the fleet runs, NOT the pin. Fail loudly if npm returns nothing.
+        run: |
+          plugin="$(npm view c8ctl-plugin-nano version)"
+          cli="$(npm view @camunda8/cli dist-tags.alpha)"
+          : "${plugin:?could not resolve latest c8ctl-plugin-nano}"
+          : "${cli:?could not resolve latest @camunda8/cli alpha}"
+          echo "plugin=$plugin" >> "$GITHUB_OUTPUT"
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+          echo "latest plugin=$plugin cli=$cli"
+      - name: install c8ctl CLI + latest nano plugin
+        run: |
+          npm install -g "@camunda8/cli@${{ steps.versions.outputs.cli }}"
+          c8 load plugin "c8ctl-plugin-nano@${{ steps.versions.outputs.plugin }}"
+          c8 nano --help | head -1
+      - name: start local nano engine
+        run: .github/scripts/start-nano-engine.sh "${{ steps.versions.outputs.plugin }}" 8080
+      - name: contract tests (Node target)
+        id: tests
+        # No continue-on-error: a real failure must fail the job (the run goes
+        # red) so drift is visible. The `if: always()` guards on the summarise /
+        # upload steps still preserve report generation after a failure, and
+        # `steps.tests.outcome` records the result for the report.
+        run: |
+          set -o pipefail
+          cargo test -p contract-tests --locked --no-fail-fast 2>&1 | tee test-output.txt
+      - name: summarise result
+        if: always()
+        run: |
+          mkdir -p drift-report
+          os='${{ matrix.os }}'
+          outcome='${{ steps.tests.outcome }}'
+          {
+            echo "## ${os}"
+            echo ""
+            echo "- plugin: \`${{ steps.versions.outputs.plugin }}\`"
+            echo "- @camunda8/cli: \`${{ steps.versions.outputs.cli }}\`"
+            echo "- result: **${outcome}**"
+          } > "drift-report/${os}.md"
+          if [ "$outcome" != "success" ]; then
+            echo "" >> "drift-report/${os}.md"
+            if [ "$outcome" = "skipped" ]; then
+              # Version resolution / install / engine start failed before the
+              # suite ran — there is no test output to quote.
+              echo "Test step never ran (an earlier step failed); treating as drift." >> "drift-report/${os}.md"
+            else
+              echo "<details><summary>Failing tests (${os})</summary>" >> "drift-report/${os}.md"
+              echo "" >> "drift-report/${os}.md"
+              echo '```' >> "drift-report/${os}.md"
+              # Lines like `test foo::bar ... FAILED` plus the trailing `failures:` block.
+              grep -E ' \.\.\. FAILED$' test-output.txt >> "drift-report/${os}.md" || true
+              echo '```' >> "drift-report/${os}.md"
+              echo "</details>" >> "drift-report/${os}.md"
+            fi
+          fi
+      - name: upload drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ matrix.os }}
+          path: drift-report/
+          retention-days: 14
+
+  report:
+    name: open/update tracking issue
+    needs: drift
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LABEL: contract-drift
+      TITLE: "Nightly contract drift: JS behaviour moved away from the pin"
+      # The matrix OSes the drift job runs; the green path requires a success
+      # report from each. Keep in sync with jobs.drift.strategy.matrix.os.
+      EXPECTED_OS: "ubuntu-latest macos-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - name: download drift reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+          pattern: drift-report-*
+          merge-multiple: true
+      - name: open or update tracking issue
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Did any matrix leg report anything other than a green test run?
+          # Fail closed: a `skipped` leg (version resolution / install / engine
+          # start failed, so the suite never ran) or a missing report must NOT
+          # close an active drift issue — only a real `success` may.
+          failed=0
+          if grep -rqiE 'result: \*\*(failure|cancelled|skipped)\*\*' reports 2>/dev/null; then
+            failed=1
+          fi
+
+          # Require a successful report from EVERY matrix OS, not just one. A
+          # leg whose artifact never uploaded (e.g. runner cancellation) leaves
+          # no report; without this check a single green leg would make `failed`
+          # stay 0 and an active drift issue would be closed despite the missing
+          # leg. Treat a missing/non-success per-OS report as drift.
+          for os in $EXPECTED_OS; do
+            if ! grep -qiE 'result: \*\*success\*\*' "reports/${os}.md" 2>/dev/null; then
+              echo "Missing or non-success report for ${os}; treating as drift."
+              failed=1
+            fi
+          done
+
+          # Idempotent label.
+          gh label create "$LABEL" --color FBCA04 \
+            --description "Nightly JS drift detected against the latest plugin/CLI" \
+            --force >/dev/null 2>&1 || true
+
+          # Look up the open tracking issue. Do NOT suppress failures here: an
+          # empty result (no open issue) already exits 0, so a non-zero exit is a
+          # genuine API/auth/outage failure. Swallowing it (|| true) would make an
+          # outage indistinguishable from "no open issue" — opening a duplicate on
+          # a red run, or silently leaving the drift issue open on a green run.
+          # Let a real lookup failure abort the job (set -e) so it is retried/visible.
+          existing="$(gh issue list --label "$LABEL" --state open \
+            --json number --jq '.[0].number')"
+
+          if [ "$failed" -eq 0 ]; then
+            echo "No drift detected."
+            if [ -n "${existing:-}" ]; then
+              # Green-path close: do NOT suppress failures. If commenting/closing
+              # fails (API outage) we must not report success while leaving the
+              # drift issue open — let the failure abort the job.
+              gh issue comment "$existing" --body \
+                "✅ Nightly contract drift run is green again ([run](${run_url})). Closing."
+              gh issue close "$existing" --reason completed
+            fi
+            exit 0
+          fi
+
+          body_file="$(mktemp)"
+          {
+            echo "The nightly drift job ran the Node-target contract suite against the"
+            echo "**latest** plugin + \`@camunda8/cli\` alpha and it failed — JS behaviour has"
+            echo "moved away from the pin in \`.github/reference-versions.env\`."
+            echo ""
+            echo "This is informational: it does **not** block PRs. To resolve, bump the pin in"
+            echo "a PR that updates the snapshots/tests and adds parity-ledger rows (issue #58)."
+            echo ""
+            echo "Run: ${run_url}"
+            echo ""
+            for f in reports/*.md; do
+              [ -e "$f" ] || continue
+              cat "$f"
+              echo ""
+            done
+          } > "$body_file"
+
+          if [ -n "${existing:-}" ]; then
+            echo "Updating tracking issue #${existing}"
+            gh issue comment "$existing" --body-file "$body_file"
+          else
+            echo "Opening tracking issue"
+            gh issue create --title "$TITLE" --label "$LABEL" --body-file "$body_file"
+          fi

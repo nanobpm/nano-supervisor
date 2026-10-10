@@ -92,3 +92,21 @@ state-file and socket-schema cases need no engine. When the target CLI is not
 installed, its cases skip with a message. See
 `contract-tests/fixtures/socket-protocol.md` for the recorded control-socket
 protocol.
+
+### Reference versions and JS-drift detection (issue #58)
+
+The Node reference the suite pins against — the `c8ctl-plugin-nano` release and
+the `@camunda8/cli` host version — lives in **one** place,
+[`.github/reference-versions.env`](.github/reference-versions.env). CI
+(`contract-tests-node`/`contract-tests-rust`) and
+[`start-nano-engine.sh`](.github/scripts/start-nano-engine.sh) all read it, so a
+pin is bumped by editing that single file.
+
+A nightly job,
+[`contract-drift.yml`](.github/workflows/contract-drift.yml) (`schedule:` +
+`workflow_dispatch`), runs the Node-target suite against the **latest** plugin
+release and the **latest** CLI alpha instead of the pin. A failure means JS
+behaviour has moved; it never blocks PRs — it opens or updates a tracking issue
+(label `contract-drift`) listing the failing tests, and closes it when the run
+goes green again. When the drift job is red, bump the pins in a deliberate PR
+that also refreshes the snapshots/tests and adds parity-ledger rows.
