@@ -12,9 +12,13 @@ on:
     - cron: "27 6 * * *"
   workflow_dispatch:
 
+# Least privilege: the workflow default is read-only. The `drift` matrix job
+# installs and runs the *latest unpinned* npm packages, so it must NOT hold an
+# issue-write token (a compromised lifecycle script could otherwise recover it
+# from the checkout). Only the `report` job — which opens/closes the tracking
+# issue — grants itself `issues: write`.
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: contract-drift
@@ -27,6 +31,10 @@ env:
 jobs:
   drift:
     name: Node contract drift (${{ matrix.os }})
+    # Read-only + no persisted token: this job installs/executes the latest
+    # unpinned npm packages, so it must not carry an issue-write credential.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +47,10 @@ jobs:
       C8CTL_NANO_NO_LAUNCHD: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Do not persist the job token in the checkout: a compromised package
+          # lifecycle script could otherwise recover it.
+          persist-credentials: false
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -121,6 +133,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       LABEL: contract-drift
       TITLE: "Nightly contract drift: JS behaviour moved away from the pin"
+      # The matrix OSes the drift job runs; the green path requires a success
+      # report from each. Keep in sync with jobs.drift.strategy.matrix.os.
+      EXPECTED_OS: "ubuntu-latest macos-latest"
     steps:
       - uses: actions/checkout@v4
       - name: download drift reports
@@ -141,9 +156,19 @@ jobs:
           failed=0
           if grep -rqiE 'result: \*\*(failure|cancelled|skipped)\*\*' reports 2>/dev/null; then
             failed=1
-          elif ! grep -rqiE 'result: \*\*success\*\*' reports 2>/dev/null; then
-            failed=1
           fi
+
+          # Require a successful report from EVERY matrix OS, not just one. A
+          # leg whose artifact never uploaded (e.g. runner cancellation) leaves
+          # no report; without this check a single green leg would make `failed`
+          # stay 0 and an active drift issue would be closed despite the missing
+          # leg. Treat a missing/non-success per-OS report as drift.
+          for os in $EXPECTED_OS; do
+            if ! grep -qiE 'result: \*\*success\*\*' "reports/${os}.md" 2>/dev/null; then
+              echo "Missing or non-success report for ${os}; treating as drift."
+              failed=1
+            fi
+          done
 
           # Idempotent label.
           gh label create "$LABEL" --color FBCA04 \
