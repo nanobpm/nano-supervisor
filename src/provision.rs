@@ -3069,7 +3069,9 @@ fn cloexec_pipe() -> Result<(std::os::unix::io::OwnedFd, std::os::unix::io::Owne
         // SAFETY: `fds` is a valid 2-element array for pipe2 to populate.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
             // SAFETY: pipe2 just handed us two fresh, owned descriptors.
-            return Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) });
+            let (read_fd, write_fd) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            return Ok((raise_above_stdio(read_fd)?, raise_above_stdio(write_fd)?));
         }
         // SAFETY: read the pipe2 error before any other libc call can clobber it.
         let err = unsafe { *libc::__errno_location() };
@@ -3098,7 +3100,35 @@ fn cloexec_pipe() -> Result<(std::os::unix::io::OwnedFd, std::os::unix::io::Owne
                 .context("setting CLOEXEC on credential pipe");
         }
     }
-    Ok((read_fd, write_fd))
+    Ok((raise_above_stdio(read_fd)?, raise_above_stdio(write_fd)?))
+}
+
+/// Re-home `fd` at descriptor **3 or above** so the credential pipe can never
+/// occupy a standard descriptor (stdin/stdout/stderr).
+///
+/// `pipe2`/`pipe` hand back the *lowest* free descriptors, so when the
+/// supervisor is launched with stdin, stdout, or stderr already closed the
+/// credential pipe can land on fd 0, 1, or 2. The child's later
+/// `Stdio::null/piped` setup then replaces that descriptor before `pre_exec`
+/// runs, leaving `NANO_GIT_CRED_FD` pointing at unrelated stdio and breaking
+/// authentication. `F_DUPFD_CLOEXEC` with a minimum of 3 moves any such fd out
+/// of the standard range (close-on-exec preserved), mirroring the identical
+/// guard `safecwd.rs` applies to its pre-exec cwd handle.
+fn raise_above_stdio(fd: std::os::unix::io::OwnedFd) -> Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+    // SAFETY: `fd` is owned and open; F_DUPFD_CLOEXEC returns a fresh owned fd
+    // at the lowest free number >= 3, with FD_CLOEXEC set.
+    let raised = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if raised < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("raising credential pipe above the standard descriptors");
+    }
+    // Dropping `fd` closes the low descriptor; the raised dup is the live copy.
+    // SAFETY: `raised` is a fresh, owned fd just returned by fcntl.
+    Ok(unsafe { OwnedFd::from_raw_fd(raised) })
 }
 
 /// The subset of `Command` behaviour [`apply_git_credential`] needs, abstracted
@@ -8225,4 +8255,69 @@ mod tests {
         );
     }
 
+    /// `pipe2`/`pipe` return the lowest free descriptors, so a supervisor
+    /// launched with stdin/stdout/stderr closed could get a credential pipe on
+    /// fd 0/1/2 — which the child's `Stdio` setup then overwrites before
+    /// `pre_exec`, aiming `NANO_GIT_CRED_FD` at unrelated stdio (Copilot review,
+    /// #62). Fork a child that closes 0/1/2, build the pipe there, and assert
+    /// both ends land above the standard descriptors.
+    #[test]
+    fn credential_pipe_never_lands_on_a_standard_descriptor() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+        // Channel for the child to report the two fd numbers back to the parent.
+        let (report_r, report_w) = cloexec_pipe().expect("report pipe");
+        let report_w_raw = report_w.as_raw_fd();
+        // SAFETY: fork in a possibly multi-threaded test binary — the child must
+        // touch no Rust allocator state. It makes only async-signal-safe libc
+        // calls plus allocation-free fd bookkeeping, then `_exit`s without ever
+        // returning to Rust.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: close the standard descriptors, then build the credential
+            // pipe and report its two raw fd numbers as eight native-endian
+            // bytes (no heap allocation).
+            unsafe {
+                libc::close(0);
+                libc::close(1);
+                libc::close(2);
+            }
+            let code = match cloexec_pipe() {
+                Ok((r, w)) => {
+                    let mut buf = [0u8; 8];
+                    buf[0..4].copy_from_slice(&r.as_raw_fd().to_ne_bytes());
+                    buf[4..8].copy_from_slice(&w.as_raw_fd().to_ne_bytes());
+                    unsafe {
+                        libc::write(report_w_raw, buf.as_ptr() as *const libc::c_void, buf.len());
+                    }
+                    0
+                }
+                Err(_) => 1,
+            };
+            unsafe { libc::_exit(code) };
+        }
+        // Parent: read the 8-byte report and reap the child.
+        drop(report_w);
+        let mut file = unsafe { std::fs::File::from_raw_fd(report_r.into_raw_fd()) };
+        let mut buf = Vec::new();
+        {
+            use std::io::Read;
+            file.read_to_end(&mut buf).expect("read child report");
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child could not build the credential pipe with stdio closed"
+        );
+        assert_eq!(buf.len(), 8, "child must report both pipe ends as 8 bytes");
+        let read_end = i32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        let write_end = i32::from_ne_bytes(buf[4..8].try_into().unwrap());
+        for fd in [read_end, write_end] {
+            assert!(
+                fd >= 3,
+                "credential pipe end landed on standard descriptor {fd}; it must be re-homed above stdin/stdout/stderr"
+            );
+        }
+    }
 }
