@@ -372,9 +372,20 @@ impl Drop for TempHome {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Remove the (now-stale) socket file so a later test's startup sweep does
-        // not mistake it for a live daemon.
-        let _ = std::fs::remove_file(&sock);
+        // Remove the socket file only once the daemon stopped answering it (the
+        // loop above broke on a failed connect, so the daemon is gone and the
+        // file is stale): a later test's startup sweep must not mistake it for a
+        // live daemon. If the daemon is STILL accepting after the grace (a live
+        // listener), leave the pathname in place — unlinking a live Unix socket
+        // does not terminate its process, it only strips the name every later
+        // sweep needs to reach and stop it, stranding an unreachable orphan
+        // (issue #54 review). The Rust target's owner watchdog is the reaper
+        // that still converges that daemon (it fires on owner death or on this
+        // home's `TempDir` removal below); retaining the socket lets a later
+        // sweep retry the stop in the meantime.
+        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            let _ = std::fs::remove_file(&sock);
+        }
     }
 }
 
@@ -442,7 +453,17 @@ fn sweep_orphaned_daemons() {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        let _ = std::fs::remove_file(&sock);
+        // Remove the socket file only once the daemon stopped answering it (the
+        // force-stop above was confirmed by a failed connect), so a later sweep
+        // does not mistake a stale file for a live daemon. If the daemon is
+        // STILL accepting — the stop request failed or the deadline expired —
+        // leave the pathname in place: unlinking a live Unix socket does not
+        // kill its process, it only strips the one name a later sweep (or this
+        // daemon's own owner watchdog, which needs no socket) could use to reach
+        // and stop it, stranding an unreachable orphan (issue #54 review).
+        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            let _ = std::fs::remove_file(&sock);
+        }
     }
 }
 

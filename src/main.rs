@@ -278,6 +278,21 @@ enum Cmd {
         /// The test's `C8CTL_NANO_HOME`; its disappearance also trips the watchdog.
         #[arg(long)]
         home: PathBuf,
+        /// The owner's start time (Linux `/proc/<pid>/stat` field 22), captured
+        /// by the daemon *before* launching this watchdog so a recycled owner pid
+        /// — still answering `kill(_, 0)` for the unrelated reuser — is detected
+        /// as owner death rather than waited on forever (issue #54 review).
+        #[arg(long)]
+        owner_start: Option<u64>,
+        /// The daemon's own group-leader start time, captured at arm (issue
+        /// #27). Together with `--self-uid` it lets the watchdog verify the
+        /// pid/pgid still names this daemon's group — not a recycled one —
+        /// before the cleanup SIGKILL.
+        #[arg(long)]
+        self_start: Option<u64>,
+        /// The daemon group leader's real uid, captured at arm.
+        #[arg(long)]
+        self_uid: Option<u32>,
     },
 }
 
@@ -545,10 +560,15 @@ async fn main() -> Result<()> {
             owner_pid,
             self_pid,
             home,
+            owner_start,
+            self_start,
+            self_uid,
         } => {
-            tokio::task::spawn_blocking(move || pdeath::owner_watchdog(owner_pid, self_pid, home))
-                .await
-                .ok();
+            tokio::task::spawn_blocking(move || {
+                pdeath::owner_watchdog(owner_pid, self_pid, home, owner_start, self_start, self_uid)
+            })
+            .await
+            .ok();
             Ok(())
         }
         Cmd::Hire {

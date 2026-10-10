@@ -229,6 +229,23 @@ pub fn arm_owner_watchdog() {
 /// dead) or merely belongs to a concurrently-running test (owner alive).
 pub const OWNER_PID_FILE: &str = "ct-owner.pid";
 
+/// The owner process's start time (Linux `/proc/<pid>/stat` field 22), captured
+/// while the owner is guaranteed alive so the owner watchdog can detect a
+/// *recycled* owner pid: a bare `kill(pid, 0)` answers success for the unrelated
+/// process that reused the number, so without an incarnation token the watchdog
+/// would wait on it forever and orphan the daemon (issue #54 review). `None`
+/// off Linux (no tick source) or when the read fails; the watchdog then falls
+/// back to the liveness-plus-home check alone.
+#[cfg(target_os = "linux")]
+fn owner_start_time(owner: u32) -> Option<u64> {
+    parent_start_time(owner)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn owner_start_time(_owner: u32) -> Option<u64> {
+    None
+}
+
 /// Spawn the detached owner watchdog for `owner`, watching `home`. Returns its
 /// pid, or `None` if it could not be spawned. Split from [`arm_owner_watchdog`]
 /// so the regression test can drive the real subcommand directly.
@@ -238,6 +255,20 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
         return None;
     };
     let self_pid = std::process::id();
+    // Capture the two incarnation tokens HERE, while both processes are
+    // guaranteed alive, and hand them to the watchdog (the same pattern
+    // `spawn_watchdog` uses for `--parent-start`/`--pgid-start`/`--pgid-uid`):
+    //
+    // - The **owner's start time** lets the watchdog tell a recycled owner pid
+    //   apart from the real owner (issue #54 review): a bare pid answers
+    //   `kill(_, 0)` for whatever unrelated process reused the number, so a
+    //   start-time mismatch — not just liveness — is what proves the owner died.
+    // - **Our own group's identity** (`self_pid` is the leader of its process
+    //   group) gates the watchdog's SIGKILL, so a daemon that already exited and
+    //   had its pid/pgid recycled by an unrelated group is never signalled
+    //   (the same recycled-PGID race issue #27 closes for the agent watchdog).
+    let owner_start = owner_start_time(owner);
+    let self_identity = leader_identity(self_pid);
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__owner-watchdog")
         .arg("--owner-pid")
@@ -246,6 +277,15 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
         .arg(self_pid.to_string())
         .arg("--home")
         .arg(&home);
+    if let Some(start) = owner_start {
+        cmd.arg("--owner-start").arg(start.to_string());
+    }
+    if let Some(id) = self_identity {
+        cmd.arg("--self-start")
+            .arg(id.start.to_string())
+            .arg("--self-uid")
+            .arg(id.uid.to_string());
+    }
     // Scrub the environment: the watchdog needs nothing but its own executable
     // and the CLI args above, and inheriting the daemon's environment would
     // expose the engine/OAuth secrets to a same-user reader of
@@ -286,17 +326,52 @@ fn spawn_owner_watchdog(_owner: u32, _home: std::path::PathBuf) -> Option<u32> {
 /// when the supervised process has already exited on its own (a normal drain),
 /// so the watchdog does not linger. This is the guaranteed reaper for a daemon
 /// whose owning test died without unwinding (issue #54).
+///
+/// Both decisions are incarnation-aware, not bare-pid (issue #54 review):
+///
+/// - **Owner death** is `!pid_alive(owner)` OR a start-time mismatch against
+///   `owner_start` (the token captured at arm). The mismatch arm catches a
+///   *recycled* owner pid: the number still answers `kill(_, 0)` for the
+///   unrelated reuser, but it is no longer the owning test, so the daemon must
+///   be reaped rather than orphaned indefinitely. With no token (`None`,
+///   e.g. off Linux) the watchdog degrades to liveness-plus-home alone.
+/// - **The SIGKILL** is gated on `group_identity_matches(self_pid, …)`, the
+///   same identity check the agent watchdog uses (issue #27): the daemon's
+///   `self_pid` is also its process-group id, and if the daemon already exited
+///   and an unrelated group recycled the number, an unguarded `kill(-pid)`
+///   would SIGKILL that group. The captured identity refuses the signal then.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn owner_watchdog(owner_pid: u32, self_pid: u32, home: std::path::PathBuf) {
+pub fn owner_watchdog(
+    owner_pid: u32,
+    self_pid: u32,
+    home: std::path::PathBuf,
+    owner_start: Option<u64>,
+    self_start: Option<u64>,
+    self_uid: Option<u32>,
+) {
+    // Rebuild the identity token the daemon captured for its own group at arm
+    // (issue #27). Both halves are required; if either is missing the watchdog
+    // has no identity and falls back to the numeric liveness probe alone.
+    let self_identity = self_start
+        .zip(self_uid)
+        .map(|(start, uid)| GroupIdentity { start, uid });
     loop {
         // The supervised daemon already exited on its own: nothing to reap.
         if !pid_alive(self_pid) {
             return;
         }
-        // Owner gone (SIGKILL / timeout / panic=abort — no unwinding, no Drop) or
+        // Owner gone (SIGKILL / timeout / panic=abort — no unwinding, no Drop),
+        // owner pid RECYCLED (the start time moved off the captured token), or
         // home removed (TempDir deleted under a live daemon): fire.
-        if !pid_alive(owner_pid) || !home.exists() {
-            sigkill_group(self_pid);
+        let owner_gone = !pid_alive(owner_pid)
+            || owner_start.is_some_and(|start| parent_start_time(owner_pid) != Some(start));
+        if owner_gone || !home.exists() {
+            // Re-verify the group's identity immediately before signalling: the
+            // daemon may have exited and its pid/pgid been recycled by an
+            // unrelated group in the window since the liveness check above.
+            if group_identity_matches(self_pid, self_identity) {
+                sigkill_group(self_pid);
+            }
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -304,7 +379,15 @@ pub fn owner_watchdog(owner_pid: u32, self_pid: u32, home: std::path::PathBuf) {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn owner_watchdog(_owner_pid: u32, _self_pid: u32, _home: std::path::PathBuf) {}
+pub fn owner_watchdog(
+    _owner_pid: u32,
+    _self_pid: u32,
+    _home: std::path::PathBuf,
+    _owner_start: Option<u64>,
+    _self_start: Option<u64>,
+    _self_uid: Option<u32>,
+) {
+}
 
 /// The identity of a process group, captured at spawn so a later cleanup can
 /// tell *the agent's* group apart from an unrelated group that recycled the
@@ -1301,6 +1384,47 @@ mod tests {
         // A pid that cannot exist yields a false (unreadable /proc) — the
         // caller's `kill(_, 0)` probe is the authority for a truly-gone pid.
         assert!(!parent_is_dead_or_zombie(u32::MAX));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_start_time_reads_own_incarnation() {
+        // The owner watchdog's PID-reuse token: our own process is alive, so its
+        // start time must be readable and stable across reads — the value the
+        // daemon captures at arm and hands to the watchdog so a recycled owner
+        // pid (still answering `kill(_, 0)`) is detected as owner death.
+        let me = std::process::id();
+        let a = owner_start_time(me).expect("own start time readable");
+        let b = owner_start_time(me).expect("own start time readable");
+        assert_eq!(a, b);
+        assert!(a > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_recycle_is_detected_as_a_start_time_mismatch() {
+        // The comparison the owner watchdog makes each poll: a live process whose
+        // start time differs from the token captured at arm is a *recycled* pid,
+        // not the original owner — treat it as owner death. Model the recycle by
+        // comparing our own live process against a forged token; the mismatch
+        // must read as "owner gone".
+        let me = std::process::id();
+        let real = owner_start_time(me).expect("own start time readable");
+        let forged = real.wrapping_add(1);
+        // Mirror the watchdog's `owner_gone` expression.
+        let owner_gone =
+            !pid_alive(me) || (Some(forged).is_some_and(|s| parent_start_time(me) != Some(s)));
+        assert!(
+            owner_gone,
+            "a start-time mismatch on a live pid must read as owner death (recycled pid)"
+        );
+        // And the matching token must NOT read as owner death.
+        let owner_gone_ok =
+            !pid_alive(me) || (Some(real).is_some_and(|s| parent_start_time(me) != Some(s)));
+        assert!(
+            !owner_gone_ok,
+            "the matching token must not read as owner death"
+        );
     }
 
     #[test]

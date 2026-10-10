@@ -133,7 +133,7 @@ jobs:
           cargo test -p contract-tests --locked \
             --test worker_prompt --test worker_env --test worker_result \
             --test worker_lease --test worker_finalize --test worker_selection \
-            --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard -- --nocapture
+            --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard --test daemon_leak -- --nocapture
       - name: fleet CLI contract tests (Rust target)
         # live_status_round_trip stays skipped (needs NS_ALLOW_LIVE_SUPERVISOR=1): CI must not start a real daemon (#40).
         run: |
