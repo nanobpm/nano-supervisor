@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::control;
 use crate::state::{job_type_matrix, normalize_capabilities, state_home};
 
 /// The ranks a hire may hold, in the order the Node plugin lists them in its
@@ -1209,12 +1210,7 @@ pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
 /// and treats a successful connect as "running".
 #[cfg(unix)]
 fn supervisor_running(home: &std::path::Path) -> bool {
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(home.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    let sock = std::env::temp_dir().join(format!("c8ctl-nano-sup-{}.sock", &hex[..8]));
+    let sock = control::socket_path(home);
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
@@ -1226,20 +1222,17 @@ fn supervisor_running(_home: &std::path::Path) -> bool {
 /// `supervisor` subcommands this target implements.
 pub enum SupervisorOp {
     Status,
+    Start { workers: Vec<String>, attach: bool },
+    Stop { force: bool },
     Add { profile: String },
 }
 
 pub fn supervisor(op: SupervisorOp) -> Result<()> {
     let home = home_dir()?;
     match op {
-        SupervisorOp::Status => {
-            if supervisor_running(&home) {
-                println!("Supervisor running");
-            } else {
-                println!("Supervisor not running");
-            }
-            Ok(())
-        }
+        SupervisorOp::Status => supervisor_status(&home),
+        SupervisorOp::Start { workers, attach } => supervisor_start(&home, &workers, attach),
+        SupervisorOp::Stop { force } => supervisor_stop(&home, force),
         SupervisorOp::Add { profile } => {
             let cfg = read_config()?;
             if !cfg.hires.contains_key(&profile) {
@@ -1248,11 +1241,136 @@ pub fn supervisor(op: SupervisorOp) -> Result<()> {
             if !supervisor_running(&home) {
                 bail!("Supervisor not running; start it with: nano-supervisor supervisor start");
             }
-            // A live daemon would take the add over the control socket; that
-            // path lands with the daemon itself (#8).
+            // Dynamic worker management over the live socket (`add`/`remove`/
+            // `restart`/`reload`) lands with the daemon's worker manager
+            // (nanobpm/nano-supervisor#8); the daemon currently answers `add`
+            // with a clean "not yet implemented" frame.
             bail!("supervisor add against a live daemon is not yet implemented on the Rust target");
         }
     }
+}
+
+/// `supervisor status`: print "not running" when no daemon is bound, else query
+/// the control socket and render the live daemon descriptor and worker roster.
+fn supervisor_status(home: &std::path::Path) -> Result<()> {
+    if !supervisor_running(home) {
+        println!("Supervisor not running");
+        return Ok(());
+    }
+    let sock = control::socket_path(home);
+    match control::request(&sock, &serde_json::json!({ "op": "status" })) {
+        Ok(frames) => {
+            let frame = frames
+                .iter()
+                .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
+                .or_else(|| frames.last());
+            match frame {
+                Some(f) => {
+                    let pid = f["daemon"]["pid"].as_u64();
+                    let workers = f["workers"].as_array().map(|w| w.len()).unwrap_or(0);
+                    match pid {
+                        Some(pid) => println!("Supervisor running (pid {pid}); {workers} worker(s)"),
+                        None => println!("Supervisor running; {workers} worker(s)"),
+                    }
+                    if let Some(ws) = f["workers"].as_array() {
+                        for w in ws {
+                            let id = w["id"].as_str().unwrap_or("?");
+                            let profile = w["profile"].as_str().unwrap_or("?");
+                            let state = w["state"].as_str().unwrap_or("?");
+                            println!("  {id} [{profile}] {state}");
+                        }
+                    }
+                }
+                None => println!("Supervisor running"),
+            }
+            Ok(())
+        }
+        // Socket vanished between the probe and the request (a race with
+        // shutdown): report the honest "not running" rather than an error.
+        Err(_) => {
+            println!("Supervisor not running");
+            Ok(())
+        }
+    }
+}
+
+/// `supervisor stop [--force]`: ask a running daemon to drain and exit.
+fn supervisor_stop(home: &std::path::Path, force: bool) -> Result<()> {
+    if !supervisor_running(home) {
+        println!("Supervisor not running");
+        return Ok(());
+    }
+    let sock = control::socket_path(home);
+    match control::request(&sock, &serde_json::json!({ "op": "stop", "force": force })) {
+        Ok(_) => {
+            println!("Supervisor stopping");
+            Ok(())
+        }
+        Err(_) => {
+            println!("Supervisor not running");
+            Ok(())
+        }
+    }
+}
+
+/// `supervisor start --worker <p>… [--attach]`: launch the daemon for the named
+/// hires. Without `--attach` the daemon is detached into its own session and
+/// this command returns once the control socket is bound; with `--attach` it
+/// runs the daemon in the foreground (Ctrl-C drains it).
+#[cfg(unix)]
+fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if supervisor_running(home) {
+        println!("Supervisor already running");
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("locating the nano-supervisor executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon");
+    for w in workers {
+        cmd.arg("--hire").arg(w);
+    }
+
+    if attach {
+        // Foreground: replace the usual detach with a direct run so Ctrl-C and
+        // the daemon's console output reach the operator.
+        let status = cmd.status().context("running the supervisor daemon")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    // Detached: a new session so the daemon outlives this short-lived launcher.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Detach from the controlling terminal / parent session.
+            if libc::setsid() == -1 {
+                // Already a session leader is fine; any other failure is
+                // non-fatal for the detach intent.
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("spawning the supervisor daemon")?;
+
+    // Wait (bounded) for the daemon to bind its control socket so a follow-up
+    // `status`/`add` sees it, then return.
+    let sock = control::socket_path(home);
+    for _ in 0..100 {
+        if sock.exists() && supervisor_running(home) {
+            println!("Supervisor started (pid {})", child.id());
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!(
+        "supervisor daemon (pid {}) did not bind its control socket within 10s",
+        child.id()
+    );
+}
+
+#[cfg(not(unix))]
+fn supervisor_start(_home: &std::path::Path, _workers: &[String], _attach: bool) -> Result<()> {
+    bail!("supervisor start is only supported on Unix");
 }
 
 // --- workforce manifests ----------------------------------------------------

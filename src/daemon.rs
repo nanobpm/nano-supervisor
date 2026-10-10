@@ -9,12 +9,14 @@
 //! daemon ([`crate::pdeath`]), so even a `kill -9` leaves no orphans.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::sync::watch;
 
+use crate::control;
 use crate::engine;
 use crate::pin;
 use crate::runtime::log;
@@ -155,6 +157,10 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
+    // The in-process slots this daemon runs, as (worker id, profile) pairs — the
+    // control socket's `status` reply reports each as a worker
+    // (nanobpm/nano-supervisor#8).
+    let mut worker_ids: Vec<(String, String)> = Vec::new();
     for hire in &runnable {
         let job_types = state::job_type_matrix(&hire.rank, &hire.capabilities);
         log(&format!(
@@ -163,9 +169,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         ));
         running_hires += 1;
         for slot_idx in 0..opts.slots {
+            let worker_name = format!("{host}-nanod-{}-{slot_idx}", hire.name);
+            worker_ids.push((worker_name.clone(), hire.name.clone()));
             let cfg = Arc::new(SlotConfig {
                 hire: (*hire).clone(),
-                worker_name: format!("{host}-nanod-{}-{slot_idx}", hire.name),
+                worker_name,
                 job_types: job_types.clone(),
                 recovery_window: opts.recovery_window,
                 idle_timeout: opts.idle_timeout,
@@ -204,13 +212,50 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         handles.len()
     ));
 
+    // --- control socket (nanobpm/nano-supervisor#8) -------------------------
+    // Bind the supervisor control socket so a client (`supervisor status` /
+    // `stop`, including the Node plugin's) can drive this daemon. A graceful
+    // `stop` op flips `graceful` before the shutdown watch so the exit is a
+    // clean drain, not the FATAL path a slot's watch flip signals.
+    let graceful = Arc::new(AtomicBool::new(false));
+    let log_file = state_home
+        .join("logs")
+        .join("supervisor")
+        .join("daemon.log");
+    let sock_path = control::socket_path(&state_home);
+    let descriptor = control::DaemonDescriptor {
+        pid: std::process::id(),
+        started_at: control::iso8601_now(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        socket: sock_path.to_string_lossy().into_owned(),
+        log_file: log_file.to_string_lossy().into_owned(),
+    };
+    let engine_for_workers = pinned_base_url.clone().unwrap_or_else(|| engine_desc.clone());
+    let control_handle = serve_control(
+        sock_path.clone(),
+        state_home.clone(),
+        descriptor,
+        worker_ids,
+        engine_for_workers,
+        control::epoch_millis(),
+        shutdown_tx.clone(),
+        graceful.clone(),
+    )
+    .await;
+
     // `wait_for_signal` reports whether a slot flipped the watch for a FATAL
     // misconfiguration (an unleased activation while leasing is enabled — the
     // default) versus an operator Ctrl-C/SIGTERM. We still drain either way, but
     // a fatal shutdown must surface as a non-zero exit (issue: default leasing is
     // documented to fail LOUDLY — returning `Ok(())` made the daemon look like a
     // clean drain).
-    let fatal = wait_for_signal(&shutdown_tx).await;
+    let mut fatal = wait_for_signal(&shutdown_tx).await;
+    // A control-socket `stop` also flips the shutdown watch (via `graceful`), but
+    // that is an operator-requested clean drain — never the fatal exit a slot's
+    // own flip signals.
+    if graceful.load(Ordering::SeqCst) {
+        fatal = false;
+    }
     if fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); draining and exiting non-zero");
     } else {
@@ -233,6 +278,16 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     } else {
         log("all slots drained; exiting");
     }
+
+    // Tear the control socket down: stop accepting, remove the socket file and
+    // the `supervisor.json` descriptor so a later `supervisor status` reports
+    // "not running" rather than probing a stale socket.
+    if let Some(handle) = control_handle {
+        handle.abort();
+    }
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(state_home.join("supervisor.json"));
+
     if fatal {
         bail!(
             "daemon shut down because a slot received an unleased activation while leasing is \
@@ -241,6 +296,181 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Bind and serve the supervisor control socket. Returns the accept-loop task
+/// (aborted on daemon exit), or `None` if the socket could not be bound (the
+/// daemon still runs its slots — it just cannot be driven over the socket).
+#[allow(clippy::too_many_arguments)]
+async fn serve_control(
+    sock_path: PathBuf,
+    state_home: PathBuf,
+    descriptor: control::DaemonDescriptor,
+    worker_ids: Vec<(String, String)>,
+    engine: String,
+    started_at_ms: u64,
+    shutdown_tx: watch::Sender<bool>,
+    graceful: Arc<AtomicBool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixListener;
+
+        // Clear a stale socket from a crashed predecessor so bind() succeeds; a
+        // live predecessor would already hold the home lock elsewhere.
+        let _ = std::fs::remove_file(&sock_path);
+        if let Some(parent) = sock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let listener = match UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                log(&format!(
+                    "control socket unavailable ({}): {e}; status/stop clients cannot attach",
+                    sock_path.display()
+                ));
+                return None;
+            }
+        };
+
+        // Record the descriptor so clients that prefer `supervisor.json` (and
+        // `supervisor status`) find the socket + pid without re-deriving them.
+        let _ = std::fs::create_dir_all(&state_home);
+        let sup_json = serde_json::json!({
+            "pid": descriptor.pid,
+            "startedAt": descriptor.started_at,
+            "version": descriptor.version,
+            "socket": descriptor.socket,
+            "logFile": descriptor.log_file,
+            "pluginVersion": descriptor.version,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&sup_json) {
+            let _ = std::fs::write(state_home.join("supervisor.json"), bytes);
+        }
+        log(&format!("control socket listening at {}", sock_path.display()));
+
+        let handle = tokio::spawn(async move {
+            let descriptor = Arc::new(descriptor);
+            let worker_ids = Arc::new(worker_ids);
+            let engine = Arc::new(engine);
+            loop {
+                let stream = match listener.accept().await {
+                    Ok((stream, _addr)) => stream,
+                    Err(_) => break,
+                };
+                let descriptor = descriptor.clone();
+                let worker_ids = worker_ids.clone();
+                let engine = engine.clone();
+                let shutdown_tx = shutdown_tx.clone();
+                let graceful = graceful.clone();
+                tokio::spawn(async move {
+                    handle_control_connection(
+                        stream,
+                        descriptor,
+                        worker_ids,
+                        engine,
+                        started_at_ms,
+                        shutdown_tx,
+                        graceful,
+                    )
+                    .await;
+                });
+            }
+        });
+        Some(handle)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            sock_path,
+            state_home,
+            descriptor,
+            worker_ids,
+            engine,
+            started_at_ms,
+            shutdown_tx,
+            graceful,
+        );
+        None
+    }
+}
+
+/// Serve one control connection: read NDJSON request lines, reply with frames,
+/// and begin a graceful shutdown when a `stop` op is dispatched.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_connection(
+    stream: tokio::net::UnixStream,
+    descriptor: Arc<control::DaemonDescriptor>,
+    worker_ids: Arc<Vec<(String, String)>>,
+    engine: Arc<String>,
+    started_at_ms: u64,
+    shutdown_tx: watch::Sender<bool>,
+    graceful: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let snapshot = control_snapshot(&descriptor, &worker_ids, &engine, started_at_ms);
+        let Some(resp) = control::handle_request(&line, &snapshot) else {
+            continue;
+        };
+        for frame in &resp.frames {
+            if write_half
+                .write_all(control::encode_frame(frame).as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = write_half.flush().await;
+        if resp.stop {
+            graceful.store(true, Ordering::SeqCst);
+            let _ = shutdown_tx.send(true);
+            return;
+        }
+    }
+}
+
+/// Build a fresh `status` snapshot (uptime recomputed per request) from the
+/// daemon's fixed slot roster.
+fn control_snapshot(
+    descriptor: &control::DaemonDescriptor,
+    worker_ids: &[(String, String)],
+    engine: &str,
+    started_at_ms: u64,
+) -> control::StatusSnapshot {
+    let uptime = control::epoch_millis().saturating_sub(started_at_ms);
+    let log_dir = PathBuf::from(&descriptor.log_file)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let workers = worker_ids
+        .iter()
+        .map(|(id, profile)| {
+            let log_file = log_dir
+                .join(format!("worker-{id}.log"))
+                .to_string_lossy()
+                .into_owned();
+            control::WorkerStatus::in_process(
+                id.clone(),
+                profile.clone(),
+                descriptor.pid,
+                started_at_ms,
+                uptime,
+                log_file,
+                engine.to_string(),
+            )
+        })
+        .collect();
+    control::StatusSnapshot {
+        daemon: descriptor.clone(),
+        plugin_version: descriptor.version.clone(),
+        workers,
+    }
 }
 
 /// Reject a hire the MVP daemon cannot run. Only the host sandbox is supported,
