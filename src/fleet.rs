@@ -589,7 +589,7 @@ fn normalized_identity(path: &Path) -> PathBuf {
 /// avoids with the same precedence. The empty lock file itself may persist
 /// between runs; it is reused, never a source of corruption, because exclusion
 /// comes from the `flock`, not the file's existence.
-struct StateLock {
+pub(crate) struct StateLock {
     // Held for the guard's lifetime; dropping it closes the fd and releases the
     // advisory `flock`. Never read directly.
     _file: std::fs::File,
@@ -725,11 +725,11 @@ fn fleet_lock_dir_in(base: &Path) -> Result<PathBuf> {
 }
 
 impl StateLock {
-    /// Acquire the exclusive lock guarding `path`, blocking until any current
-    /// holder — in this or another process — releases it. `path` is the guarded
-    /// state file (e.g. `config.json`); the lock file is derived from it.
-    fn acquire(path: &std::path::Path) -> Result<StateLock> {
-        use fs2::FileExt;
+    /// Open (creating if absent) and ownership/permission-verify the lock file
+    /// guarding `path`, returning the handle **without** taking the `flock`.
+    /// Shared by [`acquire`](Self::acquire) (blocking) and
+    /// [`try_acquire`](Self::try_acquire) (non-blocking).
+    fn open_lock_file(path: &std::path::Path) -> Result<std::fs::File> {
         let lock_path = Self::lock_file_for(path)?;
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).read(true).write(true);
@@ -761,9 +761,35 @@ impl StateLock {
                 );
             }
         }
+        Ok(file)
+    }
+
+    /// Acquire the exclusive lock guarding `path`, blocking until any current
+    /// holder — in this or another process — releases it. `path` is the guarded
+    /// state file (e.g. `config.json`); the lock file is derived from it.
+    fn acquire(path: &std::path::Path) -> Result<StateLock> {
+        use fs2::FileExt;
+        let file = Self::open_lock_file(path)?;
         file.lock_exclusive()
-            .with_context(|| format!("locking {}", lock_path.display()))?;
+            .with_context(|| format!("locking the lock for {}", path.display()))?;
         Ok(StateLock { _file: file })
+    }
+
+    /// Try to acquire the exclusive lock guarding `path` **without blocking**.
+    /// `Ok(Some(lock))` means we now hold it; `Ok(None)` means another live
+    /// process holds it right now (the contention is not an error — the caller
+    /// decides what that means, e.g. "a daemon is already running"). The flock
+    /// is OS-released, so a crashed holder's lock is already gone and a contender
+    /// sees `Some`.
+    pub(crate) fn try_acquire(path: &std::path::Path) -> Result<Option<StateLock>> {
+        use fs2::FileExt;
+        let file = Self::open_lock_file(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(StateLock { _file: file })),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("try-locking the lock for {}", path.display()))),
+        }
     }
 
     /// The lock file for `path`:
@@ -1217,6 +1243,24 @@ fn supervisor_running(home: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn supervisor_running(_home: &std::path::Path) -> bool {
     false
+}
+
+/// Try to take the per-home supervisor **startup lock** without blocking, for
+/// the daemon to hold for its whole lifetime. `Ok(None)` means another daemon
+/// already owns this state home — the caller should refuse to start.
+///
+/// The unlocked connect probe alone cannot serialize startup: two concurrent
+/// `supervisor start`s can both find no socket, then race to unlink each other's
+/// freshly-bound live control socket (nanobpm/nano-supervisor#8). This lock,
+/// keyed on the control-socket path (so it is per-home) and taken from the
+/// owner-private fleet lock dir, makes the later starter observe the lock is
+/// held and bail instead. Because the `flock` is OS-released, a crashed daemon's
+/// lock is already gone, so a legitimate restart is never blocked by a dead
+/// predecessor — and a surviving socket file left by such a crash is therefore
+/// provably stale (its owner no longer holds the lock) and safe to remove.
+#[cfg(unix)]
+pub(crate) fn try_lock_supervisor_startup(sock_path: &Path) -> Result<Option<StateLock>> {
+    StateLock::try_acquire(sock_path)
 }
 
 /// `supervisor` subcommands this target implements.

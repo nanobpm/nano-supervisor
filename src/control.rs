@@ -17,7 +17,6 @@
 //! the request dispatcher) plus a small blocking client. The daemon's async
 //! accept loop lives in [`crate::daemon`]; it calls [`handle_request`] per line.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -145,6 +144,12 @@ fn error_frame(message: &str) -> Value {
 pub struct Response {
     pub frames: Vec<Value>,
     pub stop: bool,
+    /// When `stop` is set, whether the operator asked for a **forced** shutdown
+    /// (`stop --force`): the daemon cancels in-flight work immediately instead
+    /// of waiting out the drain grace. `false` for a graceful stop and for
+    /// every non-`stop` reply, so the force mode is carried end-to-end rather
+    /// than only appearing in the interim frame (nanobpm/nano-supervisor#8).
+    pub force: bool,
 }
 
 /// Dispatch one request line against the live [`StatusSnapshot`]. Blank and
@@ -161,6 +166,7 @@ pub fn handle_request(line: &str, snapshot: &StatusSnapshot) -> Option<Response>
         "status" => Response {
             frames: vec![snapshot.status_frame(true)],
             stop: false,
+            force: false,
         },
         "stop" => {
             let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -176,6 +182,7 @@ pub fn handle_request(line: &str, snapshot: &StatusSnapshot) -> Option<Response>
                     json!({ "ok": true, "type": "stopped", "final": true }),
                 ],
                 stop: true,
+                force,
             }
         }
         // Ops the Node protocol defines but the Rust daemon does not yet drive
@@ -187,10 +194,12 @@ pub fn handle_request(line: &str, snapshot: &StatusSnapshot) -> Option<Response>
                 "op \"{op}\" is not yet implemented on the Rust supervisor"
             ))],
             stop: false,
+            force: false,
         },
         "" => Response {
             frames: vec![error_frame("request is missing an \"op\" field")],
             stop: false,
+            force: false,
         },
         other => Response {
             frames: vec![json!({
@@ -199,6 +208,7 @@ pub fn handle_request(line: &str, snapshot: &StatusSnapshot) -> Option<Response>
                 "final": true,
             })],
             stop: false,
+            force: false,
         },
     };
     Some(response)
@@ -214,46 +224,79 @@ pub fn encode_frame(frame: &Value) -> String {
 /// A blocking control-socket client: send one request object and read frames
 /// until the first `final:true` (or the peer closes). Mirrors the Node client
 /// and the contract harness's `control_request`.
+///
+/// Framing is handled byte-accurately: bytes are buffered until a newline and
+/// only a **complete** line is decoded as UTF-8, so a multi-byte code point
+/// split across two socket reads is never corrupted by a per-chunk lossy decode
+/// (nanobpm/nano-supervisor#8). A read timeout is an error unless a terminal
+/// `final:true` frame has already been parsed — a timed-out, partial response is
+/// surfaced rather than reported as a successful empty reply.
+#[cfg(unix)]
 pub fn request(socket: &Path, req: &Value) -> std::io::Result<Vec<Value>> {
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    stream.write_all(encode_frame(req).as_bytes())?;
-    stream.flush()?;
 
-    let mut buf = String::new();
-    let mut chunk = [0u8; 4096];
+    let stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    (&stream).write_all(encode_frame(req).as_bytes())?;
+    (&stream).flush()?;
+
+    let mut reader = BufReader::new(&stream);
     let mut frames = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
     loop {
-        let n = match stream.read(&mut chunk) {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            // Peer closed: return whatever complete frames we parsed.
             Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e),
-        };
-        buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-        let mut saw_final = false;
-        while let Some(idx) = buf.find('\n') {
-            let raw = buf[..idx].trim().to_string();
-            buf.drain(..=idx);
-            if raw.is_empty() {
-                continue;
-            }
-            if let Ok(frame) = serde_json::from_str::<Value>(&raw) {
-                saw_final = saw_final
-                    || frame
+            Ok(_) => {
+                // `line` is one whole NDJSON frame (through the newline), so a
+                // UTF-8 code point is never split across reads here.
+                let text = String::from_utf8_lossy(&line);
+                let raw = text.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                if let Ok(frame) = serde_json::from_str::<Value>(raw) {
+                    let is_final = frame
                         .get("final")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                frames.push(frame);
+                    frames.push(frame);
+                    // The terminal frame ends the exchange immediately, so a
+                    // later read timeout can only ever occur before it — which
+                    // the error arm below correctly surfaces as a failure.
+                    if is_final {
+                        break;
+                    }
+                }
             }
-        }
-        if saw_final {
-            break;
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No terminal frame has been parsed (we would have broken out
+                // above otherwise), so the response is incomplete: surface the
+                // timeout rather than letting the caller mistake a partial reply
+                // for success.
+                return Err(e);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(frames)
+}
+
+/// Non-Unix stub: the control socket is a Unix-domain transport, so there is no
+/// client to offer off-Unix. Returns `Unsupported` rather than failing to
+/// compile, mirroring the daemon's `cfg(not(unix))` fallbacks.
+#[cfg(not(unix))]
+pub fn request(_socket: &Path, _req: &Value) -> std::io::Result<Vec<Value>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the supervisor control-socket client is only supported on Unix",
+    ))
 }
 
 /// ISO-8601 UTC timestamp (millisecond precision), matching the Node daemon's
@@ -377,6 +420,7 @@ mod tests {
         let snap = snapshot();
         let resp = handle_request(r#"{"op":"stop"}"#, &snap).expect("a response");
         assert!(resp.stop, "stop must request a graceful shutdown");
+        assert!(!resp.force, "a plain stop is graceful, not forced");
         assert_eq!(resp.frames[0]["type"], json!("draining"));
         assert_eq!(resp.frames[1]["type"], json!("status"));
         assert_eq!(resp.frames[1]["final"], json!(false), "interim status");
@@ -392,6 +436,10 @@ mod tests {
         assert_eq!(resp.frames[0]["type"], json!("stopping"));
         assert_eq!(resp.frames[0]["force"], json!(true));
         assert!(resp.stop);
+        assert!(
+            resp.force,
+            "force must be carried end-to-end, not only in the interim frame"
+        );
     }
 
     #[test]
@@ -451,5 +499,138 @@ mod tests {
         assert!(s.ends_with('Z'));
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[10..11], "T");
+    }
+
+    // The control-socket client's framing/timeout contract. Each test stands up a
+    // throwaway `UnixListener`, scripts one connection's bytes, and asserts how
+    // `request` decodes them.
+    #[cfg(unix)]
+    mod client {
+        use super::*;
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        fn temp_sock(tag: &str) -> PathBuf {
+            let pid = std::process::id();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!("c8ctl-nano-test-{tag}-{pid}-{nanos}.sock"))
+        }
+
+        /// Serve exactly one connection: read (and discard) the request line, then
+        /// write `script` back in the supplied byte chunks with a small pause
+        /// between them, so the client is forced to read across chunk boundaries.
+        fn serve_once(path: &Path, chunks: Vec<Vec<u8>>) -> std::thread::JoinHandle<()> {
+            let _ = std::fs::remove_file(path);
+            let listener = UnixListener::bind(path).expect("bind test socket");
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    // Drain the single request line so the client's write unblocks.
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    for chunk in chunks {
+                        if stream.write_all(&chunk).is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    // Leave the connection to close, signalling EOF to the client.
+                }
+            })
+        }
+
+        #[test]
+        fn utf8_split_across_reads_is_not_corrupted() {
+            // A status frame carrying a non-ASCII profile name ("café"), whose
+            // multi-byte 'é' (0xC3 0xA9) is split across two socket reads. A
+            // per-chunk lossy decode would insert replacement characters; framing
+            // on whole lines keeps the name intact.
+            let sock = temp_sock("utf8");
+            let frame = br#"{"ok":true,"type":"status","name":"caf"#.to_vec();
+            let e_bytes = vec![0xC3u8]; // first byte of 'é'
+            let rest = {
+                let mut v = vec![0xA9u8]; // second byte of 'é'
+                v.extend_from_slice(br#"","final":true}"#);
+                v.push(b'\n');
+                v
+            };
+            let mut first = frame;
+            first.extend_from_slice(&e_bytes);
+            let handle = serve_once(&sock, vec![first, rest]);
+
+            let frames = request(&sock, &json!({ "op": "status" })).expect("ok response");
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["name"], json!("café"));
+        }
+
+        #[test]
+        fn timeout_without_terminal_frame_is_an_error() {
+            // The server sends a single non-terminal frame then holds the
+            // connection open (neither sending more nor closing) until the
+            // client has timed out. The client must return the read-timeout
+            // error rather than report a successful (incomplete) response. Using
+            // a release channel instead of a fixed sleep keeps the socket open
+            // past the client's 5s timeout deterministically, with no wall-clock
+            // race between the server's close and the client's timeout.
+            let sock = temp_sock("timeout");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let path = sock.clone();
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind test socket");
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    let mut chunk = br#"{"type":"draining","final":false}"#.to_vec();
+                    chunk.push(b'\n');
+                    let _ = stream.write_all(&chunk);
+                    let _ = stream.flush();
+                    // Hold the connection open until the client has finished
+                    // (timed out); only then drop the stream.
+                    let _ = release_rx.recv();
+                }
+            });
+
+            let err = request(&sock, &json!({ "op": "stop" })).expect_err("timeout is an error");
+            assert!(
+                err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock,
+                "expected a timeout error, got {err:?}"
+            );
+            let _ = release_tx.send(());
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+        }
+
+        #[test]
+        fn terminal_frame_before_timeout_succeeds() {
+            // When a terminal frame does arrive, a subsequent quiet period must
+            // not turn the already-complete response into an error.
+            let sock = temp_sock("final");
+            let mut chunk = br#"{"ok":true,"type":"status","final":true}"#.to_vec();
+            chunk.push(b'\n');
+            let handle = serve_once(&sock, vec![chunk]);
+            let frames = request(&sock, &json!({ "op": "status" })).expect("ok response");
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["final"], json!(true));
+        }
     }
 }

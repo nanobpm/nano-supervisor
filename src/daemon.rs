@@ -8,7 +8,7 @@
 //! Agents are spawned in their own process group and armed to die with the
 //! daemon ([`crate::pdeath`]), so even a `kill -9` leaves no orphans.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +30,11 @@ const HOST_SANDBOX: &str = "none";
 /// before the daemon exits (dropping the tasks; agents die via `kill_on_drop`
 /// and parent-death cleanup).
 const DRAIN_GRACE: Duration = Duration::from_secs(20);
+
+/// The much shorter drain window used for a forced `stop --force`: slots get a
+/// brief moment to observe the shutdown signal, then the daemon exits and reaps
+/// any remaining agents instead of waiting out [`DRAIN_GRACE`].
+const FORCE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -155,6 +160,40 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let host = short_hostname();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // A `--slots 0` daemon would run no slots at all; reject it here, before we
+    // claim the control socket, so startup never binds a socket only to bail out
+    // and leave a stale socket file advertising a daemon that immediately dies.
+    if opts.slots == 0 {
+        bail!("no slots started (is --slots 0?)");
+    }
+
+    // --- control socket: claim this home BEFORE spawning any slots ----------
+    // The supervisor control socket (nanobpm/nano-supervisor#8) must be claimed
+    // and bound before we start accepting work, for two reasons:
+    //   * Startup race (per-home exclusivity): an unlocked connect probe lets
+    //     two concurrent starts both see "no daemon" and race to unlink each
+    //     other's live socket. We take a per-home startup lock — held for the
+    //     whole daemon lifetime — so the second starter observes it is held and
+    //     refuses, and so a surviving socket file is provably stale (its owner
+    //     no longer holds the lock) before we remove it.
+    //   * Bind failure is startup-fatal: a daemon with no reachable control
+    //     endpoint cannot be driven by `status`/`stop`, and its detached
+    //     launcher would time out while this child silently kept accepting jobs.
+    //     Binding before the slot loop means a bind failure aborts startup with
+    //     no orphaned slots left running.
+    let sock_path = control::socket_path(&state_home);
+    #[cfg(unix)]
+    let _startup_lock = match crate::fleet::try_lock_supervisor_startup(&sock_path)? {
+        Some(lock) => lock,
+        None => bail!(
+            "another nano-supervisor already owns this state home (control socket {}); \
+             refusing to start a second daemon",
+            sock_path.display()
+        ),
+    };
+    #[cfg(unix)]
+    let control_listener = bind_control_socket(&sock_path)?;
+
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
     // The in-process slots this daemon runs, as (worker id, profile) pairs — the
@@ -213,16 +252,18 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     ));
 
     // --- control socket (nanobpm/nano-supervisor#8) -------------------------
-    // Bind the supervisor control socket so a client (`supervisor status` /
-    // `stop`, including the Node plugin's) can drive this daemon. A graceful
-    // `stop` op flips `graceful` before the shutdown watch so the exit is a
-    // clean drain, not the FATAL path a slot's watch flip signals.
+    // The socket was already bound above (before the slots); here we publish the
+    // live descriptor and spawn its accept loop. A graceful `stop` op flips
+    // `graceful` before the shutdown watch so the exit is a clean drain, not the
+    // FATAL path a slot's watch flip signals; `force` additionally marks a
+    // `stop --force` so the drain is cut short rather than waiting the full
+    // grace window.
     let graceful = Arc::new(AtomicBool::new(false));
+    let force = Arc::new(AtomicBool::new(false));
     let log_file = state_home
         .join("logs")
         .join("supervisor")
         .join("daemon.log");
-    let sock_path = control::socket_path(&state_home);
     let descriptor = control::DaemonDescriptor {
         pid: std::process::id(),
         started_at: control::iso8601_now(),
@@ -233,8 +274,9 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let engine_for_workers = pinned_base_url
         .clone()
         .unwrap_or_else(|| engine_desc.clone());
-    let control_handle = serve_control(
-        sock_path.clone(),
+    #[cfg(unix)]
+    let control_handle = Some(serve_control(
+        control_listener,
         state_home.clone(),
         descriptor,
         worker_ids,
@@ -242,8 +284,16 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         control::epoch_millis(),
         shutdown_tx.clone(),
         graceful.clone(),
-    )
-    .await;
+        force.clone(),
+    ));
+    #[cfg(not(unix))]
+    let control_handle: Option<tokio::task::JoinHandle<()>> = {
+        // No Unix-domain control socket off-Unix; the daemon still runs its
+        // slots, it just cannot be driven over the socket.
+        let _ = (&descriptor, &worker_ids, &engine_for_workers, &log_file);
+        log("control socket is unavailable off-Unix; status/stop clients cannot attach");
+        None
+    };
 
     // `wait_for_signal` reports whether a slot flipped the watch for a FATAL
     // misconfiguration (an unleased activation while leasing is enabled — the
@@ -266,17 +316,30 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let _ = shutdown_tx.send(true);
 
     // Give slots a bounded window to finish in-flight work; then exit (dropping
-    // any stragglers — their agents die via kill_on_drop + parent-death).
+    // any stragglers — their agents die via kill_on_drop + parent-death). A
+    // `stop --force` cuts that window short: the operator asked for immediate
+    // cancellation, so we only let slots observe the shutdown signal briefly
+    // rather than waiting out the full graceful drain.
+    let forced = force.load(Ordering::SeqCst);
     let drain = async {
         for h in handles {
             let _ = h.await;
         }
     };
-    if tokio::time::timeout(DRAIN_GRACE, drain).await.is_err() {
-        log(&format!(
-            "drain grace ({}s) elapsed; exiting and reaping remaining agents",
-            DRAIN_GRACE.as_secs()
-        ));
+    let grace = if forced {
+        FORCE_DRAIN_GRACE
+    } else {
+        DRAIN_GRACE
+    };
+    if tokio::time::timeout(grace, drain).await.is_err() {
+        if forced {
+            log("forced stop: cancelling in-flight work and reaping remaining agents");
+        } else {
+            log(&format!(
+                "drain grace ({}s) elapsed; exiting and reaping remaining agents",
+                DRAIN_GRACE.as_secs()
+            ));
+        }
     } else {
         log("all slots drained; exiting");
     }
@@ -300,12 +363,38 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
-/// Bind and serve the supervisor control socket. Returns the accept-loop task
-/// (aborted on daemon exit), or `None` if the socket could not be bound (the
-/// daemon still runs its slots — it just cannot be driven over the socket).
+/// Bind the supervisor control socket, failing startup if it cannot be bound.
+///
+/// Called **before** any slot is spawned and while the per-home startup lock is
+/// held, so (a) a bind failure aborts startup cleanly with no orphaned slots,
+/// and (b) any socket file present here is provably stale — its owner would
+/// still hold the startup lock — so removing it before `bind()` cannot clobber a
+/// live peer.
+#[cfg(unix)]
+fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
+    use tokio::net::UnixListener;
+
+    if let Some(parent) = sock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(sock_path);
+    UnixListener::bind(sock_path).with_context(|| {
+        format!(
+            "binding the supervisor control socket at {} (startup-fatal: a daemon with no \
+             reachable control endpoint cannot be driven by status/stop)",
+            sock_path.display()
+        )
+    })
+}
+
+/// Serve the supervisor control socket on an already-bound `listener`. Publishes
+/// the live `supervisor.json` descriptor and spawns the accept loop, returning
+/// its task handle (aborted on daemon exit). The socket is bound earlier by
+/// [`bind_control_socket`] so a bind failure is startup-fatal.
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
-async fn serve_control(
-    sock_path: PathBuf,
+fn serve_control(
+    listener: tokio::net::UnixListener,
     state_home: PathBuf,
     descriptor: control::DaemonDescriptor,
     worker_ids: Vec<(String, String)>,
@@ -313,91 +402,54 @@ async fn serve_control(
     started_at_ms: u64,
     shutdown_tx: watch::Sender<bool>,
     graceful: Arc<AtomicBool>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    #[cfg(unix)]
-    {
-        use tokio::net::UnixListener;
-
-        // Clear a stale socket from a crashed predecessor so bind() succeeds; a
-        // live predecessor would already hold the home lock elsewhere.
-        let _ = std::fs::remove_file(&sock_path);
-        if let Some(parent) = sock_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let listener = match UnixListener::bind(&sock_path) {
-            Ok(l) => l,
-            Err(e) => {
-                log(&format!(
-                    "control socket unavailable ({}): {e}; status/stop clients cannot attach",
-                    sock_path.display()
-                ));
-                return None;
-            }
-        };
-
-        // Record the descriptor so clients that prefer `supervisor.json` (and
-        // `supervisor status`) find the socket + pid without re-deriving them.
-        let _ = std::fs::create_dir_all(&state_home);
-        let sup_json = serde_json::json!({
-            "pid": descriptor.pid,
-            "startedAt": descriptor.started_at,
-            "version": descriptor.version,
-            "socket": descriptor.socket,
-            "logFile": descriptor.log_file,
-            "pluginVersion": descriptor.version,
-        });
-        if let Ok(bytes) = serde_json::to_vec_pretty(&sup_json) {
-            let _ = std::fs::write(state_home.join("supervisor.json"), bytes);
-        }
-        log(&format!(
-            "control socket listening at {}",
-            sock_path.display()
-        ));
-
-        let handle = tokio::spawn(async move {
-            let descriptor = Arc::new(descriptor);
-            let worker_ids = Arc::new(worker_ids);
-            let engine = Arc::new(engine);
-            loop {
-                let stream = match listener.accept().await {
-                    Ok((stream, _addr)) => stream,
-                    Err(_) => break,
-                };
-                let descriptor = descriptor.clone();
-                let worker_ids = worker_ids.clone();
-                let engine = engine.clone();
-                let shutdown_tx = shutdown_tx.clone();
-                let graceful = graceful.clone();
-                tokio::spawn(async move {
-                    handle_control_connection(
-                        stream,
-                        descriptor,
-                        worker_ids,
-                        engine,
-                        started_at_ms,
-                        shutdown_tx,
-                        graceful,
-                    )
-                    .await;
-                });
-            }
-        });
-        Some(handle)
+    force: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    // Record the descriptor so clients that prefer `supervisor.json` (and
+    // `supervisor status`) find the socket + pid without re-deriving them.
+    let _ = std::fs::create_dir_all(&state_home);
+    let sup_json = serde_json::json!({
+        "pid": descriptor.pid,
+        "startedAt": descriptor.started_at,
+        "version": descriptor.version,
+        "socket": descriptor.socket,
+        "logFile": descriptor.log_file,
+        "pluginVersion": descriptor.version,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&sup_json) {
+        let _ = std::fs::write(state_home.join("supervisor.json"), bytes);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (
-            sock_path,
-            state_home,
-            descriptor,
-            worker_ids,
-            engine,
-            started_at_ms,
-            shutdown_tx,
-            graceful,
-        );
-        None
-    }
+    log(&format!("control socket listening at {}", descriptor.socket));
+
+    tokio::spawn(async move {
+        let descriptor = Arc::new(descriptor);
+        let worker_ids = Arc::new(worker_ids);
+        let engine = Arc::new(engine);
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _addr)) => stream,
+                Err(_) => break,
+            };
+            let descriptor = descriptor.clone();
+            let worker_ids = worker_ids.clone();
+            let engine = engine.clone();
+            let shutdown_tx = shutdown_tx.clone();
+            let graceful = graceful.clone();
+            let force = force.clone();
+            tokio::spawn(async move {
+                handle_control_connection(
+                    stream,
+                    descriptor,
+                    worker_ids,
+                    engine,
+                    started_at_ms,
+                    shutdown_tx,
+                    graceful,
+                    force,
+                )
+                .await;
+            });
+        }
+    })
 }
 
 /// Serve one control connection: read NDJSON request lines, reply with frames,
@@ -412,6 +464,7 @@ async fn handle_control_connection(
     started_at_ms: u64,
     shutdown_tx: watch::Sender<bool>,
     graceful: Arc<AtomicBool>,
+    force: Arc<AtomicBool>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -433,6 +486,11 @@ async fn handle_control_connection(
         }
         let _ = write_half.flush().await;
         if resp.stop {
+            // A forced stop must be recorded BEFORE flipping the shutdown watch,
+            // so the drain loop in `run` sees the forced flag when it wakes.
+            if resp.force {
+                force.store(true, Ordering::SeqCst);
+            }
             graceful.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(true);
             return;

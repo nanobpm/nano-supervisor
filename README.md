@@ -5,7 +5,10 @@ Standalone Rust supervisor and job workers for Nano BPM coding agents (replaces 
   one shared engine connection, host sandbox, ACP + pipe protocols. See
   [`daemon/README.md`](daemon/README.md).
 - `nano-supervisor supervisor start|status|stop` — start the daemon (detached),
-  query it over the control socket, or drain and stop it. The control socket
+  query it over the control socket, or drain and stop it (`stop --force` cancels
+  in-flight work immediately instead of draining). Only one daemon may own a
+  given state home at a time: a second `start` for the same home refuses rather
+  than racing the first off its control socket. The control socket
   (`supervisor.sock`) speaks the Node daemon's NDJSON protocol, so a Node client
   can drive a Rust daemon and vice-versa (`src/control.rs`,
   [`contract-tests/fixtures/socket-protocol.md`](contract-tests/fixtures/socket-protocol.md)).
