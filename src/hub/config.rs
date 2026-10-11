@@ -80,6 +80,33 @@ fn non_empty(key: &str) -> Option<String> {
     }
 }
 
+/// The permission policies a worker may advertise. The source of truth is the
+/// hire vocabulary (`fleet::VALID_PERMISSIONS`); an override outside this closed
+/// set is a typo and must fall through to the hire/default policy rather than be
+/// advertised verbatim.
+const VALID_PERMISSIONS: [&str; 3] = ["yolo", "escalate", "filter"];
+
+/// The terminal transports a worker may declare. The source of truth is the hire
+/// vocabulary (`fleet::VALID_TERMINALS`). `NANO_AGENTIC_TERMINAL` names a MODE
+/// (`pty`/`pipe`), not a truthy flag, so only `pty` enables the terminal relay.
+const VALID_TERMINALS: [&str; 2] = ["pty", "pipe"];
+
+/// Read `key` and return its trimmed, lower-cased value only when it is one of
+/// `allowed`. An unset, empty, or out-of-vocabulary value yields `None`, so a
+/// typo (`YOLOO`, `ptyy`) falls through to the caller's default instead of being
+/// advertised as a real policy/mode. Normalising to lower-case keeps parity with
+/// the hire-side parse, which is case-insensitive.
+fn validated_mode(key: &str, allowed: &[&str]) -> Option<String> {
+    validate_mode(env::var(key).ok(), allowed)
+}
+
+/// Pure core of [`validated_mode`]: normalise a raw value (trim + lower-case)
+/// and keep it only when it is in the closed `allowed` vocabulary.
+fn validate_mode(raw: Option<String>, allowed: &[&str]) -> Option<String> {
+    let norm = raw?.trim().to_ascii_lowercase();
+    allowed.contains(&norm.as_str()).then_some(norm)
+}
+
 impl HubConfig {
     /// Resolve the hub configuration from the process environment. Returns
     /// `None` (hub disabled) unless `NANO_AGENTIC` is truthy and
@@ -108,10 +135,15 @@ impl HubConfig {
             secret: non_empty("NANO_AGENTIC_SECRET"),
             credential: non_empty("NANO_AGENTIC_CREDENTIAL"),
             protocol: non_empty("NANO_AGENTIC_PROTOCOL"),
-            permission: non_empty("NANO_AGENTIC_PERMISSION"),
-            terminal: env::var("NANO_AGENTIC_TERMINAL")
-                .ok()
-                .is_some_and(|v| env_truthy(&v)),
+            // Validate against the closed permission vocabulary: an invalid
+            // override (a typo like `YOLOO`) must fall through to the
+            // hire/default policy, not be advertised verbatim as a real policy.
+            permission: validated_mode("NANO_AGENTIC_PERMISSION", &VALID_PERMISSIONS),
+            // `NANO_AGENTIC_TERMINAL` is a MODE (`pty`/`pipe`), not a truthy
+            // flag: only `pty` enables/advertises the terminal relay. An invalid
+            // or unset value falls through to the default (relay off).
+            terminal: validated_mode("NANO_AGENTIC_TERMINAL", &VALID_TERMINALS)
+                .is_some_and(|mode| mode == "pty"),
             attribution: non_empty("NANO_AGENT_ATTRIBUTION"),
             buffer_capacity,
             buffer_byte_budget,
@@ -139,6 +171,45 @@ mod tests {
         }
         for v in ["", "0", "false", "no", "off", "enable"] {
             assert!(!env_truthy(v), "{v:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn permission_override_validates_against_the_closed_vocabulary() {
+        // Every supported policy is accepted, normalised to lower-case.
+        for v in ["yolo", "escalate", "filter", "YOLO", " Filter "] {
+            assert_eq!(
+                validate_mode(Some(v.to_string()), &VALID_PERMISSIONS),
+                Some(v.trim().to_ascii_lowercase()),
+                "{v:?} should be an accepted permission policy"
+            );
+        }
+        // A typo or any out-of-vocabulary value falls through to the default
+        // (None) rather than being advertised verbatim as a real policy.
+        for v in ["", "yoloo", "YOLOO", "allow", "deny", "garbage"] {
+            assert_eq!(
+                validate_mode(Some(v.to_string()), &VALID_PERMISSIONS),
+                None,
+                "{v:?} must not be advertised as a permission policy"
+            );
+        }
+        assert_eq!(validate_mode(None, &VALID_PERMISSIONS), None);
+    }
+
+    #[test]
+    fn terminal_override_is_a_mode_not_a_truthy_flag() {
+        // The documented modes are parsed as a mode: only `pty` enables relay.
+        let pty = |v: &str| {
+            validate_mode(Some(v.to_string()), &VALID_TERMINALS).is_some_and(|m| m == "pty")
+        };
+        for v in ["pty", "PTY", " Pty "] {
+            assert!(pty(v), "{v:?} should enable the terminal relay");
+        }
+        // `pipe` is a valid mode but disables the relay; the old truthy parse
+        // (regression under test) wrongly treated BOTH documented values as
+        // false, and any truthy-looking value as true.
+        for v in ["pipe", "PIPE", "", "true", "1", "yes", "on", "ptyy", "garbage"] {
+            assert!(!pty(v), "{v:?} should NOT enable the terminal relay");
         }
     }
 }

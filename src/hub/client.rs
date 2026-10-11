@@ -1634,7 +1634,10 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
 /// yields back to the connection `select!` loop (re-arming the outbound notify
 /// if frames remain), so a sustained producer cannot keep `read.next()` and
 /// `shutdown.changed()` from being polled. `0` means unbounded (drain the entire
-/// buffer in a single pass).
+/// buffer in a single pass). The barrier tail flush above is bounded by the SAME
+/// budget: an armed RELEASE whose job has a large buffered tail yields and
+/// resumes across passes (RELEASE + barrier held pending) rather than flushing
+/// the whole tail in one unpolled burst.
 async fn drain(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
@@ -1674,16 +1677,40 @@ async fn drain(
         // different session's control frame already drained ahead).
         if frame.family == Family::Release {
             if let ReleaseGate::Defer { stream } = client.release_gate(&frame.payload) {
-                // Write this session's own buffered bulk/interactive tail first.
-                // On a write error the connection is torn down: re-buffer the
-                // held RELEASE too (its barrier stays armed) so it is retried on
-                // reconnect AFTER the not-yet-written tail — ordering preserved.
-                if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream).await {
-                    client.outbound.lock().unwrap().requeue_front(frame);
-                    return Err(e);
+                // Write this session's own buffered bulk/interactive tail first,
+                // but in BOUNDED batches: an armed RELEASE must not let its tail
+                // flush bypass `batch_limit` and keep `read.next()` /
+                // `shutdown.changed()` unpolled while a large tail drains (one
+                // slow closing session could otherwise stall cancel/steer and
+                // shutdown for minutes-to-hours). Give the flush only this pass's
+                // remaining budget; if the tail outlasts it, re-buffer the held
+                // RELEASE (barrier still armed) and yield — the next pass resumes
+                // the remaining tail before the RELEASE, so ordering holds.
+                let budget = if batch_limit == 0 {
+                    0
+                } else {
+                    batch_limit - written
+                };
+                match drain_lower_lanes(client, write, incarnation, &stream, budget).await {
+                    Ok(flush) => {
+                        written += flush.written;
+                        if !flush.exhausted {
+                            client.outbound.lock().unwrap().requeue_front(frame);
+                            client.outbound_notify.notify_one();
+                            return Ok(());
+                        }
+                    }
+                    // On a write error the connection is torn down: re-buffer the
+                    // held RELEASE too (its barrier stays armed) so it is retried
+                    // on reconnect AFTER the not-yet-written tail — ordering
+                    // preserved.
+                    Err(e) => {
+                        client.outbound.lock().unwrap().requeue_front(frame);
+                        return Err(e);
+                    }
                 }
-                // The tail is now on the socket: consume the barrier and let the
-                // RELEASE be written.
+                // The tail is now fully on the socket: consume the barrier and
+                // let the RELEASE be written.
                 client.disarm_release_barrier(&stream);
             }
         }
@@ -1723,6 +1750,16 @@ async fn drain(
     }
 }
 
+/// Outcome of one bounded [`drain_lower_lanes`] pass over a closing session's
+/// buffered tail.
+struct LowerDrain {
+    /// Frames written to the socket during this pass.
+    written: usize,
+    /// `true` when the stream's buffered tail was fully flushed; `false` when
+    /// `budget` was hit first and more tail remains for a later pass.
+    exhausted: bool,
+}
+
 /// Write the CLOSING session's own buffered NON-control tail (interactive, then
 /// bulk frames whose [`frame_stream`] equals `stream`) to the socket, leaving
 /// the control lane AND every other session's lower-lane frames untouched. Used
@@ -1735,18 +1772,37 @@ async fn drain(
 /// connection down (the not-yet-written frames stay buffered and are retried on
 /// reconnect, ahead of the RELEASE, whose barrier is still armed — so ordering
 /// is re-established).
+///
+/// BOUNDED: `budget` caps how many frames this pass may write (`0` = unbounded).
+/// When the budget is exhausted before the tail is empty the flush stops and
+/// returns `exhausted == false`, so the caller can yield (keeping the RELEASE and
+/// its barrier pending) and resume the remaining tail on a later pass — a single
+/// large closing tail can never monopolise the connection task.
 async fn drain_lower_lanes(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
     incarnation: u32,
     stream: &str,
-) -> anyhow::Result<()> {
+    budget: usize,
+) -> anyhow::Result<LowerDrain> {
+    let mut written = 0usize;
     loop {
+        if budget != 0 && written >= budget {
+            return Ok(LowerDrain {
+                written,
+                exhausted: false,
+            });
+        }
         let mut frame = {
             let mut buf = client.outbound.lock().unwrap();
             match buf.pop_lower_lane_for_stream(stream) {
                 Some(f) => f,
-                None => return Ok(()),
+                None => {
+                    return Ok(LowerDrain {
+                        written,
+                        exhausted: true,
+                    })
+                }
             }
         };
         if frame.family == Family::Relay && frame.payload.get("op") == Some(&Value::from("produce"))
@@ -1769,6 +1825,7 @@ async fn drain_lower_lanes(
             },
             Err(_) => continue,
         }
+        written += 1;
     }
 }
 
@@ -1814,7 +1871,10 @@ async fn drain_control(
         // drain (ownership is re-derived by reconnect resync).
         if frame.family == Family::Release {
             if let ReleaseGate::Defer { stream } = client.release_gate(&frame.payload) {
-                if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream).await {
+                // Terminal path: flush the whole tail (budget `0` = unbounded).
+                // There are no reads to keep serviceable here — the socket is
+                // about to close — so bounding would only add round-trips.
+                if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream, 0).await {
                     client.disarm_release_barrier(&stream);
                     return Err(e);
                 }
@@ -3767,6 +3827,124 @@ mod tests {
             !client.release_barriers.lock().unwrap().contains_key(&stream),
             "the barrier is consumed once its RELEASE is written"
         );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // #3: the per-session RELEASE drain barrier must flush a large transcript
+    // tail in BOUNDED batches, not one unpolled burst. With a tail longer than
+    // `batch_limit`, a single `drain` pass writes at most `batch_limit` tail
+    // frames and then YIELDS with the RELEASE still buffered and its barrier
+    // still armed — so cancel/steer/shutdown stay serviceable between passes. A
+    // later unbounded pass flushes the remainder and only then writes the
+    // RELEASE (after the tail, never before). Driven over a hand-held socket so
+    // the test exercises the live `drain` batch path deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_barrier_tail_flush_is_bounded_by_the_batch_limit() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Family>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send(frame.family).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // The HubClient targets a dead port; the only socket traffic is the one
+        // we drive by hand.
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let ws = connect(&cfg).await.expect("connect to the in-process hub");
+        let (mut write, _read) = ws.split();
+
+        let instance = "w-bnd";
+        let job = "job-bnd";
+        let stream = compose_stream_id(instance, job);
+        // The shutdown state `close()` leaves, but with a MULTI-frame tail (3
+        // produce chunks) buffered behind an armed RELEASE.
+        client
+            .release_barriers
+            .lock()
+            .unwrap()
+            .insert(stream.clone(), ReleaseBarrier { armed: true });
+        {
+            let mut buf = client.outbound.lock().unwrap();
+            for i in 0..3 {
+                buf.push(Frame::new(
+                    Lane::Bulk,
+                    Family::Relay,
+                    i + 1,
+                    json!({ "op": "produce", "stream": stream, "chunk": format!("c{i}") }),
+                ));
+            }
+            buf.push(Frame::new(
+                Lane::Control,
+                Family::Release,
+                9,
+                json!({ "instance": instance, "jobKey": job }),
+            ));
+        }
+
+        // First pass: batch_limit 2 may write at most two tail frames, then it
+        // yields with the RELEASE held back and the barrier still armed.
+        drain(&client, &mut write, 2)
+            .await
+            .expect("first bounded drain pass yields without error");
+
+        let mut first: Vec<Family> = Vec::new();
+        while let Ok(Some(fam)) =
+            tokio::time::timeout(Duration::from_millis(500), frames_rx.recv()).await
+        {
+            first.push(fam);
+        }
+        assert_eq!(
+            first,
+            vec![Family::Relay, Family::Relay],
+            "a bounded pass writes exactly batch_limit tail frames and no RELEASE, got {first:?}"
+        );
+        assert!(
+            client
+                .release_barriers
+                .lock()
+                .unwrap()
+                .get(&stream)
+                .is_some_and(|b| b.armed),
+            "the barrier stays armed while the tail is only partially flushed"
+        );
+
+        // Second pass: unbounded (0) flushes the remaining tail frame, consumes
+        // the barrier, and writes the RELEASE last.
+        drain(&client, &mut write, 0)
+            .await
+            .expect("final drain pass flushes the remaining tail then the RELEASE");
+
+        let mut rest: Vec<Family> = Vec::new();
+        while let Ok(Some(fam)) =
+            tokio::time::timeout(Duration::from_millis(500), frames_rx.recv()).await
+        {
+            rest.push(fam);
+        }
+        assert_eq!(
+            rest,
+            vec![Family::Relay, Family::Release],
+            "the final pass flushes the remaining tail, then the RELEASE, got {rest:?}"
+        );
+        assert!(
+            !client.release_barriers.lock().unwrap().contains_key(&stream),
+            "the barrier is consumed once the whole tail and the RELEASE are written"
+        );
+
         client.shutdown().await;
         server.abort();
     }
