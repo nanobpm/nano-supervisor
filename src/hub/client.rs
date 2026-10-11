@@ -36,7 +36,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Notify};
-use tokio::time::{interval, sleep};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep, timeout};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
@@ -56,6 +57,16 @@ const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How often the client sends a presence heartbeat while connected.
 const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Ceiling on a single connect/handshake attempt. Without it a hung TCP/TLS or
+/// WebSocket handshake would park the connection task indefinitely, wedging both
+/// reconnect backoff and a requested shutdown (which only lands between attempts).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on the ACP-update → transcript bridge channel. It sits in front of the
+/// already-bounded outbound [`LaneBuffer`], so leaving it unbounded would let a
+/// fast agent's `session/update` stream (each frame up to ~1 MiB) grow without
+/// limit and defeat the buffer's memory cap. On overflow the producer drops the
+/// update rather than blocking the ACP read loop (see `acp.rs`).
+const TRANSCRIPT_CHANNEL_BOUND: usize = 1024;
 
 /// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a single
 /// shared capacity. Draining prefers control → interactive → bulk; overflow
@@ -82,26 +93,51 @@ impl LaneBuffer {
         self.control.len() + self.interactive.len() + self.bulk.len()
     }
 
-    /// Append `frame` to its lane, evicting the oldest frame from the
-    /// least-important non-empty lane first whenever the shared capacity is
-    /// reached.
+    /// Append `frame` to its lane. When the shared capacity is reached, evict to
+    /// make room — but only ever shed a frame whose priority is at or below the
+    /// incoming frame's, least-important lane first. A bulk flood can therefore
+    /// displace only other bulk frames; it can never evict an interactive or
+    /// control frame to admit itself. When nothing at or below the incoming
+    /// priority is available to evict (the buffer holds only higher-priority
+    /// traffic), the incoming frame is dropped instead — presence/steer control
+    /// is never sacrificed for lower-priority transcript.
     fn push(&mut self, frame: Frame) {
-        while self.len() >= self.capacity {
-            if self.bulk.pop_front().is_some()
-                || self.interactive.pop_front().is_some()
-                || self.control.pop_front().is_some()
-            {
-                continue;
-            }
-            break; // capacity 0: nothing to evict, drop on the floor below
-        }
         if self.capacity == 0 {
-            return;
+            return; // no room at all: drop on the floor
+        }
+        while self.len() >= self.capacity {
+            if !self.evict_for(frame.lane) {
+                return; // only higher-priority frames remain: drop the newcomer
+            }
         }
         match frame.lane {
             Lane::Control => self.control.push_back(frame),
             Lane::Interactive => self.interactive.push_back(frame),
             Lane::Bulk => self.bulk.push_back(frame),
+        }
+    }
+
+    /// Evict the oldest frame whose lane priority is at or below `incoming`'s,
+    /// least-important lane first. Returns `false` when no such frame exists —
+    /// i.e. every buffered frame strictly outranks `incoming` — so the caller
+    /// drops the incoming frame rather than displacing higher-priority traffic.
+    fn evict_for(&mut self, incoming: Lane) -> bool {
+        match incoming {
+            // Bulk may only evict bulk.
+            Lane::Bulk => self.bulk.pop_front().is_some(),
+            // Interactive may evict bulk, then interactive — never control.
+            Lane::Interactive => self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front())
+                .is_some(),
+            // Control may evict anything, least-important first.
+            Lane::Control => self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front())
+                .or_else(|| self.control.pop_front())
+                .is_some(),
         }
     }
 
@@ -121,6 +157,16 @@ impl LaneBuffer {
             Lane::Interactive => self.interactive.push_front(frame),
             Lane::Bulk => self.bulk.push_front(frame),
         }
+    }
+
+    /// Drop every buffered `REGISTER`/`CLAIM` frame from the control lane. The
+    /// (re)connect resync snapshot supersedes them, so leaving the stale ones
+    /// in place would duplicate presence/ownership and let a `CLAIM` buffered
+    /// while disconnected drain ahead of the snapshot's `REGISTER`. Other
+    /// control families (`RELEASE`/`DEREGISTER`/`HEARTBEAT`) are preserved.
+    fn drop_control_presence(&mut self) {
+        self.control
+            .retain(|f| !matches!(f.family, Family::Register | Family::Claim));
     }
 }
 
@@ -152,6 +198,10 @@ pub struct HubClient {
     sessions: Mutex<HashMap<String, mpsc::UnboundedSender<ControlFrame>>>,
     /// Flipped to request the connection task to deregister and exit.
     shutdown_tx: watch::Sender<bool>,
+    /// The spawned connection task's handle, awaited by [`HubClient::shutdown`]
+    /// so a clean shutdown blocks until the task has flushed its `DEREGISTER`
+    /// and torn the socket down — not merely signalled the watch.
+    conn_task: Mutex<Option<JoinHandle<()>>>,
     /// Per-client PRNG state for reconnect jitter (seeded once at spawn from a
     /// real entropy mix), so a fleet of daemons does not reconnect in lockstep.
     rng: AtomicU64,
@@ -184,6 +234,7 @@ impl HubClient {
             in_flight: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             shutdown_tx,
+            conn_task: Mutex::new(None),
             rng: AtomicU64::new(seed_rng()),
         });
         log(&format!(
@@ -196,7 +247,8 @@ impl HubClient {
                 ""
             }
         ));
-        tokio::spawn(connection_loop(client.clone(), shutdown_rx));
+        let handle = tokio::spawn(connection_loop(client.clone(), shutdown_rx));
+        *client.conn_task.lock().unwrap() = Some(handle);
         client
     }
 
@@ -256,7 +308,10 @@ impl HubClient {
         );
 
         // Bridge ACP updates → transcript produce frames on a dedicated task.
-        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<Value>();
+        // A *bounded* channel (see `TRANSCRIPT_CHANNEL_BOUND`): it fronts the
+        // already-bounded outbound buffer, so an unbounded one here would let a
+        // fast agent's updates grow without limit and defeat that cap.
+        let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(TRANSCRIPT_CHANNEL_BOUND);
         let bridge_client = self.clone();
         let bridge_stream = stream.clone();
         tokio::spawn(async move {
@@ -287,9 +342,16 @@ impl HubClient {
         }
     }
 
-    /// Stop the hub: deregister every worker and let the connection task exit.
-    pub fn shutdown(&self) {
+    /// Stop the hub: signal the connection task to deregister and exit, then
+    /// await it so this returns only once the worker's `DEREGISTER` has been
+    /// flushed and the socket torn down. Idempotent — the handle is taken on the
+    /// first call; later calls just re-signal and return.
+    pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+        let handle = self.conn_task.lock().unwrap().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
     }
 
     /// Merge the hub's config-level advertisement fields (permission policy,
@@ -326,6 +388,51 @@ impl HubClient {
         self.outbound_notify.notify_one();
     }
 
+    /// Rebuild worker presence + job ownership at the FRONT of the outbound
+    /// buffer on every (re)connect. Builds the ordered snapshot — every
+    /// REGISTER, then every CLAIM — then drops any REGISTER/CLAIM already
+    /// buffered (a disconnected `register_session` may have queued some) and
+    /// prepends the snapshot ahead of ordinary traffic. Prepending (rather than
+    /// tail-enqueuing) guarantees two invariants the hub relies on: REGISTER
+    /// strictly precedes CLAIM, and neither presence frame is duplicated —
+    /// a CLAIM buffered while disconnected can otherwise drain before the
+    /// tail-appended REGISTER and desync ownership.
+    fn resync_presence(&self) {
+        // Build the ordered snapshot (REGISTERs first, then CLAIMs) with fresh
+        // sequence numbers, holding each source lock only long enough to read it.
+        let mut snapshot: Vec<Frame> = Vec::new();
+        for (inst, cap) in self.instances.lock().unwrap().iter() {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+            snapshot.push(Frame::new(
+                Lane::Control,
+                Family::Register,
+                seq,
+                json!({ "instance": inst, "capability": cap }),
+            ));
+        }
+        for (inst, jobs) in self.in_flight.lock().unwrap().iter() {
+            for job_key in jobs {
+                let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+                snapshot.push(Frame::new(
+                    Lane::Control,
+                    Family::Claim,
+                    seq,
+                    json!({ "instance": inst, "jobKey": job_key }),
+                ));
+            }
+        }
+        {
+            let mut buf = self.outbound.lock().unwrap();
+            buf.drop_control_presence();
+            // Push in reverse so the final front order matches `snapshot`:
+            // REGISTER…REGISTER, CLAIM…CLAIM, ahead of any preserved control.
+            for frame in snapshot.into_iter().rev() {
+                buf.push_front(frame);
+            }
+        }
+        self.outbound_notify.notify_one();
+    }
+
     /// Draw the next 64 bits of per-client jitter entropy (xorshift64*).
     fn next_rand(&self) -> u64 {
         let mut x = self.rng.load(Ordering::Relaxed);
@@ -351,6 +458,21 @@ impl HubClient {
     /// `stream`. A delivery for an unknown/foreign/invalid stream is dropped —
     /// never broadcast — so a targeted steer can only ever reach its own job.
     fn route_inbound(&self, payload: &Value) {
+        // A relay *delivery* is `{stream, offset, chunk}` and carries NO `op`:
+        // only producer/control frames have an `op` (e.g. our own echoed
+        // `{op:"produce", stream, chunk}` transcript). Routing one of those as a
+        // delivery would decode our own produced transcript as inbound steer and
+        // inject it back into its own agent — a feedback loop. Accept only the
+        // delivery shape; anything carrying `op` (or missing `offset`) is dropped.
+        // A relay *delivery* is `{stream, …, chunk}` and carries NO `op`: only
+        // producer/control frames have an `op` (e.g. our own echoed
+        // `{op:"produce", stream, chunk}` transcript). Routing one of those as a
+        // delivery would decode our own produced transcript as inbound steer and
+        // inject it back into its own agent — a feedback loop. Reject anything
+        // carrying `op`; only genuine deliveries are routed.
+        if payload.get("op").is_some() {
+            return; // not a delivery: producer/control frame echoed back
+        }
         let Some(stream) = payload.get("stream").and_then(Value::as_str) else {
             return; // no stream id: not a routable delivery
         };
@@ -392,13 +514,14 @@ pub struct HubSession {
     job_key: String,
     /// The composed relay stream id for this `(instance, jobKey)` pair.
     stream: String,
-    transcript: Option<mpsc::UnboundedSender<Value>>,
+    transcript: Option<mpsc::Sender<Value>>,
     steer: Option<mpsc::UnboundedReceiver<ControlFrame>>,
 }
 
 impl HubSession {
     /// The sink the ACP agent forwards each `session/update` to. Taken once.
-    pub fn transcript_sink(&mut self) -> Option<mpsc::UnboundedSender<Value>> {
+    /// Bounded: on overflow the ACP side drops the update rather than blocking.
+    pub fn transcript_sink(&mut self) -> Option<mpsc::Sender<Value>> {
         self.transcript.clone()
     }
 
@@ -464,8 +587,22 @@ async fn connection_loop(client: Arc<HubClient>, mut shutdown: watch::Receiver<b
         if *shutdown.borrow() {
             break;
         }
-        match connect(&client.config).await {
-            Ok(stream) => {
+        // Race the connect/handshake against both a hard timeout and a shutdown
+        // request: an unbounded `connect().await` on a hung handshake would park
+        // here forever, starving reconnect backoff AND a requested shutdown
+        // (which otherwise only lands between attempts).
+        let attempt = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            result = timeout(CONNECT_TIMEOUT, connect(&client.config)) => result,
+        };
+        match attempt {
+            Ok(Ok(stream)) => {
                 backoff = BACKOFF_BASE;
                 // Bump the producer generation on every reconnect (never the
                 // first connect) so resumed transcript producers strictly
@@ -480,29 +617,24 @@ async fn connection_loop(client: Arc<HubClient>, mut shutdown: watch::Receiver<b
                 // Resync BEFORE any transcript resumes: re-REGISTER every known
                 // worker instance, then re-CLAIM every in-flight job, so hub
                 // presence and ownership are whole again first. Ordering is the
-                // contract (presence + ownership before transcript).
-                for (inst, cap) in client.instances.lock().unwrap().iter() {
-                    client.enqueue(
-                        Lane::Control,
-                        Family::Register,
-                        json!({ "instance": inst, "capability": cap }),
-                    );
-                }
-                for (inst, jobs) in client.in_flight.lock().unwrap().iter() {
-                    for job_key in jobs {
-                        client.enqueue(
-                            Lane::Control,
-                            Family::Claim,
-                            json!({ "instance": inst, "jobKey": job_key }),
-                        );
-                    }
-                }
+                // contract (presence + ownership before transcript): the snapshot
+                // is PREPENDED to the control lane (deduplicating any REGISTER/
+                // CLAIM a disconnected `register_session` already buffered) so a
+                // CLAIM can never drain ahead of its REGISTER, and neither is
+                // duplicated.
+                client.resync_presence();
                 pump(&client, stream, &mut shutdown).await;
                 client.connected.store(false, Ordering::Relaxed);
                 log("agentic hub: disconnected");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log(&format!("agentic hub: connect failed: {e:#}"));
+            }
+            Err(_) => {
+                log(&format!(
+                    "agentic hub: connect timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ));
             }
         }
         if *shutdown.borrow() {
@@ -716,7 +848,7 @@ mod tests {
             client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": i }));
         }
         assert!(client.outbound.lock().unwrap().len() <= 3);
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -734,7 +866,7 @@ mod tests {
         // Both control frames survive; only bulk was shed.
         let controls = frames.iter().filter(|(l, _, _)| *l == Lane::Control).count();
         assert_eq!(controls, 2, "control frames must not be evicted by bulk");
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -744,7 +876,7 @@ mod tests {
         client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
         let frames = buffered(&client);
         assert_eq!(frames[0].0, Lane::Control, "control lane drains first");
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -768,7 +900,7 @@ mod tests {
         assert!(frames
             .iter()
             .any(|(_, fam, p)| *fam == Family::Release && p["jobKey"] == "job-1"));
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -784,7 +916,7 @@ mod tests {
         assert!(frames
             .iter()
             .any(|(_, fam, p)| *fam == Family::Claim && p["jobKey"] == "job-2"));
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -796,7 +928,7 @@ mod tests {
         client.route_inbound(&json!({ "stream": stream, "offset": 0, "chunk": "do the thing" }));
         let got = steer.recv().await.expect("steer delivered");
         assert_eq!(got, ControlFrame::Prompt { text: "do the thing".into() });
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -810,7 +942,7 @@ mod tests {
         // And a structurally-invalid stream id is dropped too.
         client.route_inbound(&json!({ "stream": "garbage", "offset": 0, "chunk": "nope" }));
         assert!(steer.try_recv().is_err(), "foreign stream must not be routed here");
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -825,7 +957,7 @@ mod tests {
         }));
         let got = steer.recv().await.expect("steer delivered");
         assert_eq!(got, ControlFrame::Cancel { reason: Some("stop".into()) });
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -834,7 +966,7 @@ mod tests {
         let mut session = client.register_session("w-9", capability(), "job-9");
         let sink = session.transcript_sink().expect("transcript sink");
         let _ = buffered(&client); // discard the register/claim frames
-        sink.send(json!({
+        sink.try_send(json!({
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "hello" }
         }))
@@ -866,7 +998,7 @@ mod tests {
             parse_stream_id(stream),
             Some(("w-9".to_string(), "job-9".to_string()))
         );
-        client.shutdown();
+        client.shutdown().await;
     }
 
     #[test]
@@ -906,7 +1038,7 @@ mod tests {
         }
         // A real RNG produces many distinct delays, not one lockstep value.
         assert!(seen.len() > 8, "jitter is not varying: {} distinct", seen.len());
-        client.shutdown();
+        client.shutdown().await;
     }
 
     // --- In-process live WebSocket acceptance (#10) ----------------------
@@ -996,6 +1128,7 @@ mod tests {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "hi" }
         }))
+        .await
         .unwrap();
 
         // Collect frames until REGISTER, CLAIM, and the produce relay all land,
@@ -1041,7 +1174,7 @@ mod tests {
 
         // Shutdown deregisters the worker instance.
         drop(session);
-        client.shutdown();
+        client.shutdown().await;
         let mut saw_deregister = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !saw_deregister {
@@ -1121,7 +1254,127 @@ mod tests {
             first_register.unwrap() < first_claim.unwrap(),
             "reconnect re-CLAIMed before re-REGISTERing"
         );
-        client.shutdown();
+        client.shutdown().await;
         let _ = server.await;
+    }
+
+    // --- Regression tests for round-3 review findings ---
+
+    // Finding A: eviction must respect lane priority. A buffer holding only
+    // control frames must DROP an incoming bulk frame rather than evict a
+    // control frame to admit it (the old eviction shed the least-important
+    // *non-empty* lane, which was control here).
+    #[tokio::test]
+    async fn bulk_push_is_dropped_rather_than_evicting_control() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 2;
+        let client = HubClient::spawn(cfg);
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w", "n": 1 }));
+        client.enqueue(Lane::Control, Family::Claim, json!({ "instance": "w", "n": 2 }));
+        // Buffer is now full of control. A bulk push must be dropped on the floor.
+        client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": 3 }));
+        let frames = buffered(&client);
+        assert_eq!(frames.len(), 2, "bulk must be dropped, not buffered");
+        assert!(
+            frames.iter().all(|(l, _, _)| *l == Lane::Control),
+            "both control frames must survive a bulk push at capacity"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding A sibling: an interactive frame may evict bulk but never control.
+    #[tokio::test]
+    async fn interactive_push_evicts_bulk_not_control_at_capacity() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 2;
+        let client = HubClient::spawn(cfg);
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
+        client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": 1 }));
+        // Full: one control + one bulk. Interactive evicts the bulk, keeps control.
+        client.enqueue(Lane::Interactive, Family::Relay, json!({ "steer": true }));
+        let frames = buffered(&client);
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames.iter().any(|(l, _, _)| *l == Lane::Control),
+            "control must survive an interactive push"
+        );
+        assert!(
+            frames.iter().any(|(l, _, _)| *l == Lane::Interactive),
+            "interactive frame must be admitted"
+        );
+        assert!(
+            !frames.iter().any(|(l, _, _)| *l == Lane::Bulk),
+            "bulk must be the evicted lane"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding C: route_inbound must reject a payload carrying `op` — our own
+    // `{op:"produce", stream, chunk}` transcript echoed back must NOT be decoded
+    // as inbound steer and re-injected into its own agent.
+    #[tokio::test]
+    async fn inbound_produce_echo_with_op_is_not_routed_as_steer() {
+        let client = HubClient::spawn(test_config());
+        let mut session = client.register_session("w-op", capability(), "job-op");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-op", "job-op");
+        client.route_inbound(&json!({
+            "op": "produce",
+            "stream": stream,
+            "chunk": "do the thing",
+        }));
+        assert!(
+            steer.try_recv().is_err(),
+            "a produce echo (has `op`) must not be routed as steer"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding F: resync must not duplicate a REGISTER/CLAIM already buffered
+    // while disconnected, and must emit REGISTER before CLAIM.
+    #[tokio::test]
+    async fn resync_dedups_buffered_presence_and_orders_register_before_claim() {
+        let client = HubClient::spawn(test_config());
+        // Buffered by register_session while "disconnected": a REGISTER + CLAIM.
+        let _session = client.register_session("w-rs", capability(), "job-rs");
+        client.resync_presence();
+        let frames = buffered(&client);
+        let registers = frames
+            .iter()
+            .filter(|(_, f, _)| *f == Family::Register)
+            .count();
+        let claims = frames.iter().filter(|(_, f, _)| *f == Family::Claim).count();
+        assert_eq!(registers, 1, "REGISTER must not be duplicated by resync");
+        assert_eq!(claims, 1, "CLAIM must not be duplicated by resync");
+        let reg_pos = frames.iter().position(|(_, f, _)| *f == Family::Register);
+        let claim_pos = frames.iter().position(|(_, f, _)| *f == Family::Claim);
+        assert!(
+            reg_pos < claim_pos,
+            "REGISTER must drain before CLAIM after resync"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding B: the transcript sink is bounded, so a stalled consumer cannot
+    // grow it without limit.
+    #[tokio::test]
+    async fn transcript_sink_is_bounded() {
+        let client = HubClient::spawn(test_config());
+        let mut session = client.register_session("w-b", capability(), "job-b");
+        let sink = session.transcript_sink().expect("transcript sink");
+        assert_eq!(sink.max_capacity(), TRANSCRIPT_CHANNEL_BOUND);
+        client.shutdown().await;
+    }
+
+    // Findings D + E: shutdown signals AND awaits the connection task, and the
+    // connect loop is racing shutdown — so shutdown returns promptly even when
+    // the client has never managed to connect (and is mid-backoff/connect).
+    #[tokio::test]
+    async fn shutdown_awaits_task_and_returns_promptly_when_never_connected() {
+        let client = HubClient::spawn(test_config()); // port 1: never connects
+        let _session = client.register_session("w-sd", capability(), "job-sd");
+        tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("shutdown must return promptly, not hang on connect/backoff");
     }
 }

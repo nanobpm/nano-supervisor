@@ -413,7 +413,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // Stop the agentic hub (issue #10): deregister the worker and let its
     // connection task exit. Best-effort — a never-connected hub is a no-op.
     if let Some(hub) = &hub {
-        hub.shutdown();
+        hub.shutdown().await;
     }
 
     // Tear the control socket down: stop accepting, remove the socket file and

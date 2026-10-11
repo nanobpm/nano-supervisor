@@ -62,8 +62,9 @@ struct Shared {
     /// Optional live sink for raw ACP `session/update` objects (issue #10): when
     /// a job runs under the agentic hub, every update is forwarded here so the
     /// hub session can bridge it to a transcript frame. `None` keeps the agent's
-    /// behaviour identical to a hub-less run.
-    transcript: Option<mpsc::UnboundedSender<Value>>,
+    /// behaviour identical to a hub-less run. Bounded (see `register_session`):
+    /// on overflow the update is dropped rather than blocking the ACP read loop.
+    transcript: Option<mpsc::Sender<Value>>,
 }
 
 pub struct Agent {
@@ -173,7 +174,7 @@ impl Agent {
     /// hub-less run never calls this and behaves identically.
     pub fn attach_hub(
         &mut self,
-        transcript: mpsc::UnboundedSender<Value>,
+        transcript: mpsc::Sender<Value>,
         steer: mpsc::UnboundedReceiver<crate::hub::control::ControlFrame>,
     ) {
         self.shared.lock().unwrap().transcript = Some(transcript);
@@ -685,10 +686,12 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
             let update = &msg["params"]["update"];
             // Live transcript bridge (issue #10): forward the raw update to the
             // hub session, if one is attached, BEFORE the local accounting below.
-            // An unbounded send never blocks under the shared lock; a closed
-            // receiver (the session ended) just drops the update.
+            // The sink is BOUNDED, and this runs under the shared lock, so use a
+            // non-blocking `try_send`: on a full channel (a transcript consumer
+            // falling behind) or a closed receiver (the session ended) the update
+            // is dropped rather than stalling the ACP read loop under the lock.
             if let Some(tx) = &s.transcript {
-                let _ = tx.send(update.clone());
+                let _ = tx.try_send(update.clone());
             }
             // Count effective transcript turns / valid plans the Node way, BEFORE
             // the narrower match below (which only tracks message text and tool

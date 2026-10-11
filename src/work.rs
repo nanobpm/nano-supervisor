@@ -422,7 +422,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     // Stop the agentic hub (issue #10) before cleanup: deregister and let its
     // connection task exit. A never-configured hub is `None` and a no-op.
     if let Some(hub) = &hub {
-        hub.shutdown();
+        hub.shutdown().await;
     }
     // Drop this worker's namespace on a clean exit, unless `--keep-runs`. Only
     // remove it when EMPTY: `execute` intentionally retains failed run dirs for
