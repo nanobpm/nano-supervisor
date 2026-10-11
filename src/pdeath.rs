@@ -132,7 +132,7 @@ pub(crate) fn sigkill_group(_pid: u32) {}
 /// `kill(-self_pid)` there targets a nonexistent group named by the daemon's pid
 /// and the daemon survives; worse, `self_pid`'s real group is the *shared* test
 /// group, so a group kill would be aimed at the harness and its siblings. The
-/// orphan #54 is about is the supervisor process itself, and its own children
+/// orphan #54 is about the supervisor process itself, and its own children
 /// (agents, each in its own `process_group(0)` group with a parent-death binding
 /// or reap watchdog) are reaped by the existing machinery when it dies — so the
 /// correct, group-agnostic target is the pid. Harmless if already gone (`ESRCH`).
@@ -220,9 +220,12 @@ pub fn test_owner_pid() -> Option<u32> {
 /// Arm the contract-test owner watchdog (issue #54). When this daemon/worker was
 /// started by the hermetic test harness (a parseable `C8CTL_NANO_TEST_OWNER_PID`
 /// is present), spawn a detached `__owner-watchdog` process that SIGKILLs THIS
-/// process's group the moment the owning test process is gone — covering the
+/// process (by pid) the moment the owning test process is gone — covering the
 /// cases `Drop for TempHome` cannot: a SIGKILL, a timeout kill, Ctrl-C, or
-/// `panic=abort`, none of which unwind. The watchdog also fires when the test's
+/// `panic=abort`, none of which unwind. The signal targets the daemon's pid, not
+/// its process group: the daemon is not its own group leader (it shares the
+/// invoking test's group), so a group kill would miss it and aim at the harness.
+/// The watchdog also fires when the test's
 /// `C8CTL_NANO_HOME` directory disappears (the `TempDir` was removed from under
 /// a still-running daemon), which covers a recycled owner pid.
 ///
@@ -252,19 +255,31 @@ pub fn arm_owner_watchdog() {
 /// dead) or merely belongs to a concurrently-running test (owner alive).
 pub const OWNER_PID_FILE: &str = "ct-owner.pid";
 
-/// The owner process's start time (Linux `/proc/<pid>/stat` field 22), captured
-/// while the owner is guaranteed alive so the owner watchdog can detect a
-/// *recycled* owner pid: a bare `kill(pid, 0)` answers success for the unrelated
-/// process that reused the number, so without an incarnation token the watchdog
-/// would wait on it forever and orphan the daemon (issue #54 review). `None`
-/// off Linux (no tick source) or when the read fails; the watchdog then falls
-/// back to the liveness-plus-home check alone.
+/// The owner process's start time, captured while the owner is guaranteed alive
+/// so the owner watchdog can detect a *recycled* owner pid: a bare
+/// `kill(pid, 0)` answers success for the unrelated process that reused the
+/// number, so without an incarnation token the watchdog would wait on it forever
+/// and orphan the daemon (issue #54 review). Sourced from Linux
+/// `/proc/<pid>/stat` field 22 and from macOS `proc_pidinfo` (via
+/// [`leader_identity`]); `None` on a platform with no start-time source or when
+/// the read fails, in which case the watchdog falls back to the
+/// liveness-plus-home check alone.
 #[cfg(target_os = "linux")]
 fn owner_start_time(owner: u32) -> Option<u64> {
     parent_start_time(owner)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn owner_start_time(owner: u32) -> Option<u64> {
+    // macOS has no `/proc/<pid>/stat`, but `leader_identity` already reads the
+    // process start time via `proc_pidinfo(PROC_PIDTBSDINFO)` (folded to
+    // microseconds). Reuse it so owner-PID-reuse detection works on macOS too —
+    // the original fleet failure was on macOS, so disabling the incarnation
+    // check here would let a recycled owner pid strand the daemon indefinitely.
+    leader_identity(owner).map(|id| id.start)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn owner_start_time(_owner: u32) -> Option<u64> {
     None
 }
@@ -1470,6 +1485,51 @@ mod tests {
         // And the matching token must NOT read as owner death.
         let owner_gone_ok =
             !pid_alive(me) || (Some(real).is_some_and(|s| parent_start_time(me) != Some(s)));
+        assert!(
+            !owner_gone_ok,
+            "the matching token must not read as owner death"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_start_time_reads_own_incarnation() {
+        // The macOS owner-PID-reuse token comes from `proc_pidinfo` (via
+        // `leader_identity`), not `/proc`. Our own process is alive, so its
+        // start time must be readable and stable across reads — the value the
+        // daemon captures at arm and hands to the watchdog so a recycled owner
+        // pid (still answering `kill(_, 0)`) is detected as owner death. This
+        // is the regression test for the review finding that macOS previously
+        // returned `None` here, disabling owner-incarnation checking on the very
+        // platform the fleet failure occurred on.
+        let me = std::process::id();
+        let a = owner_start_time(me).expect("own start time readable");
+        let b = owner_start_time(me).expect("own start time readable");
+        assert_eq!(a, b);
+        assert!(a > 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_recycle_is_detected_as_a_start_time_mismatch() {
+        // The comparison the owner watchdog makes each poll: a live process whose
+        // start time differs from the token captured at arm is a *recycled* pid,
+        // not the original owner — treat it as owner death. Model the recycle by
+        // comparing our own live process against a forged token; the mismatch
+        // must read as "owner gone".
+        let me = std::process::id();
+        let real = owner_start_time(me).expect("own start time readable");
+        let forged = real.wrapping_add(1);
+        // Mirror the watchdog's `owner_gone` expression.
+        let owner_gone =
+            !pid_alive(me) || (Some(forged).is_some_and(|s| owner_start_time(me) != Some(s)));
+        assert!(
+            owner_gone,
+            "a start-time mismatch on a live pid must read as owner death (recycled pid)"
+        );
+        // And the matching token must NOT read as owner death.
+        let owner_gone_ok =
+            !pid_alive(me) || (Some(real).is_some_and(|s| owner_start_time(me) != Some(s)));
         assert!(
             !owner_gone_ok,
             "the matching token must not read as owner death"

@@ -98,8 +98,10 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-/// Wait up to `timeout` for `cond`, polling every 25ms, reaping `reap` each pass
-/// so a SIGKILLed child does not linger as a zombie that still answers `kill(_,0)`.
+/// Wait up to `timeout` for `cond`, polling every 25ms. The caller's `cond`
+/// reaps its child (e.g. via `try_wait`) on each pass so a SIGKILLed child does
+/// not linger as a zombie that still answers `kill(_,0)`; `eventually` itself
+/// only evaluates `cond` and takes no reaping parameter.
 #[cfg(unix)]
 fn eventually<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
     let deadline = Instant::now() + timeout;

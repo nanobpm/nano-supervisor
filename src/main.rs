@@ -264,8 +264,9 @@ enum Cmd {
         #[arg(long)]
         pgid_uid: Option<u32>,
     },
-    /// Internal: the contract-test owner watchdog (kills this daemon's process
-    /// group when the owning test process dies without unwinding, issue #54).
+    /// Internal: the contract-test owner watchdog (kills this daemon's process —
+    /// by pid, not its process group, since the daemon is not its own group
+    /// leader — when the owning test process dies without unwinding, issue #54).
     /// Not for direct use.
     #[command(name = "__owner-watchdog", hide = true)]
     OwnerWatchdog {

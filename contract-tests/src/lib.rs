@@ -261,6 +261,20 @@ impl TempHome {
             .prefix("ct-home-")
             .tempdir()
             .expect("create temp C8CTL_NANO_HOME");
+        // Issue #54 review: record the owning test process in `<home>/ct-owner.pid`
+        // HERE, at home creation — before either target can start a daemon. The
+        // Rust daemon's `arm_owner_watchdog` also writes this marker, but a live
+        // Node-target daemon (the external `c8 nano` plugin) never does, so
+        // without this write the next concurrently-created `TempHome`'s startup
+        // sweep would classify this active Node home as "no owner marker" →
+        // orphaned and force-stop its live daemon. Stamping the harness's own
+        // pid here makes the sweep's liveness guard target-agnostic and removes
+        // that race. Best-effort: a write failure just means the sweep falls
+        // back to the daemon's own marker (Rust) or treats the home as orphaned.
+        let _ = std::fs::write(
+            dir.path().join("ct-owner.pid"),
+            std::process::id().to_string(),
+        );
         TempHome { dir, target }
     }
 
@@ -359,10 +373,11 @@ impl Drop for TempHome {
         // it exits), so a still-live daemon is given the chance to stop cleanly
         // before this home's `TempDir` is deleted. A daemon that ignores the stop
         // is still reaped: it watches its `C8CTL_NANO_TEST_OWNER_PID` and this
-        // home, and the owner watchdog SIGKILLs its process group once the owner
-        // is gone or — once the `TempDir` below deletes this home — the home
-        // disappears. So no daemon outlives its test even when `Drop` is the only
-        // cleanup that ran.
+        // home, and the owner watchdog SIGKILLs the daemon process (by pid — the
+        // daemon is not its own process-group leader, so its shared test group
+        // must never be signalled) once the owner is gone or — once the `TempDir`
+        // below deletes this home — the home disappears. So no daemon outlives
+        // its test even when `Drop` is the only cleanup that ran.
         let deadline = Instant::now() + DROP_STOP_GRACE;
         while Instant::now() < deadline {
             // The socket is removed by the daemon as it exits; once it no longer
