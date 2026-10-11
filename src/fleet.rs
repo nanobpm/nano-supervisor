@@ -2360,6 +2360,12 @@ mod tests {
 
     #[test]
     fn manifest_path_accepts_plain_names() {
+        // Resolving a valid name reads the state home (`home_dir`), so this test
+        // must hold the env lock like every other state-home reader: a sibling
+        // test (`lock_base_is_invariant_to_environment`) removes `HOME` while it
+        // holds the lock, and without a deterministic `C8CTL_NANO_HOME` here a
+        // concurrent run would see neither var and panic resolving the home.
+        let _cfg = TempCfg::new();
         for good in ["default", "my-fleet", "fleet_2", "x.y"] {
             let p = manifest_path(good).unwrap_or_else(|e| panic!("{good:?}: {e}"));
             assert_eq!(

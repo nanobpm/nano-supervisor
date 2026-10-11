@@ -105,7 +105,17 @@ fn state_writes_stay_under_home() {
     // or manifests to an unexpected path would still pass the two `is_file`
     // checks above. So enumerate every file actually written under the home and
     // assert it is *exactly* the documented set — any extra file is a leak.
-    let mut written = files_under(home.path());
+    //
+    // The `ct-owner.pid` ownership marker (and its `.pid.tmp` write sibling) is
+    // written by the *harness* (`TempHome`), not the plugin under test: it is
+    // stamped into every home at creation so a concurrent startup sweep can tell
+    // a live home from an orphaned one (issue #54). Exclude it here — it is a
+    // harness artifact, not a plugin state write, so counting it would mis-report
+    // a leak that the plugin never caused.
+    let mut written: Vec<String> = files_under(home.path())
+        .into_iter()
+        .filter(|f| f != "ct-owner.pid" && f != "ct-owner.pid.tmp")
+        .collect();
     written.sort();
     assert_eq!(
         written,

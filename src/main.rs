@@ -265,6 +265,41 @@ enum Cmd {
         #[arg(long)]
         pgid_uid: Option<u32>,
     },
+    /// Internal: the contract-test owner watchdog (kills this daemon's process —
+    /// by pid, not its process group, since the daemon is not its own group
+    /// leader — when the owning test process dies without unwinding, issue #54).
+    /// Not for direct use.
+    #[command(name = "__owner-watchdog", hide = true)]
+    OwnerWatchdog {
+        /// The owning test process the harness stamped (`C8CTL_NANO_TEST_OWNER_PID`).
+        #[arg(long)]
+        owner_pid: u32,
+        /// The daemon/worker process to reap once the owner is gone.
+        #[arg(long)]
+        self_pid: u32,
+        /// The test's `C8CTL_NANO_HOME`; its disappearance also trips the watchdog.
+        #[arg(long)]
+        home: PathBuf,
+        /// The owner's start time (Linux `/proc/<pid>/stat` field 22), captured
+        /// by the daemon *before* launching this watchdog so a recycled owner pid
+        /// — still answering `kill(_, 0)` for the unrelated reuser — is detected
+        /// as owner death rather than waited on forever (issue #54 review).
+        #[arg(long)]
+        owner_start: Option<u64>,
+        /// The daemon's own start time, captured at arm (the incarnation half of
+        /// issue #27's recycle guard). Together with `--self-uid` it lets the
+        /// watchdog verify the pid still names THIS daemon incarnation — not an
+        /// unrelated process that recycled the pid — before the cleanup SIGKILL.
+        /// The daemon is a non-leader in the shared test group, so this is a
+        /// per-pid identity check (`pid_identity_matches` on `self_pid`), never a
+        /// pgid/group check.
+        #[arg(long)]
+        self_start: Option<u64>,
+        /// The daemon's own real uid, captured at arm; disambiguates a cross-user
+        /// pid recycle that lands on the same start-time tick.
+        #[arg(long)]
+        self_uid: Option<u32>,
+    },
 }
 
 /// `supervisor` subcommands implemented on the Rust target.
@@ -537,6 +572,21 @@ async fn main() -> Result<()> {
         } => {
             tokio::task::spawn_blocking(move || {
                 pdeath::reap_watchdog(parent_pid, pgid, parent_start, pgid_start, pgid_uid)
+            })
+            .await
+            .ok();
+            Ok(())
+        }
+        Cmd::OwnerWatchdog {
+            owner_pid,
+            self_pid,
+            home,
+            owner_start,
+            self_start,
+            self_uid,
+        } => {
+            tokio::task::spawn_blocking(move || {
+                pdeath::owner_watchdog(owner_pid, self_pid, home, owner_start, self_start, self_uid)
             })
             .await
             .ok();

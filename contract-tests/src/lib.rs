@@ -100,6 +100,25 @@ fn apply_hermetic_env(c: &mut Command, home: &Path, target: Target) {
     }
     c.env("C8CTL_NANO_NO_LAUNCHD", "1")
         .env("NANO_NO_UPDATE_NOTIFIER", "1");
+    // Issue #54: bind any daemon/worker this command starts to THIS test process.
+    // The daemon watches the owner pid (and its `C8CTL_NANO_HOME`) and
+    // self-terminates when the owner is gone, so a test killed without unwinding
+    // (SIGKILL, a timeout kill, `panic=abort`) can never orphan a live daemon —
+    // the `Drop for TempHome` cleanup does not run in those cases. Stamping the
+    // harness's own pid here means every spawned target inherits the binding.
+    c.env("C8CTL_NANO_TEST_OWNER_PID", std::process::id().to_string());
+    // Issue #54 review (r4240055588): also stamp the owner's *start-time
+    // incarnation* token, captured HERE while the harness is still known alive.
+    // The daemon's owner watchdog prefers this over reading the owner's start
+    // time itself: a child-side read races a harness SIGKILL during startup — if
+    // the owner pid is recycled in that window the daemon binds to the unrelated
+    // reuser and both its liveness and start-time checks pass forever, orphaning
+    // the daemon. Stamping the token while we are provably the owner closes that
+    // race. `None` only off Linux/macOS, where the watchdog degrades to the
+    // liveness-plus-home check (no worse than before).
+    if let Some(start) = owner_start_token() {
+        c.env("C8CTL_NANO_TEST_OWNER_START", start);
+    }
 }
 
 /// Which implementation the suite exercises, chosen by `NS_TARGET` (default
@@ -243,10 +262,42 @@ impl TempHome {
 
     /// Create a new isolated home for a specific target.
     pub fn with_target(target: Target) -> TempHome {
+        // Issue #54: before this test runs, sweep any daemon orphaned by an
+        // EARLIER crashed/killed test — one whose `ct-home-*` no live test owns
+        // (its owner pid is gone) or whose home directory already vanished.
+        // `Drop` covers the unwind path; this covers the leftovers from runs
+        // where even the owner-death self-termination could not help (e.g. an
+        // older binary, or a daemon killed before it bound its owner).
+        sweep_orphaned_daemons();
         let dir = tempfile::Builder::new()
             .prefix("ct-home-")
             .tempdir()
             .expect("create temp C8CTL_NANO_HOME");
+        // Issue #54 review: record the owning test process in `<home>/ct-owner.pid`
+        // HERE, at home creation — before either target can start a daemon. The
+        // Rust daemon's `arm_owner_watchdog` also writes this marker, but a live
+        // Node-target daemon (the external `c8 nano` plugin) never does, so
+        // without this write the next concurrently-created `TempHome`'s startup
+        // sweep would classify this active Node home as "no owner marker" →
+        // orphaned and force-stop its live daemon. Stamping the harness's own
+        // pid here makes the sweep's liveness guard target-agnostic and removes
+        // that race. The marker is `<pid> <start>`: the start-time incarnation
+        // token (captured while we are provably alive) lets the sweep reject a
+        // *recycled* owner pid, not just a dead one — a bare `kill(pid, 0)` also
+        // answers success for an unrelated process that reused the number, which
+        // would keep an orphaned home alive forever (issue #54 review
+        // r4240055588). Best-effort: a write failure just means the sweep falls
+        // back to the daemon's own marker (Rust) or treats the home as orphaned.
+        let mut marker = std::process::id().to_string();
+        if let Some(start) = owner_start_token() {
+            marker.push(' ');
+            marker.push_str(&start);
+        }
+        // Write the marker atomically (temp file + rename): a truncating write
+        // would let a concurrently-created `TempHome`'s startup sweep read the
+        // marker mid-write (empty/partial), fail to parse an owner, and classify
+        // this live home as orphaned — removing it and tripping the watchdog.
+        write_owner_marker_atomic(&dir.path().join("ct-owner.pid"), &marker);
         TempHome { dir, target }
     }
 
@@ -336,12 +387,57 @@ impl Drop for TempHome {
         // dropped home never orphans a background process. Ignore every error —
         // the common case is that no daemon was ever started.
         let sock = self.socket_path();
-        if sock.exists() {
-            let _ = control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }));
+        if !sock.exists() {
+            return;
+        }
+        let _ = control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }));
+        // Issue #54: don't fire-and-forget. After the force-stop, give the daemon
+        // a bounded window to release its control socket (the daemon removes it as
+        // it exits), so a still-live daemon is given the chance to stop cleanly
+        // before this home's `TempDir` is deleted. A daemon that ignores the stop
+        // is still reaped: it watches its `C8CTL_NANO_TEST_OWNER_PID` and this
+        // home, and the owner watchdog SIGKILLs the daemon process (by pid — the
+        // daemon is not its own process-group leader, so its shared test group
+        // must never be signalled) once the owner is gone or — once the `TempDir`
+        // below deletes this home — the home disappears. So no daemon outlives
+        // its test even when `Drop` is the only cleanup that ran.
+        let deadline = Instant::now() + DROP_STOP_GRACE;
+        while Instant::now() < deadline {
+            // The socket is removed by the daemon as it exits; once it no longer
+            // answers a connect the daemon is gone (or never was).
+            if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Remove the socket file only once the daemon stopped answering it (the
+        // loop above broke on a failed connect, so the daemon is gone and the
+        // file is stale): a later test's startup sweep must not mistake it for a
+        // live daemon. If the daemon is STILL accepting after the grace (a live
+        // listener), leave the pathname in place — unlinking a live Unix socket
+        // does not terminate its process, it only strips the name every later
+        // sweep needs to reach and stop it, stranding an unreachable orphan
+        // (issue #54 review). The Rust target's owner watchdog is the reaper
+        // that still converges that daemon (it fires on owner death or on this
+        // home's `TempDir` removal below); retaining the socket lets a later
+        // sweep retry the stop in the meantime.
+        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
             let _ = std::fs::remove_file(&sock);
         }
     }
 }
+
+/// How long `Drop for TempHome` waits for a force-stopped daemon to release its
+/// control socket. If the daemon stops answering within the grace, its socket
+/// file is stale and `Drop` removes it. If the daemon is STILL accepting
+/// connections after the grace (a live listener we could not stop in time),
+/// `Drop` intentionally RETAINS the socket file: unlinking a live Unix socket
+/// does not terminate its process, it only strips the name a later startup
+/// sweep needs to reach and stop it, stranding an unreachable orphan. Keep that
+/// retention when changing this cleanup so the unreachable-orphan bug is not
+/// reintroduced (issue #54 review); the Rust target's owner watchdog converges
+/// such a daemon in the meantime.
+const DROP_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Derive the plugin's control-socket path for a given home directory. Mirrors
 /// the Node plugin exactly: `join(tmpdir(), "c8ctl-nano-sup-<sha1(home)[:8]>.sock")`.
@@ -351,6 +447,266 @@ pub fn supervisor_socket_path(home: &Path) -> PathBuf {
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     std::env::temp_dir().join(format!("c8ctl-nano-sup-{}.sock", &hex[..8]))
+}
+
+/// Issue #54 startup sweep: stop any supervisor daemon orphaned by an EARLIER
+/// contract-test run that died without unwinding. Runs at the top of every new
+/// [`TempHome`] so leftovers from a crashed/killed `cargo test` are reclaimed
+/// before this test starts, rather than accumulating on a fleet machine.
+///
+/// A leftover is recognised by its `ct-home-*` state home in the system temp
+/// dir. To avoid disturbing a *concurrently-running* test's live daemon (every
+/// test in one `cargo test` process shares the same owner pid), a home is only
+/// treated as orphaned when its recorded owner pid (`ct-owner.pid`, written by
+/// the daemon when it armed its owner watchdog) is **gone** — or when there is
+/// no owner marker at all (an older binary that never wrote one). For each
+/// orphaned home whose daemon still answers its control socket we force-stop it.
+/// The daemon's own owner watchdog is the primary reaper; this sweep is the
+/// backstop for a daemon started by an older binary or one that never bound its
+/// owner. Best-effort and cheap: it never touches a home that is not a
+/// `ct-home-*` test dir, so it can never disturb a real fleet.
+fn sweep_orphaned_daemons() {
+    let tmp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&tmp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only ever look at contract-test homes — never a real fleet's home.
+        if !name.starts_with("ct-home-") {
+            continue;
+        }
+        let home = entry.path();
+        // Classify ownership: only a home whose marker positively names a
+        // dead/recycled owner (Orphaned) or one with no readable marker whose
+        // supervisor endpoint we can positively confirm (Unknown) may be
+        // reclaimed. A home with a live, matching owner marker belongs to a
+        // concurrently-running test and must be left entirely alone.
+        let ownership = classify_home(&home);
+        if matches!(ownership, HomeOwnership::Live) {
+            continue;
+        }
+        let sock = supervisor_socket_path(&home);
+        let mut endpoint_confirmed = false;
+        if sock.exists() {
+            // Ask whatever is at this socket to stop. A *genuine* supervisor
+            // answers the `stop` op with a terminal `{type:"stopped", final:true}`
+            // frame (see `contract-tests/fixtures/socket-protocol.md`); only that
+            // positive protocol response proves a supervisor daemon lived at this
+            // home. A stale leftover socket file (no listener), or an unrelated
+            // program that happens to hold a socket at this derived path, yields
+            // no such response and must NOT be treated as identification — for an
+            // `Unknown`/markerless home that would let a stale socket authorise
+            // deleting a directory we never proved is ours (issue #54 review
+            // r4240279294).
+            let answered_stop =
+                control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }))
+                    .ok()
+                    .is_some_and(|frames| {
+                        frames.iter().any(|f| {
+                            f.get("final").and_then(|v| v.as_bool()).unwrap_or(false)
+                                && f.get("type").and_then(|v| v.as_str()) == Some("stopped")
+                        })
+                    });
+            if answered_stop {
+                // A real supervisor acknowledged the force-stop: give it a bounded
+                // moment to exit before removing the (soon-stale) socket file. Its
+                // owner watchdog will SIGKILL it regardless once it notices the
+                // dead owner; this just hurries a clean stop along.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline
+                    && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            // If something is STILL accepting on the socket — the stop was never
+            // acknowledged (stale/unrelated listener) or the deadline expired —
+            // leave both the pathname and the home in place: unlinking a live Unix
+            // socket does not kill its process, it only strips the one name a
+            // later sweep (or this daemon's own owner watchdog, which needs no
+            // socket) could use to reach and stop it, stranding an unreachable
+            // orphan (issue #54 review).
+            if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                continue;
+            }
+            // Nothing answers the socket now. Remove the (stale) socket file so a
+            // later sweep is not fooled by it — but ONLY treat this as positive
+            // supervisor identification when we actually received the terminal
+            // `stopped` response above. A socket file with no valid protocol
+            // response is a stale/unrelated leftover: clear the pathname, but do
+            // not let it authorise deleting a markerless home (issue #54 review
+            // r4240279294).
+            let _ = std::fs::remove_file(&sock);
+            endpoint_confirmed = answered_stop;
+        }
+        // Recursive deletion is gated on POSITIVE ownership, not the `ct-home-`
+        // prefix alone (issue #54 review): a same-user directory under TMPDIR
+        // with that prefix but no readable marker could be unrelated, and
+        // `remove_dir_all` would destroy its contents. Remove only when either:
+        //   - the marker positively named a dead/recycled owner (Orphaned) — the
+        //     harness wrote that marker, so the home is provably ours; or
+        //   - there was no usable marker (Unknown) but we positively identified a
+        //     supervisor endpoint at this home's derived socket and stopped it.
+        // A markerless home with no reachable supervisor endpoint is left for the
+        // next sweep rather than deleted on the strength of its name alone.
+        let proven_ours = matches!(ownership, HomeOwnership::Orphaned) || endpoint_confirmed;
+        if !proven_ours {
+            continue;
+        }
+        // The owner is gone and no live daemon answers this home (either it never
+        // bound a socket, or the force-stop above was confirmed). The home is a
+        // verified orphan: its owning test died without running `TempDir::drop`,
+        // so without this removal every such `ct-home-*` directory would remain
+        // permanently and be rescanned by every future `TempHome` (issue #54
+        // review). Remove the whole tree. `remove_dir_all` on a symlink removes
+        // the link itself rather than following it, so a planted `ct-home-*`
+        // symlink can never redirect the deletion onto a real directory; the
+        // ownership gate above already confines this to a positively-identified
+        // test home, and the removal is best-effort (a busy or read-only tree is
+        // left for the next sweep).
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// A process's start-time incarnation token, in the SAME units the Rust daemon's
+/// owner watchdog compares against (`src/pdeath.rs` `owner_start_time`): Linux
+/// `/proc/<pid>/stat` field 22 (clock ticks since boot), macOS
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` start folded to microseconds. The harness
+/// captures its OWN token (`owner_start_token`) while it is provably alive and
+/// stamps it into `C8CTL_NANO_TEST_OWNER_START` and the `ct-owner.pid` marker, so
+/// neither the daemon's watchdog nor the startup sweep can be fooled by a
+/// recycled owner pid (issue #54 review). `None` on a platform with no
+/// start-time source, or when the read fails, in which case the consumer
+/// degrades to the bare-liveness check.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) can contain spaces and parens, so parse from just past
+    // the final ')': field 3 (state) is then the first token, so starttime
+    // (field 22) is the 20th token — 0-based index 19.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // Mirror `src/pdeath.rs` `leader_identity`: `proc_pidinfo(PROC_PIDTBSDINFO)`
+    // start time, folded to microseconds for a single comparable token.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        );
+        if n <= 0 {
+            return None;
+        }
+        info.pbi_start_tvsec
+            .checked_mul(1_000_000)?
+            .checked_add(info.pbi_start_tvusec)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// This harness process's start-time incarnation token, stringified for stamping
+/// into the owner env var and the `ct-owner.pid` marker. Captured while we are
+/// the live owner, so it is race-free (issue #54 review). `None` off
+/// Linux/macOS, where the consumer degrades to the liveness check.
+fn owner_start_token() -> Option<String> {
+    process_start_time(std::process::id()).map(|s| s.to_string())
+}
+
+/// Write the `ct-owner.pid` owner marker **atomically** (temp file + rename) so a
+/// concurrent startup sweep never reads a truncated intermediate and misclassifies
+/// a live home as orphaned (issue #54 review). Mirrors `src/pdeath.rs`
+/// `write_marker_atomic`; the rename is atomic on the same filesystem.
+fn write_owner_marker_atomic(path: &Path, marker: &str) {
+    let tmp = path.with_extension("pid.tmp");
+    if std::fs::write(&tmp, marker).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// The ownership verdict the startup sweep acts on, distinguishing *why* a home
+/// is not currently owned by a live test. The distinction matters because only a
+/// **positive** identification of a dead/recycled owner justifies recursively
+/// deleting the home: a `ct-home-*` *name* alone is not proof this harness owns
+/// the directory (issue #54 review).
+enum HomeOwnership {
+    /// A live, matching owner marker names a concurrently-running test: leave it.
+    Live,
+    /// A readable marker named an owner pid that is now dead or recycled. The
+    /// harness provably wrote the marker, so the home is ours to reclaim.
+    Orphaned,
+    /// No readable/parseable marker (absent, garbage, or an older pid-only
+    /// producer that predates the marker). We cannot prove ownership from the
+    /// marker alone, so the home is only reclaimable after positively
+    /// identifying its supervisor endpoint (a confirmed control socket).
+    Unknown,
+}
+
+/// Classify a `ct-home-*` home for the startup sweep. Reads the owner marker and
+/// reports whether it names a live owner, a positively dead/recycled owner, or is
+/// absent/unparseable. This is the ownership gate on recursive deletion: only
+/// `Orphaned` (a marker we wrote, now dead) authorises removing the home without
+/// further proof.
+#[cfg(unix)]
+fn classify_home(home: &Path) -> HomeOwnership {
+    let Ok(raw) = std::fs::read_to_string(home.join("ct-owner.pid")) else {
+        // No readable marker: cannot prove ownership from the marker alone.
+        return HomeOwnership::Unknown;
+    };
+    let mut fields = raw.split_whitespace();
+    let Some(pid) = fields.next().and_then(|f| f.parse::<i32>().ok()) else {
+        return HomeOwnership::Unknown;
+    };
+    if pid <= 0 {
+        return HomeOwnership::Unknown;
+    }
+    // A parseable marker exists. `kill(pid, 0)`: 0 => alive; EPERM => alive but
+    // not ours; ESRCH => gone.
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !alive {
+        // A valid marker whose owner pid is dead: positively orphaned.
+        return HomeOwnership::Orphaned;
+    }
+    // Recycle guard: when the marker recorded the owner's start-time token,
+    // require the live pid to still be that incarnation; a mismatch means the
+    // owner died and its pid was recycled → positively orphaned. A pid-only
+    // marker (older producer) cannot prove a recycle, so it stays Live on a
+    // live pid (the conservative direction).
+    //
+    // Compare only a SUCCESSFULLY READ token: a failed `process_start_time`
+    // read returns `None`, and `None != Some(token)` would misclassify a
+    // transient `/proc`/`proc_pidinfo` failure as a recycle and let the sweep
+    // force-stop and delete a concurrently running test's home even though
+    // `kill(pid, 0)` just confirmed its owner is alive (issue #54 review). Only
+    // a read that returns a DIFFERENT token proves the recycle; a read failure
+    // degrades to the liveness-only result (Live).
+    if let Some(start) = fields.next().and_then(|f| f.parse::<u64>().ok()) {
+        if matches!(process_start_time(pid as u32), Some(cur) if cur != start) {
+            return HomeOwnership::Orphaned;
+        }
+    }
+    HomeOwnership::Live
+}
+
+/// Non-unix fallback: with no liveness probe we cannot prove a home is orphaned,
+/// so report every home as Live and the sweep never deletes one it cannot prove
+/// is ours.
+#[cfg(not(unix))]
+fn classify_home(_home: &Path) -> HomeOwnership {
+    HomeOwnership::Live
 }
 
 /// The reason an engine-dependent test cannot run. Print it and return early —
@@ -2095,6 +2451,18 @@ mod is_local_tests {
 mod unit {
     use super::*;
 
+    // Issue #54: the four `sweep_*` tests below each stage `ct-home-*`
+    // directories in the shared system temp dir and then call
+    // `sweep_orphaned_daemons()`, which scans *every* `ct-home-*` entry there.
+    // Run in parallel they corrupt one another — a sibling's sweep steals a
+    // test's single-accept answerer, or force-stops/removes a home mid-assertion
+    // (the macOS Node-target flake). Serialize them on one process-wide lock so
+    // each owns the sweep namespace for the whole of its body.
+    fn sweep_serialize_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn socket_path_matches_node_derivation() {
         // sha1("/tmp/ct-b")[:8] cross-checked against the Node plugin.
@@ -2218,5 +2586,301 @@ mod unit {
         let mut silent = outcome;
         silent.output.stderr = b"no settle lines here\n".to_vec();
         assert!(silent.refresh_counts().is_empty());
+    }
+
+    // The startup sweep's ownership gate (`classify_home`) is the production
+    // classifier the sweep actually calls, so the recycle regression must assert
+    // IT directly — a separate copy could pass while the real classifier
+    // regresses (issue #54 review r4240279297). It must treat a *recycled* owner
+    // pid as orphaned, not just a dead one: a bare `kill(pid, 0)` answers success
+    // for whatever unrelated process reused the number after the owner died,
+    // which would keep an orphaned home alive forever (issue #54 review
+    // r4240055588). It must also distinguish an *absent/garbage* marker
+    // (`Unknown` — not provably ours, so not deletable on its own) from a marker
+    // that positively names a dead/recycled owner (`Orphaned`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn classify_home_distinguishes_live_orphaned_and_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let me = std::process::id();
+        let marker = home.join("ct-owner.pid");
+
+        // Live pid + its REAL start token => the owner is genuinely alive => Live.
+        let start = process_start_time(me).expect("own start time readable");
+        std::fs::write(&marker, format!("{me} {start}")).unwrap();
+        assert!(
+            matches!(classify_home(home), HomeOwnership::Live),
+            "matching start token on a live pid => Live"
+        );
+
+        // Live pid + a STALE start token models a recycled owner pid: liveness
+        // passes but the incarnation no longer matches, so the home is positively
+        // Orphaned. No real process has start time 1, so it can never match ours.
+        std::fs::write(&marker, format!("{me} 1")).unwrap();
+        assert!(
+            matches!(classify_home(home), HomeOwnership::Orphaned),
+            "stale start token => recycled owner pid => Orphaned"
+        );
+
+        // A pid-only marker (older producer) degrades to the liveness check: a
+        // live pid stays Live (the conservative direction — we cannot prove a
+        // recycle without a token).
+        std::fs::write(&marker, me.to_string()).unwrap();
+        assert!(
+            matches!(classify_home(home), HomeOwnership::Live),
+            "pid-only marker on a live pid => liveness-only => Live"
+        );
+
+        // A dead owner pid (a near-max pid no live process holds) is a valid
+        // marker positively naming a gone owner => Orphaned.
+        std::fs::write(&marker, "2147483000").unwrap();
+        assert!(
+            matches!(classify_home(home), HomeOwnership::Orphaned),
+            "valid marker naming a dead pid => Orphaned"
+        );
+
+        // An unreadable/garbage marker proves nothing about ownership => Unknown
+        // (NOT Orphaned): the sweep must not delete such a home on the strength of
+        // its name alone (issue #54 review).
+        std::fs::write(&marker, "not-a-pid").unwrap();
+        assert!(
+            matches!(classify_home(home), HomeOwnership::Unknown),
+            "garbage marker => Unknown"
+        );
+
+        // An absent marker is likewise Unknown.
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            matches!(classify_home(home), HomeOwnership::Unknown),
+            "absent marker => Unknown"
+        );
+    }
+
+    // Regression (issue #54 review): the recycle guard must compare only a
+    // SUCCESSFULLY READ start-time token. A failed `process_start_time` read
+    // returns `None`, and `None != Some(token)` would misclassify a transient
+    // `/proc`/`proc_pidinfo` failure as a recycle — letting the sweep force-stop
+    // and delete a concurrently running test's home even though `kill(pid, 0)`
+    // just confirmed its owner is alive. Model the read failure with an
+    // unreadable pid (`u32::MAX`) while the marker's token is real: the guard
+    // expression must NOT fire (it degrades to the liveness-only result).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn classify_home_recycle_guard_ignores_a_failed_start_time_read() {
+        let me = std::process::id();
+        let real = process_start_time(me).expect("own start time readable");
+        // Mirror the fixed guard: only a successfully-read, DIFFERENT token fires.
+        let fires_on_failed_read = matches!(process_start_time(u32::MAX), Some(cur) if cur != real);
+        assert!(
+            !fires_on_failed_read,
+            "a failed start-time read (None) must not satisfy the recycle guard"
+        );
+        // And the guard still fires on a genuinely different, successfully read
+        // token (the recycle it exists to catch).
+        let fires_on_real_recycle =
+            matches!(process_start_time(me), Some(cur) if cur != real.wrapping_add(1));
+        assert!(
+            fires_on_real_recycle,
+            "a successfully-read, different token must still satisfy the recycle guard"
+        );
+        // Sanity: the probe really did fail (returned None) for u32::MAX.
+        assert!(process_start_time(u32::MAX).is_none());
+    }
+
+    // The startup sweep must remove a *verified orphan* home, not just its stale
+    // socket: a test that died without running `TempDir::drop` leaves the whole
+    // `ct-home-*` tree behind, and deleting only the socket lets the leftover
+    // accumulate and be rescanned by every future `TempHome` (issue #54 review).
+    // A home whose owner is still alive must be left entirely alone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_removes_verified_orphan_home() {
+        use std::os::unix::net::UnixListener;
+
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // An orphaned home: a dead owner pid (a near-max pid no live process
+        // holds) and NO control socket. The sweep must remove the whole tree.
+        let orphan = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("orphan home");
+        let orphan_path = orphan.path().to_path_buf();
+        std::fs::write(orphan_path.join("ct-owner.pid"), "2147483000").unwrap();
+        std::fs::write(orphan_path.join("state.json"), "{}").unwrap();
+        // Keep `orphan` alive so its `TempDir` does not delete the dir on drop
+        // before we assert; we leak it deliberately and the sweep removes it.
+        let orphan_path2 = orphan_path.clone();
+        std::mem::forget(orphan);
+
+        // A concurrently-running home: a LIVE owner (this process) with its real
+        // start token. The sweep must not touch it.
+        let live = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("live home");
+        let live_path = live.path().to_path_buf();
+        let me = std::process::id();
+        let start = process_start_time(me).expect("own start time readable");
+        std::fs::write(live_path.join("ct-owner.pid"), format!("{me} {start}")).unwrap();
+        std::fs::write(live_path.join("state.json"), "{}").unwrap();
+
+        // An orphaned home whose daemon is STILL answering its socket: the sweep
+        // force-stops it, but because the (test) listener keeps accepting, the
+        // shutdown is never confirmed, so the home must be LEFT for the next
+        // sweep rather than deleted out from under a live daemon.
+        let busy = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("busy home");
+        let busy_path = busy.path().to_path_buf();
+        std::fs::write(busy_path.join("ct-owner.pid"), "2147483000").unwrap();
+        let busy_sock = supervisor_socket_path(&busy_path);
+        let _listener = UnixListener::bind(&busy_sock).expect("bind busy socket");
+
+        sweep_orphaned_daemons();
+
+        assert!(
+            !orphan_path2.exists(),
+            "verified orphan home (dead owner, no socket) must be removed"
+        );
+        assert!(
+            live_path.exists(),
+            "a home whose owner is still alive must be left alone"
+        );
+        assert!(
+            busy_path.exists(),
+            "a home whose daemon still answers must not be deleted"
+        );
+        let _ = std::fs::remove_file(&busy_sock);
+    }
+
+    // The `ct-home-` prefix is NOT proof of ownership (issue #54 review): a
+    // same-user directory under TMPDIR with that prefix but no readable marker
+    // and no reachable supervisor endpoint could be unrelated, so the sweep must
+    // NOT recursively delete it on the strength of its name alone. Only a
+    // positively-identified orphan (a marker naming a dead owner, or a confirmed
+    // supervisor endpoint) authorises removal.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_leaves_markerless_home_without_endpoint() {
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // A `ct-home-*` directory with NO owner marker and NO control socket:
+        // nothing positively ties it to this harness, so it must be left alone.
+        let stray = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("stray home");
+        let stray_path = stray.path().to_path_buf();
+        std::fs::write(stray_path.join("unrelated.txt"), "not a test home").unwrap();
+        // Deliberately no `ct-owner.pid` and no socket.
+
+        sweep_orphaned_daemons();
+
+        assert!(
+            stray_path.exists(),
+            "a markerless home with no supervisor endpoint must NOT be deleted"
+        );
+        assert!(
+            stray_path.join("unrelated.txt").exists(),
+            "its contents must be intact"
+        );
+    }
+
+    // A markerless home whose supervisor endpoint we CAN positively identify —
+    // a control socket that answers the `stop` op with the protocol's terminal
+    // `{type:"stopped", final:true}` frame and then stops — is provably a
+    // supervisor home, so the sweep reclaims it even without an owner marker (the
+    // legacy-markerless path of issue #54 review).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_removes_markerless_home_with_answered_stop() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let home = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("legacy home");
+        let home_path = home.path().to_path_buf();
+        std::mem::forget(home); // leak; the sweep removes it
+                                // No owner marker, but a socket backed by a listener that speaks the
+                                // control protocol: it accepts one connection, reads the `stop` request,
+                                // answers with the terminal `stopped` frame, then exits — dropping the
+                                // listener so the sweep's confirmation connect fails (daemon stopped).
+        let sock = supervisor_socket_path(&home_path);
+        let listener = UnixListener::bind(&sock).expect("bind legacy socket");
+        let answerer = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"{\"type\":\"stopped\",\"final\":true}\n");
+                let _ = stream.flush();
+            }
+            // listener dropped here => the socket stops answering
+        });
+
+        sweep_orphaned_daemons();
+        let _ = answerer.join();
+
+        assert!(
+            !home_path.exists(),
+            "a markerless home whose endpoint answered the stop protocol must be removed"
+        );
+    }
+
+    // A markerless home with only a STALE or unrelated socket file — nothing ever
+    // answers the `stop` protocol — must NOT be treated as an identified
+    // supervisor home: the sweep clears the stale socket but leaves the directory
+    // untouched, because a bare socket pathname is not proof of ownership (issue
+    // #54 review r4240279294). This is the false-positive the earlier
+    // bind-then-drop test wrongly accepted.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_leaves_markerless_home_with_stale_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let home = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("stale-socket home");
+        let home_path = home.path().to_path_buf();
+        std::fs::write(home_path.join("unrelated.txt"), "not a test home").unwrap();
+        // Bind then immediately drop the listener: the socket FILE lingers but
+        // nothing listens, so no `stopped` response is ever received.
+        let sock = supervisor_socket_path(&home_path);
+        {
+            let listener = UnixListener::bind(&sock).expect("bind stale socket");
+            drop(listener);
+        }
+
+        sweep_orphaned_daemons();
+
+        assert!(
+            home_path.exists(),
+            "a markerless home with only a stale socket must NOT be deleted"
+        );
+        assert!(
+            home_path.join("unrelated.txt").exists(),
+            "its contents must be intact"
+        );
+        assert!(
+            !sock.exists(),
+            "the stale socket file is cleared so a later sweep is not fooled by it"
+        );
     }
 }
