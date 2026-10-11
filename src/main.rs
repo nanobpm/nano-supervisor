@@ -285,13 +285,17 @@ enum Cmd {
         /// as owner death rather than waited on forever (issue #54 review).
         #[arg(long)]
         owner_start: Option<u64>,
-        /// The daemon's own group-leader start time, captured at arm (issue
-        /// #27). Together with `--self-uid` it lets the watchdog verify the
-        /// pid/pgid still names this daemon's group — not a recycled one —
-        /// before the cleanup SIGKILL.
+        /// The daemon's own start time, captured at arm (the incarnation half of
+        /// issue #27's recycle guard). Together with `--self-uid` it lets the
+        /// watchdog verify the pid still names THIS daemon incarnation — not an
+        /// unrelated process that recycled the pid — before the cleanup SIGKILL.
+        /// The daemon is a non-leader in the shared test group, so this is a
+        /// per-pid identity check (`pid_identity_matches` on `self_pid`), never a
+        /// pgid/group check.
         #[arg(long)]
         self_start: Option<u64>,
-        /// The daemon group leader's real uid, captured at arm.
+        /// The daemon's own real uid, captured at arm; disambiguates a cross-user
+        /// pid recycle that lands on the same start-time tick.
         #[arg(long)]
         self_uid: Option<u32>,
     },

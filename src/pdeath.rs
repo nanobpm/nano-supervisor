@@ -217,6 +217,26 @@ pub fn test_owner_pid() -> Option<u32> {
         .filter(|pid| *pid > 0)
 }
 
+/// The owner's start-time incarnation token, captured by the HARNESS while it is
+/// still known to be the owner and stamped into the hermetic environment
+/// (`C8CTL_NANO_TEST_OWNER_START`), exactly as `C8CTL_NANO_TEST_OWNER_PID`
+/// carries the owner pid. Preferring this harness-captured token over a
+/// child-side `owner_start_time` read closes a PID-reuse race: the harness can be
+/// SIGKILLed *after* spawning this daemon but *before* the daemon reads the
+/// owner's start time, and if the owner pid is recycled in that window the
+/// child-side read captures the unrelated replacement's incarnation — so both
+/// the liveness and start-time checks pass forever and the daemon is orphaned
+/// (issue #54 review). `None` when unset, empty, unparseable, or zero (no real
+/// owner process has start time 0, so a stray `0` is garbage, not a token), in
+/// which case the caller falls back to child-side discovery (no worse than
+/// before).
+pub fn test_owner_start() -> Option<u64> {
+    std::env::var("C8CTL_NANO_TEST_OWNER_START")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|start| *start > 0)
+}
+
 /// Arm the contract-test owner watchdog (issue #54). When this daemon/worker was
 /// started by the hermetic test harness (a parseable `C8CTL_NANO_TEST_OWNER_PID`
 /// is present), spawn a detached `__owner-watchdog` process that SIGKILLs THIS
@@ -284,6 +304,23 @@ fn owner_start_time(_owner: u32) -> Option<u64> {
     None
 }
 
+/// Resolve the owner's start-time incarnation token, preferring the value the
+/// HARNESS stamped (`stamped`, read from `C8CTL_NANO_TEST_OWNER_START` while it
+/// was the known owner) over a child-side `owner_start_time(owner)` discovery.
+///
+/// The harness-captured token is race-free; the child-side read is not. If the
+/// harness is SIGKILLed between spawning this daemon and the daemon reaching the
+/// read, and the owner pid is recycled in that window, the child-side read
+/// captures the *replacement* process's start time — so the watchdog's liveness
+/// and incarnation checks both pass forever and the orphaned daemon is never
+/// reaped (issue #54 review r4239955518). Preferring the stamped token closes
+/// that window entirely; falling back to discovery only when the harness did not
+/// stamp one is strictly no worse than before.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_owner_start(stamped: Option<u64>, owner: u32) -> Option<u64> {
+    stamped.or_else(|| owner_start_time(owner))
+}
+
 /// Spawn the detached owner watchdog for `owner`, watching `home`. Returns its
 /// pid, or `None` if it could not be spawned. Split from [`arm_owner_watchdog`]
 /// so the regression test can drive the real subcommand directly.
@@ -293,23 +330,28 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
         return None;
     };
     let self_pid = std::process::id();
-    // Capture the two incarnation tokens HERE, while both processes are
-    // guaranteed alive, and hand them to the watchdog (the same pattern
+    // Capture the incarnation tokens the watchdog needs (the same pattern
     // `spawn_watchdog` uses for `--parent-start`/`--pgid-start`/`--pgid-uid`):
     //
     // - The **owner's start time** lets the watchdog tell a recycled owner pid
     //   apart from the real owner (issue #54 review): a bare pid answers
     //   `kill(_, 0)` for whatever unrelated process reused the number, so a
     //   start-time mismatch — not just liveness — is what proves the owner died.
+    //   We PREFER the token the harness stamped into the environment while it was
+    //   the known owner (`test_owner_start`) over discovering it here in the
+    //   child: discovering it here races a harness SIGKILL during startup that
+    //   recycles the owner pid, which would hand us the replacement's incarnation
+    //   and orphan the daemon forever (r4239955518). We fall back to child-side
+    //   discovery only when the harness stamped nothing.
     // - **Our own pid's identity** gates the watchdog's SIGKILL, so a daemon
     //   that already exited and had its pid recycled by an unrelated process is
     //   never signalled (the same recycled-identity race issue #27 closes for
     //   the agent watchdog, here on the supervisor's pid rather than its group —
     //   the supervisor is not its own group leader, so the watchdog reaps it by
     //   pid; see `owner_watchdog`). `leader_identity` reads `/proc/<self_pid>`
-    //   (start+uid), which is the daemon's own incarnation whether or not it
-    //   leads a group.
-    let owner_start = owner_start_time(owner);
+    //   (start+uid), which is the daemon's own incarnation — a self-read, so
+    //   race-free — whether or not it leads a group.
+    let owner_start = resolve_owner_start(test_owner_start(), owner);
     let self_identity = leader_identity(self_pid);
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__owner-watchdog")
@@ -1501,6 +1543,32 @@ mod tests {
         assert!(
             !owner_gone_ok,
             "the matching token must not read as owner death"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn resolve_owner_start_prefers_stamped_token() {
+        // The harness-stamped owner incarnation token must win over a child-side
+        // `owner_start_time` read, closing the PID-reuse race where the harness
+        // dies during startup and the owner pid is recycled before the child
+        // reads it (issue #54 review r4239955518). Our own live start time is a
+        // stand-in for "what the child would discover"; a forged token distinct
+        // from it proves the stamped value is used verbatim, not the discovered
+        // one.
+        let me = std::process::id();
+        let discovered = owner_start_time(me).expect("own start time readable");
+        let stamped = discovered.wrapping_add(1);
+        assert_eq!(
+            resolve_owner_start(Some(stamped), me),
+            Some(stamped),
+            "a harness-stamped token must be preferred verbatim over child-side discovery"
+        );
+        // With no stamped token, it falls back to child-side discovery.
+        assert_eq!(
+            resolve_owner_start(None, me),
+            Some(discovered),
+            "without a stamped token, fall back to child-side discovery"
         );
     }
 
