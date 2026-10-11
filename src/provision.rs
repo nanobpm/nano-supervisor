@@ -3024,17 +3024,35 @@ async fn git_with_env(
 /// environment.
 ///
 /// Behaviour: emit the credential only for a `get` on the matching host, and
-/// ignore `store`/`erase` (draining their stdin request). The FD read is a
-/// *literal* redirection (`cat <&$NANO_GIT_CRED_FD`, with the number already
-/// substituted into the snippet) because the descriptor is always the fixed
-/// single-digit [`CRED_FD`]: a strict POSIX `/bin/sh` (dash) rejects a
-/// descriptor above 9 in a redirection (`<&10` → `Bad fd number`), and — unlike
-/// busybox `ash` — dash rejects it *even through* an `eval`'d indirection, so
-/// the helper can never rely on a dynamically-allocated high descriptor. The
-/// child's `pre_exec` therefore `dup2`s the pipe onto [`CRED_FD`] (see
-/// [`apply_git_credential`]). A repeated invocation hits EOF on the
-/// already-drained, write-closed pipe and emits an empty password, so git fails
-/// closed rather than hanging on a retry.
+/// ignore `store`/`erase` (draining their stdin request). The secret is read by
+/// **re-opening** the inherited descriptor through its `/dev/fd` path
+/// (`cat /dev/fd/$NANO_GIT_CRED_FD`, with the number already substituted into
+/// the snippet), NOT by a literal `cat <&$NANO_GIT_CRED_FD` redirection. This
+/// matters for two reasons:
+///
+/// * **Replayable across submodule helpers.** The descriptor backs a *seekable*
+///   anonymous file (a Linux `memfd` / POSIX `shm_open` object — see
+///   [`cred_secret_fd`]), not a draining pipe. A `git clone
+///   --recurse-submodules` runs the superproject's credential `get` and then a
+///   *separate* helper process for each private same-host submodule; every one
+///   of them must re-read the SAME secret. `cat <&N` reads through the *shared*
+///   open file description, so the first `get` would advance the offset to EOF
+///   and every later submodule `get` would read an empty password. Re-opening
+///   `/dev/fd/N` creates a *fresh* open file description at offset 0, so each
+///   helper reads the full secret independently. (Copilot review, #62.)
+/// * **No shell redirection of a high descriptor.** `/dev/fd/N` is a *path
+///   argument* to `cat`, not a `<&N` redirection, so a strict POSIX `/bin/sh`
+///   (dash) never has to parse the descriptor number — sidestepping dash's
+///   `Bad fd number` rejection of a multi-digit fd even through `eval`. The
+///   child's `pre_exec` still `dup2`s the secret onto the fixed single-digit
+///   [`CRED_FD`] so the `/dev/fd` path is small and stable (see
+///   [`apply_git_credential`]).
+///
+/// `/dev/fd` is the portable re-open path: on Linux it is a symlink to
+/// `/proc/self/fd`, and on macOS it is the native `fdesc` mount — both re-open
+/// a seekable fd with a fresh offset. The helper tries `/dev/fd` first and
+/// falls back to `/proc/self/fd` so a minimal Linux container that lacks the
+/// `/dev/fd` symlink still resolves the descriptor via procfs.
 ///
 /// Unix-only: referenced solely by the Unix [`apply_git_credential`] (and its
 /// tests), so gated to avoid a dead-code warning on non-Unix builds.
@@ -3044,37 +3062,44 @@ const GIT_CRED_HELPER: &str = "!f() { \
     h=; \
     while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
     test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
-    p=$(cat <&3); \
+    p=$(cat \"/dev/fd/$NANO_GIT_CRED_FD\" 2>/dev/null || cat \"/proc/self/fd/$NANO_GIT_CRED_FD\"); \
     printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$p\"; \
 }; f";
 
-/// The fixed descriptor the credential pipe's read end is remapped onto in the
+/// The fixed descriptor the credential secret file is remapped onto in the
 /// child's `pre_exec` (and that `NANO_GIT_CRED_FD` names). It must be a single
-/// digit (3–9): a strict POSIX `/bin/sh` (dash) refuses a multi-digit
-/// descriptor in a redirection, so a dynamically-allocated high fd would make
-/// the helper's `cat <&N` fail with `Bad fd number` under dash. 3 is the lowest
-/// non-standard descriptor; the `dup2` in `pre_exec` runs after the child's
-/// `Stdio` setup has already bound 0/1/2, so it can never clobber stdio.
+/// digit (3–9): the helper names it in its `/dev/fd/$NANO_GIT_CRED_FD` path
+/// (substituted into the snippet), and keeping it small and fixed makes that
+/// path stable and trivially reviewable. 3 is the lowest non-standard
+/// descriptor; the `dup2` in `pre_exec` runs after the child's `Stdio` setup
+/// has already bound 0/1/2, so it can never clobber stdio. (The single-digit
+/// requirement originally came from a strict POSIX `/bin/sh` rejecting a
+/// multi-digit fd in a `<&N` redirection; the helper now re-opens a `/dev/fd`
+/// *path* instead, so this is about path stability rather than a dash limit.)
 ///
 /// Unix-only: referenced solely by the Unix [`apply_git_credential`] (and its
 /// tests), so gated to avoid a dead-code warning on non-Unix builds.
 #[cfg(unix)]
 const CRED_FD: i32 = 3;
 
-/// Owns the parent's copy of the credential pipe's read end. The caller keeps
+/// Owns the parent's copy of the credential secret descriptor. The caller keeps
 /// it alive until *just after* `spawn` so the inherited FD stays valid through
 /// the fork, then drops it immediately: the child has already `dup2`'d its own
-/// copy onto [`CRED_FD`] (clear of CLOEXEC) in its `pre_exec` (and the write end
-/// is closed inside [`apply_git_credential`]), so once the child is spawned the
-/// parent holds no copy and the pipe reaches EOF for the reader. Dropping it
-/// right after `spawn` — rather than at the end of the command — means the
-/// daemon does not keep a readable copy of the secret-bearing pipe exposed under
+/// copy onto [`CRED_FD`] (clear of CLOEXEC) in its `pre_exec`, so once the
+/// child is spawned the parent holds no copy. Dropping it right after `spawn` —
+/// rather than at the end of the command — means the daemon does not keep a
+/// readable copy of the secret-bearing descriptor exposed under
 /// `/proc/<daemon-pid>/fd` for the lifetime of the git command.
 ///
-/// Unix-only: the pipe is built on `std::os::unix::io::OwnedFd` (see
-/// [`cloexec_pipe`]), which does not exist on other targets.
+/// Unlike the original draining pipe, the descriptor backs a *seekable*
+/// anonymous file (see [`cred_secret_fd`]) so each submodule's credential
+/// helper can re-read the secret; the guard only needs to keep the fd valid
+/// until the child has inherited it, not to impose EOF.
+///
+/// Unix-only: the descriptor is built on `std::os::unix::io::OwnedFd` (see
+/// [`cred_secret_fd`]), which does not exist on other targets.
 #[cfg(unix)]
-struct CredPipe {
+struct CredFd {
     _read: std::os::unix::io::OwnedFd,
 }
 
@@ -3083,20 +3108,23 @@ struct CredPipe {
 /// instead — credential delivery over an inherited FD is not implemented off
 /// Unix), so this carries no state.
 #[cfg(not(unix))]
-struct CredPipe;
+struct CredFd;
 
 /// Create a pipe whose both ends are atomically close-on-exec, so a concurrent
-/// slot's `fork`+`exec` in this multi-threaded daemon can never inherit the
-/// credential pipe through the window between `pipe` and `fcntl(FD_CLOEXEC)`
-/// (an inherited write end would both leak the secret and keep the reader from
-/// ever seeing EOF, hanging authentication).
+/// `fork`+`exec` in this multi-threaded daemon can never inherit it through the
+/// window between `pipe` and `fcntl(FD_CLOEXEC)`.
 ///
 /// Uses Linux's `pipe2(O_CLOEXEC)` where available and falls back to `pipe` +
 /// `fcntl(FD_CLOEXEC)` on other unixes. The fallback re-opens the close-on-exec
 /// race on non-Linux unixes, but `pipe2` is not portable there and the target
 /// platform is Linux; the fallback exists so the crate still builds and runs on
 /// other unixes.
-#[cfg(unix)]
+///
+/// Test-only: the credential secret moved off a pipe onto a seekable
+/// [`cred_secret_fd`] (so submodule helpers can replay it), leaving this helper
+/// with only test callers. Gated to `cfg(test)` to avoid a dead-code warning in
+/// production builds.
+#[cfg(all(unix, test))]
 fn cloexec_pipe() -> Result<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -3169,6 +3197,147 @@ fn raise_above_stdio(fd: std::os::unix::io::OwnedFd) -> Result<std::os::unix::io
     Ok(unsafe { OwnedFd::from_raw_fd(raised) })
 }
 
+/// Create a **seekable, anonymous, close-on-exec** in-memory file holding the
+/// credential secret, and return its read descriptor.
+///
+/// This replaces the original one-shot *pipe*: a pipe is a draining stream, so
+/// the first credential-helper `get` reads it to EOF and every later `get` (a
+/// `git clone --recurse-submodules` runs a *separate* helper process per
+/// private same-host submodule) would read an empty password and fail. A
+/// seekable file lets each helper re-read the SAME secret by re-opening the
+/// inherited descriptor through `/dev/fd` (a fresh open file description at
+/// offset 0), so authenticated recursive submodule clones keep working.
+///
+/// The secret is delivered **out of band**: it is written to an anonymous
+/// in-memory file that never touches disk, is never placed in argv or the
+/// environment (only the non-secret fd number is), and is freed by the kernel
+/// once the last descriptor closes (when the git command and its submodule
+/// children exit). The fd is atomically close-on-exec so a concurrent slot's
+/// `fork`+`exec` in this multi-threaded daemon cannot inherit it; the child's
+/// `pre_exec` clears CLOEXEC only on the single descriptor it hands to git.
+///
+/// Platform backends, both seekable and anonymous:
+///
+/// * **Linux** — `memfd_create(MFD_CLOEXEC)`: a truly unnamed in-memory file.
+/// * **other Unix (macOS, the BSDs)** — `shm_open` of a unique name, then
+///   `shm_unlink` immediately so the object is anonymous thereafter, plus
+///   `FD_CLOEXEC`. `memfd_create` is Linux-only, so the POSIX shared-memory
+///   object is the portable seekable-anonymous equivalent.
+///
+/// The returned descriptor is re-homed above the standard descriptors (see
+/// [`raise_above_stdio`]) so it can never sit on stdin/stdout/stderr.
+///
+/// Unix-only: built on `std::os::unix::io` and `libc`, which do not exist on
+/// other targets.
+#[cfg(unix)]
+fn cred_secret_fd(secret: &[u8]) -> Result<std::os::unix::io::OwnedFd> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    // Bound the secret so a malformed job cannot make the daemon buffer an
+    // unbounded credential in memory. Real git tokens are a few dozen bytes;
+    // 1 MiB is far above any legitimate PAT and matches the bound the original
+    // pipe buffer imposed. (With a seekable file the pre-spawn write can no
+    // longer deadlock on a missing reader — the original pipe concern — so this
+    // is now a plain size sanity bound, not a deadlock guard.)
+    const MAX_SECRET: usize = 1 << 20;
+    if secret.len() > MAX_SECRET {
+        return Err(anyhow::anyhow!(
+            "credential password is {} bytes, exceeding the {}-byte bound — refusing \
+             to deliver an unbounded secret",
+            secret.len(),
+            MAX_SECRET
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    let fd: OwnedFd = {
+        // SAFETY: `name` is a valid NUL-terminated c-string; MFD_CLOEXEC makes
+        // the returned memfd atomically close-on-exec.
+        let raw = unsafe {
+            libc::memfd_create(c"nano-git-cred".as_ptr(), libc::MFD_CLOEXEC)
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("creating credential secret (memfd_create)");
+        }
+        // SAFETY: `raw` is a fresh, owned memfd descriptor.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let fd: OwnedFd = {
+        // A unique shm name per call so concurrent slots never collide; the
+        // object is unlinked immediately after open so it stays anonymous.
+        let name = format!(
+            "/nano-git-cred-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let c_name = std::ffi::CString::new(name)
+            .context("building credential shm name (unexpected NUL)")?;
+        // SAFETY: `c_name` is a valid NUL-terminated string; O_RDWR|O_CREAT|
+        // O_EXCL with mode 0600 creates a private shm object.
+        let raw = unsafe {
+            libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("creating credential secret (shm_open)");
+        }
+        // Unlink immediately: the descriptor stays valid and the object becomes
+        // anonymous (freed once the last fd closes), so the name cannot be
+        // re-opened by another process.
+        // SAFETY: `c_name` is still a valid NUL-terminated string.
+        unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        // SAFETY: `raw` is a fresh, owned shm descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // shm_open does not set close-on-exec portably; set it now.
+        // SAFETY: `fd` is open and owned; only set FD_CLOEXEC on it.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading credential secret flags");
+        }
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("setting CLOEXEC on credential secret");
+        }
+        fd
+    };
+
+    // Size the object, write the secret, then rewind to offset 0 so the first
+    // read starts at the beginning. A seekable fd never blocks on these writes
+    // (no reader is required), unlike the original pipe. `File::from(OwnedFd)`
+    // would take ownership and close the fd on drop; borrow it as a `&mut File`
+    // view instead so the descriptor stays owned by `fd`.
+    // SAFETY: `fd` is open and owned; ftruncate sets its length.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), secret.len() as libc::off_t) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("sizing credential secret");
+    }
+    {
+        // Borrow `fd` as a File without taking ownership: ManuallyDrop keeps the
+        // descriptor open after the writes/seek below.
+        // SAFETY: `fd` is open and owned; we only borrow it for the duration of
+        // this block and never let the File close it (ManuallyDrop).
+        let mut f = unsafe {
+            std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(fd.as_raw_fd()))
+        };
+        f.write_all(secret).context("writing credential secret")?;
+        f.seek(SeekFrom::Start(0))
+            .context("rewinding credential secret")?;
+    }
+    raise_above_stdio(fd)
+}
+
 /// The subset of `Command` behaviour [`apply_git_credential`] needs, abstracted
 /// over the async `tokio::process::Command` (production) and the sync
 /// `std::process::Command` (tests) so both install the identical `pre_exec`
@@ -3223,33 +3392,33 @@ impl CredCommand for std::process::Command {
 }
 
 /// Configure out-of-band credential delivery on `cmd` so the password reaches
-/// git's credential helper over an inherited pipe FD instead of an environment
-/// variable (closing the same-UID `/proc/<pid>/environ` read; see #24).
+/// git's credential helper over an inherited secret FD instead of an
+/// environment variable (closing the same-UID `/proc/<pid>/environ` read; see
+/// #24).
 ///
-/// - Creates a close-on-exec pipe ([`cloexec_pipe`]) so no concurrent slot's
-///   spawn can inherit it, writes the password into it, and closes the write
-///   end so the helper reads the secret followed by a clean EOF (a repeated
-///   helper call drains empty and fails rather than hangs).
-/// - Refuses an oversized secret up front: a password larger than the pipe
-///   buffer would make the pre-spawn `write_all` block forever with no reader,
-///   wedging the worker before the command timeout could recover, so it fails
-///   cleanly instead.
-/// - Registers a `pre_exec` hook that `dup2`s the inherited read end onto the
-///   fixed single-digit [`CRED_FD`] and clears CLOEXEC, so it survives `exec`
-///   into git (and the credential helper git spawns) at a descriptor a strict
-///   POSIX sh can name. The secret must travel on a *single-digit* descriptor:
-///   dash rejects a multi-digit fd in a redirection (`<&10` → `Bad fd number`)
-///   even through `eval`, so the pipe's dynamically-allocated high number is
-///   remapped to [`CRED_FD`] before `exec`. The `dup2` runs in the forked child
-///   *after* the `Stdio` setup has bound 0/1/2, so it cannot clobber stdio, and
-///   it targets a fixed number rather than reserving a process-global fd at
-///   construction time (which could race an unrelated `open` in this
-///   multi-threaded daemon).
+/// - Creates a seekable, anonymous, close-on-exec in-memory file holding the
+///   secret ([`cred_secret_fd`]) so no concurrent slot's spawn can inherit it.
+///   Unlike a draining pipe, a seekable file lets **every** credential-helper
+///   `get` re-read the SAME secret by re-opening the descriptor through
+///   `/dev/fd` — required for `git clone --recurse-submodules`, which runs a
+///   separate helper process per private same-host submodule after the
+///   superproject's own fetch.
+/// - Refuses an oversized secret up front (a plain size sanity bound; with a
+///   seekable file the pre-spawn write can no longer deadlock on a missing
+///   reader, the original pipe concern).
+/// - Registers a `pre_exec` hook that `dup2`s the inherited secret descriptor
+///   onto the fixed single-digit [`CRED_FD`] and clears CLOEXEC, so it survives
+///   `exec` into git (and the credential helper git spawns) at a stable,
+///   small-numbered descriptor the helper names in its `/dev/fd` path. The
+///   `dup2` runs in the forked child *after* the `Stdio` setup has bound
+///   0/1/2, so it cannot clobber stdio, and it targets a fixed number rather
+///   than reserving a process-global fd at construction time (which could race
+///   an unrelated `open` in this multi-threaded daemon).
 /// - Injects the reset + our helper via `-c`, and sets only the non-secret
 ///   `NANO_GIT_CRED_HOST`/`_USER`/`_FD` in the environment.
 ///
-/// Returns a [`CredPipe`] guard the caller MUST keep alive until `spawn` (and
-/// should drop immediately afterwards — see [`CredPipe`]).
+/// Returns a [`CredFd`] guard the caller MUST keep alive until `spawn` (and
+/// should drop immediately afterwards — see [`CredFd`]).
 ///
 /// Generic over the command type so both the async `tokio::process::Command`
 /// used in production and the sync `std::process::Command` used by the tests
@@ -3259,61 +3428,20 @@ impl CredCommand for std::process::Command {
 /// `libc`, and the `CredCommand` bound exists only under `#[cfg(unix)]`. The
 /// `#[cfg(not(unix))]` stub below keeps non-Unix targets compiling.
 #[cfg(unix)]
-fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Result<CredPipe> {
-    use std::io::Write;
+fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Result<CredFd> {
     use std::os::unix::io::AsRawFd;
 
-    let (read_fd, write_fd) = cloexec_pipe()?;
-    let read_raw = read_fd.as_raw_fd();
+    let secret_fd = cred_secret_fd(c.password.as_bytes())?;
+    let read_raw = secret_fd.as_raw_fd();
 
-    // Bound the secret to the pipe's capacity so the pre-spawn write below can
-    // never block waiting on a reader that does not exist yet. Read the actual
-    // buffer size (`F_GETPIPE_SZ`, Linux) and fall back to the POSIX
-    // `_POSIX_PIPE_BUF` guarantee (4 KiB) elsewhere; a password larger than the
-    // buffer is rejected outright rather than risking a deadlock. Real git
-    // tokens are a few dozen bytes — far under any of these.
-    let capacity = {
-        // SAFETY: write_fd is open; F_GETPIPE_SZ just queries its capacity.
-        #[cfg(target_os = "linux")]
-        {
-            let sz = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETPIPE_SZ) };
-            if sz > 0 {
-                sz as usize
-            } else {
-                4096
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            4096
-        }
-    };
-    if c.password.len() > capacity {
-        return Err(anyhow::anyhow!(
-            "credential password is {} bytes, exceeding the {}-byte pipe buffer — refusing \
-             to deliver it (a pre-spawn write would block forever with no reader)",
-            c.password.len(),
-            capacity
-        ));
-    }
-
-    // Buffer the secret, then drop (close) the write end so the reader sees the
-    // password followed by EOF. Bounded to the pipe capacity above, this write
-    // never blocks before a reader exists.
-    {
-        let mut w = std::fs::File::from(write_fd);
-        w.write_all(c.password.as_bytes())
-            .context("writing credential to pipe")?;
-    }
-
-    // In the forked child, before exec: remap the inherited read end onto the
-    // fixed single-digit CRED_FD and clear CLOEXEC so git — and the credential
-    // helper git spawns — can read it after exec. The remap is required because
-    // the pipe's dynamically-allocated number can exceed 9, which a strict
-    // POSIX sh (dash) cannot name in a redirection. `dup2` runs after the
-    // child's `Stdio` setup has bound 0/1/2, so it never clobbers stdio, and it
-    // atomically replaces whatever (if anything) sat on CRED_FD. Only
-    // async-signal-safe libc calls here.
+    // In the forked child, before exec: remap the inherited secret descriptor
+    // onto the fixed single-digit CRED_FD and clear CLOEXEC so git — and the
+    // credential helper git spawns — can re-open it after exec. The remap keeps
+    // the descriptor at a small, stable number so the helper's `/dev/fd/N` path
+    // is fixed regardless of the dynamically-allocated source number. `dup2`
+    // runs after the child's `Stdio` setup has bound 0/1/2, so it never
+    // clobbers stdio, and it atomically replaces whatever (if anything) sat on
+    // CRED_FD. Only async-signal-safe libc calls here.
     // SAFETY: dup2/fcntl on an inherited fd in the pre-exec child; touches no
     // Rust allocator state and shares nothing with the parent beyond `read_raw`.
     unsafe {
@@ -3346,22 +3474,23 @@ fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Resul
     cmd.env("NANO_GIT_CRED_HOST", &c.host);
     cmd.env("NANO_GIT_CRED_USER", &c.username);
     cmd.env("NANO_GIT_CRED_FD", CRED_FD.to_string());
-    Ok(CredPipe { _read: read_fd })
+    Ok(CredFd { _read: secret_fd })
 }
 
-/// Non-Unix stub: credential delivery over an inherited pipe FD is implemented
-/// only for Unix (the pipe, the `dup2` remap, and the `CredCommand` `pre_exec`
-/// hook all build on `std::os::unix`/`libc`). Rather than silently falling back
-/// to an environment variable — re-opening the same-UID `/proc/<pid>/environ`
-/// read this code exists to close (#24) — a non-Unix host fails closed with a
-/// clear error, mirroring how `safecwd`/`main` keep their non-Unix paths
-/// explicit. These are not supported daemon hosts.
+/// Non-Unix stub: credential delivery over an inherited secret FD is
+/// implemented only for Unix (the secret file, the `dup2` remap, and the
+/// `CredCommand` `pre_exec` hook all build on `std::os::unix`/`libc`). Rather
+/// than silently falling back to an environment variable — re-opening the
+/// same-UID `/proc/<pid>/environ` read this code exists to close (#24) — a
+/// non-Unix host fails closed with a clear error, mirroring how
+/// `safecwd`/`main` keep their non-Unix paths explicit. These are not
+/// supported daemon hosts.
 ///
 /// Non-generic over the concrete `tokio::process::Command` (the only production
 /// caller, in [`git_with_env_capture`]): the `CredCommand` abstraction exists
 /// only under `#[cfg(unix)]`, so the generic form cannot be named here.
 #[cfg(not(unix))]
-fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredPipe> {
+fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredFd> {
     let _ = c;
     Err(anyhow::anyhow!(
         "git credential delivery over an inherited FD is not supported on this \
@@ -3387,15 +3516,18 @@ async fn git_with_env_capture(
     // protocol so the secret never reaches argv (world-readable
     // `/proc/<pid>/cmdline`) NOR the stable `/proc/<pid>/environ` (readable by
     // any same-UID process — e.g. another slot's agent in host mode). The
-    // password travels over an inherited pipe FD; only non-secret fields (host,
-    // username, FD number) go in the environment. The helper snippet itself is
-    // not secret and is host-scoped so a `--recurse-submodules` fetch to a
-    // different host is never handed this repo's token. `apply_git_credential`
-    // injects the empty `credential.helper=` (resetting any host/global helper)
-    // and ours via the `-c` flags that must precede the git subcommand; the
-    // returned guard owns the parent's end of the pipe and is dropped right
-    // after `spawn` below so the daemon keeps no readable copy of the secret.
-    let cred_pipe = match cred {
+    // password travels over an inherited, seekable secret FD (a memfd/shm
+    // object) that each credential-helper `get` re-opens through `/dev/fd`, so
+    // a `--recurse-submodules` clone's per-submodule helpers each re-read the
+    // SAME secret; only non-secret fields (host, username, FD number) go in the
+    // environment. The helper snippet itself is not secret and is host-scoped
+    // so a `--recurse-submodules` fetch to a different host is never handed
+    // this repo's token. `apply_git_credential` injects the empty
+    // `credential.helper=` (resetting any host/global helper) and ours via the
+    // `-c` flags that must precede the git subcommand; the returned guard owns
+    // the parent's secret descriptor and is dropped right after `spawn` below
+    // so the daemon keeps no readable copy of the secret.
+    let cred_guard = match cred {
         Some(c) => Some(apply_git_credential(&mut cmd, c)?),
         None => None,
     };
@@ -3470,13 +3602,14 @@ async fn git_with_env_capture(
     #[cfg(unix)]
     crate::pdeath::arm(&mut cmd);
     let mut child = cmd.spawn().context("spawning git")?;
-    // Drop the parent's copy of the credential pipe the instant the child is
-    // spawned: the child has already inherited (and un-CLOEXEC'd) its own copy
-    // in `pre_exec`, so the parent no longer needs it. Dropping it here — rather
-    // than letting a function-scoped binding live across the wait below — means
-    // the daemon does not keep a readable copy of the secret-bearing pipe
-    // exposed under `/proc/<daemon-pid>/fd` for the whole command.
-    drop(cred_pipe);
+    // Drop the parent's copy of the credential secret descriptor the instant
+    // the child is spawned: the child has already inherited (and un-CLOEXEC'd)
+    // its own copy in `pre_exec`, so the parent no longer needs it. Dropping it
+    // here — rather than letting a function-scoped binding live across the wait
+    // below — means the daemon does not keep a readable copy of the
+    // secret-bearing descriptor exposed under `/proc/<daemon-pid>/fd` for the
+    // whole command.
+    drop(cred_guard);
     #[cfg(unix)]
     let gpid = child.id();
     #[cfg(unix)]
@@ -8044,6 +8177,10 @@ mod tests {
     }
 
     /// A unique temp path base for credential-handshake test scratch files.
+    ///
+    /// Unix-only: used solely by the `cfg(unix)` credential-FD tests, so gated
+    /// to avoid a dead-code warning on non-Unix test builds.
+    #[cfg(unix)]
     fn cred_scratch_base(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "nano-cred-{tag}-{}-{}",
@@ -8060,6 +8197,7 @@ mod tests {
     /// invokes our helper, which reads the password from the inherited pipe FD
     /// (not an env var) and hands it back. This exercises the exact `get`
     /// handshake a clone/fetch performs against an authenticated remote.
+    #[cfg(unix)]
     #[tokio::test]
     async fn credential_handshake_delivers_password_over_fd() {
         // Build the secret at runtime so no credential-like literal is stored.
@@ -8115,12 +8253,17 @@ mod tests {
         );
     }
 
-    /// Integration test for the acceptance criteria of #24: the password is NOT
-    /// present in the git process's environment (so never in
-    /// `/proc/<pid>/environ`), yet is readable over the inherited FD; and a
-    /// repeated helper invocation drains EOF cleanly instead of hanging.
+    /// Integration test for the acceptance criteria of #24 and the recursive-
+    /// submodule fix (#62): the password is NOT present in the git process's
+    /// environment (so never in `/proc/<pid>/environ`), yet is readable over the
+    /// inherited FD; and — because the secret backs a *seekable* file that the
+    /// helper re-opens through `/dev/fd` — a repeated `get` REPLAYS the same
+    /// secret instead of draining to EOF. This is what lets each private
+    /// same-host submodule's separate helper process authenticate after the
+    /// superproject's fetch has already run a `get`.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn credential_password_absent_from_environ_and_retry_drains() {
+    async fn credential_password_absent_from_environ_and_replays() {
         let password = format!("s3cr3t-{}-ENVCHK", std::process::id());
         let cred = GitCredential {
             host: "example.test".into(),
@@ -8138,7 +8281,7 @@ mod tests {
         let env_dump = base.with_extension("env");
         // On Linux, dump our own environ (NUL-delimited) to prove the secret is
         // absent. Elsewhere `/proc` does not exist (and the exposure does not),
-        // so skip that half and only exercise the FD read + retry drain.
+        // so skip that half and only exercise the FD read + replay.
         let dump = if cfg!(target_os = "linux") {
             format!(
                 "tr '\\0' '\\n' < /proc/$$/environ > '{}';",
@@ -8147,9 +8290,9 @@ mod tests {
         } else {
             String::from(":;")
         };
-        // Feed the helper a `get` request twice over the SAME inherited FD. The
-        // first read drains the password; the second must hit EOF and emit an
-        // empty password rather than block.
+        // Feed the helper a `get` request twice over the SAME inherited FD,
+        // modelling the superproject's `get` followed by a submodule's `get`.
+        // Both must deliver the SAME secret (replay), not drain to EOF.
         let req = "printf 'protocol=https\\nhost=example.test\\n\\n'";
         let script = format!(
             "{dump} {req} | sh -c \"$TEST_HELPER get\" > '{o1}'; \
@@ -8160,12 +8303,12 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(&script);
         cmd.env("TEST_HELPER", helper_body);
-        // Configure the pipe FD + non-secret env (host/user/FD number). The git
+        // Configure the secret FD + non-secret env (host/user/FD number). The git
         // `-c` args it also appends become inert positional params to `sh -c`.
         let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
         let status = tokio::time::timeout(Duration::from_secs(20), cmd.status())
             .await
-            .expect("helper handshake must not hang (retry drains at EOF)")
+            .expect("helper handshake must not hang")
             .expect("run sh helper");
         drop(guard);
         assert!(status.success(), "helper script exited non-zero");
@@ -8176,10 +8319,13 @@ mod tests {
                 && first.contains(&format!("password={password}")),
             "first helper invocation must deliver the credential from the FD: {first}"
         );
-        let second = std::fs::read_to_string(&out2).unwrap_or_default();
+        // The recursive-submodule regression: a SECOND `get` (a submodule's
+        // helper) must re-deliver the SAME secret, not drain to an empty EOF.
+        let second = std::fs::read_to_string(&out2).expect("second helper output");
         assert!(
-            !second.contains(&format!("password={password}")),
-            "a repeated helper invocation must NOT re-deliver the drained secret: {second}"
+            second.contains(&format!("password={password}")),
+            "a repeated helper invocation (a submodule's get) must REPLAY the \
+             secret, not drain it: {second}"
         );
 
         if cfg!(target_os = "linux") {
@@ -8204,6 +8350,7 @@ mod tests {
     /// inherit it through the window between `pipe` and `fcntl(FD_CLOEXEC)`
     /// (Copilot review, #62). Assert both ends come back with `FD_CLOEXEC`
     /// already set.
+    #[cfg(unix)]
     #[test]
     fn cloexec_pipe_is_close_on_exec() {
         use std::os::unix::io::AsRawFd;
@@ -8220,18 +8367,20 @@ mod tests {
         }
     }
 
-    /// A password larger than the pipe buffer must be rejected up front rather
-    /// than block forever in the pre-spawn `write_all` (no reader exists yet, so
-    /// the write would wedge the worker before the command timeout could
-    /// recover). The pipe capacity is read from the kernel; a 1 MiB secret
-    /// exceeds every supported buffer (4 KiB-1 MiB), so this always fails
-    /// cleanly instead of hanging.
+    /// A password larger than the secret-size bound must be rejected up front
+    /// rather than buffered unboundedly into the in-memory secret file. The
+    /// bound is a plain sanity limit (1 MiB — far above any real PAT); with a
+    /// seekable file the pre-spawn write can no longer deadlock on a missing
+    /// reader, so this guards memory, not a hang. A secret one byte over the
+    /// bound always fails cleanly.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn oversized_password_is_rejected_not_deadlocked() {
+    async fn oversized_password_is_rejected() {
         let cred = GitCredential {
             host: "example.test".into(),
             username: "x-access-token".into(),
-            password: "A".repeat(1 << 20),
+            // One byte over the 1 MiB bound in `cred_secret_fd`.
+            password: "A".repeat((1 << 20) + 1),
         };
         let mut cmd = Command::new("git");
         let res = tokio::time::timeout(
@@ -8239,24 +8388,25 @@ mod tests {
             tokio::task::spawn_blocking(move || apply_git_credential(&mut cmd, &cred)),
         )
         .await
-        .expect("oversized credential must fail fast, not block on the pipe write")
+        .expect("oversized credential must fail fast")
         .expect("spawn_blocking join");
         let err = match res {
             Ok(_) => panic!("an oversized password must be refused"),
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("pipe buffer"),
-            "the rejection should name the pipe-buffer bound: {err}"
+            err.to_string().contains("exceeding the"),
+            "the rejection should name the size bound: {err}"
         );
     }
 
     /// The secret must be delivered on the descriptor `NANO_GIT_CRED_FD` names —
-    /// the fixed single-digit [`CRED_FD`] the child's `pre_exec` `dup2`s the pipe
-    /// onto, so a strict POSIX sh (dash) can name it in a redirection (dash
-    /// rejects a multi-digit fd even through `eval`). Drives the real
-    /// `apply_git_credential` + helper end-to-end and asserts the child reads the
-    /// secret over the fd `NANO_GIT_CRED_FD` reports.
+    /// the fixed single-digit [`CRED_FD`] the child's `pre_exec` `dup2`s the
+    /// secret file onto, so the helper's `/dev/fd/$NANO_GIT_CRED_FD` path is
+    /// small and stable. Drives the real `apply_git_credential` + helper
+    /// end-to-end and asserts the child reads the secret over the fd
+    /// `NANO_GIT_CRED_FD` reports.
+    #[cfg(unix)]
     #[test]
     fn credential_is_delivered_on_dynamic_fd_in_child() {
         let password = format!("s3cr3t-{}-DYNFD", std::process::id());
@@ -8301,16 +8451,15 @@ mod tests {
         let _ = std::fs::remove_file(&out1);
     }
 
-    /// Regression test for the "Previously missed" advisory on #62: a strict
-    /// POSIX `/bin/sh` (dash) rejects a multi-digit descriptor in a redirection
-    /// (`cat <&25` → `Bad fd number`) *even through* an `eval`'d indirection, so
-    /// the helper can never read the pipe's dynamically-allocated high fd
-    /// directly. The child's `pre_exec` must `dup2` it onto the single-digit
-    /// [`CRED_FD`]. Force the pipe onto a descriptor above 9 (by holding fds 3..
-    /// open so `pipe` is handed a high number), run the real
-    /// `apply_git_credential` + helper, and assert the secret is still delivered
-    /// over `NANO_GIT_CRED_FD` == [`CRED_FD`]. Without the remap this fails:
-    /// `/bin/sh` cannot open the high descriptor.
+    /// Regression test for the descriptor-remap guard on #62: the secret file's
+    /// dynamically-allocated descriptor can exceed 9, but the helper names a
+    /// *fixed* single-digit path (`/dev/fd/$NANO_GIT_CRED_FD`), so the child's
+    /// `pre_exec` must `dup2` it onto [`CRED_FD`]. Force the secret fd above 9
+    /// (by holding fds 3..=9 open so the source is handed a high number), run
+    /// the real `apply_git_credential` + helper, and assert the secret is still
+    /// delivered over `NANO_GIT_CRED_FD` == [`CRED_FD`]. Without the remap the
+    /// helper would re-open the wrong descriptor.
+    #[cfg(unix)]
     #[test]
     fn credential_is_remapped_to_a_single_digit_fd_for_posix_sh() {
         use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
@@ -8326,12 +8475,11 @@ mod tests {
         let base = cred_scratch_base("highfd");
         let out1 = base.with_extension("out");
 
-        // Hold descriptors open so the credential pipe is allocated a number
-        // above 9 — the case dash cannot read literally. Seed with a `/dev/null`
-        // open (which takes the lowest free fd, 3) then keep dup-ing from 3 until
-        // we hold a descriptor above 9, so fds 3..=9 are all occupied when
-        // `apply_git_credential` builds the pipe. Keep the holders alive until
-        // after the pipe is created.
+        // Hold descriptors open so the credential secret file is allocated a
+        // number above 9. Seed with a `/dev/null` open (which takes the lowest
+        // free fd, 3) then keep dup-ing from 3 until we hold a descriptor above
+        // 9, so fds 3..=9 are all occupied when `apply_git_credential` builds
+        // the secret fd. Keep the holders alive until after it is created.
         // SAFETY: O_RDONLY opens /dev/null; the c-literal is NUL-terminated.
         let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(
@@ -8370,8 +8518,8 @@ mod tests {
         cmd.arg("-c").arg(&script);
         cmd.env("TEST_HELPER", helper_body);
         let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
-        // The pipe's own read end was allocated above 9 (holders forced it).
-        let pipe_raw = guard._read.as_raw_fd();
+        // The secret file's own descriptor was allocated above 9 (holders forced it).
+        let secret_raw = guard._read.as_raw_fd();
         let status = cmd.status().expect("run sh helper");
         drop(guard);
         drop(holders);
@@ -8379,7 +8527,7 @@ mod tests {
         let out = std::fs::read_to_string(&out1).expect("helper output");
         assert!(
             out.contains(&format!("password={password}")),
-            "secret must be delivered even when the pipe's own fd is high ({pipe_raw}): {out}"
+            "secret must be delivered even when the secret fd is high ({secret_raw}): {out}"
         );
         let delivered: i32 = out
             .lines()
@@ -8388,15 +8536,15 @@ mod tests {
             .expect("child reports the delivered fd");
         assert_eq!(
             delivered, CRED_FD,
-            "a high pipe fd ({pipe_raw}) must be remapped to the single-digit CRED_FD for POSIX sh: {out}"
+            "a high secret fd ({secret_raw}) must be remapped to the single-digit CRED_FD: {out}"
         );
         let _ = std::fs::remove_file(&out1);
     }
 
-    /// The `CredPipe` guard owns the parent's only copy of the credential pipe's
-    /// read end, so dropping it immediately after `spawn` (as
+    /// The `CredFd` guard owns the parent's only copy of the credential secret
+    /// descriptor, so dropping it immediately after `spawn` (as
     /// `git_with_env_capture` now does) must close that copy — the daemon must
-    /// not keep a readable copy of the secret-bearing pipe exposed under
+    /// not keep a readable copy of the secret-bearing descriptor exposed under
     /// `/proc/<daemon-pid>/fd` for the lifetime of the git command (Copilot
     /// review, #62).
     #[cfg(target_os = "linux")]
@@ -8416,24 +8564,25 @@ mod tests {
         assert!(status.success());
         // Mirror the production call site: drop the guard right after spawn.
         drop(guard);
-        // The parent's copy of the read end must now be closed.
+        // The parent's copy of the secret descriptor must now be closed.
         let flags = unsafe { libc::fcntl(read_raw, libc::F_GETFD) };
         assert!(
             flags < 0,
-            "the parent's credential pipe read end (fd {read_raw}) must be closed once the guard is dropped after spawn"
+            "the parent's credential secret descriptor (fd {read_raw}) must be closed once the guard is dropped after spawn"
         );
     }
 
-    /// `pipe2`/`pipe` return the lowest free descriptors, so a supervisor
-    /// launched with stdin/stdout/stderr closed could get a credential pipe on
-    /// fd 0/1/2 — which the child's `Stdio` setup then overwrites before
-    /// `pre_exec`, aiming `NANO_GIT_CRED_FD` at unrelated stdio (Copilot review,
-    /// #62). Fork a child that closes 0/1/2, build the pipe there, and assert
-    /// both ends land above the standard descriptors.
+    /// `memfd_create`/`shm_open` return the lowest free descriptor, so a
+    /// supervisor launched with stdin/stdout/stderr closed could get the
+    /// credential secret on fd 0/1/2 — which the child's `Stdio` setup then
+    /// overwrites before `pre_exec`, aiming `NANO_GIT_CRED_FD` at unrelated
+    /// stdio (Copilot review, #62). Fork a child that closes 0/1/2, build the
+    /// secret fd there, and assert it lands above the standard descriptors.
+    #[cfg(unix)]
     #[test]
-    fn credential_pipe_never_lands_on_a_standard_descriptor() {
+    fn credential_secret_never_lands_on_a_standard_descriptor() {
         use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-        // Channel for the child to report the two fd numbers back to the parent.
+        // Channel for the child to report the fd number back to the parent.
         let (report_r, report_w) = cloexec_pipe().expect("report pipe");
         let report_w_raw = report_w.as_raw_fd();
         // SAFETY: fork in a possibly multi-threaded test binary — the child must
@@ -8444,18 +8593,16 @@ mod tests {
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
             // Child: close the standard descriptors, then build the credential
-            // pipe and report its two raw fd numbers as eight native-endian
+            // secret fd and report its raw fd number as four native-endian
             // bytes (no heap allocation).
             unsafe {
                 libc::close(0);
                 libc::close(1);
                 libc::close(2);
             }
-            let code = match cloexec_pipe() {
-                Ok((r, w)) => {
-                    let mut buf = [0u8; 8];
-                    buf[0..4].copy_from_slice(&r.as_raw_fd().to_ne_bytes());
-                    buf[4..8].copy_from_slice(&w.as_raw_fd().to_ne_bytes());
+            let code = match cred_secret_fd(b"s3cr3t") {
+                Ok(fd) => {
+                    let buf = fd.as_raw_fd().to_ne_bytes();
                     unsafe {
                         libc::write(report_w_raw, buf.as_ptr() as *const libc::c_void, buf.len());
                     }
@@ -8465,7 +8612,7 @@ mod tests {
             };
             unsafe { libc::_exit(code) };
         }
-        // Parent: read the 8-byte report and reap the child.
+        // Parent: read the 4-byte report and reap the child.
         drop(report_w);
         let mut file = unsafe { std::fs::File::from_raw_fd(report_r.into_raw_fd()) };
         let mut buf = Vec::new();
@@ -8477,16 +8624,13 @@ mod tests {
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "child could not build the credential pipe with stdio closed"
+            "child could not build the credential secret with stdio closed"
         );
-        assert_eq!(buf.len(), 8, "child must report both pipe ends as 8 bytes");
-        let read_end = i32::from_ne_bytes(buf[0..4].try_into().unwrap());
-        let write_end = i32::from_ne_bytes(buf[4..8].try_into().unwrap());
-        for fd in [read_end, write_end] {
-            assert!(
-                fd >= 3,
-                "credential pipe end landed on standard descriptor {fd}; it must be re-homed above stdin/stdout/stderr"
-            );
-        }
+        assert_eq!(buf.len(), 4, "child must report the secret fd as 4 bytes");
+        let secret_fd = i32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        assert!(
+            secret_fd >= 3,
+            "credential secret fd landed on standard descriptor {secret_fd}; it must be re-homed above stdin/stdout/stderr"
+        );
     }
 }
