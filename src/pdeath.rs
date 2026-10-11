@@ -263,9 +263,18 @@ pub fn arm_owner_watchdog() {
     // (`<home>/ct-owner.pid`), so the sweep can tell an orphaned daemon (its
     // owning test process is gone) apart from a concurrently-running test's live
     // daemon (same shared `cargo test` pid, still alive) and only reap the former.
-    // Best-effort: a write failure just means the sweep falls back to leaving the
-    // daemon to its own watchdog.
-    let _ = std::fs::write(home.join(OWNER_PID_FILE), owner.to_string());
+    // The marker is `<pid> <start>`: recording the owner's start-time incarnation
+    // token alongside the pid lets the sweep reject a *recycled* owner pid, not
+    // just a dead one (issue #54 review r4240055588). Prefer the harness-stamped
+    // race-free token (`test_owner_start`) over a child-side read, exactly as the
+    // watchdog does. Best-effort: a write failure just means the sweep falls back
+    // to leaving the daemon to its own watchdog.
+    let mut marker = owner.to_string();
+    if let Some(start) = test_owner_start().or_else(|| owner_start_time(owner)) {
+        marker.push(' ');
+        marker.push_str(&start.to_string());
+    }
+    let _ = std::fs::write(home.join(OWNER_PID_FILE), marker);
     let _ = spawn_owner_watchdog(owner, home);
 }
 

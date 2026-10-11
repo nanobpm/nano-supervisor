@@ -107,6 +107,18 @@ fn apply_hermetic_env(c: &mut Command, home: &Path, target: Target) {
     // the `Drop for TempHome` cleanup does not run in those cases. Stamping the
     // harness's own pid here means every spawned target inherits the binding.
     c.env("C8CTL_NANO_TEST_OWNER_PID", std::process::id().to_string());
+    // Issue #54 review (r4240055588): also stamp the owner's *start-time
+    // incarnation* token, captured HERE while the harness is still known alive.
+    // The daemon's owner watchdog prefers this over reading the owner's start
+    // time itself: a child-side read races a harness SIGKILL during startup — if
+    // the owner pid is recycled in that window the daemon binds to the unrelated
+    // reuser and both its liveness and start-time checks pass forever, orphaning
+    // the daemon. Stamping the token while we are provably the owner closes that
+    // race. `None` only off Linux/macOS, where the watchdog degrades to the
+    // liveness-plus-home check (no worse than before).
+    if let Some(start) = owner_start_token() {
+        c.env("C8CTL_NANO_TEST_OWNER_START", start);
+    }
 }
 
 /// Which implementation the suite exercises, chosen by `NS_TARGET` (default
@@ -269,12 +281,19 @@ impl TempHome {
         // sweep would classify this active Node home as "no owner marker" →
         // orphaned and force-stop its live daemon. Stamping the harness's own
         // pid here makes the sweep's liveness guard target-agnostic and removes
-        // that race. Best-effort: a write failure just means the sweep falls
+        // that race. The marker is `<pid> <start>`: the start-time incarnation
+        // token (captured while we are provably alive) lets the sweep reject a
+        // *recycled* owner pid, not just a dead one — a bare `kill(pid, 0)` also
+        // answers success for an unrelated process that reused the number, which
+        // would keep an orphaned home alive forever (issue #54 review
+        // r4240055588). Best-effort: a write failure just means the sweep falls
         // back to the daemon's own marker (Rust) or treats the home as orphaned.
-        let _ = std::fs::write(
-            dir.path().join("ct-owner.pid"),
-            std::process::id().to_string(),
-        );
+        let mut marker = std::process::id().to_string();
+        if let Some(start) = owner_start_token() {
+            marker.push(' ');
+            marker.push_str(&start);
+        }
+        let _ = std::fs::write(dir.path().join("ct-owner.pid"), marker);
         TempHome { dir, target }
     }
 
@@ -482,27 +501,100 @@ fn sweep_orphaned_daemons() {
     }
 }
 
+/// A process's start-time incarnation token, in the SAME units the Rust daemon's
+/// owner watchdog compares against (`src/pdeath.rs` `owner_start_time`): Linux
+/// `/proc/<pid>/stat` field 22 (clock ticks since boot), macOS
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` start folded to microseconds. The harness
+/// captures its OWN token (`owner_start_token`) while it is provably alive and
+/// stamps it into `C8CTL_NANO_TEST_OWNER_START` and the `ct-owner.pid` marker, so
+/// neither the daemon's watchdog nor the startup sweep can be fooled by a
+/// recycled owner pid (issue #54 review). `None` on a platform with no
+/// start-time source, or when the read fails, in which case the consumer
+/// degrades to the bare-liveness check.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) can contain spaces and parens, so parse from just past
+    // the final ')': field 3 (state) is then the first token, so starttime
+    // (field 22) is the 20th token — 0-based index 19.
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // Mirror `src/pdeath.rs` `leader_identity`: `proc_pidinfo(PROC_PIDTBSDINFO)`
+    // start time, folded to microseconds for a single comparable token.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        );
+        if n <= 0 {
+            return None;
+        }
+        info.pbi_start_tvsec
+            .checked_mul(1_000_000)?
+            .checked_add(info.pbi_start_tvusec)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// This harness process's start-time incarnation token, stringified for stamping
+/// into the owner env var and the `ct-owner.pid` marker. Captured while we are
+/// the live owner, so it is race-free (issue #54 review). `None` off
+/// Linux/macOS, where the consumer degrades to the liveness check.
+fn owner_start_token() -> Option<String> {
+    process_start_time(std::process::id()).map(|s| s.to_string())
+}
+
 /// Whether the owning test process recorded in `<home>/ct-owner.pid` is still
-/// alive. `true` (leave the daemon alone) when the marker names a live process;
-/// `false` (the home is orphaned) when the marker is absent, unreadable, or names
-/// a dead process. The pid is the shared `cargo test` process id, so a live
-/// marker means a *concurrently-running* test owns this daemon.
+/// alive. `true` (leave the daemon alone) when the marker names a live process
+/// *of the recorded incarnation*; `false` (the home is orphaned) when the marker
+/// is absent, unreadable, names a dead process, or names a live pid whose
+/// start-time token no longer matches (a *recycled* owner pid). The pid is the
+/// shared `cargo test` process id, so a live, matching marker means a
+/// *concurrently-running* test owns this daemon.
 #[cfg(unix)]
 fn owner_still_alive(home: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(home.join("ct-owner.pid")) else {
         return false;
     };
-    let Ok(pid) = raw.trim().parse::<i32>() else {
+    // Marker is `<pid>` or `<pid> <start>` (the start-time incarnation token,
+    // added issue #54 review r4240055588). Parse the pid from the first field so
+    // an older pid-only marker still reads.
+    let mut fields = raw.split_whitespace();
+    let Some(pid) = fields.next().and_then(|f| f.parse::<i32>().ok()) else {
         return false;
     };
     if pid <= 0 {
         return false;
     }
     // `kill(pid, 0)`: 0 => alive; EPERM => alive but not ours; ESRCH => gone.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !alive {
+        return false;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Recycle guard: a bare `kill(pid, 0)` also answers success for an unrelated
+    // process that reused the owner's pid after it died, which would keep this
+    // orphaned home alive forever. When the marker recorded the owner's
+    // start-time token, require the live pid to still be that incarnation; a
+    // mismatch means the owner is gone and its pid was recycled → treat the home
+    // as orphaned (issue #54 review). A pid-only marker (older producer, or a
+    // platform with no start-time source) degrades to the liveness check alone.
+    if let Some(start) = fields.next().and_then(|f| f.parse::<u64>().ok()) {
+        return process_start_time(pid as u32) == Some(start);
+    }
+    true
 }
 
 /// Non-unix fallback: with no liveness probe, assume the owner is alive so the
@@ -2377,5 +2469,47 @@ mod unit {
         let mut silent = outcome;
         silent.output.stderr = b"no settle lines here\n".to_vec();
         assert!(silent.refresh_counts().is_empty());
+    }
+
+    // The startup sweep must treat a *recycled* owner pid as orphaned, not just a
+    // dead one: a bare `kill(pid, 0)` answers success for whatever unrelated
+    // process reused the number after the owner died, which would keep an
+    // orphaned home alive forever (issue #54 review r4240055588). Exercise the
+    // `<pid> <start>` marker's incarnation check.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owner_still_alive_rejects_recycled_owner_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let me = std::process::id();
+        let marker = home.join("ct-owner.pid");
+
+        // Live pid + its REAL start token => the owner is genuinely alive.
+        let start = process_start_time(me).expect("own start time readable");
+        std::fs::write(&marker, format!("{me} {start}")).unwrap();
+        assert!(
+            owner_still_alive(home),
+            "matching start token on a live pid => owner alive"
+        );
+
+        // Live pid + a STALE start token models a recycled owner pid: liveness
+        // passes but the incarnation no longer matches, so the home is orphaned.
+        // No real process has start time 1, so it can never match our own.
+        std::fs::write(&marker, format!("{me} 1")).unwrap();
+        assert!(
+            !owner_still_alive(home),
+            "stale start token => recycled owner pid => orphaned"
+        );
+
+        // A pid-only marker (older producer) degrades to the liveness check.
+        std::fs::write(&marker, me.to_string()).unwrap();
+        assert!(
+            owner_still_alive(home),
+            "pid-only marker on a live pid => liveness-only => alive"
+        );
+
+        // An unreadable/garbage marker is orphaned.
+        std::fs::write(&marker, "not-a-pid").unwrap();
+        assert!(!owner_still_alive(home), "garbage marker => orphaned");
     }
 }
