@@ -360,9 +360,7 @@ fn open_confined_parent(path: &Path) -> Result<RawFdGuard> {
 /// (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
 fn create_confined_parent(path: &Path) -> Result<RawFdGuard> {
-    let parent = path
-        .parent()
-        .context("log path has no parent directory")?;
+    let parent = path.parent().context("log path has no parent directory")?;
     let anchor = home_dir()?;
     let tail = parent.strip_prefix(&anchor).map_err(|_| {
         anyhow::anyhow!(
@@ -448,7 +446,10 @@ fn open_log_confined(path: &Path) -> Result<std::fs::File> {
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!("opening log file without following symlinks: {}", path.display())
+            format!(
+                "opening log file without following symlinks: {}",
+                path.display()
+            )
         });
     }
     let fd = RawFdGuard(fd);
@@ -464,7 +465,6 @@ fn open_log_confined(path: &Path) -> Result<std::fs::File> {
 
     Ok(fd.into_file())
 }
-
 
 /// the confined read to map "the file (or a directory above it) does not exist"
 /// to `None` while still surfacing a symlinked/foreign tail (`ELOOP`/`ENOTDIR`)

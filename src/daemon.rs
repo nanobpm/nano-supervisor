@@ -277,35 +277,37 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // `supervisor status` client, so a failure here aborts startup rather than
     // serving the socket (nanobpm/nano-supervisor#8).
     #[cfg(unix)]
-    let control_handle = Some(match serve_control(
-        control_listener,
-        state_home.clone(),
-        descriptor,
-        worker_ids,
-        engine_for_workers,
-        control::epoch_millis(),
-        shutdown_tx.clone(),
-    ) {
-        Ok(handle) => handle,
-        Err(e) => {
-            // Control setup is startup-fatal, but the slots were already spawned
-            // and the socket already bound above. Returning `?` here would merely
-            // DROP the `JoinHandle`s — detaching the slots (each still holding a
-            // shutdown sender and possibly already activating work) rather than
-            // stopping them — and leave the bound socket file behind as a stale
-            // leftover. Fail closed instead: tell the slots to abort in-flight
-            // work, join them, and remove the socket + any descriptor before
-            // surfacing the error.
-            abort_slots_and_cleanup(
-                handles,
-                &shutdown_tx,
-                &sock_path,
-                &state_home.join("supervisor.json"),
-            )
-            .await;
-            return Err(e);
-        }
-    });
+    let control_handle = Some(
+        match serve_control(
+            control_listener,
+            state_home.clone(),
+            descriptor,
+            worker_ids,
+            engine_for_workers,
+            control::epoch_millis(),
+            shutdown_tx.clone(),
+        ) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Control setup is startup-fatal, but the slots were already spawned
+                // and the socket already bound above. Returning `?` here would merely
+                // DROP the `JoinHandle`s — detaching the slots (each still holding a
+                // shutdown sender and possibly already activating work) rather than
+                // stopping them — and leave the bound socket file behind as a stale
+                // leftover. Fail closed instead: tell the slots to abort in-flight
+                // work, join them, and remove the socket + any descriptor before
+                // surfacing the error.
+                abort_slots_and_cleanup(
+                    handles,
+                    &shutdown_tx,
+                    &sock_path,
+                    &state_home.join("supervisor.json"),
+                )
+                .await;
+                return Err(e);
+            }
+        },
+    );
     #[cfg(not(unix))]
     let control_handle: Option<tokio::task::JoinHandle<()>> = {
         // No Unix-domain control socket off-Unix; the daemon still runs its
@@ -526,19 +528,26 @@ fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
 #[cfg(unix)]
 fn restrict_socket_to_owner(sock_path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)).with_context(|| {
-        format!(
-            "securing the supervisor control socket at {} (refusing to run a world-accessible \
+    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "securing the supervisor control socket at {} (refusing to run a world-accessible \
              control endpoint)",
-            sock_path.display()
-        )
-    })?;
+                sock_path.display()
+            )
+        },
+    )?;
     // Verify the mode actually took: on a filesystem that silently ignores the
     // chmod (or races a umask re-application) the socket could still be
     // group/other-accessible. Fail startup rather than listen on a socket other
     // local users can drive.
     let mode = std::fs::metadata(sock_path)
-        .with_context(|| format!("stat the supervisor control socket at {}", sock_path.display()))?
+        .with_context(|| {
+            format!(
+                "stat the supervisor control socket at {}",
+                sock_path.display()
+            )
+        })?
         .permissions()
         .mode()
         & 0o777;
@@ -603,7 +612,10 @@ fn serve_control(
     });
     crate::fleet::write_json_atomic_confined(&state_home.join("supervisor.json"), &sup_json)
         .context("publishing the supervisor.json descriptor")?;
-    log(&format!("control socket listening at {}", descriptor.socket));
+    log(&format!(
+        "control socket listening at {}",
+        descriptor.socket
+    ));
 
     Ok(tokio::spawn(async move {
         let descriptor = Arc::new(descriptor);
@@ -2164,10 +2176,17 @@ mod tests {
             std::process::id()
         ));
         let listener = bind_control_socket(&sock).expect("bind control socket");
-        let mode = std::fs::metadata(&sock).expect("stat socket").permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&sock)
+            .expect("stat socket")
+            .permissions()
+            .mode()
+            & 0o777;
         drop(listener);
         let _ = std::fs::remove_file(&sock);
-        assert_eq!(mode, 0o700, "control socket must be owner-only, got {mode:o}");
+        assert_eq!(
+            mode, 0o700,
+            "control socket must be owner-only, got {mode:o}"
+        );
     }
 
     // A self-connection is owned by this process's user, so the peer-credential
@@ -2310,7 +2329,8 @@ mod tests {
         let drain = std::future::pending::<()>(); // a slot that never finishes
 
         let start = std::time::Instant::now();
-        let drained = drain_within_deadline(drain, &mut rx, initial_grace, Duration::from_millis(100)).await;
+        let drained =
+            drain_within_deadline(drain, &mut rx, initial_grace, Duration::from_millis(100)).await;
         let elapsed = start.elapsed();
 
         assert!(!drained, "a stuck slot never drains");
@@ -2328,8 +2348,7 @@ mod tests {
         let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
         let mut rx = tx.subscribe();
         let drain = async {};
-        let drained =
-            drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
+        let drained = drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
         assert!(drained, "an immediately-finished drain must report success");
     }
 

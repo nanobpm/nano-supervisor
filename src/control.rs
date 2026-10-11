@@ -567,12 +567,14 @@ pub(crate) fn probe_within_deadline(
             "control probe budget exhausted before contacting the daemon",
         ));
     }
-    let deadline = std::time::Instant::now().checked_add(timeout).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "control probe timeout overflows the monotonic clock",
-        )
-    })?;
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control probe timeout overflows the monotonic clock",
+            )
+        })?;
     // Completing the handshake is enough to prove a live, accepting peer; drop
     // the stream without reading so we do not consume the daemon's accept queue.
     connect_within_deadline(socket, deadline).map(|_| ())
@@ -851,7 +853,10 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            std::env::temp_dir().join(format!("c8ctl-nano-test-{tag}-{pid}-{nanos}.sock"))
+            // Keep this well under macOS's SUN_LEN (104) by using a short name:
+            // the temp_dir prefix (e.g. /var/folders/.../T/) already eats most of
+            // the budget, so a long filename pushes the bound path over the limit.
+            std::env::temp_dir().join(format!("nst-{tag}-{pid}-{nanos}.sock"))
         }
 
         /// Serve exactly one connection: read (and discard) the request line, then
