@@ -169,13 +169,14 @@ impl LaneBuffer {
 
     /// Append `frame` to its lane. When either the count cap OR the byte budget
     /// would be exceeded, evict to make room — but only ever shed a frame whose
-    /// priority is at or below the incoming frame's, least-important lane first.
-    /// A bulk flood can therefore displace only other bulk frames; it can never
-    /// evict an interactive or control frame to admit itself. When nothing at or
-    /// below the incoming priority remains to evict (the buffer holds only
-    /// higher-priority traffic, or the frame alone exceeds the whole byte
-    /// budget), the incoming frame is dropped instead — presence/steer control
-    /// is never sacrificed for lower-priority transcript.
+    /// priority is at or below the incoming frame's, least-important lane first,
+    /// and NEVER a control frame. A bulk flood can therefore displace only other
+    /// bulk frames; it can never evict an interactive or control frame to admit
+    /// itself. When nothing at or below the incoming priority remains to evict
+    /// (the buffer holds only higher-priority traffic, or the frame alone
+    /// exceeds the whole byte budget), the incoming frame is dropped instead —
+    /// presence/steer control is never sacrificed, even for another control
+    /// frame (see [`LaneBuffer::evict_for`]).
     fn push(&mut self, frame: Frame) {
         if self.capacity == 0 {
             return; // no room at all: drop on the floor
@@ -215,18 +216,29 @@ impl LaneBuffer {
     /// least-important lane first. Returns `false` when no such frame exists —
     /// i.e. every buffered frame strictly outranks `incoming` — so the caller
     /// drops the incoming frame rather than displacing higher-priority traffic.
+    ///
+    /// CONTROL IS NEVER EVICTED, not even by another control frame: presence
+    /// frames are an ordered, interdependent set (a `CLAIM` is meaningless
+    /// without its prerequisite `REGISTER`, and `REGISTER` strictly precedes
+    /// `CLAIM`), so shedding one control frame to admit another can silently
+    /// desync ownership — e.g. under a tiny `NANO_AGENTIC_BUFFER_CAPACITY` a
+    /// `register_session`'s CLAIM would evict the REGISTER it was enqueued
+    /// after, and the hub would learn ownership of an instance it never saw
+    /// registered. Control is low-volume by design, so when only control
+    /// remains the incoming frame is dropped instead (a bounded buffer must
+    /// drop *something*; dropping the newcomer preserves the ordering of what
+    /// is already queued). The reconnect resync rebuilds the full presence set
+    /// from state via `push_front_control_bounded`, so a dropped frame is
+    /// repaired on the next reconnect.
     fn evict_for(&mut self, incoming: Lane) -> bool {
         let evicted = match incoming {
             // Bulk may only evict bulk.
             Lane::Bulk => self.bulk.pop_front(),
             // Interactive may evict bulk, then interactive — never control.
             Lane::Interactive => self.bulk.pop_front().or_else(|| self.interactive.pop_front()),
-            // Control may evict anything, least-important first.
-            Lane::Control => self
-                .bulk
-                .pop_front()
-                .or_else(|| self.interactive.pop_front())
-                .or_else(|| self.control.pop_front()),
+            // Control may shed lower-priority traffic (bulk, then interactive)
+            // to make room, but NEVER another control frame (see above).
+            Lane::Control => self.bulk.pop_front().or_else(|| self.interactive.pop_front()),
         };
         match evicted {
             Some(bf) => {
@@ -256,7 +268,9 @@ impl LaneBuffer {
     /// otherwise repeated write failures could grow the buffer past its
     /// advertised count/byte caps. When only strictly-higher-priority traffic
     /// remains (or the frame alone exceeds the whole byte budget), the retry
-    /// frame is dropped rather than displacing more important frames.
+    /// frame is dropped rather than displacing more important frames. Like
+    /// `push`, a control retry never evicts another control frame (see
+    /// [`LaneBuffer::evict_for`]).
     fn push_front(&mut self, frame: Frame) {
         if self.capacity == 0 {
             return; // no room at all: drop on the floor
@@ -1302,6 +1316,48 @@ mod tests {
         buf.push_front(popped);
         assert_eq!(buf.len(), 2, "bulk retry dropped; control preserved");
         assert_eq!(buf.control.len(), 2, "both control frames survive");
+    }
+
+    // Finding (round 8): control admission must NEVER evict an earlier control
+    // frame. Presence frames are an ordered, interdependent set — a CLAIM is
+    // meaningless without its prerequisite REGISTER — so under a tiny capacity a
+    // `register_session`'s CLAIM must not evict the REGISTER it was enqueued
+    // after. The newcomer is dropped instead, preserving the ordering of what is
+    // already queued (the reconnect resync rebuilds the full set from state).
+    #[test]
+    fn control_push_never_evicts_control() {
+        let mut buf = LaneBuffer::with_limits(1, 0);
+        buf.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "w" })));
+        // Capacity 1 and already holding a control frame: a second control frame
+        // must NOT evict the REGISTER — it is dropped on the floor instead.
+        buf.push(Frame::new(Lane::Control, Family::Claim, 2, json!({ "instance": "w", "jobKey": "j" })));
+        assert_eq!(buf.len(), 1, "a full control-only buffer drops the newcomer");
+        assert_eq!(
+            buf.control.len(),
+            1,
+            "the REGISTER must survive the CLAIM's admission"
+        );
+        assert_eq!(
+            buf.control[0].frame.family,
+            Family::Register,
+            "REGISTER (not the later CLAIM) is what remains buffered"
+        );
+    }
+
+    #[test]
+    fn control_push_sheds_lower_priority_to_make_room() {
+        // A control frame may still evict bulk/interactive traffic to make room
+        // — only control-vs-control eviction is forbidden.
+        let mut buf = LaneBuffer::with_limits(1, 0);
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
+        buf.push(Frame::new(Lane::Control, Family::Register, 2, json!({ "instance": "w" })));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(
+            buf.control.len(),
+            1,
+            "control evicts the bulk frame and is admitted"
+        );
+        assert!(buf.bulk.is_empty(), "the bulk frame was shed for control");
     }
 
     #[tokio::test]
