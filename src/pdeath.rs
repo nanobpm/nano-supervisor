@@ -122,6 +122,24 @@ pub(crate) fn sigkill_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn sigkill_group(_pid: u32) {}
 
+/// Checked `u32` → `libc::pid_t` conversion for a pid we are about to signal or
+/// probe. `pid_t` is a signed 32-bit int on every supported unix, so any `u32`
+/// above `i32::MAX` wraps to a **negative** `pid_t` under `as` — and `kill(2)`
+/// treats negative values specially (`-1` broadcasts to every process the caller
+/// may signal, `<-1` targets a process group). The owner watchdog's `--self-pid`
+/// is an unrestricted `u32` CLI arg, so without this gate `u32::MAX` would reach
+/// `kill(-1, SIGKILL)` and broadcast across the user's processes instead of
+/// reaping one daemon (issue #54 review). Reject `0` (this process's group) and
+/// anything out of `pid_t`'s positive range; the watchdog only ever targets a
+/// real, positive pid.
+#[cfg(unix)]
+fn checked_pid(pid: u32) -> Option<libc::pid_t> {
+    if pid == 0 || pid > libc::pid_t::MAX as u32 {
+        return None;
+    }
+    Some(pid as libc::pid_t)
+}
+
 /// `SIGKILL` a single process by pid (`kill(pid, SIGKILL)`, not the group).
 ///
 /// Used by the owner watchdog to reap an orphaned contract-test daemon/worker.
@@ -138,10 +156,18 @@ pub(crate) fn sigkill_group(_pid: u32) {}
 /// correct, group-agnostic target is the pid. Harmless if already gone (`ESRCH`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn sigkill_pid(pid: u32) {
-    // SAFETY: a plain libc kill of a single pid; no Rust state is touched and an
-    // already-dead (or zombie) pid simply yields ESRCH / a harmless no-op.
+    // Reject a pid that cannot be represented as a positive `pid_t`: `as` would
+    // wrap it negative and `kill(2)` would read `-1` as "broadcast to every
+    // process I may signal" (issue #54 review). Out-of-range => nothing of ours
+    // to reap; treat as a no-op.
+    let Some(pid) = checked_pid(pid) else {
+        return;
+    };
+    // SAFETY: a plain libc kill of a single positive pid; no Rust state is
+    // touched and an already-dead (or zombie) pid simply yields ESRCH / a
+    // harmless no-op.
     unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
     }
 }
 
@@ -186,12 +212,16 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// wrongful exit, so the fail-open direction is the safe one here.
 #[cfg(unix)]
 pub(crate) fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
+    // Reject a pid that cannot be represented as a positive `pid_t`: `as` would
+    // wrap it negative, and `kill(-1, 0)` would probe *every* signalable process
+    // (returning success) rather than naming one — a recycled/out-of-range pid
+    // must read as "not ours", never as "alive" (issue #54 review).
+    let Some(pid) = checked_pid(pid) else {
         return false;
-    }
+    };
     // `kill(pid, 0)` sends no signal: 0 => alive; EPERM => alive but not ours;
     // ESRCH => no such process.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+    if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -274,8 +304,25 @@ pub fn arm_owner_watchdog() {
         marker.push(' ');
         marker.push_str(&start.to_string());
     }
-    let _ = std::fs::write(home.join(OWNER_PID_FILE), marker);
+    write_marker_atomic(&home.join(OWNER_PID_FILE), &marker);
     let _ = spawn_owner_watchdog(owner, home);
+}
+
+/// Write the `ct-owner.pid` owner marker **atomically**: a plain
+/// `std::fs::write` truncates the existing file before writing, so a concurrent
+/// contract-test startup sweep can read it in that window (empty or partial),
+/// fail to parse an owner, and classify this *live* daemon's home as orphaned —
+/// removing the home and tripping the very watchdog this marker arms (issue #54
+/// review). Write to a sibling temp file and `rename(2)` it over the target so a
+/// reader always sees either the previous valid marker or the new one, never a
+/// truncated intermediate. The rename is atomic on the same filesystem (the temp
+/// file sits in the same directory). Best-effort: a failure just means the sweep
+/// falls back to the daemon's own watchdog.
+fn write_marker_atomic(path: &std::path::Path, marker: &str) {
+    let tmp = path.with_extension("pid.tmp");
+    if std::fs::write(&tmp, marker).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// The file (under the test's `C8CTL_NANO_HOME`) recording the owning test
@@ -2048,6 +2095,78 @@ mod tests {
             !pid_identity_matches(pid, None),
             "a dead pid fails the liveness probe"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_pid_rejects_wrap_and_zero() {
+        // `pid_t` is a signed 32-bit int, so a `u32` above `i32::MAX` wraps
+        // negative under `as` — and `kill(2)` reads `-1` as "broadcast to every
+        // process I may signal" (issue #54 review). The conversion must reject
+        // those values before any `kill` call.
+        assert_eq!(checked_pid(1), Some(1));
+        assert_eq!(checked_pid(i32::MAX as u32), Some(i32::MAX));
+        assert_eq!(checked_pid(0), None, "pid 0 names this process's group");
+        assert_eq!(
+            checked_pid(u32::MAX),
+            None,
+            "u32::MAX would wrap to -1 => kill(-1) broadcast"
+        );
+        assert_eq!(
+            checked_pid((i32::MAX as u32) + 1),
+            None,
+            "i32::MAX+1 wraps to i32::MIN (a process-group target)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn out_of_range_pid_is_never_probed_or_signalled() {
+        // The watchdog's `--self-pid` is an unrestricted `u32`. An out-of-range
+        // value must read as "not ours" (never "alive") and must never reach
+        // `kill` — otherwise `u32::MAX` becomes `kill(-1, …)`, a broadcast.
+        assert!(
+            !pid_alive(u32::MAX),
+            "an out-of-range pid must not be probed as alive (would broadcast)"
+        );
+        assert!(!pid_alive(0), "pid 0 must not be probed as alive");
+        // `sigkill_pid` on an out-of-range pid is a no-op (returns before any
+        // `kill`); this must not panic or broadcast. We cannot observe the
+        // absence of a signal directly, but the function returning at all — with
+        // the process still alive to continue the test — is the regression guard.
+        sigkill_pid(u32::MAX);
+        sigkill_pid(0);
+        // A real, in-range pid still works: our own process is alive.
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_marker_atomic_leaves_a_complete_marker() {
+        // The atomic write (temp + rename) must leave a complete, parseable
+        // marker — never a truncated intermediate a concurrent sweep could
+        // misread as "no owner" (issue #54 review).
+        let dir = std::env::temp_dir().join(format!(
+            "nano-marker-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp marker dir");
+        let marker = dir.join("ct-owner.pid");
+        write_marker_atomic(&marker, "1234 5678");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1234 5678");
+        // Overwriting an existing marker atomically replaces it wholesale.
+        write_marker_atomic(&marker, "4321 8765");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "4321 8765");
+        // The temp file must not linger after the rename.
+        assert!(
+            !dir.join("ct-owner.pid.tmp").exists(),
+            "the temp file is renamed away, not left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

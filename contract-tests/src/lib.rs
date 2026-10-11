@@ -293,7 +293,11 @@ impl TempHome {
             marker.push(' ');
             marker.push_str(&start);
         }
-        let _ = std::fs::write(dir.path().join("ct-owner.pid"), marker);
+        // Write the marker atomically (temp file + rename): a truncating write
+        // would let a concurrently-created `TempHome`'s startup sweep read the
+        // marker mid-write (empty/partial), fail to parse an owner, and classify
+        // this live home as orphaned — removing it and tripping the watchdog.
+        write_owner_marker_atomic(&dir.path().join("ct-owner.pid"), &marker);
         TempHome { dir, target }
     }
 
@@ -466,12 +470,17 @@ fn sweep_orphaned_daemons() {
             continue;
         }
         let home = entry.path();
-        // Skip a home whose owning test is still alive: that daemon belongs to a
-        // concurrently-running test and must not be stopped from under it.
-        if owner_still_alive(&home) {
+        // Classify ownership: only a home whose marker positively names a
+        // dead/recycled owner (Orphaned) or one with no readable marker whose
+        // supervisor endpoint we can positively confirm (Unknown) may be
+        // reclaimed. A home with a live, matching owner marker belongs to a
+        // concurrently-running test and must be left entirely alone.
+        let ownership = classify_home(&home);
+        if matches!(ownership, HomeOwnership::Live) {
             continue;
         }
         let sock = supervisor_socket_path(&home);
+        let mut endpoint_confirmed = false;
         if sock.exists() {
             // A daemon still answers this orphaned home's socket: force-stop it,
             // then give it a bounded moment to exit before removing the
@@ -499,6 +508,25 @@ fn sweep_orphaned_daemons() {
                 continue;
             }
             let _ = std::fs::remove_file(&sock);
+            // We bound and stopped a live supervisor endpoint at this home's
+            // derived socket path: positive identification that this is a
+            // supervisor home, independent of any owner marker.
+            endpoint_confirmed = true;
+        }
+        // Recursive deletion is gated on POSITIVE ownership, not the `ct-home-`
+        // prefix alone (issue #54 review): a same-user directory under TMPDIR
+        // with that prefix but no readable marker could be unrelated, and
+        // `remove_dir_all` would destroy its contents. Remove only when either:
+        //   - the marker positively named a dead/recycled owner (Orphaned) — the
+        //     harness wrote that marker, so the home is provably ours; or
+        //   - there was no usable marker (Unknown) but we positively identified a
+        //     supervisor endpoint at this home's derived socket and stopped it.
+        // A markerless home with no reachable supervisor endpoint is left for the
+        // next sweep rather than deleted on the strength of its name alone.
+        let proven_ours =
+            matches!(ownership, HomeOwnership::Orphaned) || endpoint_confirmed;
+        if !proven_ours {
+            continue;
         }
         // The owner is gone and no live daemon answers this home (either it never
         // bound a socket, or the force-stop above was confirmed). The home is a
@@ -508,9 +536,9 @@ fn sweep_orphaned_daemons() {
         // review). Remove the whole tree. `remove_dir_all` on a symlink removes
         // the link itself rather than following it, so a planted `ct-home-*`
         // symlink can never redirect the deletion onto a real directory; the
-        // `ct-home-` prefix check above already confines this to test homes, and
-        // the removal is best-effort (a busy or read-only tree is left for the
-        // next sweep).
+        // ownership gate above already confines this to a positively-identified
+        // test home, and the removal is best-effort (a busy or read-only tree is
+        // left for the next sweep).
         let _ = std::fs::remove_dir_all(&home);
     }
 }
@@ -616,6 +644,82 @@ fn owner_still_alive(home: &Path) -> bool {
 #[cfg(not(unix))]
 fn owner_still_alive(_home: &Path) -> bool {
     true
+}
+
+/// Write the `ct-owner.pid` owner marker **atomically** (temp file + rename) so a
+/// concurrent startup sweep never reads a truncated intermediate and misclassifies
+/// a live home as orphaned (issue #54 review). Mirrors `src/pdeath.rs`
+/// `write_marker_atomic`; the rename is atomic on the same filesystem.
+fn write_owner_marker_atomic(path: &Path, marker: &str) {
+    let tmp = path.with_extension("pid.tmp");
+    if std::fs::write(&tmp, marker).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// The ownership verdict the startup sweep acts on, distinguishing *why* a home
+/// is not currently owned by a live test. The distinction matters because only a
+/// **positive** identification of a dead/recycled owner justifies recursively
+/// deleting the home: a `ct-home-*` *name* alone is not proof this harness owns
+/// the directory (issue #54 review).
+enum HomeOwnership {
+    /// A live, matching owner marker names a concurrently-running test: leave it.
+    Live,
+    /// A readable marker named an owner pid that is now dead or recycled. The
+    /// harness provably wrote the marker, so the home is ours to reclaim.
+    Orphaned,
+    /// No readable/parseable marker (absent, garbage, or an older pid-only
+    /// producer that predates the marker). We cannot prove ownership from the
+    /// marker alone, so the home is only reclaimable after positively
+    /// identifying its supervisor endpoint (a confirmed control socket).
+    Unknown,
+}
+
+/// Classify a `ct-home-*` home for the startup sweep. Reads the owner marker and
+/// reports whether it names a live owner, a positively dead/recycled owner, or is
+/// absent/unparseable. This is the ownership gate on recursive deletion: only
+/// `Orphaned` (a marker we wrote, now dead) authorises removing the home without
+/// further proof.
+#[cfg(unix)]
+fn classify_home(home: &Path) -> HomeOwnership {
+    let Ok(raw) = std::fs::read_to_string(home.join("ct-owner.pid")) else {
+        // No readable marker: cannot prove ownership from the marker alone.
+        return HomeOwnership::Unknown;
+    };
+    let mut fields = raw.split_whitespace();
+    let Some(pid) = fields.next().and_then(|f| f.parse::<i32>().ok()) else {
+        return HomeOwnership::Unknown;
+    };
+    if pid <= 0 {
+        return HomeOwnership::Unknown;
+    }
+    // A parseable marker exists. `kill(pid, 0)`: 0 => alive; EPERM => alive but
+    // not ours; ESRCH => gone.
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !alive {
+        // A valid marker whose owner pid is dead: positively orphaned.
+        return HomeOwnership::Orphaned;
+    }
+    // Recycle guard: when the marker recorded the owner's start-time token,
+    // require the live pid to still be that incarnation; a mismatch means the
+    // owner died and its pid was recycled → positively orphaned. A pid-only
+    // marker (older producer) cannot prove a recycle, so it stays Live on a
+    // live pid (the conservative direction).
+    if let Some(start) = fields.next().and_then(|f| f.parse::<u64>().ok()) {
+        if process_start_time(pid as u32) != Some(start) {
+            return HomeOwnership::Orphaned;
+        }
+    }
+    HomeOwnership::Live
+}
+
+/// Non-unix fallback: with no liveness probe we cannot prove a home is orphaned,
+/// so report every home as Live and the sweep never deletes one it cannot prove
+/// is ours (mirrors the `owner_still_alive` non-unix fallback).
+#[cfg(not(unix))]
+fn classify_home(_home: &Path) -> HomeOwnership {
+    HomeOwnership::Live
 }
 
 /// The reason an engine-dependent test cannot run. Print it and return early —
@@ -2591,5 +2695,72 @@ mod unit {
             "a home whose daemon still answers must not be deleted"
         );
         let _ = std::fs::remove_file(&busy_sock);
+    }
+
+    // The `ct-home-` prefix is NOT proof of ownership (issue #54 review): a
+    // same-user directory under TMPDIR with that prefix but no readable marker
+    // and no reachable supervisor endpoint could be unrelated, so the sweep must
+    // NOT recursively delete it on the strength of its name alone. Only a
+    // positively-identified orphan (a marker naming a dead owner, or a confirmed
+    // supervisor endpoint) authorises removal.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_leaves_markerless_home_without_endpoint() {
+        // A `ct-home-*` directory with NO owner marker and NO control socket:
+        // nothing positively ties it to this harness, so it must be left alone.
+        let stray = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("stray home");
+        let stray_path = stray.path().to_path_buf();
+        std::fs::write(stray_path.join("unrelated.txt"), "not a test home").unwrap();
+        // Deliberately no `ct-owner.pid` and no socket.
+
+        sweep_orphaned_daemons();
+
+        assert!(
+            stray_path.exists(),
+            "a markerless home with no supervisor endpoint must NOT be deleted"
+        );
+        assert!(
+            stray_path.join("unrelated.txt").exists(),
+            "its contents must be intact"
+        );
+    }
+
+    // A markerless home whose supervisor endpoint we CAN positively identify (a
+    // control socket that answers, then stops) is provably a supervisor home, so
+    // the sweep reclaims it even without an owner marker (the legacy-markerless
+    // path of issue #54 review).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_removes_markerless_home_with_confirmed_endpoint() {
+        use std::os::unix::net::UnixListener;
+
+        let home = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("legacy home");
+        let home_path = home.path().to_path_buf();
+        std::mem::forget(home); // leak; the sweep removes it
+        // No owner marker, but a socket we can bind then close to simulate a
+        // daemon that answered and then stopped.
+        let sock = supervisor_socket_path(&home_path);
+        {
+            let listener = UnixListener::bind(&sock).expect("bind legacy socket");
+            // Answer one force-stop then drop the listener so the sweep's
+            // confirmation connect fails (daemon stopped).
+            drop(listener);
+        }
+        // The socket path exists but nothing is listening now: the sweep's
+        // connect fails, so it removes the stale socket and treats the endpoint
+        // as confirmed-stopped. endpoint_confirmed is only set when the socket
+        // file existed, which it does here.
+        sweep_orphaned_daemons();
+
+        assert!(
+            !home_path.exists(),
+            "a markerless home with a confirmed supervisor endpoint must be removed"
+        );
     }
 }
