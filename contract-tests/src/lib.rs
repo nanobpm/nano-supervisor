@@ -472,32 +472,46 @@ fn sweep_orphaned_daemons() {
             continue;
         }
         let sock = supervisor_socket_path(&home);
-        if !sock.exists() {
-            continue;
-        }
-        // A daemon still answers this orphaned home's socket: force-stop it, then
-        // give it a bounded moment to exit before removing the (soon-stale)
-        // socket file. Its owner watchdog will SIGKILL it regardless once it
-        // notices the dead owner; this just hurries a clean stop along.
-        if control_request(&sock, &serde_json::json!({ "op": "stop", "force": true })).is_ok() {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline
-                && std::os::unix::net::UnixStream::connect(&sock).is_ok()
-            {
-                std::thread::sleep(Duration::from_millis(50));
+        if sock.exists() {
+            // A daemon still answers this orphaned home's socket: force-stop it,
+            // then give it a bounded moment to exit before removing the
+            // (soon-stale) socket file. Its owner watchdog will SIGKILL it
+            // regardless once it notices the dead owner; this just hurries a
+            // clean stop along.
+            if control_request(&sock, &serde_json::json!({ "op": "stop", "force": true })).is_ok() {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline
+                    && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
-        }
-        // Remove the socket file only once the daemon stopped answering it (the
-        // force-stop above was confirmed by a failed connect), so a later sweep
-        // does not mistake a stale file for a live daemon. If the daemon is
-        // STILL accepting — the stop request failed or the deadline expired —
-        // leave the pathname in place: unlinking a live Unix socket does not
-        // kill its process, it only strips the one name a later sweep (or this
-        // daemon's own owner watchdog, which needs no socket) could use to reach
-        // and stop it, stranding an unreachable orphan (issue #54 review).
-        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            // Remove the socket file only once the daemon stopped answering it
+            // (the force-stop above was confirmed by a failed connect), so a later
+            // sweep does not mistake a stale file for a live daemon. If the daemon
+            // is STILL accepting — the stop request failed or the deadline expired
+            // — leave both the pathname and the home in place: unlinking a live
+            // Unix socket does not kill its process, it only strips the one name a
+            // later sweep (or this daemon's own owner watchdog, which needs no
+            // socket) could use to reach and stop it, stranding an unreachable
+            // orphan (issue #54 review).
+            if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                continue;
+            }
             let _ = std::fs::remove_file(&sock);
         }
+        // The owner is gone and no live daemon answers this home (either it never
+        // bound a socket, or the force-stop above was confirmed). The home is a
+        // verified orphan: its owning test died without running `TempDir::drop`,
+        // so without this removal every such `ct-home-*` directory would remain
+        // permanently and be rescanned by every future `TempHome` (issue #54
+        // review). Remove the whole tree. `remove_dir_all` on a symlink removes
+        // the link itself rather than following it, so a planted `ct-home-*`
+        // symlink can never redirect the deletion onto a real directory; the
+        // `ct-home-` prefix check above already confines this to test homes, and
+        // the removal is best-effort (a busy or read-only tree is left for the
+        // next sweep).
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
@@ -2511,5 +2525,71 @@ mod unit {
         // An unreadable/garbage marker is orphaned.
         std::fs::write(&marker, "not-a-pid").unwrap();
         assert!(!owner_still_alive(home), "garbage marker => orphaned");
+    }
+
+    // The startup sweep must remove a *verified orphan* home, not just its stale
+    // socket: a test that died without running `TempDir::drop` leaves the whole
+    // `ct-home-*` tree behind, and deleting only the socket lets the leftover
+    // accumulate and be rescanned by every future `TempHome` (issue #54 review).
+    // A home whose owner is still alive must be left entirely alone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sweep_removes_verified_orphan_home() {
+        use std::os::unix::net::UnixListener;
+
+        // An orphaned home: a dead owner pid (a near-max pid no live process
+        // holds) and NO control socket. The sweep must remove the whole tree.
+        let orphan = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("orphan home");
+        let orphan_path = orphan.path().to_path_buf();
+        std::fs::write(orphan_path.join("ct-owner.pid"), "2147483000").unwrap();
+        std::fs::write(orphan_path.join("state.json"), "{}").unwrap();
+        // Keep `orphan` alive so its `TempDir` does not delete the dir on drop
+        // before we assert; we leak it deliberately and the sweep removes it.
+        let orphan_path2 = orphan_path.clone();
+        std::mem::forget(orphan);
+
+        // A concurrently-running home: a LIVE owner (this process) with its real
+        // start token. The sweep must not touch it.
+        let live = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("live home");
+        let live_path = live.path().to_path_buf();
+        let me = std::process::id();
+        let start = process_start_time(me).expect("own start time readable");
+        std::fs::write(live_path.join("ct-owner.pid"), format!("{me} {start}")).unwrap();
+        std::fs::write(live_path.join("state.json"), "{}").unwrap();
+
+        // An orphaned home whose daemon is STILL answering its socket: the sweep
+        // force-stops it, but because the (test) listener keeps accepting, the
+        // shutdown is never confirmed, so the home must be LEFT for the next
+        // sweep rather than deleted out from under a live daemon.
+        let busy = tempfile::Builder::new()
+            .prefix("ct-home-")
+            .tempdir()
+            .expect("busy home");
+        let busy_path = busy.path().to_path_buf();
+        std::fs::write(busy_path.join("ct-owner.pid"), "2147483000").unwrap();
+        let busy_sock = supervisor_socket_path(&busy_path);
+        let _listener = UnixListener::bind(&busy_sock).expect("bind busy socket");
+
+        sweep_orphaned_daemons();
+
+        assert!(
+            !orphan_path2.exists(),
+            "verified orphan home (dead owner, no socket) must be removed"
+        );
+        assert!(
+            live_path.exists(),
+            "a home whose owner is still alive must be left alone"
+        );
+        assert!(
+            busy_path.exists(),
+            "a home whose daemon still answers must not be deleted"
+        );
+        let _ = std::fs::remove_file(&busy_sock);
     }
 }
