@@ -8209,7 +8209,10 @@ mod tests {
         let (guard, file) =
             cred_secret_file(b"s3cr3t-cleanup").expect("write credential secret file");
         let dir = guard.dir.clone();
-        assert!(file.exists(), "secret file must exist before the guard drops");
+        assert!(
+            file.exists(),
+            "secret file must exist before the guard drops"
+        );
         assert!(dir.exists(), "secret dir must exist before the guard drops");
         drop(guard);
         assert!(
