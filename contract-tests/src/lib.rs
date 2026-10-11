@@ -500,17 +500,15 @@ fn sweep_orphaned_daemons() {
             // `Unknown`/markerless home that would let a stale socket authorise
             // deleting a directory we never proved is ours (issue #54 review
             // r4240279294).
-            let answered_stop = control_request(
-                &sock,
-                &serde_json::json!({ "op": "stop", "force": true }),
-            )
-            .ok()
-            .is_some_and(|frames| {
-                frames.iter().any(|f| {
-                    f.get("final").and_then(|v| v.as_bool()).unwrap_or(false)
-                        && f.get("type").and_then(|v| v.as_str()) == Some("stopped")
-                })
-            });
+            let answered_stop =
+                control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }))
+                    .ok()
+                    .is_some_and(|frames| {
+                        frames.iter().any(|f| {
+                            f.get("final").and_then(|v| v.as_bool()).unwrap_or(false)
+                                && f.get("type").and_then(|v| v.as_str()) == Some("stopped")
+                        })
+                    });
             if answered_stop {
                 // A real supervisor acknowledged the force-stop: give it a bounded
                 // moment to exit before removing the (soon-stale) socket file. Its
@@ -553,8 +551,7 @@ fn sweep_orphaned_daemons() {
         //     supervisor endpoint at this home's derived socket and stopped it.
         // A markerless home with no reachable supervisor endpoint is left for the
         // next sweep rather than deleted on the strength of its name alone.
-        let proven_ours =
-            matches!(ownership, HomeOwnership::Orphaned) || endpoint_confirmed;
+        let proven_ours = matches!(ownership, HomeOwnership::Orphaned) || endpoint_confirmed;
         if !proven_ours {
             continue;
         }
@@ -2793,10 +2790,10 @@ mod unit {
             .expect("legacy home");
         let home_path = home.path().to_path_buf();
         std::mem::forget(home); // leak; the sweep removes it
-        // No owner marker, but a socket backed by a listener that speaks the
-        // control protocol: it accepts one connection, reads the `stop` request,
-        // answers with the terminal `stopped` frame, then exits — dropping the
-        // listener so the sweep's confirmation connect fails (daemon stopped).
+                                // No owner marker, but a socket backed by a listener that speaks the
+                                // control protocol: it accepts one connection, reads the `stop` request,
+                                // answers with the terminal `stopped` frame, then exits — dropping the
+                                // listener so the sweep's confirmation connect fails (daemon stopped).
         let sock = supervisor_socket_path(&home_path);
         let listener = UnixListener::bind(&sock).expect("bind legacy socket");
         let answerer = std::thread::spawn(move || {
