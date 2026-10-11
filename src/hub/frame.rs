@@ -239,6 +239,28 @@ mod tests {
     }
 
     #[test]
+    fn payload_keys_serialize_in_insertion_order() {
+        // The live codec promises byte-exact payloads, so object keys MUST stay
+        // in insertion order (requires the root crate's serde_json
+        // `preserve_order` feature). A sorted `BTreeMap` backing would reorder
+        // `{instance, capability}` to `{capability, instance}` — exactly the
+        // REGISTER divergence from the golden corpus. This test fails (red) if
+        // the feature is ever dropped from Cargo.toml.
+        let frame = Frame::new(
+            Lane::Control,
+            Family::Register,
+            0,
+            json!({ "instance": "w-1", "capability": { "family": "senior" } }),
+        );
+        let bytes = encode_frame(&frame).expect("encode");
+        let text = std::str::from_utf8(&bytes[FRAME_HEADER_BYTES..]).expect("utf8 payload");
+        assert!(
+            text.starts_with("{\"instance\":"),
+            "payload keys must stay in insertion order (preserve_order), got: {text}"
+        );
+    }
+
+    #[test]
     fn header_is_exactly_thirteen_bytes_before_payload() {
         let frame = Frame::new(Lane::Bulk, Family::Relay, 1, json!({}));
         let bytes = encode_frame(&frame).unwrap();

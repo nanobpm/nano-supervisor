@@ -61,6 +61,14 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 /// WebSocket handshake would park the connection task indefinitely, wedging both
 /// reconnect backoff and a requested shutdown (which only lands between attempts).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling on any single socket write/flush. A hub that stops reading lets TCP
+/// backpressure fill the kernel send buffer; without this bound `drain` (and so
+/// the entire connection task, including the `shutdown`-watch branch that only
+/// runs between `select!` iterations) could park inside one `send` forever,
+/// wedging reconnect and shutdown alike. On timeout the in-flight frame is
+/// re-buffered and the connection is torn down so reconnect — or shutdown — can
+/// proceed instead of blocking on the wedged socket.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Count ceiling on the ACP-update → transcript bridge channel. It sits in
 /// front of the already-byte-bounded outbound [`LaneBuffer`]; the EFFECTIVE
 /// bound used per session is the smaller of this and a byte-derived bound (see
@@ -240,12 +248,25 @@ impl LaneBuffer {
         Some(bf.frame)
     }
 
-    /// Re-admit a popped frame to the FRONT of its lane (a write failed; retry
-    /// it first on reconnect, preserving its lane priority). This is a single
-    /// retry of a frame we just popped, so it does not re-run capacity eviction
-    /// (it cannot grow the buffer beyond its pre-pop size).
+    /// Re-admit a popped frame to the FRONT of its lane (a write failed or timed
+    /// out; retry it first on reconnect, preserving its lane priority). The
+    /// buffer is NOT guaranteed to still be at its pre-pop size: producers can
+    /// refill the freed slot while the failing write is awaited, so this re-runs
+    /// the SAME priority-aware eviction as `push` before restoring the frame —
+    /// otherwise repeated write failures could grow the buffer past its
+    /// advertised count/byte caps. When only strictly-higher-priority traffic
+    /// remains (or the frame alone exceeds the whole byte budget), the retry
+    /// frame is dropped rather than displacing more important frames.
     fn push_front(&mut self, frame: Frame) {
+        if self.capacity == 0 {
+            return; // no room at all: drop on the floor
+        }
         let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            if !self.evict_for(frame.lane) {
+                return; // only higher-priority frames remain / too large: drop
+            }
+        }
         self.store_front(BufferedFrame { bytes, frame });
     }
 
@@ -1070,7 +1091,14 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                         }
                     }
                     Some(Ok(Message::Ping(p))) => {
-                        if write.send(Message::Pong(p)).await.is_err() { break; }
+                        // Bounded like every other write: a stalled socket must
+                        // not wedge the pump inside the Pong send.
+                        if !matches!(
+                            timeout(WRITE_TIMEOUT, write.send(Message::Pong(p))).await,
+                            Ok(Ok(()))
+                        ) {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
@@ -1092,7 +1120,7 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                         );
                     }
                     let _ = drain(client, &mut write).await;
-                    let _ = write.send(Message::Close(None)).await;
+                    let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
                     break;
                 }
             }
@@ -1128,10 +1156,22 @@ async fn drain(
         }
         match encode_frame(&frame) {
             Ok(bytes) => {
-                if let Err(e) = write.send(Message::Binary(bytes)).await {
-                    // Re-buffer the frame we popped so it is retried on reconnect.
-                    client.outbound.lock().unwrap().push_front(frame);
-                    return Err(e.into());
+                // Bound the write: a hub that stops reading must not park the
+                // connection task (and its shutdown branch) inside `send`
+                // forever. On error OR timeout, re-buffer the popped frame (so
+                // it is retried on reconnect) and tear the connection down.
+                match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        client.outbound.lock().unwrap().push_front(frame);
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        client.outbound.lock().unwrap().push_front(frame);
+                        return Err(anyhow::anyhow!(
+                            "agentic hub: socket write timed out; tearing down the stalled connection"
+                        ));
+                    }
                 }
             }
             // An unserialisable/too-large frame is dropped, not retried forever.
@@ -1215,6 +1255,53 @@ mod tests {
         let frames = buffered(&client);
         assert_eq!(frames[0].0, Lane::Control, "control lane drains first");
         client.shutdown().await;
+    }
+
+    #[test]
+    fn push_front_retry_respects_count_cap() {
+        // A write failed/timed out: `drain` popped a frame, then producers
+        // refilled the freed slot while the write was awaiting. Re-admitting the
+        // retry frame at the front must NOT grow the buffer past its count cap —
+        // otherwise repeated failures keep the "bounded" buffer growing.
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 2 })));
+        let popped = buf.pop().expect("a frame to send");
+        assert_eq!(buf.len(), 1);
+        // Producers refill the freed slot (and more) during the await.
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 3, json!({ "n": 3 })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 4, json!({ "n": 4 })));
+        assert_eq!(buf.len(), 2, "buffer back at capacity before the retry");
+        buf.push_front(popped);
+        assert!(buf.len() <= 2, "retry re-admission must honour the count cap");
+    }
+
+    #[test]
+    fn push_front_retry_respects_byte_budget() {
+        // Same race, byte budget instead of count. The budget holds two frames;
+        // after a refill fills it, a retry must shed to fit rather than exceed.
+        let one = frame_bytes(&Frame::new(Lane::Bulk, Family::Relay, 0, json!({ "n": 0 })));
+        let mut buf = LaneBuffer::with_limits(1000, one * 2);
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
+        let popped = buf.pop().expect("a frame");
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 2 })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 3, json!({ "n": 3 })));
+        buf.push_front(popped);
+        assert!(buf.bytes <= one * 2, "retry re-admission must honour the byte budget");
+    }
+
+    #[test]
+    fn push_front_retry_never_evicts_higher_priority() {
+        // When a full buffer holds only strictly-higher-priority traffic, a
+        // low-priority retry is dropped rather than displacing control frames.
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        let popped = Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 }));
+        buf.push(Frame::new(Lane::Control, Family::Register, 2, json!({ "instance": "w" })));
+        buf.push(Frame::new(Lane::Control, Family::Claim, 3, json!({ "instance": "w" })));
+        assert_eq!(buf.len(), 2);
+        buf.push_front(popped);
+        assert_eq!(buf.len(), 2, "bulk retry dropped; control preserved");
+        assert_eq!(buf.control.len(), 2, "both control frames survive");
     }
 
     #[tokio::test]

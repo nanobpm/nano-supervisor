@@ -28,7 +28,14 @@ clap = { version = "4", features = ["derive"] }
 # or argument containing spaces can be preserved by quoting (src/main.rs).
 shlex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps JSON object keys in insertion order through the live hub
+# codec (src/hub/frame.rs), so REGISTER/CLAIM/transcript payloads serialize
+# byte-exactly as the golden corpus and the hub expect. Without it the root-only
+# `cargo build` backs `serde_json::Value` with a sorted `BTreeMap` and reorders
+# keys (e.g. `{instance, capability}` -> `{capability, instance}`), diverging
+# from the wire contract — the workspace build only gets this feature
+# transitively from `contract-tests`, so it MUST be declared here too.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Derive the supervisor control-socket path exactly like the Node plugin
 # (`join(tmpdir(), "c8ctl-nano-sup-<sha1(home)[:8]>.sock")`) so `supervisor
 # status` / `workforce status` can probe a running daemon. Already in the
