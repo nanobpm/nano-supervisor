@@ -292,6 +292,18 @@ impl LaneBuffer {
         Some(bf.frame)
     }
 
+    /// Pop the next CONTROL frame only, leaving the lower (interactive/bulk)
+    /// lanes untouched. Used by the terminal shutdown drain ([`drain_control`]),
+    /// which must flush the DEREGISTER control snapshot to the socket but
+    /// deliberately DISCARDS the lower-lane backlog (bulk transcript,
+    /// interactive steer) rather than blocking shutdown on it. Returns `None`
+    /// when the control lane is empty, even if lower lanes still hold frames.
+    fn pop_control(&mut self) -> Option<Frame> {
+        let bf = self.control.pop_front()?;
+        self.account_removed(&bf);
+        Some(bf.frame)
+    }
+
     /// Re-admit a popped frame to the FRONT of its lane (a write failed or timed
     /// out; retry it first on reconnect, preserving its lane priority). The
     /// buffer is NOT guaranteed to still be at its pre-pop size: producers can
@@ -314,6 +326,26 @@ impl LaneBuffer {
             }
         }
         self.store_front(BufferedFrame { bytes, frame });
+    }
+
+    /// Re-admit a popped frame to the FRONT of its lane after a failed or
+    /// timed-out write, like [`push_front`] — but a MUST-DELIVER control frame
+    /// (`RELEASE` / `DEREGISTER`) is re-admitted EXEMPT from the buffer bound
+    /// (via [`push_front_control_bounded`]) so a write failure can NEVER silently
+    /// drop it. A `RELEASE` for a job already removed from `in_flight` cannot be
+    /// rebuilt by the reconnect resync, so dropping it on re-buffer would strand
+    /// the job's CLAIM on the hub (ownership desync); a `DEREGISTER` is the only
+    /// frame that retires a worker's presence. Everything else re-buffers through
+    /// the ordinary bounded [`push_front`], which may shed it under pressure
+    /// (transcript/steer is repairable, presence is not).
+    fn requeue_front(&mut self, frame: Frame) {
+        if frame.lane == Lane::Control
+            && matches!(frame.family, Family::Release | Family::Deregister)
+        {
+            self.push_front_control_bounded(frame);
+        } else {
+            self.push_front(frame);
+        }
     }
 
     /// Prepend a CONTROL frame to the front of its lane, shedding lower-priority
@@ -797,12 +829,22 @@ impl HubClient {
     /// re-claiming it) and enqueue the `release {instance, jobKey}` control
     /// frame. Called by [`HubSession::close`] (behind the drain barrier) and, as
     /// a best-effort fallback, by `Drop` when a session was never closed.
+    ///
+    /// The RELEASE is enqueued EXEMPT from the buffer bound (via
+    /// [`HubClient::enqueue_control_exempt`] /
+    /// [`LaneBuffer::push_back_control_bounded`]), NOT the ordinary bounded
+    /// [`HubClient::enqueue`]. Once the job is removed from `in_flight` the
+    /// reconnect resync can no longer recreate its CLAIM, so this RELEASE is the
+    /// ONLY frame that can retire the hub's ownership of the job. The bounded
+    /// `enqueue` drops a control newcomer when the control lane is full (control
+    /// never evicts control), which would silently strand the job's CLAIM on the
+    /// hub forever — an unrepairable ownership desync. The exempt admission sheds
+    /// lower-priority traffic to make room but never drops the RELEASE itself.
     fn release_job(&self, instance: &str, job_key: &str) {
         if let Some(jobs) = self.in_flight.lock().unwrap().get_mut(instance) {
             jobs.remove(job_key);
         }
-        self.enqueue(
-            Lane::Control,
+        self.enqueue_control_exempt(
             Family::Release,
             json!({ "instance": instance, "jobKey": job_key }),
         );
@@ -1426,11 +1468,14 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                             json!({ "instance": inst, "reason": "shutdown" }),
                         );
                     }
-                    // Terminal path: drain the WHOLE buffer in one pass (batch 0 =
-                    // unbounded) so every DEREGISTER reaches the socket before the
-                    // Close — a bounded batch could exit with DEREGISTERs still
-                    // buffered.
-                    let _ = drain(client, &mut write, 0).await;
+                    // Terminal path: drain ONLY the control lane (the DEREGISTER
+                    // snapshot, plus any still-buffered RELEASE/HEARTBEAT) so
+                    // every DEREGISTER reaches the socket before the Close,
+                    // WITHOUT blocking shutdown on the lower-lane (bulk
+                    // transcript / interactive steer) backlog. That backlog is
+                    // discarded with the socket, so draining it would only delay
+                    // deregistration by up to WRITE_TIMEOUT per buffered frame.
+                    let _ = drain_control(client, &mut write).await;
                     let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
                     break;
                 }
@@ -1454,8 +1499,8 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
 /// BOUNDED BATCH: `batch_limit` caps how many frames are written before `drain`
 /// yields back to the connection `select!` loop (re-arming the outbound notify
 /// if frames remain), so a sustained producer cannot keep `read.next()` and
-/// `shutdown.changed()` from being polled. `0` means unbounded (the terminal
-/// shutdown drain, which must flush the whole DEREGISTER snapshot in one pass).
+/// `shutdown.changed()` from being polled. `0` means unbounded (drain the entire
+/// buffer in a single pass).
 async fn drain(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
@@ -1497,7 +1542,7 @@ async fn drain(
                 // held RELEASE too (its barrier stays armed) so it is retried on
                 // reconnect AFTER the not-yet-written tail — ordering preserved.
                 if let Err(e) = drain_lower_lanes(client, write, incarnation).await {
-                    client.outbound.lock().unwrap().push_front(frame);
+                    client.outbound.lock().unwrap().requeue_front(frame);
                     return Err(e);
                 }
                 // The tail is now on the socket: consume the barrier and let the
@@ -1514,11 +1559,11 @@ async fn drain(
                 match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        client.outbound.lock().unwrap().push_front(frame);
+                        client.outbound.lock().unwrap().requeue_front(frame);
                         return Err(e.into());
                     }
                     Err(_) => {
-                        client.outbound.lock().unwrap().push_front(frame);
+                        client.outbound.lock().unwrap().requeue_front(frame);
                         return Err(anyhow::anyhow!(
                             "agentic hub: socket write timed out; tearing down the stalled connection"
                         ));
@@ -1580,6 +1625,49 @@ async fn drain_lower_lanes(
                     ));
                 }
             },
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Terminal shutdown drain: write ONLY the control lane (the DEREGISTER
+/// snapshot, plus any still-buffered RELEASE/HEARTBEAT) to the socket, then
+/// return so the caller can send the Close. Unlike [`drain`], it deliberately
+/// leaves the lower lanes (bulk transcript, interactive steer) buffered and
+/// UNSENT: a clean shutdown must deregister every worker promptly and must not
+/// block for up to `WRITE_TIMEOUT` per frame on a potentially large bulk/steer
+/// backlog the process is about to discard with the socket anyway.
+///
+/// There is no RELEASE drain barrier here — the transcript tail a RELEASE orders
+/// against is exactly the lower-lane backlog being discarded — and no
+/// incarnation re-stamping, since control frames are never transcript `produce`
+/// relays. A write error or timeout ends the drain WITHOUT re-buffering: this is
+/// the terminal path, so there is no reconnect to retry on.
+async fn drain_control(
+    client: &Arc<HubClient>,
+    write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+) -> anyhow::Result<()> {
+    loop {
+        let frame = {
+            let mut buf = client.outbound.lock().unwrap();
+            match buf.pop_control() {
+                Some(f) => f,
+                None => return Ok(()),
+            }
+        };
+        match encode_frame(&frame) {
+            Ok(bytes) => match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
+                Ok(Ok(())) => {}
+                // Terminal path: a failed/stalled socket ends the drain. Do not
+                // re-buffer — the process is exiting and will not reconnect.
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "agentic hub: socket write timed out during the shutdown deregister drain"
+                    ))
+                }
+            },
+            // An unserialisable/too-large control frame is skipped, not retried.
             Err(_) => continue,
         }
     }
@@ -1707,6 +1795,124 @@ mod tests {
         buf.push_front(popped);
         assert_eq!(buf.len(), 2, "bulk retry dropped; control preserved");
         assert_eq!(buf.control.len(), 2, "both control frames survive");
+    }
+
+    // Finding (round 10, HIGH): a RELEASE must survive a saturated control lane.
+    // `release_job` removes the job from `in_flight` BEFORE enqueuing the
+    // RELEASE, so the reconnect resync can no longer recreate its CLAIM — the
+    // RELEASE is the ONLY frame that can retire the hub's ownership of the job.
+    // The ordinary bounded `push` drops a control newcomer once the control lane
+    // fills (control never evicts control), which would strand the CLAIM on the
+    // hub forever. The exempt admission (`push_back_control_bounded`, used by
+    // `enqueue_control_exempt`/`release_job`) must keep it instead.
+    #[test]
+    fn release_survives_a_full_control_lane() {
+        let has_release =
+            |buf: &LaneBuffer| buf.iter_frames().any(|f| f.family == Family::Release);
+
+        // Baseline (red without the fix): the ordinary bounded `push` DROPS the
+        // RELEASE when the control lane is already at capacity.
+        let mut dropped = LaneBuffer::with_limits(2, 0);
+        dropped.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "a" })));
+        dropped.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        dropped.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            3,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        assert!(!has_release(&dropped), "ordinary push drops the RELEASE");
+
+        // The fix: exempt admission sheds lower lanes (none here) but never
+        // drops the RELEASE itself, so the ownership-retiring frame survives.
+        let mut kept = LaneBuffer::with_limits(2, 0);
+        kept.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "a" })));
+        kept.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        kept.push_back_control_bounded(Frame::new(
+            Lane::Control,
+            Family::Release,
+            3,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        assert!(has_release(&kept), "exempt admission keeps the RELEASE");
+    }
+
+    // Finding (round 10, HIGH, sibling): a write failure/timeout that re-buffers
+    // a popped frame must not silently drop a must-deliver control frame either.
+    // `requeue_front` re-admits RELEASE/DEREGISTER EXEMPT from the bound (while a
+    // sheddable transcript/steer frame still goes through the bounded path).
+    #[test]
+    fn requeue_front_preserves_must_deliver_control() {
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        buf.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "a" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        // Control lane is full; a plain `push_front` would drop this RELEASE.
+        buf.requeue_front(Frame::new(
+            Lane::Control,
+            Family::Release,
+            3,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        assert!(
+            buf.iter_frames().any(|f| f.family == Family::Release),
+            "requeue_front must not drop a re-buffered RELEASE"
+        );
+
+        // A DEREGISTER (the only frame that retires a worker's presence) is
+        // likewise exempt on re-buffer.
+        buf.requeue_front(Frame::new(
+            Lane::Control,
+            Family::Deregister,
+            4,
+            json!({ "instance": "a", "reason": "shutdown" }),
+        ));
+        assert!(
+            buf.iter_frames().any(|f| f.family == Family::Deregister),
+            "requeue_front must not drop a re-buffered DEREGISTER"
+        );
+
+        // A sheddable bulk retry still honours the bound (dropped, not grown).
+        let before = buf.len();
+        buf.requeue_front(Frame::new(Lane::Bulk, Family::Relay, 5, json!({ "n": 1 })));
+        assert_eq!(buf.len(), before, "a sheddable bulk retry stays bounded");
+    }
+
+    // Finding (round 10, MEDIUM): the terminal shutdown drain must flush the
+    // control lane (DEREGISTER snapshot) WITHOUT draining the lower-lane backlog,
+    // so deregistration is not delayed by up to WRITE_TIMEOUT per buffered bulk
+    // transcript / interactive steer frame. `pop_control` pops ONLY control.
+    #[test]
+    fn pop_control_drains_only_the_control_lane() {
+        let mut buf = LaneBuffer::with_limits(100, 0);
+        buf.push(Frame::new(Lane::Control, Family::Deregister, 1, json!({ "instance": "a" })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 1 })));
+        buf.push(Frame::new(Lane::Control, Family::Deregister, 3, json!({ "instance": "b" })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 4, json!({ "n": 2 })));
+
+        // Yields ONLY the control frames (DEREGISTERs), in order...
+        assert_eq!(buf.pop_control().map(|f| f.family), Some(Family::Deregister));
+        assert_eq!(buf.pop_control().map(|f| f.family), Some(Family::Deregister));
+        assert!(buf.pop_control().is_none(), "no control frames left");
+        // ...leaving the two bulk (transcript) frames buffered to be discarded
+        // with the socket rather than blocking the shutdown.
+        assert_eq!(buf.len(), 2, "lower lanes are retained, not drained");
+        assert_eq!(buf.pop().map(|f| f.lane), Some(Lane::Bulk));
+        assert_eq!(buf.pop().map(|f| f.lane), Some(Lane::Bulk));
     }
 
     // Finding (round 8): control admission must NEVER evict an earlier control
