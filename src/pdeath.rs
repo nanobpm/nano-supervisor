@@ -1679,11 +1679,25 @@ mod tests {
     /// terminal Ctrl-C fans SIGINT out to the whole foreground group — and a
     /// watchdog that shares it would die before reaping the orphaned daemon,
     /// defeating the fallback exactly when it is needed. `spawn_owner_watchdog`
-    /// therefore sets `process_group(0)`, so the watchdog's pgid must equal its
-    /// own pid (it leads its own group) and must differ from ours.
+    /// therefore sets `process_group(0)`.
+    ///
+    /// This test cannot observe that on the watchdog child itself: the watchdog
+    /// re-execs `current_exe()`, which under `cargo test` is the libtest binary.
+    /// It does not dispatch `__owner-watchdog` and exits at once (exactly as the
+    /// `spawn_watchdog` reaping test above documents), so reading the spawned
+    /// child's pgid would race its exit/reaper thread and intermittently see
+    /// `ESRCH` (issue #54 review, the "Previously missed" advisory). Instead we (1) assert
+    /// `spawn_owner_watchdog` spawns successfully, exercising the real spawn path
+    /// (env scrub, args, `process_group(0)`), and (2) verify the group-leadership
+    /// MECHANISM it relies on against a deterministically long-lived child we
+    /// fully own: a child launched with `process_group(0)` must lead its own
+    /// group (pgid == pid) and must not share ours.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn owner_watchdog_leads_its_own_process_group() {
+        // (1) The real spawn path must succeed. The background reaper the spawn
+        // installs cleans up the short-lived child; we deliberately do not read
+        // its pgid (see the doc comment — that read is racy).
         let home = std::env::temp_dir().join(format!(
             "nano-owner-wd-pgid-{}-{}",
             std::process::id(),
@@ -1693,40 +1707,50 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&home).expect("create temp home");
-        // The owner is ourselves (alive for the whole test), so the spawned
-        // watchdog stays alive polling until we reap it — giving us a live child
-        // whose process group we can inspect.
-        let pid =
-            spawn_owner_watchdog(std::process::id(), home.clone()).expect("watchdog spawns");
-        // SAFETY: a single async-signal-safe libc call reading our own group.
-        let our_pgid = unsafe { libc::getpgid(0) };
-        // SAFETY: same, reading the watchdog child's group by pid.
-        let wd_pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
         assert!(
-            wd_pgid >= 0,
-            "getpgid(watchdog) must succeed for the live child"
+            spawn_owner_watchdog(std::process::id(), home.clone()).is_some(),
+            "spawn_owner_watchdog must spawn the watchdog child"
         );
-        let wd_pgid = wd_pgid as u32;
+        let _ = std::fs::remove_dir_all(&home);
+
+        // (2) The group-leadership mechanism, verified deterministically against a
+        // known long-lived child. `sleep` is present on both targets this test
+        // runs on. We fully own this child's lifecycle, so there is no reaper race
+        // and the raw SIGKILL below can never hit a recycled pid (we waitpid it
+        // ourselves before it could be reused).
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn long-lived child");
+        let pid = child.id();
+        // SAFETY: a single async-signal-safe libc call reading the live child's
+        // group by pid; the child is alive (it is `sleep 30`) and unreaped.
+        let child_pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert!(
+            child_pgid >= 0,
+            "getpgid(child) must succeed for the live child"
+        );
+        // SAFETY: reading our own group.
+        let our_pgid = unsafe { libc::getpgid(0) };
         assert_eq!(
-            wd_pgid, pid,
-            "the owner watchdog must lead its own process group (pgid == pid)"
+            child_pgid as u32, pid,
+            "a process_group(0) child must lead its own group (pgid == pid)"
         );
         assert_ne!(
-            wd_pgid, our_pgid as u32,
-            "the owner watchdog must not share the daemon/test group"
+            child_pgid as u32, our_pgid as u32,
+            "the child must not share the daemon/test group"
         );
-        // Cleanup: kill + reap the watchdog and drop the temp home.
-        // SAFETY: signalling a child we just spawned.
+        // Cleanup: kill and reap the child we own (no recycle risk — see above).
+        // SAFETY: signalling a live child we just spawned and still hold.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
-        // Reap via a blocking wait on the pid (it is our child).
-        let mut status: libc::c_int = 0;
-        // SAFETY: waitpid on our own child.
-        unsafe {
-            libc::waitpid(pid as libc::pid_t, &mut status, 0);
-        }
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = child.wait();
     }
 
     #[test]
