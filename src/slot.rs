@@ -2339,7 +2339,13 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Some(prepared.agent_cwd()),
     )?;
     let payload = build_agent_payload(&cfg, &job, &env);
-    let acp = cfg.hire.protocol == Protocol::Acp;
+    // Use the EFFECTIVE protocol (the hub's `NANO_AGENTIC_PROTOCOL` override, if
+    // any), resolved in one place, so this `acp` flag — which selects the
+    // result-nudge encoding below — never diverges from how `run_agent` actually
+    // drives the agent. Computing it from `cfg.hire.protocol` alone would wrap a
+    // `pipe → acp` nudge in pipe framing (or send raw ACP text to a pipe harness)
+    // on the override path.
+    let acp = effective_protocol(&cfg) == Protocol::Acp;
 
     // First turn: every protocol receives the JSON job payload (Node's
     // `buildAgentStdin` — ACP delivers it verbatim as the `session/prompt` text).
@@ -2655,6 +2661,20 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     Ok(settle)
 }
 
+/// Resolve the EFFECTIVE harness protocol for this hire: the hub's
+/// `NANO_AGENTIC_PROTOCOL` override (`pipe`/`acp`) when present and recognised,
+/// otherwise the hire's configured protocol. Resolved in ONE place so every
+/// consumer — `run_agent`'s dispatch and the caller's result-nudge encoding —
+/// agrees on the protocol under an override (an unrecognised value is ignored,
+/// so the configured protocol stands).
+fn effective_protocol(cfg: &SlotConfig) -> Protocol {
+    cfg.hub
+        .as_ref()
+        .and_then(|hub| hub.config().hire_protocol_override())
+        .and_then(crate::state::Protocol::parse_override)
+        .unwrap_or(cfg.hire.protocol)
+}
+
 /// Run the hired agent once with `stdin` (the ACP prompt text, or the pipe
 /// harness's stdin) and report what happened. Never errors: a harness failure is
 /// a failed [`RunResult`], settled by the caller.
@@ -2666,16 +2686,11 @@ async fn run_agent(
     env: &[(String, String)],
 ) -> RunResult {
     // `NANO_AGENTIC_PROTOCOL` is a harness-protocol override (the referenced
-    // worker's `pipe`/`acp` selector), not a WebSocket subprotocol. Apply it
-    // here, when resolving the hire protocol, so a hub-configured override
-    // actually steers how the agent is driven — an unrecognised value is
-    // ignored (the hire's configured protocol stands) rather than coerced.
-    let protocol = cfg
-        .hub
-        .as_ref()
-        .and_then(|hub| hub.config().hire_protocol_override())
-        .and_then(crate::state::Protocol::parse_override)
-        .unwrap_or(cfg.hire.protocol);
+    // worker's `pipe`/`acp` selector), not a WebSocket subprotocol. Resolve it
+    // through the shared `effective_protocol` so this dispatch and the caller's
+    // nudge encoding can never disagree — an unrecognised value is ignored (the
+    // hire's configured protocol stands) rather than coerced.
+    let protocol = effective_protocol(cfg);
     match protocol {
         Protocol::Acp => {
             // Plugin 1.70.1 parity: a plain ACP hire whose command carries no
@@ -2697,7 +2712,7 @@ async fn run_agent(
             // presence and live transcript appear on the hub and inbound steer
             // reaches the running ACP turn. Held for the turn's lifetime; it
             // deregisters on drop. Absent the hub, the agent runs unchanged.
-            let _hub_session = cfg.hub.as_ref().map(|hub| {
+            let mut hub_session = cfg.hub.as_ref().map(|hub| {
                 // Worker identity (instance) + declared capability for presence,
                 // matching the Node emit client's `register {instance, capability}`.
                 let capability = serde_json::json!({
@@ -2727,6 +2742,14 @@ async fn run_agent(
             ));
             let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
             agent.shutdown().await;
+            // Flush this session's transcript tail on the runtime (bounded)
+            // BEFORE it deregisters, so the RELEASE enqueued on drop never
+            // overtakes the tail. This async close awaits the bridge drain
+            // without parking a Tokio worker thread; `HubSession::drop` stays
+            // nonblocking as a best-effort fallback for paths that skip it.
+            if let Some(session) = hub_session.as_mut() {
+                session.close().await;
+            }
             match out {
                 Ok(o) => {
                     log(&format!(
@@ -3583,6 +3606,60 @@ mod tests {
             }),
             hub: None,
         }
+    }
+
+    /// Spawn a hub client whose `NANO_AGENTIC_PROTOCOL` override is `protocol`.
+    /// The URL points at a dead port so it only ever backs off; the test shuts
+    /// it down. Used to exercise `effective_protocol`'s override resolution.
+    fn hub_with_protocol(protocol: Option<&str>) -> std::sync::Arc<crate::hub::HubClient> {
+        crate::hub::HubClient::spawn(crate::hub::HubConfig {
+            url: "ws://127.0.0.1:1/na".into(),
+            token: None,
+            secret: None,
+            credential: None,
+            protocol: protocol.map(str::to_string),
+            permission: None,
+            terminal: false,
+            attribution: None,
+            buffer_capacity: 8,
+            buffer_byte_budget: 0,
+        })
+    }
+
+    // Finding (round 6): the hub's `NANO_AGENTIC_PROTOCOL` override is resolved
+    // in ONE place, so `run_agent`'s dispatch and the result-nudge caller never
+    // disagree about the effective protocol. Without a hub the hire protocol
+    // stands; a recognised override flips it both ways; an unrecognised one is
+    // ignored.
+    #[tokio::test]
+    async fn effective_protocol_honours_the_hub_override() {
+        // No hub: the hire's configured protocol stands.
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Pipe;
+        assert_eq!(effective_protocol(&c), Protocol::Pipe);
+        c.hire.protocol = Protocol::Acp;
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+
+        // Override pipe -> acp (flips a Pipe hire).
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Pipe;
+        c.hub = Some(hub_with_protocol(Some("acp")));
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+        c.hub.as_ref().unwrap().shutdown().await;
+
+        // Override acp -> pipe (flips an Acp hire).
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Acp;
+        c.hub = Some(hub_with_protocol(Some("pipe")));
+        assert_eq!(effective_protocol(&c), Protocol::Pipe);
+        c.hub.as_ref().unwrap().shutdown().await;
+
+        // Unrecognised / empty override is ignored: the hire protocol stands.
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Acp;
+        c.hub = Some(hub_with_protocol(Some("garbage")));
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+        c.hub.as_ref().unwrap().shutdown().await;
     }
 
     /// A hermetic, unique `result.json` path for a `build_agent_env` test.

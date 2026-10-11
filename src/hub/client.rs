@@ -61,12 +61,19 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 /// WebSocket handshake would park the connection task indefinitely, wedging both
 /// reconnect backoff and a requested shutdown (which only lands between attempts).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on the ACP-update → transcript bridge channel. It sits in front of the
-/// already-bounded outbound [`LaneBuffer`], so leaving it unbounded would let a
-/// fast agent's `session/update` stream (each frame up to ~1 MiB) grow without
-/// limit and defeat the buffer's memory cap. On overflow the producer drops the
-/// update rather than blocking the ACP read loop (see `acp.rs`).
+/// Count ceiling on the ACP-update → transcript bridge channel. It sits in
+/// front of the already-byte-bounded outbound [`LaneBuffer`]; the EFFECTIVE
+/// bound used per session is the smaller of this and a byte-derived bound (see
+/// [`transcript_channel_bound`]), so this queue's own worst-case memory is held
+/// to the configured byte budget instead of `1024 × 1 MiB ≈ 1 GiB`. On overflow
+/// the producer drops the update rather than blocking the ACP read loop (see
+/// `acp.rs`).
 const TRANSCRIPT_CHANNEL_BOUND: usize = 1024;
+/// Upper bound on a single buffered `session/update` value. The ACP reader caps
+/// each JSON-RPC line (hence each update) at ~1 MiB, so this mirrors `acp.rs`'s
+/// `MAX_ACP_FRAME` and lets [`transcript_channel_bound`] translate the byte
+/// budget into a worst-case item count for the pre-buffer queue.
+const MAX_TRANSCRIPT_UPDATE_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRAME
 /// Bound on each session's inbound-steer channel. A hub delivering controls
 /// faster than the ACP turn consumes them (e.g. while setup or the agent is
 /// stalled) must not grow daemon memory without limit, so the channel is
@@ -96,6 +103,22 @@ fn frame_bytes(frame: &Frame) -> usize {
         + serde_json::to_string(&frame.payload)
             .map(|s| s.len())
             .unwrap_or(0)
+}
+
+/// Effective count bound for one session's pre-buffer transcript channel,
+/// derived from the configured outbound byte budget. Each queued update is
+/// bounded to [`MAX_TRANSCRIPT_UPDATE_BYTES`] by the ACP reader, so capping the
+/// channel at `byte_budget / MAX_TRANSCRIPT_UPDATE_BYTES` holds this queue's
+/// worst-case memory to the same budget as the outbound buffer (rather than a
+/// flat `1024 × 1 MiB ≈ 1 GiB`). A disabled byte budget (`0`, meaning the
+/// outbound buffer enforces no byte cap) falls back to the flat count ceiling.
+/// The result is clamped to `1..=TRANSCRIPT_CHANNEL_BOUND` so a tiny budget
+/// still admits at least one update and a large one never exceeds the ceiling.
+fn transcript_channel_bound(byte_budget: usize) -> usize {
+    if byte_budget == 0 {
+        return TRANSCRIPT_CHANNEL_BOUND;
+    }
+    (byte_budget / MAX_TRANSCRIPT_UPDATE_BYTES).clamp(1, TRANSCRIPT_CHANNEL_BOUND)
 }
 
 /// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a shared
@@ -441,10 +464,14 @@ impl HubClient {
         self.outbound_notify.notify_one();
 
         // Bridge ACP updates → transcript produce frames on a dedicated task.
-        // A *bounded* channel (see `TRANSCRIPT_CHANNEL_BOUND`): it fronts the
-        // already-bounded outbound buffer, so an unbounded one here would let a
-        // fast agent's updates grow without limit and defeat that cap.
-        let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(TRANSCRIPT_CHANNEL_BOUND);
+        // A *bounded* channel: it fronts the already-byte-bounded outbound
+        // buffer, so an unbounded (or loosely count-bounded) one here would let a
+        // fast agent's updates — each up to ~1 MiB — accumulate and defeat that
+        // memory cap. The bound is derived from the configured byte budget (see
+        // `transcript_channel_bound`), not the flat count ceiling, so this
+        // pre-buffer queue's own worst case stays within the documented budget.
+        let channel_bound = transcript_channel_bound(self.config.buffer_byte_budget);
+        let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(channel_bound);
         let bridge_client = self.clone();
         let bridge_stream = stream.clone();
         // The bridge drains updates until EITHER the channel closes (all senders
@@ -453,7 +480,7 @@ impl HubClient {
         // signal lets a drop close input and wait for the tail without needing
         // the last sender to be gone first.
         let (close_tx, mut close_rx) = watch::channel(false);
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let bridge_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -722,12 +749,13 @@ impl HubClient {
 
 /// A handle to flush one session's transcript bridge: closing `close_tx` makes
 /// the bridge drain its accepted updates and exit, and `done_rx` resolves once
-/// the bridge task has finished (so the tail is enqueued before RELEASE). Both
-/// are synchronous primitives so a synchronous `Drop` can drive the flush
-/// without a runtime context.
+/// the bridge task has finished (so the tail is enqueued before RELEASE).
+/// `done_rx` is a Tokio oneshot so the preferred async [`HubSession::close`] can
+/// await it WITHOUT parking a runtime worker thread; the synchronous `Drop`
+/// fallback never waits on it (it only signals `close_tx`).
 struct BridgeFlush {
     close_tx: watch::Sender<bool>,
-    done_rx: std::sync::mpsc::Receiver<()>,
+    done_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// A per-job hub session: worker presence is live for its instance, the job is
@@ -761,22 +789,23 @@ impl HubSession {
     pub fn take_steer(&mut self) -> Option<mpsc::Receiver<ControlFrame>> {
         self.steer.take()
     }
-
-    /// Flush this session's accepted-but-not-yet-bridged transcript updates into
-    /// the outbound buffer, so they are queued BEFORE the RELEASE enqueued on
-    /// drop. The bridge task converts updates to bulk frames asynchronously, so
-    /// without this barrier a RELEASE (control lane, always drained first) can
-    /// overtake tail transcript chunks — emitting them for a job the hub has
-    /// already released. Closing the channel lets the bridge drain every accepted
-    /// update and exit; awaiting its handle guarantees the tail is enqueued
-    /// first. Best-effort and bounded by `TRANSCRIPT_FLUSH_TIMEOUT` so a wedged
-    /// bridge can never hang the dropping task; on timeout the RELEASE proceeds.
-    fn flush_transcript(&mut self) {
-        // Take the sender out so no new update can be accepted from this side,
-        // then signal the bridge to finish and synchronously wait (bounded) for
-        // it to drain its accepted backlog into the outbound buffer. This is
-        // runtime-free: `Drop` cannot `.await`, so the flush rides a synchronous
-        // watch + std channel rather than the tokio task handle.
+    /// Asynchronously flush this session's accepted-but-not-yet-bridged
+    /// transcript updates into the outbound buffer, so they are queued BEFORE the
+    /// RELEASE enqueued on drop. The bridge converts updates to bulk frames
+    /// asynchronously, so without this barrier a RELEASE (control lane, always
+    /// drained first) can overtake tail transcript chunks — emitting them for a
+    /// job the hub has already released. This is the PREFERRED close path: it
+    /// awaits the bridge drain on the runtime, so (unlike `Drop`) it never parks
+    /// a Tokio worker thread with a blocking wait — critical on a one-worker
+    /// runtime or when concurrent drops occupy every worker. Bounded by
+    /// `TRANSCRIPT_FLUSH_TIMEOUT` so a wedged bridge can never hang the caller; on
+    /// timeout the RELEASE (on drop) proceeds and the tail is best-effort.
+    /// Idempotent: after it runs, `Drop::flush_transcript` finds no bridge and
+    /// returns immediately.
+    pub async fn close(&mut self) {
+        // Take the sender so no new update is accepted, remove the bridge handle
+        // (so Drop's fallback is a no-op), signal the bridge to finish, then
+        // await completion on the runtime.
         let _tx = self.transcript.take();
         let Some(flush) = self
             .client
@@ -788,16 +817,37 @@ impl HubSession {
             return; // never attached to an agent, or already flushed
         };
         let _ = flush.close_tx.send(true);
-        // Bounded wait: a wedged bridge must never hang the dropping task. On
-        // timeout the RELEASE proceeds and the (already-closed) tail is dropped.
-        let _ = flush.done_rx.recv_timeout(TRANSCRIPT_FLUSH_TIMEOUT);
+        let _ = timeout(TRANSCRIPT_FLUSH_TIMEOUT, flush.done_rx).await;
+    }
+
+    /// Nonblocking transcript-flush fallback for drop paths that did not call
+    /// the async [`close`](Self::close) (e.g. a panic unwind). It signals the
+    /// bridge to stop accepting and finish, but — unlike `close` — NEVER waits:
+    /// a blocking wait inside `Drop` would park a Tokio worker thread, and the
+    /// bridge (spawned on the same runtime) might never make progress on a
+    /// saturated runtime, stalling every completing job. The tail is therefore
+    /// best-effort on this fallback path; `close` is what preserves it.
+    fn flush_transcript(&mut self) {
+        let _tx = self.transcript.take();
+        let Some(flush) = self
+            .client
+            .bridge_tasks
+            .lock()
+            .unwrap()
+            .remove(&self.session_id)
+        else {
+            return; // already flushed by `close`, or never attached
+        };
+        // Signal the bridge to finish; do NOT wait (see the doc comment).
+        let _ = flush.close_tx.send(true);
     }
 }
 
 impl Drop for HubSession {
     fn drop(&mut self) {
-        // Flush the transcript tail BEFORE releasing, so no chunk is emitted for
-        // a job the hub has already released (see `flush_transcript`).
+        // Nonblocking transcript-flush fallback (the preferred path is the async
+        // `close`, which awaits the tail first). Signals the bridge to finish but
+        // never waits, so drop can never park a Tokio worker thread.
         self.flush_transcript();
         self.client.sessions.lock().unwrap().remove(&self.stream);
         // RELEASE the job (worker REGISTER persists until shutdown/deregister).
@@ -1655,6 +1705,78 @@ mod tests {
         client.shutdown().await;
     }
 
+    // Finding (round 6): the pre-buffer transcript channel is byte-aware. It
+    // fronts the byte-bounded outbound buffer, so a flat 1024-item count bound
+    // (each item up to ~1 MiB) could hold ~1 GiB before the byte budget bites.
+    // `transcript_channel_bound` derives the item count from the byte budget.
+    #[test]
+    fn transcript_channel_bound_derives_from_byte_budget() {
+        // Disabled byte budget (0) falls back to the flat count ceiling.
+        assert_eq!(transcript_channel_bound(0), TRANSCRIPT_CHANNEL_BOUND);
+        // 64 MiB / 1 MiB = 64 items (matches the outbound buffer's worst case).
+        assert_eq!(transcript_channel_bound(64 * 1024 * 1024), 64);
+        // A tiny-but-nonzero budget still admits at least one update.
+        assert_eq!(transcript_channel_bound(1), 1);
+        assert_eq!(transcript_channel_bound(MAX_TRANSCRIPT_UPDATE_BYTES - 1), 1);
+        // A huge budget is clamped to the count ceiling, never above it.
+        assert_eq!(
+            transcript_channel_bound(usize::MAX),
+            TRANSCRIPT_CHANNEL_BOUND
+        );
+    }
+
+    // Finding (round 6): a session's transcript sink capacity actually follows
+    // the configured byte budget, not the flat ceiling.
+    #[tokio::test]
+    async fn transcript_sink_capacity_follows_byte_budget() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB => 8 items
+        let client = HubClient::spawn(cfg);
+        let mut session = client.register_session("w-bb", capability(), "job-bb");
+        let sink = session.transcript_sink().expect("transcript sink");
+        assert_eq!(sink.max_capacity(), 8);
+        client.shutdown().await;
+    }
+
+    // Finding (round 6): the async `close` flushes the transcript tail BEFORE
+    // the session is dropped (and thus before RELEASE), and returns promptly —
+    // it must never park a worker the way the old blocking Drop could.
+    #[tokio::test]
+    async fn session_close_flushes_transcript_tail_and_returns_promptly() {
+        let client = HubClient::spawn(test_config());
+        let mut session = client.register_session("w-cl", capability(), "job-cl");
+        let sink = session.transcript_sink().expect("transcript sink");
+        let _ = buffered(&client); // discard register/claim frames
+        sink.try_send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "tail" }
+        }))
+        .unwrap();
+        // close() awaits the bridge drain on the runtime, bounded by the flush
+        // timeout, so it must return well within it.
+        tokio::time::timeout(TRANSCRIPT_FLUSH_TIMEOUT, session.close())
+            .await
+            .expect("close must return promptly, not hang");
+        // The tail update was flushed to a relay frame before any RELEASE.
+        let relay = client
+            .outbound
+            .lock()
+            .unwrap()
+            .bulk
+            .iter()
+            .find(|bf| bf.frame.family == Family::Relay)
+            .map(|bf| bf.frame.clone());
+        assert!(
+            relay.is_some(),
+            "close() must flush the queued transcript update before returning"
+        );
+        // A second close is a no-op (idempotent) and still returns promptly.
+        tokio::time::timeout(TRANSCRIPT_FLUSH_TIMEOUT, session.close())
+            .await
+            .expect("second close must be a prompt no-op");
+        client.shutdown().await;
+    }
+
     // Findings D + E: shutdown signals AND awaits the connection task, and the
     // connect loop is racing shutdown — so shutdown returns promptly even when
     // the client has never managed to connect (and is mid-backoff/connect).
@@ -1777,9 +1899,11 @@ mod tests {
         client.shutdown().await;
     }
 
-    // Finding (round 4): dropping a session flushes its accepted transcript tail
-    // into the buffer BEFORE the RELEASE is enqueued, so no chunk is emitted for
-    // a job the hub has already released.
+    // Finding (round 4 → round 6): the flush-before-RELEASE guarantee now lives
+    // on the async `close` (Drop is nonblocking so it can never park a worker).
+    // Closing a session flushes its accepted transcript tail into the buffer
+    // BEFORE the RELEASE is enqueued, so no chunk is emitted for a job the hub
+    // has already released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn release_is_enqueued_after_transcript_tail() {
         let client = HubClient::spawn(test_config());
@@ -1791,7 +1915,9 @@ mod tests {
             "content": { "type": "text", "text": "tail" }
         }))
         .unwrap();
-        // Dropping the session flushes the bridged chunk, then RELEASEs.
+        // `close` awaits the bridged chunk into the buffer; the subsequent drop
+        // enqueues the RELEASE.
+        session.close().await;
         drop(session);
         // Assert ENQUEUE order (frame `seq`), not drain order: the buffer always
         // drains control (RELEASE) before bulk (transcript), so the guarantee
