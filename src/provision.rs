@@ -589,6 +589,13 @@ fn is_hex_sha(s: &str) -> bool {
 /// (see [`apply_git_credential`]) rather than an environment variable, so it
 /// never appears in the git process's `/proc/<pid>/environ` (which a same-UID
 /// process could otherwise read for the duration of the clone/fetch — #24).
+///
+/// The credential is *parsed* from the remote URL on every platform
+/// ([`split_url_credential`]), but it is only *read* — delivered to git over the
+/// inherited FD — by the Unix [`apply_git_credential`]; the non-Unix stub rejects
+/// it unread. Permit the fields to go unread there so the non-Unix build stays
+/// warning-clean (`-D warnings`).
+#[cfg_attr(not(unix), allow(dead_code))]
 struct GitCredential {
     /// Host (without port) the credential is scoped to, so the helper never
     /// hands the token to a differently-hosted submodule remote.
@@ -3028,6 +3035,10 @@ async fn git_with_env(
 /// [`apply_git_credential`]). A repeated invocation hits EOF on the
 /// already-drained, write-closed pipe and emits an empty password, so git fails
 /// closed rather than hanging on a retry.
+///
+/// Unix-only: referenced solely by the Unix [`apply_git_credential`] (and its
+/// tests), so gated to avoid a dead-code warning on non-Unix builds.
+#[cfg(unix)]
 const GIT_CRED_HELPER: &str = "!f() { \
     test \"$1\" = get || exit 0; \
     h=; \
@@ -3044,6 +3055,10 @@ const GIT_CRED_HELPER: &str = "!f() { \
 /// the helper's `cat <&N` fail with `Bad fd number` under dash. 3 is the lowest
 /// non-standard descriptor; the `dup2` in `pre_exec` runs after the child's
 /// `Stdio` setup has already bound 0/1/2, so it can never clobber stdio.
+///
+/// Unix-only: referenced solely by the Unix [`apply_git_credential`] (and its
+/// tests), so gated to avoid a dead-code warning on non-Unix builds.
+#[cfg(unix)]
 const CRED_FD: i32 = 3;
 
 /// Owns the parent's copy of the credential pipe's read end. The caller keeps
@@ -3055,9 +3070,20 @@ const CRED_FD: i32 = 3;
 /// right after `spawn` — rather than at the end of the command — means the
 /// daemon does not keep a readable copy of the secret-bearing pipe exposed under
 /// `/proc/<daemon-pid>/fd` for the lifetime of the git command.
+///
+/// Unix-only: the pipe is built on `std::os::unix::io::OwnedFd` (see
+/// [`cloexec_pipe`]), which does not exist on other targets.
+#[cfg(unix)]
 struct CredPipe {
     _read: std::os::unix::io::OwnedFd,
 }
+
+/// Non-Unix placeholder so [`git_with_env_capture`] can bind and drop the guard
+/// uniformly. The non-Unix [`apply_git_credential`] never returns one (it errors
+/// instead — credential delivery over an inherited FD is not implemented off
+/// Unix), so this carries no state.
+#[cfg(not(unix))]
+struct CredPipe;
 
 /// Create a pipe whose both ends are atomically close-on-exec, so a concurrent
 /// slot's `fork`+`exec` in this multi-threaded daemon can never inherit the
@@ -3070,6 +3096,7 @@ struct CredPipe {
 /// race on non-Linux unixes, but `pipe2` is not portable there and the target
 /// platform is Linux; the fallback exists so the crate still builds and runs on
 /// other unixes.
+#[cfg(unix)]
 fn cloexec_pipe() -> Result<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -3124,6 +3151,7 @@ fn cloexec_pipe() -> Result<(std::os::unix::io::OwnedFd, std::os::unix::io::Owne
 /// authentication. `F_DUPFD_CLOEXEC` with a minimum of 3 moves any such fd out
 /// of the standard range (close-on-exec preserved), mirroring the identical
 /// guard `safecwd.rs` applies to its pre-exec cwd handle.
+#[cfg(unix)]
 fn raise_above_stdio(fd: std::os::unix::io::OwnedFd) -> Result<std::os::unix::io::OwnedFd> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
     if fd.as_raw_fd() >= 3 {
@@ -3226,6 +3254,11 @@ impl CredCommand for std::process::Command {
 /// Generic over the command type so both the async `tokio::process::Command`
 /// used in production and the sync `std::process::Command` used by the tests
 /// install the same `pre_exec` hook (see [`CredCommand`]).
+///
+/// Unix-only: the inherited-FD mechanism is built on `std::os::unix::io` and
+/// `libc`, and the `CredCommand` bound exists only under `#[cfg(unix)]`. The
+/// `#[cfg(not(unix))]` stub below keeps non-Unix targets compiling.
+#[cfg(unix)]
 fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Result<CredPipe> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
@@ -3314,6 +3347,26 @@ fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Resul
     cmd.env("NANO_GIT_CRED_USER", &c.username);
     cmd.env("NANO_GIT_CRED_FD", CRED_FD.to_string());
     Ok(CredPipe { _read: read_fd })
+}
+
+/// Non-Unix stub: credential delivery over an inherited pipe FD is implemented
+/// only for Unix (the pipe, the `dup2` remap, and the `CredCommand` `pre_exec`
+/// hook all build on `std::os::unix`/`libc`). Rather than silently falling back
+/// to an environment variable — re-opening the same-UID `/proc/<pid>/environ`
+/// read this code exists to close (#24) — a non-Unix host fails closed with a
+/// clear error, mirroring how `safecwd`/`main` keep their non-Unix paths
+/// explicit. These are not supported daemon hosts.
+///
+/// Non-generic over the concrete `tokio::process::Command` (the only production
+/// caller, in [`git_with_env_capture`]): the `CredCommand` abstraction exists
+/// only under `#[cfg(unix)]`, so the generic form cannot be named here.
+#[cfg(not(unix))]
+fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredPipe> {
+    let _ = c;
+    Err(anyhow::anyhow!(
+        "git credential delivery over an inherited FD is not supported on this \
+         (non-Unix) platform; cannot provision an authenticated git remote safely"
+    ))
 }
 
 /// Core git runner. Returns `(stdout_tail, stdout_truncated)`; `stdout_truncated`
