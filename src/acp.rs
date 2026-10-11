@@ -92,7 +92,7 @@ pub struct Agent {
     /// `session/prompt` input, a `cancel` is mapped to `session/cancel`, and a
     /// `permission` outcome is applied to the turn's permission handling.
     /// `None` runs the turn exactly as a hub-less agent does.
-    steer: Option<mpsc::UnboundedReceiver<crate::hub::control::ControlFrame>>,
+    steer: Option<mpsc::Receiver<crate::hub::control::ControlFrame>>,
 }
 
 impl Agent {
@@ -175,7 +175,7 @@ impl Agent {
     pub fn attach_hub(
         &mut self,
         transcript: mpsc::Sender<Value>,
-        steer: mpsc::UnboundedReceiver<crate::hub::control::ControlFrame>,
+        steer: mpsc::Receiver<crate::hub::control::ControlFrame>,
     ) {
         self.shared.lock().unwrap().transcript = Some(transcript);
         self.steer = Some(steer);

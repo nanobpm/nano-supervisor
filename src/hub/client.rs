@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
@@ -67,6 +67,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// limit and defeat the buffer's memory cap. On overflow the producer drops the
 /// update rather than blocking the ACP read loop (see `acp.rs`).
 const TRANSCRIPT_CHANNEL_BOUND: usize = 1024;
+/// Bound on each session's inbound-steer channel. A hub delivering controls
+/// faster than the ACP turn consumes them (e.g. while setup or the agent is
+/// stalled) must not grow daemon memory without limit, so the channel is
+/// bounded and `route_inbound` drops the control on overflow rather than
+/// blocking the socket read loop.
+const STEER_CHANNEL_BOUND: usize = 256;
+/// Ceiling on how long `HubSession::drop` waits for the transcript bridge to
+/// drain its accepted updates before RELEASE (finding: RELEASE must not
+/// overtake the transcript tail). Bounded so a wedged bridge can never hang the
+/// dropping task; on timeout the RELEASE proceeds (the tail is best-effort).
+const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a single
 /// shared capacity. Draining prefers control → interactive → bulk; overflow
@@ -159,6 +170,25 @@ impl LaneBuffer {
         }
     }
 
+    /// Prepend a CONTROL frame to the front of its lane while honouring the
+    /// shared capacity: shed lower-priority (bulk, then interactive) traffic to
+    /// make room — never another control frame, so presence/ownership ordering
+    /// is preserved. Used by the reconnect resync snapshot, which must land at
+    /// the front in REGISTER-then-CLAIM order without bypassing the advertised
+    /// bound (a raw `push_front` would let a large snapshot exceed it).
+    fn push_front_control_bounded(&mut self, frame: Frame) {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        while self.len() >= self.capacity {
+            // Shed the least-important non-control frame. If only control
+            // frames remain, stop evicting (presence is never sacrificed) and
+            // prepend anyway — the snapshot is bounded by live instances+jobs.
+            if self.bulk.pop_front().is_none() && self.interactive.pop_front().is_none() {
+                break;
+            }
+        }
+        self.control.push_front(frame);
+    }
+
     /// Drop every buffered `REGISTER`/`CLAIM` frame from the control lane. The
     /// (re)connect resync snapshot supersedes them, so leaving the stale ones
     /// in place would duplicate presence/ownership and let a `CLAIM` buffered
@@ -167,6 +197,16 @@ impl LaneBuffer {
     fn drop_control_presence(&mut self) {
         self.control
             .retain(|f| !matches!(f.family, Family::Register | Family::Claim));
+    }
+
+    /// Test-only: iterate every buffered frame (across all lanes) so a test can
+    /// read each frame's `seq` — the enqueue order — independent of drain order.
+    #[cfg(test)]
+    fn iter_frames(&self) -> impl Iterator<Item = &Frame> {
+        self.control
+            .iter()
+            .chain(self.interactive.iter())
+            .chain(self.bulk.iter())
     }
 }
 
@@ -195,13 +235,22 @@ pub struct HubClient {
     in_flight: Mutex<HashMap<String, HashSet<String>>>,
     /// Per-session steer sinks, keyed by the session's composed **stream id**,
     /// used to route an inbound relay delivery to the one job owning it.
-    sessions: Mutex<HashMap<String, mpsc::UnboundedSender<ControlFrame>>>,
+    sessions: Mutex<HashMap<String, mpsc::Sender<ControlFrame>>>,
     /// Flipped to request the connection task to deregister and exit.
     shutdown_tx: watch::Sender<bool>,
     /// The spawned connection task's handle, awaited by [`HubClient::shutdown`]
     /// so a clean shutdown blocks until the task has flushed its `DEREGISTER`
     /// and torn the socket down — not merely signalled the watch.
     conn_task: Mutex<Option<JoinHandle<()>>>,
+    /// Per-session transcript-bridge flush handles, keyed by a unique session
+    /// sequence (NOT the stream id, which a later session for the same job
+    /// would reuse and so could steal a predecessor's flush handle). Lets a
+    /// dropping [`HubSession`] close its bridge's input and synchronously wait
+    /// for its accepted updates to reach the outbound buffer BEFORE enqueuing
+    /// the job's RELEASE (see [`HubSession::flush_transcript`]).
+    bridge_tasks: Mutex<HashMap<u64, BridgeFlush>>,
+    /// Allocates the unique per-session key for `bridge_tasks`.
+    next_session_seq: AtomicU64,
     /// Per-client PRNG state for reconnect jitter (seeded once at spawn from a
     /// real entropy mix), so a fleet of daemons does not reconnect in lockstep.
     rng: AtomicU64,
@@ -235,6 +284,8 @@ impl HubClient {
             sessions: Mutex::new(HashMap::new()),
             shutdown_tx,
             conn_task: Mutex::new(None),
+            bridge_tasks: Mutex::new(HashMap::new()),
+            next_session_seq: AtomicU64::new(0),
             rng: AtomicU64::new(seed_rng()),
         });
         log(&format!(
@@ -263,7 +314,9 @@ impl HubClient {
         job_key: &str,
     ) -> HubSession {
         let stream = compose_stream_id(instance, job_key);
-        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<ControlFrame>();
+        // Bounded (see `STEER_CHANNEL_BOUND`): a hub delivering steer faster
+        // than the turn consumes it must not grow memory without limit.
+        let (steer_tx, steer_rx) = mpsc::channel::<ControlFrame>(STEER_CHANNEL_BOUND);
         self.sessions
             .lock()
             .unwrap()
@@ -314,29 +367,66 @@ impl HubClient {
         let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(TRANSCRIPT_CHANNEL_BOUND);
         let bridge_client = self.clone();
         let bridge_stream = stream.clone();
-        tokio::spawn(async move {
-            while let Some(update) = updates_rx.recv().await {
-                if let Some(chunk) = acp_update_to_transcript_chunk(&update) {
-                    let incarnation = bridge_client.generation.load(Ordering::Relaxed);
-                    bridge_client.enqueue(
-                        Lane::Bulk,
-                        Family::Relay,
-                        json!({
-                            "op": "produce",
-                            "stream": bridge_stream,
-                            "incarnation": incarnation,
-                            "chunk": chunk,
-                        }),
-                    );
+        // The bridge drains updates until EITHER the channel closes (all senders
+        // dropped) OR the session's drop signals a flush, whichever first — then
+        // it finishes and notifies the (synchronous) flush waiter. The flush
+        // signal lets a drop close input and wait for the tail without needing
+        // the last sender to be gone first.
+        let (close_tx, mut close_rx) = watch::channel(false);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let bridge_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Prioritise draining any queued update; only when none is
+                    // immediately ready does a flush signal take effect.
+                    biased;
+                    maybe = updates_rx.recv() => {
+                        match maybe {
+                            Some(update) => {
+                                if let Some(chunk) = acp_update_to_transcript_chunk(&update) {
+                                    let incarnation = bridge_client.generation.load(Ordering::Relaxed);
+                                    bridge_client.enqueue(
+                                        Lane::Bulk,
+                                        Family::Relay,
+                                        json!({
+                                            "op": "produce",
+                                            "stream": bridge_stream,
+                                            "incarnation": incarnation,
+                                            "chunk": chunk,
+                                        }),
+                                    );
+                                }
+                            }
+                            // Channel closed (all senders dropped): drained.
+                            None => break,
+                        }
+                    }
+                    // Flush requested by the session's drop: stop accepting and
+                    // finish so the tail already enqueued is what gets sent.
+                    _ = close_rx.changed() => break,
                 }
             }
+            // Signal completion (ignore a gone waiter).
+            let _ = done_tx.send(());
         });
+        // Detach the JoinHandle (the flush uses `done_rx`, not the handle).
+        drop(bridge_handle);
+        // Track the flush handle under a UNIQUE session id (not the stream id,
+        // which a later session for the same job would reuse and so could steal
+        // this session's flush handle), so this session's drop flushes exactly
+        // its own bridge before RELEASE.
+        let session_id = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
+        self.bridge_tasks
+            .lock()
+            .unwrap()
+            .insert(session_id, BridgeFlush { close_tx, done_rx });
 
         HubSession {
             client: self.clone(),
             instance: instance.to_string(),
             job_key: job_key.to_string(),
             stream,
+            session_id,
             transcript: Some(updates_tx),
             steer: Some(steer_rx),
         }
@@ -380,12 +470,33 @@ impl HubClient {
         cap
     }
 
+    /// The resolved hub configuration this client was spawned with. Exposed so
+    /// a slot can honour the `NANO_AGENTIC_PROTOCOL` harness override when
+    /// resolving a job's hire protocol (it is a harness setting, not a wire
+    /// subprotocol — see [`HubConfig::hire_protocol_override`]).
+    pub fn config(&self) -> &HubConfig {
+        &self.config
+    }
+
     /// Enqueue a frame for delivery. Bounded and QoS-aware: see [`LaneBuffer`].
     fn enqueue(&self, lane: Lane, family: Family, payload: Value) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let frame = Frame::new(lane, family, seq, payload);
         self.outbound.lock().unwrap().push(frame);
         self.outbound_notify.notify_one();
+    }
+
+    /// Test-only probe recording the order frames are enqueued (their `seq`),
+    /// so a test can assert enqueue order independent of the drain order
+    /// `buffered()` reports (which always pulls control lanes first).
+    #[cfg(test)]
+    fn enqueue_log(&self) -> Vec<(u32, Lane, Family)> {
+        self.outbound
+            .lock()
+            .unwrap()
+            .iter_frames()
+            .map(|f| (f.seq, f.lane, f.family))
+            .collect()
     }
 
     /// Rebuild worker presence + job ownership at the FRONT of the outbound
@@ -400,6 +511,8 @@ impl HubClient {
     fn resync_presence(&self) {
         // Build the ordered snapshot (REGISTERs first, then CLAIMs) with fresh
         // sequence numbers, holding each source lock only long enough to read it.
+        // Reversed, so the capacity-aware re-admission below lands the snapshot
+        // in its intended front order (REGISTER…REGISTER, CLAIM…CLAIM).
         let mut snapshot: Vec<Frame> = Vec::new();
         for (inst, cap) in self.instances.lock().unwrap().iter() {
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -423,11 +536,16 @@ impl HubClient {
         }
         {
             let mut buf = self.outbound.lock().unwrap();
+            // Drop the superseded REGISTER/CLAIM frames first so the snapshot
+            // re-admits them within the SAME shared capacity rather than
+            // bypassing it. Prepending in REVERSE via `push_front_control_bounded`
+            // lands the snapshot at the front in REGISTER-then-CLAIM order while
+            // shedding only lower-priority (bulk/interactive) traffic to make
+            // room — never another control frame — so presence ordering holds and
+            // the advertised bound is honoured (a raw `push_front` would exceed it).
             buf.drop_control_presence();
-            // Push in reverse so the final front order matches `snapshot`:
-            // REGISTER…REGISTER, CLAIM…CLAIM, ahead of any preserved control.
             for frame in snapshot.into_iter().rev() {
-                buf.push_front(frame);
+                buf.push_front_control_bounded(frame);
             }
         }
         self.outbound_notify.notify_one();
@@ -499,9 +617,21 @@ impl HubClient {
         };
         // Preserve the typed control end-to-end; the ACP steer task maps it to
         // the matching session semantics (prompt injection / cancellation /
-        // permission outcome).
-        let _ = sink.send(decoded.frame);
+        // permission outcome). The channel is bounded (`STEER_CHANNEL_BOUND`):
+        // on overflow drop the control rather than block the socket read loop
+        // or grow memory — a stalled turn must not wedge inbound routing.
+        let _ = sink.try_send(decoded.frame);
     }
+}
+
+/// A handle to flush one session's transcript bridge: closing `close_tx` makes
+/// the bridge drain its accepted updates and exit, and `done_rx` resolves once
+/// the bridge task has finished (so the tail is enqueued before RELEASE). Both
+/// are synchronous primitives so a synchronous `Drop` can drive the flush
+/// without a runtime context.
+struct BridgeFlush {
+    close_tx: watch::Sender<bool>,
+    done_rx: std::sync::mpsc::Receiver<()>,
 }
 
 /// A per-job hub session: worker presence is live for its instance, the job is
@@ -514,8 +644,12 @@ pub struct HubSession {
     job_key: String,
     /// The composed relay stream id for this `(instance, jobKey)` pair.
     stream: String,
+    /// Unique per-session key into `HubClient::bridge_tasks` (NOT the stream
+    /// id, which a later session for the same job would reuse), so this drop
+    /// flushes exactly its own transcript bridge.
+    session_id: u64,
     transcript: Option<mpsc::Sender<Value>>,
-    steer: Option<mpsc::UnboundedReceiver<ControlFrame>>,
+    steer: Option<mpsc::Receiver<ControlFrame>>,
 }
 
 impl HubSession {
@@ -526,14 +660,49 @@ impl HubSession {
     }
 
     /// The inbound-steer receiver handed to the ACP agent so a hub-delivered
-    /// control is applied to the running turn. Taken once.
-    pub fn take_steer(&mut self) -> Option<mpsc::UnboundedReceiver<ControlFrame>> {
+    /// control is applied to the running turn. Taken once. Bounded: on overflow
+    /// `route_inbound` drops the control rather than growing memory.
+    pub fn take_steer(&mut self) -> Option<mpsc::Receiver<ControlFrame>> {
         self.steer.take()
+    }
+
+    /// Flush this session's accepted-but-not-yet-bridged transcript updates into
+    /// the outbound buffer, so they are queued BEFORE the RELEASE enqueued on
+    /// drop. The bridge task converts updates to bulk frames asynchronously, so
+    /// without this barrier a RELEASE (control lane, always drained first) can
+    /// overtake tail transcript chunks — emitting them for a job the hub has
+    /// already released. Closing the channel lets the bridge drain every accepted
+    /// update and exit; awaiting its handle guarantees the tail is enqueued
+    /// first. Best-effort and bounded by `TRANSCRIPT_FLUSH_TIMEOUT` so a wedged
+    /// bridge can never hang the dropping task; on timeout the RELEASE proceeds.
+    fn flush_transcript(&mut self) {
+        // Take the sender out so no new update can be accepted from this side,
+        // then signal the bridge to finish and synchronously wait (bounded) for
+        // it to drain its accepted backlog into the outbound buffer. This is
+        // runtime-free: `Drop` cannot `.await`, so the flush rides a synchronous
+        // watch + std channel rather than the tokio task handle.
+        let _tx = self.transcript.take();
+        let Some(flush) = self
+            .client
+            .bridge_tasks
+            .lock()
+            .unwrap()
+            .remove(&self.session_id)
+        else {
+            return; // never attached to an agent, or already flushed
+        };
+        let _ = flush.close_tx.send(true);
+        // Bounded wait: a wedged bridge must never hang the dropping task. On
+        // timeout the RELEASE proceeds and the (already-closed) tail is dropped.
+        let _ = flush.done_rx.recv_timeout(TRANSCRIPT_FLUSH_TIMEOUT);
     }
 }
 
 impl Drop for HubSession {
     fn drop(&mut self) {
+        // Flush the transcript tail BEFORE releasing, so no chunk is emitted for
+        // a job the hub has already released (see `flush_transcript`).
+        self.flush_transcript();
         self.client.sessions.lock().unwrap().remove(&self.stream);
         // RELEASE the job (worker REGISTER persists until shutdown/deregister).
         if let Some(jobs) = self
@@ -707,11 +876,11 @@ async fn connect(config: &HubConfig) -> anyhow::Result<WsStream> {
             HeaderValue::from_str(&format!("Bearer {secret}"))?,
         );
     }
-    if let Some(protocol) = &config.protocol {
-        request
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_str(protocol)?);
-    }
+    // NOTE: `config.protocol` (`NANO_AGENTIC_PROTOCOL`) is deliberately NOT sent
+    // as a `Sec-WebSocket-Protocol` header. It names the worker's *harness*
+    // override (`pipe`/`acp`), not a WebSocket subprotocol; presenting it as one
+    // can make a configured hub handshake fail. It is applied when resolving the
+    // hire protocol (see `HubConfig::hire_protocol_override`), never on the wire.
     let (stream, _response) = tokio_tungstenite::connect_async(request).await?;
     Ok(stream)
 }
@@ -781,14 +950,26 @@ async fn drain(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
 ) -> anyhow::Result<()> {
+    // The incarnation fences a transcript producer to the connection that
+    // generated it. It is stamped HERE — at drain on the live socket — not at
+    // buffer-enqueue time: a transcript chunk queued during an outage (or
+    // re-buffered after a failed write) would otherwise keep the previous
+    // generation even though the reconnect bumped `generation`, so frames sent
+    // on the new socket would fail to fence the stale producer. Re-stamping at
+    // drain guarantees every relay produce frame carries the CURRENT generation.
+    let incarnation = client.generation.load(Ordering::Relaxed);
     loop {
-        let frame = {
+        let mut frame = {
             let mut buf = client.outbound.lock().unwrap();
             match buf.pop() {
                 Some(f) => f,
                 None => return Ok(()),
             }
         };
+        if frame.family == Family::Relay && frame.payload.get("op") == Some(&Value::from("produce"))
+        {
+            frame.payload["incarnation"] = Value::from(incarnation);
+        }
         match encode_frame(&frame) {
             Ok(bytes) => {
                 if let Err(e) = write.send(Message::Binary(bytes)).await {
@@ -1376,5 +1557,153 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), client.shutdown())
             .await
             .expect("shutdown must return promptly, not hang on connect/backoff");
+    }
+
+    // Finding (round 4): the inbound steer channel is bounded, so a hub flooding
+    // controls faster than the turn consumes them cannot grow memory without
+    // limit — overflow is dropped, not queued.
+    #[tokio::test]
+    async fn inbound_steer_channel_is_bounded_and_drops_on_overflow() {
+        let client = HubClient::spawn(test_config());
+        let mut session = client.register_session("w-sb", capability(), "job-sb");
+        let steer = session.take_steer().expect("steer receiver");
+        assert_eq!(steer.max_capacity(), STEER_CHANNEL_BOUND);
+        let stream = compose_stream_id("w-sb", "job-sb");
+        // Flood well past the bound without consuming; the receiver must cap at
+        // the bound (the rest are dropped), never grow to the full flood.
+        for _ in 0..(STEER_CHANNEL_BOUND * 4) {
+            client.route_inbound(&json!({
+                "stream": stream,
+                "offset": 0,
+                "chunk": "x",
+            }));
+        }
+        let mut drained = 0usize;
+        let mut steer = steer;
+        while steer.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert!(
+            drained <= STEER_CHANNEL_BOUND,
+            "steer channel grew past its bound: {drained} > {STEER_CHANNEL_BOUND}"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 4): the transcript incarnation is re-stamped at DRAIN time
+    // from the current generation, so a chunk buffered during an outage (or
+    // re-buffered after a failed write) fences the stale producer on the new
+    // connection rather than carrying the old generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_restamps_relay_incarnation_to_current_generation() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Value>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                let frame = decode_frame(&bytes).expect("server decodes a frame");
+                if frame.family == Family::Relay {
+                    let _ = frames_tx.send(frame.payload);
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let client = HubClient::spawn(cfg);
+        // Buffer a relay produce frame stamped with the OLD generation (0) while
+        // "disconnected", as if queued during an outage.
+        client.enqueue(
+            Lane::Bulk,
+            Family::Relay,
+            json!({ "op": "produce", "stream": "s", "incarnation": 0, "chunk": "c" }),
+        );
+        // Simulate the reconnect bump: the new connection is generation 1.
+        client.generation.fetch_add(1, Ordering::Relaxed);
+        client.connected.store(true, Ordering::Relaxed);
+        // Wait for the produce frame to arrive on the wire.
+        let payload = tokio::time::timeout(Duration::from_secs(5), frames_rx.recv())
+            .await
+            .expect("produce frame did not drain")
+            .expect("server channel closed");
+        assert_eq!(
+            payload["incarnation"], 1,
+            "drain must re-stamp the incarnation to the current generation"
+        );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // Finding (round 4): the reconnect resync snapshot is admitted within the
+    // shared buffer capacity — it sheds lower-priority (bulk) traffic to make
+    // room rather than bypassing the bound with a raw push_front.
+    #[tokio::test]
+    async fn resync_snapshot_respects_buffer_capacity() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 4;
+        let client = HubClient::spawn(cfg);
+        // Fill the buffer with bulk traffic while "disconnected".
+        for i in 0..4 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": i }));
+        }
+        assert_eq!(client.outbound.lock().unwrap().len(), 4);
+        // Register a session so the resync snapshot has a REGISTER + a CLAIM.
+        let _session = client.register_session("w-cap", capability(), "job-cap");
+        client.resync_presence();
+        let frames = buffered(&client);
+        // The snapshot's REGISTER + CLAIM are present, and the total stays
+        // within the advertised capacity (bulk was shed to make room).
+        assert!(frames.iter().any(|(_, f, _)| *f == Family::Register));
+        assert!(frames.iter().any(|(_, f, _)| *f == Family::Claim));
+        assert!(
+            frames.len() <= 4,
+            "resync must not exceed buffer capacity: {} > 4",
+            frames.len()
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 4): dropping a session flushes its accepted transcript tail
+    // into the buffer BEFORE the RELEASE is enqueued, so no chunk is emitted for
+    // a job the hub has already released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_is_enqueued_after_transcript_tail() {
+        let client = HubClient::spawn(test_config());
+        let mut session = client.register_session("w-fl", capability(), "job-fl");
+        let sink = session.transcript_sink().expect("transcript sink");
+        let _ = buffered(&client); // discard register/claim
+        sink.try_send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "tail" }
+        }))
+        .unwrap();
+        // Dropping the session flushes the bridged chunk, then RELEASEs.
+        drop(session);
+        // Assert ENQUEUE order (frame `seq`), not drain order: the buffer always
+        // drains control (RELEASE) before bulk (transcript), so the guarantee
+        // being tested is that the tail was enqueued first — i.e. it sits in the
+        // buffer ahead of the RELEASE in insertion order.
+        let log = client.enqueue_log();
+        let relay_seq = log
+            .iter()
+            .find(|(_, _, f)| *f == Family::Relay)
+            .map(|(s, _, _)| *s);
+        let release_seq = log
+            .iter()
+            .find(|(_, _, f)| *f == Family::Release)
+            .map(|(s, _, _)| *s);
+        let relay_seq = relay_seq.expect("the accepted transcript chunk must be flushed, not lost");
+        let release_seq = release_seq.expect("drop must enqueue a RELEASE");
+        assert!(
+            relay_seq < release_seq,
+            "transcript tail (seq {relay_seq}) must be enqueued before RELEASE (seq {release_seq})"
+        );
+        client.shutdown().await;
     }
 }

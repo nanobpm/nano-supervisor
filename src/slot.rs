@@ -2665,7 +2665,18 @@ async fn run_agent(
     stdin: &str,
     env: &[(String, String)],
 ) -> RunResult {
-    match cfg.hire.protocol {
+    // `NANO_AGENTIC_PROTOCOL` is a harness-protocol override (the referenced
+    // worker's `pipe`/`acp` selector), not a WebSocket subprotocol. Apply it
+    // here, when resolving the hire protocol, so a hub-configured override
+    // actually steers how the agent is driven — an unrecognised value is
+    // ignored (the hire's configured protocol stands) rather than coerced.
+    let protocol = cfg
+        .hub
+        .as_ref()
+        .and_then(|hub| hub.config().hire_protocol_override())
+        .and_then(crate::state::Protocol::parse_override)
+        .unwrap_or(cfg.hire.protocol);
+    match protocol {
         Protocol::Acp => {
             // Plugin 1.70.1 parity: a plain ACP hire whose command carries no
             // ACP selector is launched with `--acp` appended, so the agent starts

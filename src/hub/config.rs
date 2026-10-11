@@ -29,7 +29,10 @@ pub struct HubConfig {
     /// An opaque credential echoed in the presence payload
     /// (`NANO_AGENTIC_CREDENTIAL`).
     pub credential: Option<String>,
-    /// The WebSocket sub-protocol to request (`NANO_AGENTIC_PROTOCOL`).
+    /// The worker's harness-protocol override (`NANO_AGENTIC_PROTOCOL`), e.g.
+    /// `pipe` or `acp`. This is NOT a WebSocket subprotocol: it is applied when
+    /// resolving the hire protocol (see [`HubConfig::hire_protocol_override`])
+    /// and is never sent on the wire.
     pub protocol: Option<String>,
     /// The permission policy the worker advertises (`NANO_AGENTIC_PERMISSION`).
     pub permission: Option<String>,
@@ -90,6 +93,15 @@ impl HubConfig {
             attribution: non_empty("NANO_AGENT_ATTRIBUTION"),
             buffer_capacity,
         })
+    }
+
+    /// The harness-protocol override named by `NANO_AGENTIC_PROTOCOL`, if any.
+    /// This is the referenced worker's override for the hire protocol (`pipe` or
+    /// `acp`) — distinct from a WebSocket subprotocol, so it is applied when
+    /// resolving the hire protocol and never sent as a `Sec-WebSocket-Protocol`
+    /// header. Returns the trimmed override, or `None` when unset/empty.
+    pub fn hire_protocol_override(&self) -> Option<&str> {
+        self.protocol.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
 }
 
