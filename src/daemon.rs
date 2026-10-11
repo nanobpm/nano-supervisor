@@ -68,8 +68,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // Issue #54: when the hermetic contract-test harness started us (it stamps
     // `C8CTL_NANO_TEST_OWNER_PID`), arm the owner watchdog so a test killed
     // without unwinding (SIGKILL/timeout/panic=abort) can never orphan this
-    // daemon. A no-op for a real fleet daemon (no owner binding).
-    crate::pdeath::arm_owner_watchdog();
+    // daemon. A no-op for a real fleet daemon (no owner binding). Fatal if the
+    // binding is active but the watchdog cannot be armed on a supported platform
+    // (issue #54 review): starting without the only owner-SIGKILL-proof reaper
+    // would reintroduce the orphan this guards against.
+    crate::pdeath::arm_owner_watchdog()?;
     let decision = pin::resolve_or_pin(&state_home, opts.profile.as_deref())?;
     let engine_desc = decision.pin.describe();
     // The console header leads daemon startup output with the engine it is

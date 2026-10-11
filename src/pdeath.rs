@@ -280,14 +280,22 @@ pub fn test_owner_start() -> Option<u64> {
 /// a still-running daemon), which covers a recycled owner pid.
 ///
 /// A no-op when there is no owner binding (a real fleet daemon/worker), so
-/// production processes are untouched. Best-effort: a spawn failure is logged,
-/// never fatal — the in-process `Drop` path still covers the unwind case.
-pub fn arm_owner_watchdog() {
+/// production processes are untouched. When the owner binding IS active but the
+/// watchdog cannot be armed on a platform that supports it (Linux/macOS),
+/// startup FAILS (`Err`): the watchdog is the only cleanup path that survives an
+/// owner SIGKILL — the in-process `Drop` cannot run on a SIGKILL/timeout/
+/// `panic=abort`, and the startup sweep has neither this process's pid (the
+/// marker records the *owner* pid) nor a control socket to stop it, so it can
+/// only delete the home. Continuing past a failed arm would therefore still
+/// permit exactly the orphan this change prevents (issue #54 review
+/// r4240360017). The intentional unsupported-platform behavior is preserved:
+/// where no owner watchdog exists, arming is skipped, never failed.
+pub fn arm_owner_watchdog() -> anyhow::Result<()> {
     let Some(owner) = test_owner_pid() else {
-        return;
+        return Ok(());
     };
     let Some(home) = crate::state::state_home() else {
-        return;
+        return Ok(());
     };
     // Record the owner binding where the contract-test startup sweep can read it
     // (`<home>/ct-owner.pid`), so the sweep can tell an orphaned daemon (its
@@ -305,7 +313,31 @@ pub fn arm_owner_watchdog() {
         marker.push_str(&start.to_string());
     }
     write_marker_atomic(&home.join(OWNER_PID_FILE), &marker);
-    let _ = spawn_owner_watchdog(owner, home);
+    arm_outcome(spawn_owner_watchdog(owner, home))
+}
+
+/// Whether this platform has an owner-watchdog implementation at all. On
+/// Linux/macOS [`spawn_owner_watchdog`] spawns a real reaper, so a `None` return
+/// is a genuine spawn failure; elsewhere the function is an intentional no-op
+/// that always returns `None` and must not fail startup.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const OWNER_WATCHDOG_SUPPORTED: bool = true;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const OWNER_WATCHDOG_SUPPORTED: bool = false;
+
+/// Decide whether a failed watchdog arm must abort startup. On a supported
+/// platform a `None` from [`spawn_owner_watchdog`] is a real spawn failure that
+/// leaves the daemon/worker orphanable, so startup fails; on an unsupported
+/// platform `None` is the intentional no-op and startup proceeds (see
+/// [`arm_owner_watchdog`]).
+fn arm_outcome(spawned: Option<u32>) -> anyhow::Result<()> {
+    if spawned.is_none() && OWNER_WATCHDOG_SUPPORTED {
+        return Err(anyhow::anyhow!(
+            "issue #54: could not arm the owner watchdog; refusing to start a \
+             contract-test daemon/worker that an owner SIGKILL could orphan"
+        ));
+    }
+    Ok(())
 }
 
 /// Write the `ct-owner.pid` owner marker **atomically**: a plain
@@ -378,8 +410,10 @@ fn resolve_owner_start(stamped: Option<u64>, owner: u32) -> Option<u64> {
 }
 
 /// Spawn the detached owner watchdog for `owner`, watching `home`. Returns its
-/// pid, or `None` if it could not be spawned. Split from [`arm_owner_watchdog`]
-/// so the regression test can drive the real subcommand directly.
+/// pid, or `None` if it could not be spawned (which [`arm_owner_watchdog`] turns
+/// into a fatal startup error on this supported platform). Split from
+/// [`arm_owner_watchdog`] so the regression test can drive the real subcommand
+/// directly.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
     let Ok(exe) = std::env::current_exe() else {
@@ -1751,6 +1785,26 @@ mod tests {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
         let _ = child.wait();
+    }
+
+    /// A failed owner-watchdog arm must FAIL startup on a platform that has a
+    /// watchdog (issue #54 review r4240360017): continuing without the one reaper
+    /// that survives an owner SIGKILL would leave the daemon/worker orphanable,
+    /// since `Drop` cannot run on a SIGKILL and the startup sweep has no pid or
+    /// socket to stop it. A successful arm proceeds. The unsupported-platform
+    /// no-op (where `spawn_owner_watchdog` always returns `None` by design) is
+    /// covered by `OWNER_WATCHDOG_SUPPORTED`; the test suite only runs on
+    /// supported platforms, where that flag is `true`.
+    #[test]
+    fn failed_owner_watchdog_arm_fails_startup() {
+        assert!(
+            arm_outcome(None).is_err(),
+            "a failed arm on a supported platform must abort startup"
+        );
+        assert!(
+            arm_outcome(Some(4321)).is_ok(),
+            "a successful arm must let startup proceed"
+        );
     }
 
     #[test]

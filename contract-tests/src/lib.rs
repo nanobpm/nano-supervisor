@@ -428,7 +428,15 @@ impl Drop for TempHome {
 }
 
 /// How long `Drop for TempHome` waits for a force-stopped daemon to release its
-/// control socket before giving up and removing the (now-stale) socket file.
+/// control socket. If the daemon stops answering within the grace, its socket
+/// file is stale and `Drop` removes it. If the daemon is STILL accepting
+/// connections after the grace (a live listener we could not stop in time),
+/// `Drop` intentionally RETAINS the socket file: unlinking a live Unix socket
+/// does not terminate its process, it only strips the name a later startup
+/// sweep needs to reach and stop it, stranding an unreachable orphan. Keep that
+/// retention when changing this cleanup so the unreachable-orphan bug is not
+/// reintroduced (issue #54 review); the Rust target's owner watchdog converges
+/// such a daemon in the meantime.
 const DROP_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Derive the plugin's control-socket path for a given home directory. Mirrors
