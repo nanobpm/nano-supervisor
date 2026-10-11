@@ -8,13 +8,14 @@
 //! Agents are spawned in their own process group and armed to die with the
 //! daemon ([`crate::pdeath`]), so even a `kill -9` leaves no orphans.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::sync::watch;
 
+use crate::control;
 use crate::engine;
 use crate::pin;
 use crate::runtime::log;
@@ -28,6 +29,11 @@ const HOST_SANDBOX: &str = "none";
 /// before the daemon exits (dropping the tasks; agents die via `kill_on_drop`
 /// and parent-death cleanup).
 const DRAIN_GRACE: Duration = Duration::from_secs(20);
+
+/// The much shorter drain window used for a forced `stop --force`: slots get a
+/// brief moment to observe the shutdown signal, then the daemon exits and reaps
+/// any remaining agents instead of waiting out [`DRAIN_GRACE`].
+const FORCE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
@@ -151,10 +157,48 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         pinned_base_url.as_deref(),
     )?;
     let host = short_hostname();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
+
+    // A `--slots 0` daemon would run no slots at all; reject it here, before we
+    // claim the control socket, so startup never binds a socket only to bail out
+    // and leave a stale socket file advertising a daemon that immediately dies.
+    if opts.slots == 0 {
+        bail!("no slots started (is --slots 0?)");
+    }
+
+    // --- control socket: claim this home BEFORE spawning any slots ----------
+    // The supervisor control socket (nanobpm/nano-supervisor#8) must be claimed
+    // and bound before we start accepting work, for two reasons:
+    //   * Startup race (per-home exclusivity): an unlocked connect probe lets
+    //     two concurrent starts both see "no daemon" and race to unlink each
+    //     other's live socket. We take a per-home startup lock — held for the
+    //     whole daemon lifetime — so the second starter observes it is held and
+    //     refuses, and so a surviving socket file is provably stale (its owner
+    //     no longer holds the lock) before we remove it.
+    //   * Bind failure is startup-fatal: a daemon with no reachable control
+    //     endpoint cannot be driven by `status`/`stop`, and its detached
+    //     launcher would time out while this child silently kept accepting jobs.
+    //     Binding before the slot loop means a bind failure aborts startup with
+    //     no orphaned slots left running.
+    let sock_path = control::socket_path(&state_home);
+    #[cfg(unix)]
+    let _startup_lock = match crate::fleet::try_lock_supervisor_startup(&state_home)? {
+        Some(lock) => lock,
+        None => bail!(
+            "another nano-supervisor already owns this state home (control socket {}); \
+             refusing to start a second daemon",
+            sock_path.display()
+        ),
+    };
+    #[cfg(unix)]
+    let control_listener = bind_control_socket(&sock_path)?;
 
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
+    // The in-process slots this daemon runs, as (worker id, profile) pairs — the
+    // control socket's `status` reply reports each as a worker
+    // (nanobpm/nano-supervisor#8).
+    let mut worker_ids: Vec<(String, String)> = Vec::new();
     for hire in &runnable {
         let job_types = state::job_type_matrix(&hire.rank, &hire.capabilities);
         log(&format!(
@@ -163,9 +207,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         ));
         running_hires += 1;
         for slot_idx in 0..opts.slots {
+            let worker_name = format!("{host}-nanod-{}-{slot_idx}", hire.name);
+            worker_ids.push((worker_name.clone(), hire.name.clone()));
             let cfg = Arc::new(SlotConfig {
                 hire: (*hire).clone(),
-                worker_name: format!("{host}-nanod-{}-{slot_idx}", hire.name),
+                worker_name,
                 job_types: job_types.clone(),
                 recovery_window: opts.recovery_window,
                 idle_timeout: opts.idle_timeout,
@@ -204,35 +250,169 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         handles.len()
     ));
 
-    // `wait_for_signal` reports whether a slot flipped the watch for a FATAL
-    // misconfiguration (an unleased activation while leasing is enabled — the
-    // default) versus an operator Ctrl-C/SIGTERM. We still drain either way, but
-    // a fatal shutdown must surface as a non-zero exit (issue: default leasing is
-    // documented to fail LOUDLY — returning `Ok(())` made the daemon look like a
-    // clean drain).
-    let fatal = wait_for_signal(&shutdown_tx).await;
-    if fatal {
+    // --- control socket (nanobpm/nano-supervisor#8) -------------------------
+    // The socket was already bound above (before the slots); here we publish the
+    // live descriptor and spawn its accept loop. A control `stop` op requests a
+    // `Drain` (or `Cancel` for `stop --force`) on the shutdown watch; the watch's
+    // precedence (Fatal > Cancel > Drain > Running) keeps a slot's concurrent
+    // fatal flip from being masked into a clean exit, and keeps a plain stop from
+    // clobbering a force already in flight (see `slot::request_shutdown`).
+    let log_file = state_home
+        .join("logs")
+        .join("supervisor")
+        .join("daemon.log");
+    let descriptor = control::DaemonDescriptor {
+        pid: std::process::id(),
+        started_at: control::iso8601_now(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        socket: sock_path.to_string_lossy().into_owned(),
+        log_file: log_file.to_string_lossy().into_owned(),
+    };
+    let engine_for_workers = pinned_base_url
+        .clone()
+        .unwrap_or_else(|| engine_desc.clone());
+    // Publishing `supervisor.json` is startup-fatal if it cannot be written
+    // confined (no-follow, atomic): a daemon that silently overwrote a planted
+    // symlink or served with a stale/missing descriptor would mislead every
+    // `supervisor status` client, so a failure here aborts startup rather than
+    // serving the socket (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    let control_handle = Some(
+        match serve_control(
+            control_listener,
+            state_home.clone(),
+            descriptor,
+            worker_ids,
+            engine_for_workers,
+            control::epoch_millis(),
+            shutdown_tx.clone(),
+        ) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Control setup is startup-fatal, but the slots were already spawned
+                // and the socket already bound above. Returning `?` here would merely
+                // DROP the `JoinHandle`s — detaching the slots (each still holding a
+                // shutdown sender and possibly already activating work) rather than
+                // stopping them — and leave the bound socket file behind as a stale
+                // leftover. Fail closed instead: tell the slots to abort in-flight
+                // work, join them, and remove the socket + any descriptor before
+                // surfacing the error.
+                abort_slots_and_cleanup(
+                    handles,
+                    &shutdown_tx,
+                    &sock_path,
+                    &state_home.join("supervisor.json"),
+                )
+                .await;
+                return Err(e);
+            }
+        },
+    );
+    #[cfg(not(unix))]
+    let control_handle: Option<tokio::task::JoinHandle<()>> = {
+        // No Unix-domain control socket off-Unix; the daemon still runs its
+        // slots, it just cannot be driven over the socket.
+        let _ = (&descriptor, &worker_ids, &engine_for_workers, &log_file);
+        log("control socket is unavailable off-Unix; status/stop clients cannot attach");
+        None
+    };
+
+    // `wait_for_signal` reports the shutdown REASON (a `slot::Shutdown`): a slot's
+    // FATAL misconfiguration (an unleased activation while leasing is enabled —
+    // the default), an operator Ctrl-C/SIGTERM `Drain`, or a control `stop`'s
+    // `Drain`/`Cancel`. We drain either way, but a fatal shutdown must surface as
+    // a non-zero exit (default leasing is documented to fail LOUDLY — returning
+    // `Ok(())` made the daemon look like a clean drain). Fatal WINS the race: a
+    // slot can publish its fatal flip on the same tick a client requests `stop`,
+    // so a graceful reason must not mask a concurrent fatal into exit 0.
+    let reason = wait_for_signal(&shutdown_tx).await;
+    // Log from the snapshot; the AUTHORITATIVE reason is re-read after the drain
+    // below (a fatal escalation can land mid-drain — see the `settled` re-read).
+    if reason == slot::Shutdown::Fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); draining and exiting non-zero");
     } else {
         log("shutdown signal received; draining slots…");
     }
-    let _ = shutdown_tx.send(true);
+    // Publish the reason to the slots. An OS signal does not write the watch, so
+    // this is what lets the slots observe a Ctrl-C/SIGTERM drain; `request_shutdown`
+    // never downgrades a higher-precedence reason already settled (e.g. a fatal
+    // flip), so this cannot mask a fatal shutdown.
+    let _ = slot::request_shutdown(&shutdown_tx, reason);
 
     // Give slots a bounded window to finish in-flight work; then exit (dropping
-    // any stragglers — their agents die via kill_on_drop + parent-death).
+    // any stragglers — their agents die via kill_on_drop + parent-death). A
+    // `stop --force` (`Cancel`) cuts that window short and has the slots abort
+    // in-flight work immediately; a graceful `Drain` lets each in-flight job
+    // finish within the full grace window.
+    //
+    // `reason` is only the snapshot `wait_for_signal` returned. A slot that
+    // already passed its pre-batch shutdown check can still detect an unleased
+    // activation DURING this drain and escalate the watch to `Fatal`; the watch
+    // (via `request_shutdown`) keeps that escalation, so re-read the SETTLED
+    // reason after draining rather than trusting the snapshot — otherwise the
+    // daemon would exit zero and mask the fatal fencing failure.
     let drain = async {
         for h in handles {
             let _ = h.await;
         }
     };
-    if tokio::time::timeout(DRAIN_GRACE, drain).await.is_err() {
-        log(&format!(
-            "drain grace ({}s) elapsed; exiting and reaping remaining agents",
-            DRAIN_GRACE.as_secs()
-        ));
+    // Pick the grace window from the LIVE reason, and keep watching the shutdown
+    // reason WHILE draining: a plain `Drain` chooses the full 20s window, yet a
+    // second client can escalate it with `stop --force` (`Cancel`), or a slot
+    // can flip it to `Fatal`, mid-drain. Both reasons abort in-flight work, so a
+    // stuck slot must NOT be able to ride the long graceful window — shorten the
+    // active deadline to the forced window the moment the settled reason starts
+    // aborting in-flight work. Freezing the grace from the snapshot (the old bug)
+    // let a mid-drain escalation leave the daemon/socket alive for the full 20s
+    // instead of the promised forced-stop window.
+    // Subscribe BEFORE choosing the initial grace, then seed the grace from the
+    // receiver's CURRENT settled value — not the stale `reason` snapshot
+    // `wait_for_signal` returned. A `watch::Receiver` considers the value present
+    // at `subscribe()` as already-seen, so a `Cancel`/`Fatal` that lands between
+    // the snapshot and `subscribe()` would never fire `changed()`; seeding from
+    // the receiver picks that escalation up so a stuck slot cannot ride the full
+    // graceful window (nanobpm/nano-supervisor#8).
+    let mut escalation_rx = shutdown_tx.subscribe();
+    let initial_grace = if escalation_rx.borrow_and_update().aborts_inflight() {
+        FORCE_DRAIN_GRACE
+    } else {
+        DRAIN_GRACE
+    };
+    let drained =
+        drain_within_deadline(drain, &mut escalation_rx, initial_grace, FORCE_DRAIN_GRACE).await;
+    if !drained {
+        if (*shutdown_tx.borrow()).aborts_inflight() {
+            log("forced stop: cancelling in-flight work and reaping remaining agents");
+        } else {
+            log(&format!(
+                "drain grace ({}s) elapsed; exiting and reaping remaining agents",
+                DRAIN_GRACE.as_secs()
+            ));
+        }
     } else {
         log("all slots drained; exiting");
     }
+
+    // Re-read the watch's settled value now that draining has finished: a fatal
+    // escalation that landed mid-drain must decide the exit status (and would
+    // have been masked by the `reason` snapshot above). `request_shutdown`
+    // guarantees the settled value is the highest-precedence reason ever
+    // published, so this is the authoritative shutdown reason.
+    let settled = *shutdown_tx.borrow();
+    let fatal = settled == slot::Shutdown::Fatal;
+    if fatal && reason != slot::Shutdown::Fatal {
+        log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); the fatal escalation arrived during the drain — exiting non-zero");
+    }
+
+    // Tear the control socket down: stop accepting, remove the socket file and
+    // the `supervisor.json` descriptor so a later `supervisor status` reports
+    // "not running" rather than probing a stale socket.
+    if let Some(handle) = control_handle {
+        handle.abort();
+    }
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(state_home.join("supervisor.json"));
+
     if fatal {
         bail!(
             "daemon shut down because a slot received an unleased activation while leasing is \
@@ -241,6 +421,350 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Fail-closed teardown for a startup step that fails AFTER the slots have been
+/// spawned and the control socket bound. At that point simply returning the
+/// error would drop the slot `JoinHandle`s — which only *detaches* the slots
+/// (each still holds a shutdown sender and may already be activating work) —
+/// and leave the bound socket pathname and any published descriptor behind as
+/// stale leftovers. Instead, tell the slots to abort in-flight work, join every
+/// one, and remove the socket + descriptor, so a half-started daemon never
+/// orphans live slots or a stale socket file.
+#[cfg(unix)]
+async fn abort_slots_and_cleanup(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_tx: &watch::Sender<slot::Shutdown>,
+    sock_path: &Path,
+    descriptor_path: &Path,
+) {
+    let _ = slot::request_shutdown(shutdown_tx, slot::Shutdown::Cancel);
+    for h in handles {
+        h.abort();
+        let _ = h.await;
+    }
+    let _ = std::fs::remove_file(sock_path);
+    let _ = std::fs::remove_file(descriptor_path);
+}
+
+/// Bind the supervisor control socket, failing startup if it cannot be bound.
+///
+/// Called **before** any slot is spawned and while the per-home startup lock is
+/// held, so a bind failure aborts startup cleanly with no orphaned slots.
+///
+/// The startup lock alone does NOT prove a pre-existing socket file is stale:
+/// that lock is a Rust-private `flock`, and a protocol-compatible **Node**
+/// daemon — which binds the SAME derived socket path (see
+/// `control::socket_path`) — never holds it. So a live Node daemon (or a direct
+/// `nano-supervisor daemon` started without the lock) can own the socket while
+/// this Rust starter holds the flock. Unlinking unconditionally would disconnect
+/// that live daemon's control endpoint and leave two fleets running. We
+/// therefore treat the socket as stale only when it is present but REFUSES a
+/// connection (a dead owner's leftover); a socket that still answers a connect
+/// belongs to a live peer and is startup-fatal to clobber.
+#[cfg(unix)]
+fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
+    use tokio::net::UnixListener;
+
+    if let Some(parent) = sock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if sock_path.exists() {
+        // Cross-implementation ownership check. The bounded probe is classified
+        // three ways and we FAIL CLOSED on anything but a proven-dead owner:
+        //   - Live        → a daemon (Rust or Node) is bound here; refuse to
+        //                   unlink its socket out from under it.
+        //   - Indeterminate (e.g. `TimedOut` from a live peer whose listen
+        //                   backlog is full) → we cannot prove the owner is dead,
+        //                   so we must NOT clobber it — a timeout here is an
+        //                   unresponsive LIVE daemon, not a stale leftover.
+        //   - Absent      → the connect failed fast with ECONNREFUSED/ENOENT,
+        //                   proving a dead owner's stale leftover; only THEN is it
+        //                   safe to remove the file before binding.
+        // A bare `is_ok()` would fold Indeterminate in with Absent and unlink a
+        // live, backlogged daemon's endpoint, leaving two fleets active. The
+        // probe is nonblocking and deadline-bounded so a full backlog cannot stall
+        // a blocking `connect` (and with it startup) before `bind`
+        // (nanobpm/nano-supervisor#8).
+        match control::probe_liveness(sock_path, std::time::Duration::from_secs(2)) {
+            control::Liveness::Absent => {
+                let _ = std::fs::remove_file(sock_path);
+            }
+            control::Liveness::Live => bail!(
+                "the supervisor control socket at {} is live — another daemon (Rust or Node) \
+                 already owns this state home; refusing to clobber its control endpoint",
+                sock_path.display()
+            ),
+            control::Liveness::Indeterminate(e) => bail!(
+                "the supervisor control socket at {} could not be probed ({e}); refusing to \
+                 clobber a potentially live control endpoint — a timeout here means a live \
+                 daemon with a full listen backlog, not a dead owner's stale leftover",
+                sock_path.display()
+            ),
+        }
+    }
+    let listener = UnixListener::bind(sock_path).with_context(|| {
+        format!(
+            "binding the supervisor control socket at {} (startup-fatal: a daemon with no \
+             reachable control endpoint cannot be driven by status/stop)",
+            sock_path.display()
+        )
+    })?;
+    // The socket lives in the shared system temp dir, so its pathname is
+    // guessable by other local users (the hash is derivable from the home path).
+    // `bind` honours the process umask, which under a common `022` leaves the
+    // socket world-accessible — anyone could then read status or issue `stop`.
+    // Force owner-only read/write regardless of the caller's umask, and fail
+    // startup if that protection cannot be established (nanobpm/nano-supervisor#8).
+    restrict_socket_to_owner(sock_path)?;
+    Ok(listener)
+}
+
+/// Restrict the control socket to its owner (`rwx------`, i.e. no group/other
+/// access), independent of the process umask. Combined with the peer-UID check
+/// in [`handle_control_connection`], this keeps another local user from driving
+/// the daemon. Startup fails if the mode cannot be set, so a daemon is never
+/// left listening on a world-accessible socket.
+#[cfg(unix)]
+fn restrict_socket_to_owner(sock_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "securing the supervisor control socket at {} (refusing to run a world-accessible \
+             control endpoint)",
+                sock_path.display()
+            )
+        },
+    )?;
+    // Verify the mode actually took: on a filesystem that silently ignores the
+    // chmod (or races a umask re-application) the socket could still be
+    // group/other-accessible. Fail startup rather than listen on a socket other
+    // local users can drive.
+    let mode = std::fs::metadata(sock_path)
+        .with_context(|| {
+            format!(
+                "stat the supervisor control socket at {}",
+                sock_path.display()
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "the supervisor control socket at {} is not owner-only (mode {mode:o}); refusing to \
+             run a control endpoint other local users could drive",
+            sock_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether the peer at the other end of an accepted control connection is owned
+/// by the same user as this daemon. Defence in depth on top of the owner-only
+/// socket mode: even if a peer somehow opens the socket, a UID mismatch is
+/// rejected before any request is served.
+#[cfg(unix)]
+fn peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == unsafe { libc::geteuid() },
+        // If we cannot determine the peer, fail closed.
+        Err(_) => false,
+    }
+}
+
+/// Serve the supervisor control socket on an already-bound `listener`. Publishes
+/// the live `supervisor.json` descriptor and spawns the accept loop, returning
+/// its task handle (aborted on daemon exit). The socket is bound earlier by
+/// [`bind_control_socket`] so a bind failure is startup-fatal.
+///
+/// Publishing the descriptor is itself fallible and startup-fatal: it is written
+/// through the SAME confined, no-follow atomic writer every other state file uses
+/// (`fleet::write_json_atomic`), so a pre-planted `supervisor.json` symlink
+/// cannot redirect the write out of the state home and a write failure is
+/// propagated rather than suppressed — a daemon serving with a stale or missing
+/// descriptor would mislead every `supervisor status` client
+/// (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn serve_control(
+    listener: tokio::net::UnixListener,
+    state_home: PathBuf,
+    descriptor: control::DaemonDescriptor,
+    worker_ids: Vec<(String, String)>,
+    engine: String,
+    started_at_ms: u64,
+    shutdown_tx: watch::Sender<slot::Shutdown>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    // Record the descriptor so clients that prefer `supervisor.json` (and
+    // `supervisor status`) find the socket + pid without re-deriving them.
+    // Written through the confined no-follow atomic writer (not a bare
+    // `std::fs::write`, which follows a planted symlink and swallows errors):
+    // failure aborts startup BEFORE the accept loop serves the socket.
+    let sup_json = serde_json::json!({
+        "pid": descriptor.pid,
+        "startedAt": descriptor.started_at,
+        "version": descriptor.version,
+        "socket": descriptor.socket,
+        "logFile": descriptor.log_file,
+        "pluginVersion": descriptor.version,
+    });
+    crate::fleet::write_json_atomic_confined(&state_home.join("supervisor.json"), &sup_json)
+        .context("publishing the supervisor.json descriptor")?;
+    log(&format!(
+        "control socket listening at {}",
+        descriptor.socket
+    ));
+
+    Ok(tokio::spawn(async move {
+        let descriptor = Arc::new(descriptor);
+        let worker_ids = Arc::new(worker_ids);
+        let engine = Arc::new(engine);
+        // Transient `accept(2)` failures (EMFILE/ENFILE fd exhaustion, ENOBUFS,
+        // ECONNABORTED, EINTR) must NOT tear down the only control loop: breaking
+        // here would leave the socket bound but make `status`/`stop` unusable,
+        // stranding an unreachable daemon with its worker slots still running.
+        // Back off briefly (so an EMFILE storm cannot busy-spin a core) and keep
+        // serving. Back-to-back transient failures escalate the backoff up to a
+        // 1s cap and reset on the first clean accept.
+        let mut backoff = std::time::Duration::from_millis(10);
+        let backoff_cap = std::time::Duration::from_secs(1);
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    backoff = std::time::Duration::from_millis(10);
+                    stream
+                }
+                Err(e) => {
+                    log(&format!(
+                        "control accept failed ({e}); retrying after {}ms",
+                        backoff.as_millis()
+                    ));
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(backoff_cap);
+                    continue;
+                }
+            };
+            // Reject any peer not owned by this daemon's user before serving it.
+            // The socket mode is owner-only, but that is a filesystem check a
+            // determined local user on a misconfigured system might bypass; the
+            // peer-credential check is kernel-enforced (nanobpm/nano-supervisor#8).
+            if !peer_is_owner(&stream) {
+                log("rejected a control connection from a non-owner peer");
+                continue;
+            }
+            let descriptor = descriptor.clone();
+            let worker_ids = worker_ids.clone();
+            let engine = engine.clone();
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                handle_control_connection(
+                    stream,
+                    descriptor,
+                    worker_ids,
+                    engine,
+                    started_at_ms,
+                    shutdown_tx,
+                )
+                .await;
+            });
+        }
+    }))
+}
+
+/// Serve one control connection: read NDJSON request lines, reply with frames,
+/// and begin a graceful shutdown when a `stop` op is dispatched.
+#[cfg(unix)]
+async fn handle_control_connection(
+    stream: tokio::net::UnixStream,
+    descriptor: Arc<control::DaemonDescriptor>,
+    worker_ids: Arc<Vec<(String, String)>>,
+    engine: Arc<String>,
+    started_at_ms: u64,
+    shutdown_tx: watch::Sender<slot::Shutdown>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let snapshot = control_snapshot(&descriptor, &worker_ids, &engine, started_at_ms);
+        let Some(resp) = control::handle_request(&line, &snapshot) else {
+            continue;
+        };
+        // Publish a parsed `stop` BEFORE writing the reply, not after: the
+        // shutdown is the authoritative side effect of the request and must not
+        // hinge on delivering every response frame. If the client disconnects
+        // after sending `stop` (or an interim frame write fails), gating the
+        // `request_shutdown` on a successful write would `return` early and leave
+        // the daemon running forever. A plain `stop` requests a graceful `Drain`
+        // (let in-flight work finish, exit zero); `stop --force` requests a
+        // `Cancel` (abort in-flight work now). `request_shutdown` publishes it
+        // without ever downgrading a slot's concurrent FATAL flip, so an operator
+        // stop can never mask a fatal shutdown into a clean exit.
+        if resp.stop {
+            let want = if resp.force {
+                slot::Shutdown::Cancel
+            } else {
+                slot::Shutdown::Drain
+            };
+            let _ = slot::request_shutdown(&shutdown_tx, want);
+        }
+        for frame in &resp.frames {
+            if write_half
+                .write_all(control::encode_frame(frame).as_bytes())
+                .await
+                .is_err()
+            {
+                // The shutdown (if any) is already published above, so a failed
+                // write only costs the client its reply — the daemon still drains.
+                return;
+            }
+        }
+        let _ = write_half.flush().await;
+        if resp.stop {
+            return;
+        }
+    }
+}
+
+/// Build a fresh `status` snapshot (uptime recomputed per request) from the
+/// daemon's fixed slot roster.
+fn control_snapshot(
+    descriptor: &control::DaemonDescriptor,
+    worker_ids: &[(String, String)],
+    engine: &str,
+    started_at_ms: u64,
+) -> control::StatusSnapshot {
+    let uptime = control::epoch_millis().saturating_sub(started_at_ms);
+    let log_dir = PathBuf::from(&descriptor.log_file)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let workers = worker_ids
+        .iter()
+        .map(|(id, profile)| {
+            let log_file = log_dir
+                .join(format!("worker-{id}.log"))
+                .to_string_lossy()
+                .into_owned();
+            control::WorkerStatus::in_process(
+                id.clone(),
+                profile.clone(),
+                descriptor.pid,
+                started_at_ms,
+                uptime,
+                log_file,
+                engine.to_string(),
+            )
+        })
+        .collect();
+    control::StatusSnapshot {
+        daemon: descriptor.clone(),
+        plugin_version: descriptor.version.clone(),
+        workers,
+    }
 }
 
 /// Reject a hire the MVP daemon cannot run. Only the host sandbox is supported,
@@ -752,51 +1276,123 @@ pub(crate) fn short_hostname() -> String {
         .to_ascii_lowercase()
 }
 
-/// Block until a shutdown trigger fires. Returns `true` when a slot flipped the
-/// `fatal` watch — an unrecoverable misconfiguration (e.g. an unleased
-/// activation while leasing is enabled, the default) that must exit loudly — and
-/// `false` for an operator Ctrl-C/SIGTERM drain. The caller distinguishes the two
-/// so a fatal shutdown surfaces as a non-zero exit rather than a clean `Ok(())`.
-pub(crate) async fn wait_for_signal(fatal: &watch::Sender<bool>) -> bool {
-    // Also wake if a slot flips the shutdown watch (a fatal misconfiguration,
-    // e.g. an unleased activation while leasing is enabled), so the daemon exits
-    // loudly rather than lingering with the offending slot stopped.
-    let mut fatal_rx = fatal.subscribe();
-    // A second subscription used only to re-read the watch's *final* value after
-    // the wait returns — `select!` reports whichever arm fired, not the channel's
-    // settled state, so a fatal flip published in the same tick an operator
+/// Block until a shutdown trigger fires, returning the shutdown REASON (a
+/// [`slot::Shutdown`]):
+///   * [`slot::Shutdown::Fatal`] when a slot published a fatal misconfiguration
+///     (e.g. an unleased activation while leasing is enabled, the default) — the
+///     daemon must exit loudly (non-zero);
+///   * the settled watch value ([`slot::Shutdown::Drain`] or
+///     [`slot::Shutdown::Cancel`]) when a control `stop` flipped it;
+///   * [`slot::Shutdown::Drain`] for an operator Ctrl-C/SIGTERM (an OS signal
+///     does not write the watch, so the caller publishes the drain afterwards).
+///
+/// Fatal always WINS: a slot can publish a fatal flip in the same tick a signal
+/// or a control `stop` arrives, so the settled watch value is re-read and a fatal
+/// reason is surfaced regardless of which `select!` arm woke us.
+pub(crate) async fn wait_for_signal(shutdown: &watch::Sender<slot::Shutdown>) -> slot::Shutdown {
+    // Wake on any watch flip (a slot's fatal misconfiguration, or a control
+    // `stop`'s drain/cancel), so the daemon reacts rather than lingering.
+    let mut watch_rx = shutdown.subscribe();
+    // A second subscription used only to re-read the watch's *settled* value
+    // after the wait returns — `select!` reports whichever arm fired, not the
+    // channel's final state, so a flip published in the same tick an operator
     // Ctrl-C/SIGTERM arrives could otherwise be masked by the signal arm winning.
-    let recheck_rx = fatal.subscribe();
-    let slot_requested = async {
-        let _ = fatal_rx.wait_for(|stop| *stop).await;
+    let recheck_rx = shutdown.subscribe();
+    let watch_flipped = async {
+        let _ = watch_rx.wait_for(|s| s.is_shutdown()).await;
     };
-    let signal_was_fatal = {
+    let via_signal = {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
             match signal(SignalKind::terminate()) {
                 Ok(mut term) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => false,
-                    _ = term.recv() => false,
-                    _ = slot_requested => true,
+                    _ = tokio::signal::ctrl_c() => true,
+                    _ = term.recv() => true,
+                    _ = watch_flipped => false,
                 },
                 Err(_) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => false,
-                    _ = slot_requested => true,
+                    _ = tokio::signal::ctrl_c() => true,
+                    _ = watch_flipped => false,
                 },
             }
         }
         #[cfg(not(unix))]
         {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => false,
-                _ = slot_requested => true,
+                _ = tokio::signal::ctrl_c() => true,
+                _ = watch_flipped => false,
             }
         }
     };
-    // Fatal always wins: if a slot has published a fatal state by now, surface it
-    // even when an operator signal was the arm that woke us.
-    signal_was_fatal || *recheck_rx.borrow()
+    let settled = *recheck_rx.borrow();
+    // Fatal always wins: surface it even when a signal or a non-fatal stop was
+    // the arm that woke us.
+    if settled == slot::Shutdown::Fatal {
+        return slot::Shutdown::Fatal;
+    }
+    if via_signal {
+        // An OS signal is an operator-requested graceful drain.
+        slot::Shutdown::Drain
+    } else if settled.is_shutdown() {
+        // Woken by a control `stop`: honour its reason (Drain or Cancel).
+        settled
+    } else {
+        // Defensive: a watch flip that settled back to `Running` is treated as a
+        // graceful drain rather than a no-op.
+        slot::Shutdown::Drain
+    }
+}
+
+/// Await `drain`, bounded by `initial_grace`, but collapse the deadline to
+/// `forced_grace` the instant the shutdown watch escalates to a reason that
+/// aborts in-flight work (`stop --force`'s `Cancel`, or a slot's `Fatal` flip).
+/// Returns `true` when the drain finished within the (possibly shortened)
+/// window, `false` on timeout.
+///
+/// This exists because the grace window must NOT be frozen from the snapshot
+/// reason: a graceful `Drain` picks the long window, but if a second client then
+/// escalates with `stop --force` a stuck slot could otherwise keep the
+/// daemon/socket alive for the full graceful window instead of the promised
+/// forced-stop window. Watching the live reason while draining fixes the whole
+/// class (any escalation that starts aborting in-flight work shortens the
+/// deadline), not just the one cited `Drain -> Cancel` case.
+pub(crate) async fn drain_within_deadline(
+    drain: impl std::future::Future<Output = ()>,
+    watch_rx: &mut watch::Receiver<slot::Shutdown>,
+    initial_grace: Duration,
+    forced_grace: Duration,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    let mut deadline = start + initial_grace;
+    let mut watching = true;
+    tokio::pin!(drain);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut drain => return true,
+            changed = watch_rx.changed(), if watching => {
+                match changed {
+                    // On an escalation that aborts in-flight work, collapse the
+                    // deadline to the forced window (never lengthen it).
+                    Ok(()) => {
+                        if watch_rx.borrow_and_update().aborts_inflight() {
+                            let forced_deadline = start + forced_grace;
+                            if forced_deadline < deadline {
+                                deadline = forced_deadline;
+                            }
+                        }
+                    }
+                    // The sender was dropped, so no further escalation can
+                    // arrive; stop polling the watch (an errored `changed()`
+                    // is ready immediately and would otherwise busy-loop) and
+                    // just race the drain against the deadline.
+                    Err(_) => watching = false,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1463,16 +2059,17 @@ mod tests {
         ));
     }
 
-    // A slot that flips the fatal watch (an unleased activation while leasing is
-    // enabled, the default) must be reported as fatal so `run` exits non-zero
-    // rather than returning a clean drain `Ok(())`.
+    // A slot that flips the watch to `Fatal` (an unleased activation while
+    // leasing is enabled, the default) must be reported as `Fatal` so `run`
+    // exits non-zero rather than returning a clean drain `Ok(())`.
     #[tokio::test]
     async fn wait_for_signal_reports_slot_requested_fatal() {
-        let (tx, _rx) = watch::channel(false);
-        tx.send(true).expect("flip fatal watch");
-        assert!(
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Fatal);
+        assert_eq!(
             wait_for_signal(&tx).await,
-            "a slot-flipped watch must be reported as a fatal shutdown"
+            slot::Shutdown::Fatal,
+            "a slot-flipped Fatal watch must be reported as a fatal shutdown"
         );
     }
 
@@ -1482,15 +2079,369 @@ mod tests {
     // guards that a fatal flip is never masked by the signal arm winning.
     #[tokio::test]
     async fn wait_for_signal_reports_fatal_flipped_during_wait() {
-        let (tx, _rx) = watch::channel(false);
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
         let flipper = tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            let _ = flipper.send(true);
+            let _ = slot::request_shutdown(&flipper, slot::Shutdown::Fatal);
         });
-        assert!(
+        assert_eq!(
             wait_for_signal(&tx).await,
+            slot::Shutdown::Fatal,
             "a fatal state published during the wait must be reported as fatal"
         );
+    }
+
+    // A control `stop`'s graceful `Drain` must be reported AS a drain, not
+    // escalated to the fatal non-zero path: the single-bool watch used to make
+    // every flip look fatal, so a normal `stop` exited non-zero
+    // (nanobpm/nano-supervisor#8).
+    #[tokio::test]
+    async fn wait_for_signal_reports_control_stop_as_drain_not_fatal() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Drain);
+        assert_eq!(
+            wait_for_signal(&tx).await,
+            slot::Shutdown::Drain,
+            "a graceful control stop must drain (exit zero), not take the fatal path"
+        );
+    }
+
+    // A `stop --force` (`Cancel`) must be reported as a cancel so `run` uses the
+    // short grace window — but still exit zero (only `Fatal` is non-zero).
+    #[tokio::test]
+    async fn wait_for_signal_reports_force_stop_as_cancel() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Cancel);
+        assert_eq!(
+            wait_for_signal(&tx).await,
+            slot::Shutdown::Cancel,
+            "a forced stop must be reported as a cancel"
+        );
+    }
+
+    // Fatal outranks a concurrent operator `stop`: if a slot has already
+    // published `Fatal`, a later graceful `stop` must NOT downgrade the settled
+    // reason into a clean exit (`request_shutdown` precedence).
+    #[tokio::test]
+    async fn fatal_is_not_downgraded_by_a_concurrent_stop() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        assert!(slot::request_shutdown(&tx, slot::Shutdown::Fatal));
+        assert!(
+            !slot::request_shutdown(&tx, slot::Shutdown::Drain),
+            "a graceful drain must not downgrade a settled Fatal"
+        );
+        assert_eq!(*tx.borrow(), slot::Shutdown::Fatal);
+        assert_eq!(wait_for_signal(&tx).await, slot::Shutdown::Fatal);
+    }
+
+    // The exit-status decision must use the watch's SETTLED value after the
+    // drain, not the snapshot `wait_for_signal` returned: a slot that passed its
+    // pre-batch check can still escalate `Drain` → `Fatal` mid-drain, and the
+    // daemon must exit non-zero rather than mask the fencing failure (#8).
+    #[tokio::test]
+    async fn settled_watch_escalation_to_fatal_is_not_masked() {
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        // Operator stop arrives first: the snapshot reason is a graceful Drain.
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Drain);
+        let reason = wait_for_signal(&tx).await;
+        assert_eq!(reason, slot::Shutdown::Drain);
+        let _ = slot::request_shutdown(&tx, reason);
+        // Mid-drain, a slot detects an unleased activation and escalates.
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Fatal);
+        // Re-reading the settled watch (as `run` now does after draining) must
+        // surface the fatal escalation, not the Drain snapshot.
+        let settled = *tx.borrow();
+        assert_eq!(
+            settled,
+            slot::Shutdown::Fatal,
+            "a mid-drain Drain->Fatal escalation must decide the exit status"
+        );
+    }
+
+    // The control socket must be created owner-only (`rwx------`) regardless of
+    // the process umask, so another local user cannot read status or issue
+    // `stop` against a socket whose pathname lives in the shared temp dir
+    // (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-perm-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = bind_control_socket(&sock).expect("bind control socket");
+        let mode = std::fs::metadata(&sock)
+            .expect("stat socket")
+            .permissions()
+            .mode()
+            & 0o777;
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        assert_eq!(
+            mode, 0o700,
+            "control socket must be owner-only, got {mode:o}"
+        );
+    }
+
+    // A self-connection is owned by this process's user, so the peer-credential
+    // check must accept it (we cannot spoof a foreign UID in a test, but this
+    // pins the accept path so a regression that rejects the owner is caught).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn peer_is_owner_accepts_own_connection() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-cred-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = bind_control_socket(&sock).expect("bind control socket");
+        let client = std::os::unix::net::UnixStream::connect(&sock).expect("connect to own socket");
+        let (stream, _) = listener.accept().await.expect("accept own connection");
+        let accepted = peer_is_owner(&stream);
+        drop(client);
+        drop(stream);
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        assert!(accepted, "a same-user peer must be accepted");
+    }
+
+    // Cross-implementation containment (#8): a socket that still ANSWERS a
+    // connect belongs to a live daemon — possibly a protocol-compatible Node
+    // daemon that never holds the Rust-private startup flock — so
+    // `bind_control_socket` must REFUSE to unlink it rather than disconnect the
+    // live peer and leave two fleets running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_control_socket_refuses_a_live_peer_socket() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-live-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        // A live "peer" (standing in for a Node daemon) bound to the path.
+        let peer = tokio::net::UnixListener::bind(&sock).expect("bind peer socket");
+        let result = bind_control_socket(&sock);
+        drop(peer);
+        let _ = std::fs::remove_file(&sock);
+        assert!(
+            result.is_err(),
+            "a live, connectable socket must not be clobbered"
+        );
+    }
+
+    // The complement: a socket file whose owner is DEAD (nothing listening, so a
+    // connect is refused) is a stale leftover and must be removed so the new
+    // daemon can bind — otherwise a crashed daemon's socket would block every
+    // restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_control_socket_removes_a_stale_socket() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "c8ctl-nano-stale-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        // Bind then drop, leaving the socket file with no listener behind it.
+        {
+            let _dead = tokio::net::UnixListener::bind(&sock).expect("bind dead socket");
+        }
+        let listener = bind_control_socket(&sock).expect("bind over a stale socket");
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // A graceful `Drain` that is escalated to `Cancel` (a second `stop --force`)
+    // mid-drain must collapse the active deadline to the forced window: a stuck
+    // slot must not be able to ride the full graceful grace after the operator
+    // demanded a forced stop (nanobpm/nano-supervisor#8). A long `initial_grace`
+    // stands in for `DRAIN_GRACE`: without the shortening the call would block
+    // for the full window, so finishing quickly proves the escalation shortened it.
+    #[tokio::test]
+    async fn forced_escalation_shortens_active_drain_deadline() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
+        let mut rx = tx.subscribe();
+        // A slot that never finishes draining.
+        let drain = std::future::pending::<()>();
+
+        let txc = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = slot::request_shutdown(&txc, slot::Shutdown::Cancel);
+        });
+
+        let start = std::time::Instant::now();
+        let drained = drain_within_deadline(
+            drain,
+            &mut rx,
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(!drained, "a stuck slot never drains");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a forced escalation must collapse the deadline to the forced window rather than \
+             riding the full graceful grace; took {elapsed:?}"
+        );
+    }
+
+    // Regression (stale snapshot): the initial grace must be seeded from the
+    // receiver's CURRENT settled value, not the snapshot `wait_for_signal`
+    // returned. A `watch::Receiver` treats the value present at `subscribe()` as
+    // already-seen, so a `Cancel` published BEFORE `subscribe()` never fires
+    // `changed()`; if the grace were seeded from the stale snapshot the stuck
+    // drain would ride the full graceful window. Seeding from
+    // `borrow_and_update()` (the production pattern at the drain site) picks the
+    // already-settled `Cancel` up and chooses the forced window immediately
+    // (nanobpm/nano-supervisor#8).
+    #[tokio::test]
+    async fn grace_seeded_from_receiver_not_stale_snapshot() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Running);
+        // The escalation lands BEFORE the drain site subscribes, so `changed()`
+        // would never report it to a receiver created afterwards.
+        let _ = slot::request_shutdown(&tx, slot::Shutdown::Cancel);
+
+        // Mirror the production drain site: subscribe, then seed the grace from
+        // the receiver's settled value.
+        let mut rx = tx.subscribe();
+        let initial_grace = if rx.borrow_and_update().aborts_inflight() {
+            Duration::from_millis(100) // FORCE_DRAIN_GRACE analogue
+        } else {
+            Duration::from_secs(30) // DRAIN_GRACE analogue
+        };
+        let drain = std::future::pending::<()>(); // a slot that never finishes
+
+        let start = std::time::Instant::now();
+        let drained =
+            drain_within_deadline(drain, &mut rx, initial_grace, Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+
+        assert!(!drained, "a stuck slot never drains");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "seeding from the receiver's settled value must choose the forced window even when the \
+             escalation predates subscribe(); took {elapsed:?}"
+        );
+    }
+
+    // The complement: a drain that completes before the deadline returns `true`
+    // (drained cleanly), regardless of the window chosen.
+    #[tokio::test]
+    async fn drain_within_deadline_reports_a_clean_drain() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
+        let mut rx = tx.subscribe();
+        let drain = async {};
+        let drained = drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
+        assert!(drained, "an immediately-finished drain must report success");
+    }
+
+    // A parsed `stop` must publish the shutdown BEFORE the reply is written, so a
+    // client that disconnects after sending the request (or a failed interim
+    // frame write) cannot leave the daemon running forever (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_publishes_shutdown_even_when_client_disconnects() {
+        use tokio::io::AsyncWriteExt;
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        let descriptor = Arc::new(control::DaemonDescriptor {
+            pid: std::process::id(),
+            started_at: "2026-01-01T00:00:00.000Z".into(),
+            version: "0.0.1".into(),
+            socket: "/tmp/c8ctl-nano-stop-test.sock".into(),
+            log_file: "/tmp/c8ctl-nano-stop-test.log".into(),
+        });
+        let worker_ids = Arc::new(Vec::new());
+        let engine = Arc::new("http://localhost:8080".to_string());
+
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        // Send a graceful stop, then close our end so the daemon's reply writes
+        // fail — the shutdown must still be published.
+        client
+            .write_all(b"{\"op\":\"stop\"}\n")
+            .await
+            .expect("send stop request");
+        client.shutdown().await.ok();
+        drop(client);
+
+        handle_control_connection(server, descriptor, worker_ids, engine, 0, tx.clone()).await;
+
+        assert_eq!(
+            *tx.borrow(),
+            slot::Shutdown::Drain,
+            "a parsed stop must publish shutdown even when the client disconnected before the reply"
+        );
+    }
+
+    // When a startup step fails AFTER the slots are spawned, the fail-closed
+    // teardown must STOP the slots (not merely detach them) and remove the bound
+    // socket + published descriptor, rather than leaking live slots and a stale
+    // socket file (nanobpm/nano-supervisor#8, "setup failure detaches slots").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_slots_and_cleanup_stops_slots_and_removes_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "c8ctl-nano-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock_path = dir.join("supervisor.sock");
+        let descriptor_path = dir.join("supervisor.json");
+        std::fs::write(&sock_path, b"").expect("bound socket stand-in");
+        std::fs::write(&descriptor_path, b"{}").expect("descriptor stand-in");
+
+        let (tx, _rx) = watch::channel(slot::Shutdown::Running);
+        // Two slots that would run forever unless aborted; if the teardown merely
+        // dropped their handles they would keep running (detached).
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..2)
+            .map(|_| {
+                tokio::spawn(async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                })
+            })
+            .collect();
+        let probes: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+
+        abort_slots_and_cleanup(handles, &tx, &sock_path, &descriptor_path).await;
+
+        for p in &probes {
+            assert!(p.is_finished(), "every slot must be stopped, not detached");
+        }
+        assert!(
+            !sock_path.exists(),
+            "the bound socket file must be removed on the error path"
+        );
+        assert!(
+            !descriptor_path.exists(),
+            "the published descriptor must be removed on the error path"
+        );
+        assert_eq!(
+            *tx.borrow(),
+            slot::Shutdown::Cancel,
+            "slots must be told to abort in-flight work before being joined"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

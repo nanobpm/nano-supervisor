@@ -7,6 +7,7 @@
 //! Both share one job core ([`slot`]) that mirrors the Node plugin's behaviour.
 
 mod acp;
+mod control;
 mod daemon;
 mod engine;
 mod envelope;
@@ -269,8 +270,23 @@ enum Cmd {
 /// `supervisor` subcommands implemented on the Rust target.
 #[derive(Subcommand)]
 enum SupervisorCmd {
+    /// Start the supervisor daemon for the named hires.
+    Start {
+        /// A hire to run (repeatable); default = every hire in config.json.
+        #[arg(long = "worker")]
+        worker: Vec<String>,
+        /// Run the daemon in the foreground instead of detaching it.
+        #[arg(long)]
+        attach: bool,
+    },
     /// Report whether the supervisor daemon is running.
     Status,
+    /// Stop a running supervisor daemon (drain, or `--force`).
+    Stop {
+        /// Force-stop without waiting for in-flight jobs to drain.
+        #[arg(long)]
+        force: bool,
+    },
     /// Add a hired profile to a running supervisor.
     Add {
         /// The hire to add.
@@ -337,9 +353,9 @@ fn daemon_leases(no_lease: bool) -> bool {
 /// Env var the worker stamps on every agent process (`slot::build_agent_env`) to
 /// mark its process tree as belonging to an agent run. Its presence here means
 /// *this* `nano-supervisor` was launched by an agent.
-const AGENT_RUN_ENV: &str = "NANO_AGENT_RUN";
+pub(crate) const AGENT_RUN_ENV: &str = "NANO_AGENT_RUN";
 /// Explicit opt-in letting a supervisor/worker run attached inside an agent run.
-const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
+pub(crate) const ALLOW_NESTED_ENV: &str = "NANO_ALLOW_NESTED_SUPERVISOR";
 
 /// Pure refusal decision for a nested supervisor/worker (#40), split out so it is
 /// testable without touching process-global env. Returns the explanatory error
@@ -562,7 +578,14 @@ async fn main() -> Result<()> {
             capabilities,
         } => fleet::assign(&profile, &capabilities),
         Cmd::Supervisor { cmd } => match cmd {
+            SupervisorCmd::Start { worker, attach } => {
+                fleet::supervisor(fleet::SupervisorOp::Start {
+                    workers: worker,
+                    attach,
+                })
+            }
             SupervisorCmd::Status => fleet::supervisor(fleet::SupervisorOp::Status),
+            SupervisorCmd::Stop { force } => fleet::supervisor(fleet::SupervisorOp::Stop { force }),
             SupervisorCmd::Add { profile } => {
                 fleet::supervisor(fleet::SupervisorOp::Add { profile })
             }

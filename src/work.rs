@@ -373,7 +373,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         connection: decision.pin.clone(),
         connection_profile: decision.profile.clone(),
     });
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));
     // The slot's `JoinHandle` resolves to `Result<(), JoinError>`: `Ok(())` on a
     // clean return, `Err` on a PANIC/abort. That error must NOT be discarded —
@@ -388,7 +388,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         }
         _ = wait_for_signal(&shutdown_tx) => {
             log("shutdown signal received; draining…");
-            let _ = shutdown_tx.send(true);
+            let _ = slot::request_shutdown(&shutdown_tx, slot::Shutdown::Drain);
             // A graceful drain that ends in a slot panic is still a crash —
             // surface it rather than reporting a clean shutdown. On timeout the
             // slot is STILL RUNNING: `timeout` only cancels the join *wait*, and

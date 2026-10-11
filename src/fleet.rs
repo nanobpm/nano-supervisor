@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::control;
 use crate::state::{job_type_matrix, normalize_capabilities, state_home};
 
 /// The ranks a hire may hold, in the order the Node plugin lists them in its
@@ -221,6 +222,17 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     }
 }
 
+/// Publish a JSON value to `path` through the confined, no-follow atomic writer
+/// every state file uses. `path` MUST lie under the trusted state home; a
+/// planted symlink anywhere in the operator-controlled tail (including on the
+/// final component) is refused rather than followed, and any write failure is
+/// returned rather than suppressed. Exposed for the supervisor daemon, which
+/// publishes `supervisor.json` with the same guarantees as `config.json`
+/// (nanobpm/nano-supervisor#8).
+pub(crate) fn write_json_atomic_confined(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_atomic(path, value)
+}
+
 #[cfg(unix)]
 struct RawFdGuard(libc::c_int);
 
@@ -338,7 +350,122 @@ fn open_confined_parent(path: &Path) -> Result<RawFdGuard> {
     Ok(dirfd)
 }
 
-/// True if any link in the error chain is an OS `NotFound` (`ENOENT`). Used by
+/// Like [`open_confined_parent`], but CREATES each missing directory in the
+/// tail (e.g. `logs/supervisor`) as it walks, still confined to the trusted
+/// state home: every component is `mkdirat`-ed (ignoring "already exists") and
+/// then re-opened with `O_NOFOLLOW | O_DIRECTORY`, so a planted symlink anywhere
+/// in the operator-controlled tail is refused with `ELOOP`/`ENOTDIR` rather than
+/// followed out of the home. Returns a pinned dirfd for `path`'s parent. Used to
+/// anchor the supervisor daemon log the same way state files are anchored
+/// (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+fn create_confined_parent(path: &Path) -> Result<RawFdGuard> {
+    let parent = path.parent().context("log path has no parent directory")?;
+    let anchor = home_dir()?;
+    let tail = parent.strip_prefix(&anchor).map_err(|_| {
+        anyhow::anyhow!(
+            "log path {} is not under the trusted state home {}",
+            path.display(),
+            anchor.display()
+        )
+    })?;
+
+    let anchor_c = cstring_from_path(&anchor)?;
+    let anchor_fd = unsafe {
+        libc::open(
+            anchor_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if anchor_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening trusted state home: {}", anchor.display()));
+    }
+    let mut dirfd = RawFdGuard(anchor_fd);
+
+    for component in tail.components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            std::path::Component::CurDir => continue,
+            other => bail!(
+                "log path {} escapes the trusted state home via {:?}",
+                path.display(),
+                other
+            ),
+        };
+        let name_c = cstring_from_component(name)?;
+        // Create the directory if absent; an existing entry (dir OR a planted
+        // symlink) makes `mkdirat` fail `EEXIST`, which we ignore here and let
+        // the no-follow `openat` below decide: a real directory opens, a symlink
+        // is refused with `ELOOP`.
+        unsafe {
+            libc::mkdirat(dirfd.0, name_c.as_ptr(), 0o700);
+        }
+        let fd = unsafe {
+            libc::openat(
+                dirfd.0,
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "creating log directory without following symlinks: {}",
+                    parent.display()
+                )
+            });
+        }
+        dirfd = RawFdGuard(fd);
+    }
+
+    Ok(dirfd)
+}
+
+/// Open (creating if absent) an append-mode log file confined to the trusted
+/// state home: its parent tail is created/opened no-follow via
+/// [`create_confined_parent`], and the final component is opened
+/// `O_CREAT | O_APPEND | O_WRONLY | O_NOFOLLOW`, so a planted symlink at the log
+/// path is refused rather than followed to clobber an arbitrary target. The
+/// opened descriptor is verified to be a regular file. Failures are returned,
+/// not suppressed, so the launcher can refuse to spawn rather than silently
+/// discarding the daemon's diagnostics.
+#[cfg(unix)]
+fn open_log_confined(path: &Path) -> Result<std::fs::File> {
+    let file_name = path.file_name().context("log path has no file name")?;
+    let final_c = cstring_from_component(file_name)?;
+    let dirfd = create_confined_parent(path)?;
+
+    let fd = unsafe {
+        libc::openat(
+            dirfd.0,
+            final_c.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "opening log file without following symlinks: {}",
+                path.display()
+            )
+        });
+    }
+    let fd = RawFdGuard(fd);
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.0, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statting log file {}", path.display()));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        bail!("log path is not a regular file: {}", path.display());
+    }
+
+    Ok(fd.into_file())
+}
+
 /// the confined read to map "the file (or a directory above it) does not exist"
 /// to `None` while still surfacing a symlinked/foreign tail (`ELOOP`/`ENOTDIR`)
 /// as a hard error.
@@ -517,6 +644,16 @@ fn write_config(cfg: &ConfigFile) -> Result<()> {
 }
 
 fn normalized_identity(path: &Path) -> PathBuf {
+    // If the full path already exists, canonicalize it DIRECTLY so the final
+    // component's symlinks are resolved too. Walking only the parent (below)
+    // leaves the leaf un-resolved, so `C8CTL_NANO_HOME=/alias` symlinked to
+    // `/real/home` would key a different identity than a daemon spelled
+    // `/real/home` and both could take different startup locks and run slots
+    // against the same home (nanobpm/nano-supervisor#8).
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+
     let mut suffix = Vec::new();
     if let Some(file_name) = path.file_name() {
         suffix.push(file_name.to_os_string());
@@ -588,7 +725,7 @@ fn normalized_identity(path: &Path) -> PathBuf {
 /// avoids with the same precedence. The empty lock file itself may persist
 /// between runs; it is reused, never a source of corruption, because exclusion
 /// comes from the `flock`, not the file's existence.
-struct StateLock {
+pub(crate) struct StateLock {
     // Held for the guard's lifetime; dropping it closes the fd and releases the
     // advisory `flock`. Never read directly.
     _file: std::fs::File,
@@ -724,11 +861,11 @@ fn fleet_lock_dir_in(base: &Path) -> Result<PathBuf> {
 }
 
 impl StateLock {
-    /// Acquire the exclusive lock guarding `path`, blocking until any current
-    /// holder — in this or another process — releases it. `path` is the guarded
-    /// state file (e.g. `config.json`); the lock file is derived from it.
-    fn acquire(path: &std::path::Path) -> Result<StateLock> {
-        use fs2::FileExt;
+    /// Open (creating if absent) and ownership/permission-verify the lock file
+    /// guarding `path`, returning the handle **without** taking the `flock`.
+    /// Shared by [`acquire`](Self::acquire) (blocking) and
+    /// [`try_acquire`](Self::try_acquire) (non-blocking).
+    fn open_lock_file(path: &std::path::Path) -> Result<std::fs::File> {
         let lock_path = Self::lock_file_for(path)?;
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).read(true).write(true);
@@ -760,9 +897,35 @@ impl StateLock {
                 );
             }
         }
+        Ok(file)
+    }
+
+    /// Acquire the exclusive lock guarding `path`, blocking until any current
+    /// holder — in this or another process — releases it. `path` is the guarded
+    /// state file (e.g. `config.json`); the lock file is derived from it.
+    fn acquire(path: &std::path::Path) -> Result<StateLock> {
+        use fs2::FileExt;
+        let file = Self::open_lock_file(path)?;
         file.lock_exclusive()
-            .with_context(|| format!("locking {}", lock_path.display()))?;
+            .with_context(|| format!("locking the lock for {}", path.display()))?;
         Ok(StateLock { _file: file })
+    }
+
+    /// Try to acquire the exclusive lock guarding `path` **without blocking**.
+    /// `Ok(Some(lock))` means we now hold it; `Ok(None)` means another live
+    /// process holds it right now (the contention is not an error — the caller
+    /// decides what that means, e.g. "a daemon is already running"). The flock
+    /// is OS-released, so a crashed holder's lock is already gone and a contender
+    /// sees `Some`.
+    pub(crate) fn try_acquire(path: &std::path::Path) -> Result<Option<StateLock>> {
+        use fs2::FileExt;
+        let file = Self::open_lock_file(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(StateLock { _file: file })),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("try-locking the lock for {}", path.display()))),
+        }
     }
 
     /// The lock file for `path`:
@@ -1205,17 +1368,25 @@ pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
 // --- supervisor control socket ---------------------------------------------
 
 /// Whether a supervisor daemon is listening on this home's control socket.
-/// Mirrors the Node derivation (`<tmp>/c8ctl-nano-sup-<sha1(home)[:8]>.sock`)
-/// and treats a successful connect as "running".
+/// Mirrors the Node derivation (`<tmp>/c8ctl-nano-sup-<sha1(home)[:8]>.sock`).
+///
+/// The probe is nonblocking and deadline-bounded, not a raw blocking
+/// `UnixStream::connect`: a live daemon that has stopped accepting (full listen
+/// backlog) would otherwise hang `supervisor status`/`stop`/`start` here before
+/// they ever reach the deadline-aware control client. Crucially we FAIL CLOSED:
+/// only a probe that proves absence (`ECONNREFUSED`/`ENOENT`) counts as "not
+/// running"; a `TimedOut` (live-but-backlogged) or any other ambiguous error is
+/// a live-but-unhealthy daemon and is reported as RUNNING, never silently as
+/// absent. A bare `is_ok()` would map `TimedOut` to `false`, so `status`/`stop`
+/// would print "not running" and `start` would launch a second daemon over a
+/// live one (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
 fn supervisor_running(home: &std::path::Path) -> bool {
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(home.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    let sock = std::env::temp_dir().join(format!("c8ctl-nano-sup-{}.sock", &hex[..8]));
-    std::os::unix::net::UnixStream::connect(sock).is_ok()
+    let sock = control::socket_path(home);
+    !matches!(
+        control::probe_liveness(&sock, std::time::Duration::from_millis(500)),
+        control::Liveness::Absent
+    )
 }
 
 #[cfg(not(unix))]
@@ -1223,23 +1394,48 @@ fn supervisor_running(_home: &std::path::Path) -> bool {
     false
 }
 
+/// Try to take the per-home supervisor **startup lock** without blocking, for
+/// the daemon to hold for its whole lifetime. `Ok(None)` means another daemon
+/// already owns this state home — the caller should refuse to start.
+///
+/// The unlocked connect probe alone cannot serialize startup: two concurrent
+/// `supervisor start`s can both find no socket, then race to unlink each other's
+/// freshly-bound live control socket (nanobpm/nano-supervisor#8). This lock,
+/// keyed on the state home (so it is per-home) and taken from the owner-private
+/// fleet lock dir, makes the later starter observe the lock is held and bail
+/// instead. Because the `flock` is OS-released, a crashed daemon's lock is
+/// already gone, so a legitimate restart is never blocked by a dead predecessor
+/// — and a surviving socket file left by such a crash is therefore provably
+/// stale (its owner no longer holds the lock) and safe to remove.
+///
+/// The lock is keyed on the home's **canonical filesystem identity**, NOT on the
+/// derived control-socket path. The socket name hashes the raw home *string* for
+/// byte-for-byte Node compatibility, so two equivalent spellings of the same
+/// home (`/state/home` and `/state/home/.`, a trailing slash, or a symlinked
+/// alias) hash to *different* socket names and would take *different* startup
+/// locks — letting two daemons run slots against the same config and run
+/// directories. `StateLock` keys on a normalized/canonical identity, so locking
+/// on the home itself makes those spellings contend on one lock while the socket
+/// derivation stays unchanged (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+pub(crate) fn try_lock_supervisor_startup(home: &Path) -> Result<Option<StateLock>> {
+    StateLock::try_acquire(home)
+}
+
 /// `supervisor` subcommands this target implements.
 pub enum SupervisorOp {
     Status,
+    Start { workers: Vec<String>, attach: bool },
+    Stop { force: bool },
     Add { profile: String },
 }
 
 pub fn supervisor(op: SupervisorOp) -> Result<()> {
     let home = home_dir()?;
     match op {
-        SupervisorOp::Status => {
-            if supervisor_running(&home) {
-                println!("Supervisor running");
-            } else {
-                println!("Supervisor not running");
-            }
-            Ok(())
-        }
+        SupervisorOp::Status => supervisor_status(&home),
+        SupervisorOp::Start { workers, attach } => supervisor_start(&home, &workers, attach),
+        SupervisorOp::Stop { force } => supervisor_stop(&home, force),
         SupervisorOp::Add { profile } => {
             let cfg = read_config()?;
             if !cfg.hires.contains_key(&profile) {
@@ -1248,11 +1444,354 @@ pub fn supervisor(op: SupervisorOp) -> Result<()> {
             if !supervisor_running(&home) {
                 bail!("Supervisor not running; start it with: nano-supervisor supervisor start");
             }
-            // A live daemon would take the add over the control socket; that
-            // path lands with the daemon itself (#8).
+            // Dynamic worker management over the live socket (`add`/`remove`/
+            // `restart`/`reload`) lands with the daemon's worker manager
+            // (nanobpm/nano-supervisor#8); the daemon currently answers `add`
+            // with a clean "not yet implemented" frame.
             bail!("supervisor add against a live daemon is not yet implemented on the Rust target");
         }
     }
+}
+
+/// `supervisor status`: print "not running" when no daemon is bound, else query
+/// the control socket and render the live daemon descriptor and worker roster.
+fn supervisor_status(home: &std::path::Path) -> Result<()> {
+    if !supervisor_running(home) {
+        println!("Supervisor not running");
+        return Ok(());
+    }
+    let sock = control::socket_path(home);
+    match control::request(&sock, &serde_json::json!({ "op": "status" })) {
+        Ok(frames) => {
+            // A protocol-level error frame (`{ok:false,error,…,final:true}`, e.g.
+            // a Node daemon rejecting the op) must be surfaced, not reported as a
+            // healthy daemon (nanobpm/nano-supervisor#8).
+            if let Some(err) = terminal_frame_error(&frames) {
+                bail!("supervisor status failed: {err}");
+            }
+            let frame = frames
+                .iter()
+                .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
+                .or_else(|| frames.last());
+            match frame {
+                Some(f) => {
+                    let pid = f["daemon"]["pid"].as_u64();
+                    let workers = f["workers"].as_array().map(|w| w.len()).unwrap_or(0);
+                    match pid {
+                        Some(pid) => {
+                            println!("Supervisor running (pid {pid}); {workers} worker(s)")
+                        }
+                        None => println!("Supervisor running; {workers} worker(s)"),
+                    }
+                    if let Some(ws) = f["workers"].as_array() {
+                        for w in ws {
+                            let id = w["id"].as_str().unwrap_or("?");
+                            let profile = w["profile"].as_str().unwrap_or("?");
+                            let state = w["state"].as_str().unwrap_or("?");
+                            println!("  {id} [{profile}] {state}");
+                        }
+                    }
+                }
+                None => println!("Supervisor running"),
+            }
+            Ok(())
+        }
+        // The socket vanished between the probe and the request (a genuine race
+        // with shutdown): report the honest "not running". But ONLY for a
+        // connection-absence error — a timeout, `UnexpectedEof`, or other
+        // transport failure means a live-but-unhealthy daemon, which must be
+        // propagated rather than hidden behind an exit-0 "not running"
+        // (nanobpm/nano-supervisor#8).
+        Err(e) if is_daemon_absent(&e) => {
+            println!("Supervisor not running");
+            Ok(())
+        }
+        Err(e) => Err(e).context("querying the supervisor control socket"),
+    }
+}
+
+/// Whether a control-socket transport error means "no daemon is listening" (the
+/// honest "not running" answer during a shutdown race) rather than a
+/// live-but-unhealthy daemon. ONLY a connect-time absence qualifies; a read
+/// timeout, `UnexpectedEof` (a daemon cut off mid-reply), or any other transport
+/// failure is a real operational error that must be propagated, not mapped to an
+/// exit-0 "not running" that hides an unresponsive daemon or a failed/incomplete
+/// stop (nanobpm/nano-supervisor#8).
+fn is_daemon_absent(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    matches!(err.kind(), NotFound | ConnectionRefused)
+}
+
+/// Extract a protocol-level error from a control reply's terminal frame. The
+/// daemon ends every exchange with a `final:true` frame; a `{ok:false,error}`
+/// there is a protocol error (e.g. a Node daemon rejecting the op) that callers
+/// must surface rather than treat as success (nanobpm/nano-supervisor#8).
+fn terminal_frame_error(frames: &[serde_json::Value]) -> Option<String> {
+    let frame = frames
+        .iter()
+        .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
+        .or_else(|| frames.last())?;
+    if frame.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        Some(
+            frame
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("control request failed")
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// `supervisor stop [--force]`: ask a running daemon to drain and exit.
+fn supervisor_stop(home: &std::path::Path, force: bool) -> Result<()> {
+    if !supervisor_running(home) {
+        println!("Supervisor not running");
+        return Ok(());
+    }
+    let sock = control::socket_path(home);
+    match control::request(&sock, &serde_json::json!({ "op": "stop", "force": force })) {
+        Ok(frames) => {
+            // Inspect the terminal frame: a daemon that rejected the stop
+            // (`{ok:false,error,…}`) must not be reported as "stopping"
+            // (nanobpm/nano-supervisor#8).
+            if let Some(err) = terminal_frame_error(&frames) {
+                bail!("supervisor stop failed: {err}");
+            }
+            println!("Supervisor stopping");
+            Ok(())
+        }
+        // Only a connection-absence error is the honest shutdown-race "not
+        // running"; a timeout or `UnexpectedEof` after the daemon accepted the
+        // request (a failed/incomplete stop) must be propagated, not hidden
+        // behind exit-0 "not running" (nanobpm/nano-supervisor#8).
+        Err(e) if is_daemon_absent(&e) => {
+            println!("Supervisor not running");
+            Ok(())
+        }
+        Err(e) => Err(e).context("sending stop to the supervisor control socket"),
+    }
+}
+
+/// Pure nested-supervisor containment decision for `supervisor start` (#40),
+/// split out so it is testable without touching process-global env.
+///
+/// Returns the effective `attach` flag, or an explanatory refusal message.
+/// Inside an agent run (`in_agent_run`) a DETACHED start is never allowed: the
+/// daemon child arms parent-death against this short-lived launcher (killed on
+/// Linux when the launcher exits) or escapes the job's process group via
+/// `setsid` (non-Linux). So we refuse without the opt-in, and FORCE attached
+/// mode with it. Outside an agent run the caller's `attach` passes through.
+fn nested_start_decision(in_agent_run: bool, opted_in: bool, attach: bool) -> Result<bool, String> {
+    if !in_agent_run {
+        return Ok(attach);
+    }
+    if !opted_in {
+        return Err(format!(
+            "refusing to start `nano-supervisor supervisor start` inside an agent run \
+             ({run}=…). A supervisor started by an agent would run as an unintended nested \
+             fleet outside the job's lifecycle. If this IS a contract test, opt in with \
+             `{allow}=1` (runs attached, bound to the invoking process).",
+            run = crate::AGENT_RUN_ENV,
+            allow = crate::ALLOW_NESTED_ENV,
+        ));
+    }
+    // Opted in: force attached so the daemon stays bound to the invoking
+    // process's lifecycle rather than daemonizing out of containment.
+    Ok(true)
+}
+
+/// `supervisor start --worker <p>… [--attach]`: launch the daemon for the named
+/// hires. Without `--attach` the daemon is detached into its own session and
+/// this command returns once the control socket is bound; with `--attach` it
+/// runs the daemon in the foreground (Ctrl-C drains it).
+#[cfg(unix)]
+fn supervisor_start(home: &std::path::Path, workers: &[String], attach: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if supervisor_running(home) {
+        println!("Supervisor already running");
+        return Ok(());
+    }
+
+    // Nested-supervisor containment (#40): the daemon child this launcher spawns
+    // runs `nano-supervisor daemon`, which — when `NANO_AGENT_RUN` is set and the
+    // opt-in is present — arms parent-death against THIS short-lived launcher. A
+    // DETACHED start would then be killed on Linux the moment this launcher
+    // reports success and exits, and on non-Linux its `setsid` would let it
+    // escape the invoking job's process group entirely. So inside an agent run we
+    // never daemonize: refuse without the opt-in, and with the opt-in FORCE
+    // attached mode (overriding a missing `--attach`) so the daemon stays bound
+    // to the invoking process's lifecycle.
+    let in_agent_run = std::env::var_os(crate::AGENT_RUN_ENV).is_some();
+    let opted_in = std::env::var(crate::ALLOW_NESTED_ENV).ok().as_deref() == Some("1");
+    let attach = match nested_start_decision(in_agent_run, opted_in, attach) {
+        Ok(attach) => attach,
+        Err(msg) => bail!(msg),
+    };
+
+    let exe = std::env::current_exe().context("locating the nano-supervisor executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon");
+    for w in workers {
+        cmd.arg("--hire").arg(w);
+    }
+
+    if attach {
+        // Foreground: replace the usual detach with a direct run so Ctrl-C and
+        // the daemon's console output reach the operator.
+        let status = cmd.status().context("running the supervisor daemon")?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    // Detached: a new session so the daemon outlives this short-lived launcher,
+    // with its console redirected to the daemon log so it never holds this
+    // process's stdio open (which would block the caller) and its output is
+    // captured where `supervisor status` reports it.
+    //
+    // The log is opened through a state-home-anchored no-follow helper: a planted
+    // symlink in `logs`, `supervisor`, or `daemon.log` is refused rather than
+    // followed out of the confined tree (the same policy the state-file writer
+    // enforces, `fleet.rs` `write_json_atomic_unix`). Any setup/clone failure is
+    // PROPAGATED, not swallowed into a silent `/dev/null` fallback: the operator
+    // is told to read this log, so a daemon spawned with no diagnostics would be
+    // a debugging dead end.
+    let log_file = home.join("logs").join("supervisor").join("daemon.log");
+    let log_out = open_log_confined(&log_file)
+        .with_context(|| format!("preparing supervisor daemon log {}", log_file.display()))?;
+    let log_err = log_out
+        .try_clone()
+        .with_context(|| format!("duplicating supervisor daemon log {}", log_file.display()))?;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(log_out))
+        .stderr(std::process::Stdio::from(log_err));
+    unsafe {
+        cmd.pre_exec(|| {
+            // Detach from the controlling terminal / parent session. Tolerate
+            // EPERM: it means the child is ALREADY a session or process-group
+            // leader, so it is not in the launcher's session and the detach
+            // intent still holds. Any OTHER error means detachment could not be
+            // established — the child would remain in the launcher's session and
+            // later receive its terminal/session signals — so fail the spawn
+            // rather than report a detached daemon that is not actually detached
+            // (nanobpm/nano-supervisor#8).
+            if libc::setsid() == -1 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EPERM) {
+                    return Err(e);
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().context("spawning the supervisor daemon")?;
+
+    // Wait (bounded) for the daemon to bind its control socket so a follow-up
+    // `status`/`add` sees it, then return.
+    //
+    // Readiness must be attributed to THIS child, not to any daemon answering at
+    // the derived socket. During concurrent `supervisor start`s both launchers
+    // spawn children; the per-home startup lock rejects the loser, but that
+    // loser's launcher would otherwise see the WINNER's socket and report success
+    // against its own already-failed child's PID (nanobpm/nano-supervisor#8). So
+    // we (a) bail early if our child has already exited, and (b) require the
+    // status frame's `daemon.pid` to equal our child's PID before claiming the
+    // launch succeeded — a different PID means another start won the race.
+    // Readiness is bounded by ONE overall deadline (10s), not by iteration
+    // count: each `supervisor_daemon_pid` probe is capped by the budget still
+    // remaining. The previous `for _ in 0..100` loop gave each probe the fixed
+    // 5-second `control::request` read timeout, so a child that bound the socket
+    // but never answered could stall startup for ~500s (100 × 5s) before the
+    // "10s" error — the advertised bound was not actually enforced.
+    let sock = control::socket_path(home);
+    let readiness_window = std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + readiness_window;
+    loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            bail!(
+                "supervisor daemon (pid {}) exited during startup (status {}); another start may \
+                 already own this state home, or the daemon failed — see the daemon log",
+                child.id(),
+                status
+            );
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if sock.exists() {
+            // Cap each probe at a short slice (but never past the remaining
+            // budget) so a daemon that has bound its socket but is briefly slow
+            // to answer still gets several quick retries, while the loop as a
+            // whole can never exceed `readiness_window`.
+            let probe_timeout = remaining.min(std::time::Duration::from_secs(1));
+            if let Some(pid) = supervisor_daemon_pid(home, probe_timeout) {
+                if pid == child.id() {
+                    println!("Supervisor started (pid {})", child.id());
+                    return Ok(());
+                }
+                // A daemon is answering but it is not the child we launched:
+                // another start won the startup race. Our child lost the per-home
+                // startup lock and must die — terminate and reap it so dropping
+                // `std::process::Child` cannot leave a detached daemon that later
+                // binds the socket and runs on (nanobpm/nano-supervisor#8).
+                kill_and_reap(&mut child);
+                bail!(
+                    "another supervisor daemon (pid {}) already owns this state home; \
+                     this start (pid {}) lost the race",
+                    pid,
+                    child.id()
+                );
+            }
+        }
+        // Sleep between probes, but never past the overall deadline.
+        let nap = remaining.min(std::time::Duration::from_millis(100));
+        std::thread::sleep(nap);
+    }
+    // Startup timed out. Dropping `child` does NOT terminate it, so a slow child
+    // could still bind the socket and run indefinitely after the operator was
+    // told startup failed. Terminate and reap it before returning the error
+    // (nanobpm/nano-supervisor#8).
+    kill_and_reap(&mut child);
+    bail!(
+        "supervisor daemon (pid {}) did not become responsive on its control socket within 10s \
+         (the socket may have bound but never answered a status probe)",
+        child.id()
+    );
+}
+
+/// Terminate and reap a spawned child so it cannot outlive a failed
+/// `supervisor start`. `std::process::Child` does not kill on drop, so every
+/// error path after a successful spawn must call this: send SIGKILL (best
+/// effort; the child may already be gone) and `wait` to reap the zombie.
+#[cfg(unix)]
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The PID of the daemon answering this home's control socket, taken from the
+/// `daemon.pid` field of its `status` reply. `None` when no daemon is bound or
+/// the reply carries no PID. Used to attribute a readiness probe to the exact
+/// child this launcher spawned, so a concurrent start's winner is not mistaken
+/// for our own (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+fn supervisor_daemon_pid(home: &std::path::Path, timeout: std::time::Duration) -> Option<u32> {
+    let sock = control::socket_path(home);
+    let frames =
+        control::request_with_timeout(&sock, &serde_json::json!({ "op": "status" }), timeout)
+            .ok()?;
+    let frame = frames
+        .iter()
+        .find(|f| f.get("final").and_then(|v| v.as_bool()).unwrap_or(false))
+        .or_else(|| frames.last());
+    frame?["daemon"]["pid"].as_u64().map(|p| p as u32)
+}
+
+#[cfg(not(unix))]
+fn supervisor_start(_home: &std::path::Path, _workers: &[String], _attach: bool) -> Result<()> {
+    bail!("supervisor start is only supported on Unix");
 }
 
 // --- workforce manifests ----------------------------------------------------
@@ -1701,6 +2240,77 @@ pub fn workforce_status(name: &str, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_absent_only_for_connection_absence() {
+        use std::io::{Error, ErrorKind};
+        // Connect-time absence IS the honest shutdown-race "not running".
+        assert!(is_daemon_absent(&Error::from(ErrorKind::NotFound)));
+        assert!(is_daemon_absent(&Error::from(ErrorKind::ConnectionRefused)));
+        // Live-but-unhealthy daemon errors MUST propagate, not read as "not
+        // running" (nanobpm/nano-supervisor#8).
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::UnexpectedEof)));
+        assert!(!is_daemon_absent(&Error::from(ErrorKind::BrokenPipe)));
+    }
+
+    #[test]
+    fn terminal_frame_error_surfaces_protocol_failures() {
+        use serde_json::json;
+        // A clean terminal frame carries no error.
+        let ok = vec![json!({"ok": true, "type": "status", "final": true})];
+        assert_eq!(terminal_frame_error(&ok), None);
+        // A `{ok:false,…,final:true}` frame is a protocol error to surface.
+        let err = vec![json!({"ok": false, "error": "boom", "final": true})];
+        assert_eq!(terminal_frame_error(&err).as_deref(), Some("boom"));
+        // Interim frames before a failing terminal frame are ignored.
+        let streamed = vec![
+            json!({"type": "draining", "final": false}),
+            json!({"ok": false, "error": "stop refused", "final": true}),
+        ];
+        assert_eq!(
+            terminal_frame_error(&streamed).as_deref(),
+            Some("stop refused")
+        );
+        // An `ok:false` with no message still reports a generic error.
+        let bare = vec![json!({"ok": false, "final": true})];
+        assert_eq!(
+            terminal_frame_error(&bare).as_deref(),
+            Some("control request failed")
+        );
+        // Empty frame list: nothing to surface.
+        assert_eq!(terminal_frame_error(&[]), None);
+    }
+
+    // Nested-supervisor containment (#40): a detached `supervisor start` inside
+    // an agent run is never allowed — the daemon child arms parent-death against
+    // the short-lived launcher (killed on Linux when it exits) or escapes the
+    // job's process group via `setsid` (non-Linux).
+    #[test]
+    fn nested_start_decision_refuses_detached_in_agent_run_without_opt_in() {
+        let result = nested_start_decision(true, false, false);
+        assert!(
+            result.is_err(),
+            "an agent-run start without the opt-in must be refused"
+        );
+    }
+
+    #[test]
+    fn nested_start_decision_forces_attach_in_agent_run_with_opt_in() {
+        // Even without `--attach`, an opted-in nested start must run attached so
+        // the daemon stays bound to the invoking process's lifecycle.
+        assert_eq!(nested_start_decision(true, true, false), Ok(true));
+        assert_eq!(nested_start_decision(true, true, true), Ok(true));
+    }
+
+    #[test]
+    fn nested_start_decision_passes_attach_through_outside_an_agent_run() {
+        assert_eq!(nested_start_decision(false, false, false), Ok(false));
+        assert_eq!(nested_start_decision(false, false, true), Ok(true));
+        // The opt-in is irrelevant outside an agent run.
+        assert_eq!(nested_start_decision(false, true, false), Ok(false));
+    }
 
     fn hire_args(name: &str) -> HireArgs {
         HireArgs {
@@ -2442,6 +3052,64 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    // The supervisor daemon log must be opened through a state-home-anchored
+    // no-follow helper: a planted symlink at the log path is refused rather than
+    // followed to clobber an arbitrary target, and setup failures are propagated
+    // rather than silently swallowed into /dev/null (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[test]
+    fn open_log_confined_refuses_a_symlinked_log_file() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let logs = home.join("logs").join("supervisor");
+        std::fs::create_dir_all(&logs).unwrap();
+        let victim = home.join("victim.log");
+        std::fs::write(&victim, "do not touch").unwrap();
+        std::os::unix::fs::symlink(&victim, logs.join("daemon.log")).unwrap();
+
+        let err = open_log_confined(&logs.join("daemon.log"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without following symlinks"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "a planted symlink must not redirect the daemon log open"
+        );
+    }
+
+    // A symlink planted on an intermediate log directory component (`logs` ->
+    // elsewhere) must also be refused, not walked out of the home.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_confined_refuses_a_symlinked_log_dir() {
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let real = home.join("real-logs");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, home.join("logs")).unwrap();
+
+        let err = open_log_confined(&home.join("logs").join("supervisor").join("daemon.log"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without following symlinks"), "{err}");
+    }
+
+    // The happy path: with no planted symlinks, the helper creates the tail
+    // directories and returns an appendable regular file.
+    #[cfg(unix)]
+    #[test]
+    fn open_log_confined_creates_and_opens_a_regular_log() {
+        use std::io::Write;
+        let _cfg = TempCfg::new();
+        let home = home_dir().unwrap();
+        let log = home.join("logs").join("supervisor").join("daemon.log");
+        let mut f = open_log_confined(&log).expect("open log");
+        f.write_all(b"hello\n").expect("write log");
+        drop(f);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "hello\n");
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_json_atomic_refuses_symlinked_parent() {
@@ -2624,6 +3292,47 @@ mod tests {
         let rel_lock = StateLock::lock_file_for(&relative).unwrap();
         let abs_lock = StateLock::lock_file_for(&absolute).unwrap();
         assert_eq!(rel_lock, abs_lock);
+    }
+
+    // Regression (symlink-alias startup lock): `normalized_identity` previously
+    // canonicalized only the parent and re-appended the raw final component, so a
+    // symlinked state home (`C8CTL_NANO_HOME=/alias` -> `/real/home`) keyed a
+    // DIFFERENT lock than a daemon spelled `/real/home`, letting two daemons take
+    // different startup locks and run slots against the same home. The final
+    // component must be resolved too, so both spellings contend on ONE lock
+    // (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[test]
+    fn state_lock_normalizes_symlink_alias_identity() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "c8ctl-nano-alias-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let real = base.join("real-home");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.join("alias-home");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let real_lock = StateLock::lock_file_for(&real).unwrap();
+        let alias_lock = StateLock::lock_file_for(&alias).unwrap();
+        // Also a trailing-slash spelling of the alias must collapse to the same.
+        let alias_slash = StateLock::lock_file_for(&alias.join(".")).unwrap();
+
+        let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            real_lock, alias_lock,
+            "a symlinked state home must take the SAME startup lock as its real target"
+        );
+        assert_eq!(
+            real_lock, alias_slash,
+            "a `.`/trailing-slash spelling of the alias must also collapse to one lock"
+        );
     }
 
     /// Regression (finding `r4182128486`): the lock base must be a single
@@ -3023,5 +3732,70 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
+    }
+
+    // Regression: the supervisor startup lock must key on the state home's
+    // canonical filesystem identity, NOT on the derived socket path. The socket
+    // name hashes the raw home STRING, so equivalent spellings (`/h` and `/h/.`,
+    // a trailing slash) produce different socket names and — before the fix —
+    // different locks, letting two daemons run slots against the same home.
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_contends_across_equivalent_home_spellings() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "c8ctl-nano-startlock-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+
+        // First holder takes the lock on the plain spelling.
+        let held = try_lock_supervisor_startup(&home)
+            .expect("acquire startup lock")
+            .expect("lock should be free initially");
+
+        // An equivalent spelling of the SAME home must observe the lock is held.
+        let dotted = home.join(".");
+        assert!(
+            try_lock_supervisor_startup(&dotted)
+                .expect("try equivalent spelling")
+                .is_none(),
+            "`/h/.` must contend on the same startup lock as `/h`"
+        );
+        let trailing = PathBuf::from(format!("{}/", home.display()));
+        assert!(
+            try_lock_supervisor_startup(&trailing)
+                .expect("try trailing-slash spelling")
+                .is_none(),
+            "a trailing-slash spelling must contend on the same startup lock"
+        );
+
+        // A genuinely different home is independent.
+        let other = std::env::temp_dir().join(format!(
+            "c8ctl-nano-startlock-other-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&other).expect("create other home");
+        assert!(
+            try_lock_supervisor_startup(&other)
+                .expect("acquire other lock")
+                .is_some(),
+            "a different home must not be blocked"
+        );
+
+        // Releasing the holder frees the lock for the equivalent spelling.
+        drop(held);
+        assert!(
+            try_lock_supervisor_startup(&dotted)
+                .expect("re-acquire after release")
+                .is_some(),
+            "releasing the lock must let an equivalent spelling acquire it"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 }

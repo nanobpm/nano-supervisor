@@ -49,7 +49,7 @@ ryu = "1"
 # age-based reclaim could steal the lock from a merely-slow owner and break
 # mutual exclusion) and the lock file never persists under the state home.)
 fs2 = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs", "net"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).
 [target.'cfg(unix)'.dependencies]

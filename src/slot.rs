@@ -33,6 +33,70 @@ use crate::state::{Hire, Protocol};
 /// Per-type long-poll cap when a slot round-robins several job types.
 const MULTI_TYPE_POLL_CAP: Duration = Duration::from_secs(1);
 
+/// Why a slot (and the daemon) is shutting down. A single boolean watch could
+/// not tell an operator's graceful stop apart from a slot's fatal
+/// misconfiguration or a `--force` cancel, so every flip looked fatal and every
+/// flip cancelled in-flight work (nanobpm/nano-supervisor#8). This enum carries
+/// the reason explicitly, with a strict precedence so a higher-severity reason
+/// is never downgraded by a concurrent lower one:
+///
+/// `Running` < `Drain` < `Cancel` < `Fatal`.
+///
+///   * `Drain`  — a graceful stop (operator `stop`, Ctrl-C, SIGTERM): stop
+///     taking NEW work but let the in-flight job finish within the drain grace
+///     window; exit zero.
+///   * `Cancel` — a forced stop (`stop --force`): abort in-flight work now;
+///     exit zero.
+///   * `Fatal`  — an unrecoverable slot misconfiguration (an unleased activation
+///     while leasing is enabled, the default): abort in-flight work now and exit
+///     NON-zero so the failure is loud.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Shutdown {
+    #[default]
+    Running,
+    Drain,
+    Cancel,
+    Fatal,
+}
+
+impl Shutdown {
+    fn precedence(self) -> u8 {
+        match self {
+            Shutdown::Running => 0,
+            Shutdown::Drain => 1,
+            Shutdown::Cancel => 2,
+            Shutdown::Fatal => 3,
+        }
+    }
+
+    /// Whether any shutdown has been requested (the slot stops taking new work).
+    pub(crate) fn is_shutdown(self) -> bool {
+        self != Shutdown::Running
+    }
+
+    /// Whether the in-flight job must be ABORTED rather than allowed to drain.
+    /// A graceful `Drain` lets the current job finish; `Cancel`/`Fatal` do not.
+    pub(crate) fn aborts_inflight(self) -> bool {
+        matches!(self, Shutdown::Cancel | Shutdown::Fatal)
+    }
+}
+
+/// Publish `want` on a shutdown watch without ever downgrading a
+/// higher-precedence reason already settled there (Fatal > Cancel > Drain >
+/// Running). This is what keeps a fatal slot flip from being masked into a clean
+/// exit by a concurrent operator `stop`, and a plain `stop` from clobbering a
+/// `--force` already in flight. Returns whether the settled reason advanced.
+pub(crate) fn request_shutdown(tx: &watch::Sender<Shutdown>, want: Shutdown) -> bool {
+    tx.send_if_modified(|cur| {
+        if want.precedence() > cur.precedence() {
+            *cur = want;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Everything a slot needs, shared (via `Arc`) across its per-job tasks.
 #[derive(Debug, Clone)]
 pub struct SlotConfig {
@@ -80,8 +144,8 @@ pub struct SlotConfig {
 pub async fn run(
     jobs: Jobs,
     cfg: Arc<SlotConfig>,
-    mut shutdown: watch::Receiver<bool>,
-    fatal: watch::Sender<bool>,
+    mut shutdown: watch::Receiver<Shutdown>,
+    fatal: watch::Sender<Shutdown>,
 ) {
     log(&format!(
         "slot {} up: types {:?} (recovery {}s, poll {}s, idle {}s, lease {}, protocol {:?})",
@@ -107,7 +171,7 @@ pub async fn run(
             ));
             return;
         }
-        if *shutdown.borrow() {
+        if shutdown.borrow().is_shutdown() {
             log(&format!("slot {} draining", cfg.worker_name));
             return;
         }
@@ -167,7 +231,7 @@ pub async fn run(
         // set `shutdown` while `activate` was in flight. Starting these jobs now
         // would lease/run work after draining was requested, so drop the batch
         // (the activations simply expire and are redelivered) and stop the slot.
-        if *shutdown.borrow() {
+        if shutdown.borrow().is_shutdown() {
             log(&format!("slot {} draining", cfg.worker_name));
             return;
         }
@@ -188,59 +252,93 @@ pub async fn run(
                     cfg.worker_name,
                     job.job.job_key.value()
                 ));
-                let _ = fatal.send(true);
+                let _ = request_shutdown(&fatal, Shutdown::Fatal);
                 return;
             }
             // Run the job on its own task and ABORT it (not detach) when the slot
-            // is asked to drain. Awaiting `handle` directly would let a drain
-            // timeout that aborts the OUTER slot task drop `handle` mid-await —
-            // detaching its inner `execute`/agent, which could keep writing under
-            // `runs_dir` after `work::run` tears the namespace down and returns.
-            // Aborting this task drops `handle`, whose inner `execute` handle is
-            // wrapped in `AbortOnDrop` so that drop aborts (never detaches) it;
-            // the execute child processes are `kill_on_drop`, so the whole per-job
-            // tree is torn down and no job outlives the slot.
-            let mut job_task = tokio::spawn(handle(jobs.clone(), cfg.clone(), job));
-            tokio::select! {
-                // Bias the drain watch: if SIGTERM lands in the same tick the job
-                // finishes, draining wins and the job task is aborted below.
-                biased;
-                _ = shutdown.changed() => {
-                    log(&format!(
-                        "slot {} draining; aborting in-flight job",
-                        cfg.worker_name
-                    ));
-                    job_task.abort();
-                    // Join the aborted task so the execute/agent is fully torn
-                    // down before the slot returns (the abort error is expected).
-                    let _ = job_task.await;
-                    return;
-                }
-                r = &mut job_task => {
-                    // Surface a panic in the job task rather than swallowing it.
-                    // In standalone `work` mode a swallowed panic would let the
-                    // slot return `Ok(())` and the process exit 0 — the
-                    // supervisor-visible clean-exit failure `work::run`'s join
-                    // propagation exists to prevent — so re-raise it to crash the
-                    // slot task (its `JoinHandle` carries the panic up to
-                    // `work::run`, which exits non-zero). A cancellation (drain
-                    // abort) is never a crash, and the daemon keeps its explicit
-                    // per-job resilience policy (log and carry on).
-                    if job_panic_is_fatal(&r, cfg.propagate_job_panic) {
+            // is asked to CANCEL (a `--force` stop or a fatal shutdown). A plain
+            // graceful `Drain` instead lets the in-flight job finish within the
+            // daemon's drain grace window — only the NEXT job is withheld.
+            // Awaiting `handle` directly would let a drain timeout that aborts the
+            // OUTER slot task drop `handle` mid-await — detaching its inner
+            // `execute`/agent, which could keep writing under `runs_dir` after
+            // `work::run` tears the namespace down and returns. Wrap the spawned
+            // per-job task in `AbortOnDrop` so that ANY drop aborts (never
+            // detaches) it: the explicit cancel path below still aborts+joins
+            // through `.0`, but if the OUTER slot task is itself aborted (e.g. the
+            // daemon's drain grace expires and `drain_within_deadline` aborts this
+            // slot's JoinHandle) the guard's drop aborts the job rather than
+            // letting a bare `JoinHandle` drop detach it. Its inner `execute`
+            // handle is likewise `AbortOnDrop`, and the execute child processes
+            // are `kill_on_drop`, so the whole per-job tree is torn down and no
+            // job outlives the slot.
+            let mut job_task = AbortOnDrop(tokio::spawn(handle(jobs.clone(), cfg.clone(), job)));
+            loop {
+                tokio::select! {
+                    // Bias the drain watch: if a shutdown lands in the same tick
+                    // the job finishes, the shutdown arm is observed first so a
+                    // `Cancel`/`Fatal` still aborts (and a `Drain` still records
+                    // that no further jobs should start).
+                    biased;
+                    changed = shutdown.changed() => {
+                        // A closed watch (sender dropped) is treated as a cancel:
+                        // the daemon is tearing down, so do not keep running.
+                        let abort = changed.is_err() || shutdown.borrow().aborts_inflight();
+                        if abort {
+                            log(&format!(
+                                "slot {} draining; aborting in-flight job",
+                                cfg.worker_name
+                            ));
+                            job_task.0.abort();
+                            // Join the aborted task so the execute/agent is fully
+                            // torn down before the slot returns (abort err is
+                            // expected).
+                            let _ = (&mut job_task.0).await;
+                            return;
+                        }
+                        // Graceful drain: stop taking NEW work, but let this job
+                        // finish. Keep waiting for it to complete — or for a later
+                        // escalation to `Cancel`/`Fatal`, which the next
+                        // `changed()` surfaces and the branch above then aborts.
                         log(&format!(
-                            "slot {} job task panicked; propagating as a worker crash",
+                            "slot {} draining; letting the in-flight job finish",
                             cfg.worker_name
                         ));
-                        std::panic::resume_unwind(r.unwrap_err().into_panic());
+                        continue;
                     }
-                    if let Err(e) = r {
-                        if !e.is_cancelled() {
-                            log(&format!("slot {} job task failed: {e:#}", cfg.worker_name));
+                    r = &mut job_task.0 => {
+                        // Surface a panic in the job task rather than swallowing it.
+                        // In standalone `work` mode a swallowed panic would let the
+                        // slot return `Ok(())` and the process exit 0 — the
+                        // supervisor-visible clean-exit failure `work::run`'s join
+                        // propagation exists to prevent — so re-raise it to crash the
+                        // slot task (its `JoinHandle` carries the panic up to
+                        // `work::run`, which exits non-zero). A cancellation (drain
+                        // abort) is never a crash, and the daemon keeps its explicit
+                        // per-job resilience policy (log and carry on).
+                        if job_panic_is_fatal(&r, cfg.propagate_job_panic) {
+                            log(&format!(
+                                "slot {} job task panicked; propagating as a worker crash",
+                                cfg.worker_name
+                            ));
+                            std::panic::resume_unwind(r.unwrap_err().into_panic());
                         }
+                        if let Err(e) = r {
+                            if !e.is_cancelled() {
+                                log(&format!("slot {} job task failed: {e:#}", cfg.worker_name));
+                            }
+                        }
+                        break;
                     }
                 }
             }
             handled += 1;
+            // A graceful drain requested while this job ran means no further work:
+            // stop now rather than starting the next job in this batch.
+            if shutdown.borrow().is_shutdown() {
+                log(&format!("slot {} draining", cfg.worker_name));
+                return;
+            }
         }
     }
 }
@@ -3351,6 +3449,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shutdown_precedence_and_predicates() {
+        // `Running` is the only non-shutdown state; every other reason stops the
+        // slot taking new work.
+        assert!(!Shutdown::Running.is_shutdown());
+        assert!(Shutdown::Drain.is_shutdown());
+        assert!(Shutdown::Cancel.is_shutdown());
+        assert!(Shutdown::Fatal.is_shutdown());
+
+        // Only `Cancel`/`Fatal` abort the in-flight job; a graceful `Drain` lets
+        // it finish — the whole point of the enum (nanobpm/nano-supervisor#8).
+        assert!(!Shutdown::Running.aborts_inflight());
+        assert!(!Shutdown::Drain.aborts_inflight());
+        assert!(Shutdown::Cancel.aborts_inflight());
+        assert!(Shutdown::Fatal.aborts_inflight());
+    }
+
+    #[test]
+    fn request_shutdown_never_downgrades_a_higher_reason() {
+        let (tx, _rx) = watch::channel(Shutdown::Running);
+
+        // Running -> Drain advances.
+        assert!(request_shutdown(&tx, Shutdown::Drain));
+        assert_eq!(*tx.borrow(), Shutdown::Drain);
+        // Drain -> Drain is a no-op (no spurious change).
+        assert!(!request_shutdown(&tx, Shutdown::Drain));
+        // Drain -> Cancel escalates (force after a graceful stop).
+        assert!(request_shutdown(&tx, Shutdown::Cancel));
+        assert_eq!(*tx.borrow(), Shutdown::Cancel);
+        // Cancel -> Drain must NOT downgrade.
+        assert!(!request_shutdown(&tx, Shutdown::Drain));
+        assert_eq!(*tx.borrow(), Shutdown::Cancel);
+        // Anything -> Fatal always wins.
+        assert!(request_shutdown(&tx, Shutdown::Fatal));
+        assert_eq!(*tx.borrow(), Shutdown::Fatal);
+        // Fatal is never downgraded, even by a later cancel — a slot's fatal
+        // flip must not be masked into a clean exit by a concurrent stop.
+        assert!(!request_shutdown(&tx, Shutdown::Cancel));
+        assert_eq!(*tx.borrow(), Shutdown::Fatal);
+    }
+
+    #[test]
     fn process_rand_token_is_stable_hex_and_feeds_the_suffix() {
         // Regression for the cross-worker fallback-branch collision class: the
         // token must be stable within a process (so a retry inside ONE process
@@ -6177,5 +6316,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // Regression: the OUTER per-job task must be wrapped so that dropping it
+    // ABORTS (never detaches) the spawned job. A bare `tokio::JoinHandle` drop
+    // detaches its task, so if the slot's own task were aborted (e.g. the
+    // daemon's drain grace expired and `drain_within_deadline` aborted this
+    // slot's handle) the in-flight job — and its agent still writing under
+    // `runs_dir` — would keep running after teardown. `AbortOnDrop` is the guard
+    // that prevents that; prove its drop cancels a never-ending task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_on_drop_cancels_the_task_rather_than_detaching_it() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            // Run "forever"; only an abort should end this. If it were merely
+            // detached it would survive the drop and eventually set the flag.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            flag2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let handle = guard.0.abort_handle();
+        assert!(!handle.is_finished(), "task should still be running");
+        drop(guard);
+        // Give the runtime a moment to process the abort.
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            handle.is_finished(),
+            "dropping AbortOnDrop must abort the task, not detach it"
+        );
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted task body must not have run to completion"
+        );
     }
 }
