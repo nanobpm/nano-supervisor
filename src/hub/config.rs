@@ -14,6 +14,15 @@ use std::env;
 /// without bound). Overridable with `NANO_AGENTIC_BUFFER_CAPACITY`.
 pub const DEFAULT_BUFFER_CAPACITY: usize = 1024;
 
+/// Total byte budget for the outbound buffer's retained payloads. A count cap
+/// alone does not bound *memory*: a transcript `produce` chunk may be up to
+/// ~1 MiB (`MAX_ACP_FRAME`), so `DEFAULT_BUFFER_CAPACITY` frames could retain
+/// ~1 GiB per session and multiple slots multiply that. This caps the summed
+/// payload bytes the buffer holds regardless of frame count; a frame that would
+/// exceed it sheds lower-priority traffic first and is otherwise dropped.
+/// Overridable with `NANO_AGENTIC_BUFFER_BYTES`.
+pub const DEFAULT_BUFFER_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
 /// Resolved hub configuration. Absent (`from_env` → `None`) means the hub is
 /// disabled and the daemon runs without any hub connection.
 #[derive(Debug, Clone)]
@@ -44,6 +53,11 @@ pub struct HubConfig {
     /// Bounded outbound buffer depth while disconnected
     /// (`NANO_AGENTIC_BUFFER_CAPACITY`, default [`DEFAULT_BUFFER_CAPACITY`]).
     pub buffer_capacity: usize,
+    /// Total byte budget for retained outbound payloads
+    /// (`NANO_AGENTIC_BUFFER_BYTES`, default [`DEFAULT_BUFFER_BYTE_BUDGET`]). A
+    /// count cap alone cannot bound memory because a single transcript chunk may
+    /// be ~1 MiB; this caps the summed bytes the buffer holds.
+    pub buffer_byte_budget: usize,
 }
 
 /// Is an environment flag truthy the way the Node launcher treats it? `1`,
@@ -80,6 +94,11 @@ impl HubConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_BUFFER_CAPACITY);
+        let buffer_byte_budget = env::var("NANO_AGENTIC_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_BUFFER_BYTE_BUDGET);
         Some(HubConfig {
             url,
             token: non_empty("NANO_AGENTIC_TOKEN"),
@@ -92,6 +111,7 @@ impl HubConfig {
                 .is_some_and(|v| env_truthy(&v)),
             attribution: non_empty("NANO_AGENT_ATTRIBUTION"),
             buffer_capacity,
+            buffer_byte_budget,
         })
     }
 

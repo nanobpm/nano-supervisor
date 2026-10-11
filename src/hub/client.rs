@@ -46,7 +46,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 use crate::hub::config::HubConfig;
 use crate::hub::control::{parse_inbound_relay_chunk, ControlFrame};
-use crate::hub::frame::{decode_frame, encode_frame, Family, Frame, Lane};
+use crate::hub::frame::{decode_frame, encode_frame, Family, Frame, Lane, FRAME_HEADER_BYTES};
 use crate::hub::stream::{compose_stream_id, parse_stream_id};
 use crate::hub::transcript::acp_update_to_transcript_chunk;
 use crate::runtime::log;
@@ -79,23 +79,48 @@ const STEER_CHANNEL_BOUND: usize = 256;
 /// dropping task; on timeout the RELEASE proceeds (the tail is best-effort).
 const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a single
-/// shared capacity. Draining prefers control → interactive → bulk; overflow
-/// eviction sheds the least-important non-empty lane first (bulk, then
-/// interactive, then control), so a bulk transcript flood can never displace a
-/// `register`/`claim`/`deregister` control frame and break presence.
+/// A buffered frame carrying its precomputed on-wire byte size, so the buffer
+/// can enforce a memory (byte) budget without re-serialising the payload on
+/// every eviction/drain.
+struct BufferedFrame {
+    bytes: usize,
+    frame: Frame,
+}
+
+/// Approximate on-wire byte size of a frame: the fixed header plus its
+/// serialised JSON payload. Used only for the buffer's memory budget, so a
+/// serialisation failure (never expected for frames we construct) counts as the
+/// header alone.
+fn frame_bytes(frame: &Frame) -> usize {
+    FRAME_HEADER_BYTES
+        + serde_json::to_string(&frame.payload)
+            .map(|s| s.len())
+            .unwrap_or(0)
+}
+
+/// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a shared
+/// frame-count cap AND a shared byte budget. Draining prefers control →
+/// interactive → bulk; overflow eviction sheds the least-important non-empty
+/// lane first (bulk, then interactive, then control), so a bulk transcript
+/// flood can never displace a `register`/`claim`/`deregister` control frame and
+/// break presence. The byte budget bounds *memory*: a count cap alone cannot,
+/// because a single transcript chunk may be ~1 MiB, so `capacity` frames could
+/// otherwise retain ~1 GiB.
 #[derive(Default)]
 struct LaneBuffer {
-    control: VecDeque<Frame>,
-    interactive: VecDeque<Frame>,
-    bulk: VecDeque<Frame>,
+    control: VecDeque<BufferedFrame>,
+    interactive: VecDeque<BufferedFrame>,
+    bulk: VecDeque<BufferedFrame>,
     capacity: usize,
+    byte_capacity: usize,
+    bytes: usize,
 }
 
 impl LaneBuffer {
-    fn with_capacity(capacity: usize) -> LaneBuffer {
+    fn with_limits(capacity: usize, byte_capacity: usize) -> LaneBuffer {
         LaneBuffer {
             capacity,
+            byte_capacity,
             ..LaneBuffer::default()
         }
     }
@@ -104,28 +129,55 @@ impl LaneBuffer {
         self.control.len() + self.interactive.len() + self.bulk.len()
     }
 
-    /// Append `frame` to its lane. When the shared capacity is reached, evict to
-    /// make room — but only ever shed a frame whose priority is at or below the
-    /// incoming frame's, least-important lane first. A bulk flood can therefore
-    /// displace only other bulk frames; it can never evict an interactive or
-    /// control frame to admit itself. When nothing at or below the incoming
-    /// priority is available to evict (the buffer holds only higher-priority
-    /// traffic), the incoming frame is dropped instead — presence/steer control
+    /// Would admitting `incoming` more bytes still fit the byte budget? A zero
+    /// budget means "unbounded" (never used in production, but keeps tests that
+    /// only exercise the count cap simple).
+    fn bytes_fit(&self, incoming: usize) -> bool {
+        self.byte_capacity == 0 || self.bytes + incoming <= self.byte_capacity
+    }
+
+    /// Append `frame` to its lane. When either the count cap OR the byte budget
+    /// would be exceeded, evict to make room — but only ever shed a frame whose
+    /// priority is at or below the incoming frame's, least-important lane first.
+    /// A bulk flood can therefore displace only other bulk frames; it can never
+    /// evict an interactive or control frame to admit itself. When nothing at or
+    /// below the incoming priority remains to evict (the buffer holds only
+    /// higher-priority traffic, or the frame alone exceeds the whole byte
+    /// budget), the incoming frame is dropped instead — presence/steer control
     /// is never sacrificed for lower-priority transcript.
     fn push(&mut self, frame: Frame) {
         if self.capacity == 0 {
             return; // no room at all: drop on the floor
         }
-        while self.len() >= self.capacity {
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
             if !self.evict_for(frame.lane) {
-                return; // only higher-priority frames remain: drop the newcomer
+                return; // only higher-priority frames remain / too large: drop
             }
         }
-        match frame.lane {
-            Lane::Control => self.control.push_back(frame),
-            Lane::Interactive => self.interactive.push_back(frame),
-            Lane::Bulk => self.bulk.push_back(frame),
+        self.store_back(BufferedFrame { bytes, frame });
+    }
+
+    fn store_back(&mut self, bf: BufferedFrame) {
+        self.bytes += bf.bytes;
+        match bf.frame.lane {
+            Lane::Control => self.control.push_back(bf),
+            Lane::Interactive => self.interactive.push_back(bf),
+            Lane::Bulk => self.bulk.push_back(bf),
         }
+    }
+
+    fn store_front(&mut self, bf: BufferedFrame) {
+        self.bytes += bf.bytes;
+        match bf.frame.lane {
+            Lane::Control => self.control.push_front(bf),
+            Lane::Interactive => self.interactive.push_front(bf),
+            Lane::Bulk => self.bulk.push_front(bf),
+        }
+    }
+
+    fn account_removed(&mut self, bf: &BufferedFrame) {
+        self.bytes = self.bytes.saturating_sub(bf.bytes);
     }
 
     /// Evict the oldest frame whose lane priority is at or below `incoming`'s,
@@ -133,60 +185,68 @@ impl LaneBuffer {
     /// i.e. every buffered frame strictly outranks `incoming` — so the caller
     /// drops the incoming frame rather than displacing higher-priority traffic.
     fn evict_for(&mut self, incoming: Lane) -> bool {
-        match incoming {
+        let evicted = match incoming {
             // Bulk may only evict bulk.
-            Lane::Bulk => self.bulk.pop_front().is_some(),
+            Lane::Bulk => self.bulk.pop_front(),
             // Interactive may evict bulk, then interactive — never control.
-            Lane::Interactive => self
-                .bulk
-                .pop_front()
-                .or_else(|| self.interactive.pop_front())
-                .is_some(),
+            Lane::Interactive => self.bulk.pop_front().or_else(|| self.interactive.pop_front()),
             // Control may evict anything, least-important first.
             Lane::Control => self
                 .bulk
                 .pop_front()
                 .or_else(|| self.interactive.pop_front())
-                .or_else(|| self.control.pop_front())
-                .is_some(),
+                .or_else(|| self.control.pop_front()),
+        };
+        match evicted {
+            Some(bf) => {
+                self.account_removed(&bf);
+                true
+            }
+            None => false,
         }
     }
 
     /// Pop the next frame to send, draining the highest-priority lane first.
     fn pop(&mut self) -> Option<Frame> {
-        self.control
+        let bf = self
+            .control
             .pop_front()
             .or_else(|| self.interactive.pop_front())
-            .or_else(|| self.bulk.pop_front())
+            .or_else(|| self.bulk.pop_front())?;
+        self.account_removed(&bf);
+        Some(bf.frame)
     }
 
     /// Re-admit a popped frame to the FRONT of its lane (a write failed; retry
-    /// it first on reconnect, preserving its lane priority).
+    /// it first on reconnect, preserving its lane priority). This is a single
+    /// retry of a frame we just popped, so it does not re-run capacity eviction
+    /// (it cannot grow the buffer beyond its pre-pop size).
     fn push_front(&mut self, frame: Frame) {
-        match frame.lane {
-            Lane::Control => self.control.push_front(frame),
-            Lane::Interactive => self.interactive.push_front(frame),
-            Lane::Bulk => self.bulk.push_front(frame),
-        }
+        let bytes = frame_bytes(&frame);
+        self.store_front(BufferedFrame { bytes, frame });
     }
 
     /// Prepend a CONTROL frame to the front of its lane while honouring the
-    /// shared capacity: shed lower-priority (bulk, then interactive) traffic to
-    /// make room — never another control frame, so presence/ownership ordering
-    /// is preserved. Used by the reconnect resync snapshot, which must land at
-    /// the front in REGISTER-then-CLAIM order without bypassing the advertised
-    /// bound (a raw `push_front` would let a large snapshot exceed it).
+    /// shared count cap AND byte budget: shed lower-priority (bulk, then
+    /// interactive) traffic to make room — never another control frame, so
+    /// presence/ownership ordering is preserved. Used by the reconnect resync
+    /// snapshot, which must land at the front in REGISTER-then-CLAIM order
+    /// without bypassing the advertised bound (a raw `push_front` would let a
+    /// large snapshot exceed it).
     fn push_front_control_bounded(&mut self, frame: Frame) {
         debug_assert_eq!(frame.lane, Lane::Control);
-        while self.len() >= self.capacity {
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
             // Shed the least-important non-control frame. If only control
             // frames remain, stop evicting (presence is never sacrificed) and
             // prepend anyway — the snapshot is bounded by live instances+jobs.
-            if self.bulk.pop_front().is_none() && self.interactive.pop_front().is_none() {
-                break;
+            let evicted = self.bulk.pop_front().or_else(|| self.interactive.pop_front());
+            match evicted {
+                Some(bf) => self.account_removed(&bf),
+                None => break,
             }
         }
-        self.control.push_front(frame);
+        self.store_front(BufferedFrame { bytes, frame });
     }
 
     /// Drop every buffered `REGISTER`/`CLAIM` frame from the control lane. The
@@ -195,8 +255,15 @@ impl LaneBuffer {
     /// while disconnected drain ahead of the snapshot's `REGISTER`. Other
     /// control families (`RELEASE`/`DEREGISTER`/`HEARTBEAT`) are preserved.
     fn drop_control_presence(&mut self) {
-        self.control
-            .retain(|f| !matches!(f.family, Family::Register | Family::Claim));
+        let mut freed = 0;
+        self.control.retain(|bf| {
+            let keep = !matches!(bf.frame.family, Family::Register | Family::Claim);
+            if !keep {
+                freed += bf.bytes;
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
     }
 
     /// Test-only: iterate every buffered frame (across all lanes) so a test can
@@ -207,6 +274,7 @@ impl LaneBuffer {
             .iter()
             .chain(self.interactive.iter())
             .chain(self.bulk.iter())
+            .map(|bf| &bf.frame)
     }
 }
 
@@ -262,6 +330,7 @@ impl std::fmt::Debug for HubClient {
             .field("url", &self.config.url)
             .field("connected", &self.connected.load(Ordering::Relaxed))
             .field("buffer_capacity", &self.config.buffer_capacity)
+            .field("buffer_byte_budget", &self.config.buffer_byte_budget)
             .finish_non_exhaustive()
     }
 }
@@ -272,9 +341,10 @@ impl HubClient {
     pub fn spawn(config: HubConfig) -> Arc<HubClient> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let capacity = config.buffer_capacity;
+        let byte_capacity = config.buffer_byte_budget;
         let client = Arc::new(HubClient {
             config,
-            outbound: Mutex::new(LaneBuffer::with_capacity(capacity)),
+            outbound: Mutex::new(LaneBuffer::with_limits(capacity, byte_capacity)),
             outbound_notify: Notify::new(),
             seq: AtomicU32::new(0),
             connected: AtomicBool::new(false),
@@ -322,43 +392,53 @@ impl HubClient {
             .unwrap()
             .insert(stream.clone(), steer_tx);
 
-        // Worker presence: REGISTER this instance exactly once (its lifetime is
-        // the worker's, not any single job's), folding in the config-level
-        // advertisement fields the hub exposes.
-        let newly_registered = {
-            let mut insts = self.instances.lock().unwrap();
-            if insts.contains_key(instance) {
-                false
-            } else {
-                let cap = self.capability_payload(capability);
-                insts.insert(instance.to_string(), cap);
-                true
-            }
-        };
-        if newly_registered {
-            let cap = self.instances.lock().unwrap().get(instance).cloned();
-            if let Some(cap) = cap {
-                self.enqueue(
+        // Worker presence + job ownership. The state mutations (instances,
+        // in_flight) AND the matching REGISTER/CLAIM enqueues are performed
+        // together under the SINGLE outbound lock, so they are atomic with
+        // respect to `resync_presence` (which also takes the outbound lock while
+        // it snapshots that state and replaces the buffered presence frames).
+        // Without this, a reconnect snapshot could read the state BEFORE this
+        // insert, then `drop_control_presence` could delete the REGISTER/CLAIM
+        // this call just enqueued — leaving the live job unregistered until the
+        // next reconnect. Lock order is always outbound → instances/in_flight
+        // (the heartbeat/shutdown loops snapshot keys first to honour it), so no
+        // deadlock is possible.
+        {
+            let mut buf = self.outbound.lock().unwrap();
+            // REGISTER this instance exactly once (its lifetime is the worker's,
+            // not any single job's), folding in the config-level advertisement.
+            let register = {
+                let mut insts = self.instances.lock().unwrap();
+                if insts.contains_key(instance) {
+                    None
+                } else {
+                    let cap = self.capability_payload(capability);
+                    insts.insert(instance.to_string(), cap.clone());
+                    Some(cap)
+                }
+            };
+            if let Some(cap) = register {
+                buf.push(self.make_frame(
                     Lane::Control,
                     Family::Register,
                     json!({ "instance": instance, "capability": cap }),
-                );
+                ));
             }
+            // Job ownership: CLAIM {instance, jobKey}; track in-flight so a
+            // reconnect re-claims it.
+            self.in_flight
+                .lock()
+                .unwrap()
+                .entry(instance.to_string())
+                .or_default()
+                .insert(job_key.to_string());
+            buf.push(self.make_frame(
+                Lane::Control,
+                Family::Claim,
+                json!({ "instance": instance, "jobKey": job_key }),
+            ));
         }
-
-        // Job ownership: CLAIM {instance, jobKey}; track in-flight so a reconnect
-        // re-claims it.
-        self.in_flight
-            .lock()
-            .unwrap()
-            .entry(instance.to_string())
-            .or_default()
-            .insert(job_key.to_string());
-        self.enqueue(
-            Lane::Control,
-            Family::Claim,
-            json!({ "instance": instance, "jobKey": job_key }),
-        );
+        self.outbound_notify.notify_one();
 
         // Bridge ACP updates → transcript produce frames on a dedicated task.
         // A *bounded* channel (see `TRANSCRIPT_CHANNEL_BOUND`): it fronts the
@@ -478,10 +558,19 @@ impl HubClient {
         &self.config
     }
 
+    /// Build a frame with the next monotonic sequence number (but do not
+    /// enqueue it). Used where the caller must push into an already-held
+    /// outbound lock (e.g. [`HubClient::register_session`], which mutates
+    /// presence state and enqueues the matching control frame atomically so a
+    /// concurrent reconnect resync cannot delete it).
+    fn make_frame(&self, lane: Lane, family: Family, payload: Value) -> Frame {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        Frame::new(lane, family, seq, payload)
+    }
+
     /// Enqueue a frame for delivery. Bounded and QoS-aware: see [`LaneBuffer`].
     fn enqueue(&self, lane: Lane, family: Family, payload: Value) {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let frame = Frame::new(lane, family, seq, payload);
+        let frame = self.make_frame(lane, family, payload);
         self.outbound.lock().unwrap().push(frame);
         self.outbound_notify.notify_one();
     }
@@ -509,45 +598,49 @@ impl HubClient {
     /// a CLAIM buffered while disconnected can otherwise drain before the
     /// tail-appended REGISTER and desync ownership.
     fn resync_presence(&self) {
+        // Hold the outbound lock for the WHOLE snapshot-and-replace so it is
+        // atomic with `register_session` (which mutates presence state and
+        // enqueues its REGISTER/CLAIM under the same lock). Reading the state
+        // inside this lock guarantees the snapshot and the buffered frames we
+        // drop reflect the same instant: a concurrent registration either lands
+        // entirely before us (its instance is in the snapshot) or entirely after
+        // (its frames are enqueued after we replace) — never half-applied, which
+        // is what let `drop_control_presence` delete a just-enqueued REGISTER.
+        // Lock order is outbound → instances/in_flight everywhere, so no
+        // deadlock (heartbeat/shutdown snapshot their keys before enqueuing).
+        let mut buf = self.outbound.lock().unwrap();
         // Build the ordered snapshot (REGISTERs first, then CLAIMs) with fresh
-        // sequence numbers, holding each source lock only long enough to read it.
-        // Reversed, so the capacity-aware re-admission below lands the snapshot
-        // in its intended front order (REGISTER…REGISTER, CLAIM…CLAIM).
+        // sequence numbers. Reversed, so the capacity-aware re-admission below
+        // lands the snapshot in its intended front order (REGISTER…, CLAIM…).
         let mut snapshot: Vec<Frame> = Vec::new();
         for (inst, cap) in self.instances.lock().unwrap().iter() {
-            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-            snapshot.push(Frame::new(
+            snapshot.push(self.make_frame(
                 Lane::Control,
                 Family::Register,
-                seq,
                 json!({ "instance": inst, "capability": cap }),
             ));
         }
         for (inst, jobs) in self.in_flight.lock().unwrap().iter() {
             for job_key in jobs {
-                let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-                snapshot.push(Frame::new(
+                snapshot.push(self.make_frame(
                     Lane::Control,
                     Family::Claim,
-                    seq,
                     json!({ "instance": inst, "jobKey": job_key }),
                 ));
             }
         }
-        {
-            let mut buf = self.outbound.lock().unwrap();
-            // Drop the superseded REGISTER/CLAIM frames first so the snapshot
-            // re-admits them within the SAME shared capacity rather than
-            // bypassing it. Prepending in REVERSE via `push_front_control_bounded`
-            // lands the snapshot at the front in REGISTER-then-CLAIM order while
-            // shedding only lower-priority (bulk/interactive) traffic to make
-            // room — never another control frame — so presence ordering holds and
-            // the advertised bound is honoured (a raw `push_front` would exceed it).
-            buf.drop_control_presence();
-            for frame in snapshot.into_iter().rev() {
-                buf.push_front_control_bounded(frame);
-            }
+        // Drop the superseded REGISTER/CLAIM frames first so the snapshot
+        // re-admits them within the SAME shared capacity rather than
+        // bypassing it. Prepending in REVERSE via `push_front_control_bounded`
+        // lands the snapshot at the front in REGISTER-then-CLAIM order while
+        // shedding only lower-priority (bulk/interactive) traffic to make
+        // room — never another control frame — so presence ordering holds and
+        // the advertised bound is honoured (a raw `push_front` would exceed it).
+        buf.drop_control_presence();
+        for frame in snapshot.into_iter().rev() {
+            buf.push_front_control_bounded(frame);
         }
+        drop(buf);
         self.outbound_notify.notify_one();
     }
 
@@ -581,15 +674,18 @@ impl HubClient {
         // `{op:"produce", stream, chunk}` transcript). Routing one of those as a
         // delivery would decode our own produced transcript as inbound steer and
         // inject it back into its own agent — a feedback loop. Accept only the
-        // delivery shape; anything carrying `op` (or missing `offset`) is dropped.
-        // A relay *delivery* is `{stream, …, chunk}` and carries NO `op`: only
-        // producer/control frames have an `op` (e.g. our own echoed
-        // `{op:"produce", stream, chunk}` transcript). Routing one of those as a
-        // delivery would decode our own produced transcript as inbound steer and
-        // inject it back into its own agent — a feedback loop. Reject anything
-        // carrying `op`; only genuine deliveries are routed.
+        // full delivery shape; anything carrying `op`, or missing the integer
+        // `offset`, is dropped.
         if payload.get("op").is_some() {
             return; // not a delivery: producer/control frame echoed back
+        }
+        // A genuine delivery carries an unsigned integer byte `offset`; a
+        // producer/control frame (or a hand-rolled `{stream, chunk}` object)
+        // does not. Require it — a non-negative integer — BEFORE the session
+        // lookup, so a frame lacking an offset (or carrying a non-integer one)
+        // cannot masquerade as a delivery and inject steer into a live job.
+        if !payload.get("offset").is_some_and(Value::is_u64) {
+            return; // no integer offset: not a routable delivery
         }
         let Some(stream) = payload.get("stream").and_then(Value::as_str) else {
             return; // no stream id: not a routable delivery
@@ -897,8 +993,14 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                 if drain(client, &mut write).await.is_err() { break; }
             }
             _ = heartbeat.tick() => {
-                // One heartbeat per registered worker instance.
-                for inst in client.instances.lock().unwrap().keys() {
+                // One heartbeat per registered worker instance. Snapshot the
+                // instance keys FIRST (releasing the instances lock) before
+                // `enqueue` takes the outbound lock, so this path never nests
+                // instances → outbound — preserving the outbound → instances
+                // lock order that `register_session`/`resync_presence` rely on.
+                let insts: Vec<String> =
+                    client.instances.lock().unwrap().keys().cloned().collect();
+                for inst in insts {
                     client.enqueue(Lane::Control, Family::Heartbeat, json!({ "instance": inst }));
                 }
                 if drain(client, &mut write).await.is_err() { break; }
@@ -928,7 +1030,11 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     // Best-effort graceful deregister of every worker before exit.
-                    for inst in client.instances.lock().unwrap().keys() {
+                    // Snapshot keys first (see the heartbeat note) to keep the
+                    // outbound → instances lock order.
+                    let insts: Vec<String> =
+                        client.instances.lock().unwrap().keys().cloned().collect();
+                    for inst in insts {
                         client.enqueue(
                             Lane::Control,
                             Family::Deregister,
@@ -1000,6 +1106,7 @@ mod tests {
             terminal: false,
             attribution: Some("nano".into()),
             buffer_capacity: 8,
+            buffer_byte_budget: 0,
         }
     }
 
@@ -1134,6 +1241,7 @@ mod tests {
         let stream = compose_stream_id("w-8", "job-8");
         client.route_inbound(&json!({
             "stream": stream,
+            "offset": 0,
             "chunk": r#"{"nanoControlFrame":1,"kind":"cancel","reason":"stop"}"#,
         }));
         let got = steer.recv().await.expect("steer delivered");
@@ -1161,8 +1269,8 @@ mod tests {
                 .unwrap()
                 .bulk
                 .iter()
-                .find(|f| f.family == Family::Relay)
-                .cloned()
+                .find(|bf| bf.frame.family == Family::Relay)
+                .map(|bf| bf.frame.clone())
             {
                 produce = Some(f);
                 break;
@@ -1704,6 +1812,130 @@ mod tests {
             relay_seq < release_seq,
             "transcript tail (seq {relay_seq}) must be enqueued before RELEASE (seq {release_seq})"
         );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): `route_inbound` must require the protocol's integer
+    // `offset` before routing a delivery. A `{stream, chunk}` object lacking an
+    // offset (or carrying a non-integer one) is NOT a delivery frame and must be
+    // dropped, so it cannot masquerade as one and inject steer into a live job.
+    #[tokio::test]
+    async fn route_inbound_requires_integer_offset_to_route_steer() {
+        let client = HubClient::spawn(test_config());
+        let mut session = client.register_session("w-of", capability(), "job-of");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-of", "job-of");
+        let chunk = r#"{"nanoControlFrame":1,"kind":"cancel","reason":"x"}"#;
+        // Missing offset: dropped.
+        client.route_inbound(&json!({ "stream": stream, "chunk": chunk }));
+        // Non-integer offset (string): dropped.
+        client.route_inbound(&json!({ "stream": stream, "offset": "0", "chunk": chunk }));
+        // Negative offset (not a u64): dropped.
+        client.route_inbound(&json!({ "stream": stream, "offset": -1, "chunk": chunk }));
+        assert!(
+            steer.try_recv().is_err(),
+            "a payload without a valid integer offset must not be routed as steer"
+        );
+        // A genuine delivery (integer offset) IS routed.
+        client.route_inbound(&json!({ "stream": stream, "offset": 7, "chunk": chunk }));
+        let got = steer.recv().await.expect("valid delivery must be routed");
+        assert_eq!(got, ControlFrame::Cancel { reason: Some("x".into()) });
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): a frame-COUNT cap alone cannot bound memory because a
+    // single transcript chunk may be ~1 MiB. The buffer also enforces a BYTE
+    // budget: pushing many large bulk frames never retains more than the budget
+    // of bytes, regardless of how far the count cap would otherwise allow.
+    #[tokio::test]
+    async fn buffer_byte_budget_bounds_retained_memory_regardless_of_count() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 10_000; // a very permissive COUNT cap
+        cfg.buffer_byte_budget = 64 * 1024; // but a tight BYTE budget
+        let client = HubClient::spawn(cfg);
+        let big = "x".repeat(16 * 1024); // ~16 KiB payload each
+        for _ in 0..1000 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "chunk": big }));
+        }
+        let (bytes, byte_capacity, len) = {
+            let buf = client.outbound.lock().unwrap();
+            (buf.bytes, buf.byte_capacity, buf.len())
+        };
+        assert!(
+            bytes <= byte_capacity,
+            "retained bytes {bytes} exceeded the byte budget {byte_capacity}"
+        );
+        // A handful of 16 KiB frames, not the full 1000-frame count cap.
+        assert!(
+            len < 10,
+            "count should be bounded by the byte budget, got {len}"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): a control frame must never be dropped by the byte
+    // budget to admit lower-priority bulk — presence/steer is never sacrificed
+    // for transcript, and a control frame exceeding the budget is still admitted.
+    #[tokio::test]
+    async fn byte_budget_never_sheds_control_for_bulk() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 10_000;
+        cfg.buffer_byte_budget = 8 * 1024;
+        let client = HubClient::spawn(cfg);
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
+        let big = "x".repeat(16 * 1024); // larger than the whole budget
+        for _ in 0..50 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "chunk": big.clone() }));
+        }
+        let buf_control_len = {
+            let buf = client.outbound.lock().unwrap();
+            buf.control.len()
+        };
+        assert_eq!(
+            buf_control_len, 1,
+            "the control REGISTER must survive a bulk flood under the byte budget"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): the reconnect snapshot is atomic with session
+    // registration. Under concurrent `register_session` and `resync_presence`,
+    // no live job's presence may be lost — every in-flight job keeps exactly one
+    // buffered CLAIM and every instance exactly one REGISTER. (The old
+    // non-atomic snapshot could `drop_control_presence` a just-enqueued frame.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resync_is_atomic_with_concurrent_registration() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 100_000; // never shed presence during the stress
+        let client = HubClient::spawn(cfg);
+        let resync_client = client.clone();
+        let resyncer = tokio::task::spawn_blocking(move || {
+            for _ in 0..2000 {
+                resync_client.resync_presence();
+            }
+        });
+        let mut sessions = Vec::new();
+        for i in 0..200 {
+            sessions.push(client.register_session("w-atomic", capability(), &format!("job-{i}")));
+            if i % 7 == 0 {
+                std::thread::yield_now();
+            }
+        }
+        resyncer.await.unwrap();
+        // One final resync establishes a clean, fully-rebuilt presence snapshot.
+        client.resync_presence();
+        let frames = client.enqueue_log();
+        let registers = frames
+            .iter()
+            .filter(|(_, _, f)| *f == Family::Register)
+            .count();
+        let claims = frames.iter().filter(|(_, _, f)| *f == Family::Claim).count();
+        assert_eq!(registers, 1, "exactly one REGISTER for the single instance");
+        assert_eq!(
+            claims, 200,
+            "every registered job must retain its CLAIM after concurrent resync, got {claims}"
+        );
+        drop(sessions);
         client.shutdown().await;
     }
 }
