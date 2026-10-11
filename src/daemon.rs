@@ -468,23 +468,38 @@ fn bind_control_socket(sock_path: &Path) -> Result<tokio::net::UnixListener> {
         let _ = std::fs::create_dir_all(parent);
     }
     if sock_path.exists() {
-        // Cross-implementation ownership check: a connect that SUCCEEDS means a
-        // live daemon (Rust or Node) is bound here — refuse to unlink its socket
-        // out from under it. Only a connect that FAILS (ECONNREFUSED / ENOENT
-        // racing a teardown) marks the file as a dead owner's stale leftover that
-        // is safe to remove before binding. The probe is nonblocking and
-        // deadline-bounded: a live peer whose listen backlog is full would
-        // otherwise stall a blocking `connect` (and with it direct/detached
-        // startup) indefinitely before `bind` is attempted
+        // Cross-implementation ownership check. The bounded probe is classified
+        // three ways and we FAIL CLOSED on anything but a proven-dead owner:
+        //   - Live        → a daemon (Rust or Node) is bound here; refuse to
+        //                   unlink its socket out from under it.
+        //   - Indeterminate (e.g. `TimedOut` from a live peer whose listen
+        //                   backlog is full) → we cannot prove the owner is dead,
+        //                   so we must NOT clobber it — a timeout here is an
+        //                   unresponsive LIVE daemon, not a stale leftover.
+        //   - Absent      → the connect failed fast with ECONNREFUSED/ENOENT,
+        //                   proving a dead owner's stale leftover; only THEN is it
+        //                   safe to remove the file before binding.
+        // A bare `is_ok()` would fold Indeterminate in with Absent and unlink a
+        // live, backlogged daemon's endpoint, leaving two fleets active. The
+        // probe is nonblocking and deadline-bounded so a full backlog cannot stall
+        // a blocking `connect` (and with it startup) before `bind`
         // (nanobpm/nano-supervisor#8).
-        if control::probe_within_deadline(sock_path, std::time::Duration::from_secs(2)).is_ok() {
-            bail!(
+        match control::probe_liveness(sock_path, std::time::Duration::from_secs(2)) {
+            control::Liveness::Absent => {
+                let _ = std::fs::remove_file(sock_path);
+            }
+            control::Liveness::Live => bail!(
                 "the supervisor control socket at {} is live — another daemon (Rust or Node) \
                  already owns this state home; refusing to clobber its control endpoint",
                 sock_path.display()
-            );
+            ),
+            control::Liveness::Indeterminate(e) => bail!(
+                "the supervisor control socket at {} could not be probed ({e}); refusing to \
+                 clobber a potentially live control endpoint — a timeout here means a live \
+                 daemon with a full listen backlog, not a dead owner's stale leftover",
+                sock_path.display()
+            ),
         }
-        let _ = std::fs::remove_file(sock_path);
     }
     let listener = UnixListener::bind(sock_path).with_context(|| {
         format!(

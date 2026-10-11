@@ -578,6 +578,51 @@ pub(crate) fn probe_within_deadline(
     connect_within_deadline(socket, deadline).map(|_| ())
 }
 
+/// The classified outcome of a bounded liveness probe, for callers that MUST
+/// fail closed on ambiguity (refuse to unlink a socket, refuse to report a
+/// daemon absent). A bare `is_ok()` collapses the three cases into two and
+/// treats every failure — including a `TimedOut` against a live-but-backlogged
+/// peer — as proof of absence, which lets startup clobber a live daemon's socket
+/// and lets `status`/`stop` report a wedged daemon as "not running"
+/// (nanobpm/nano-supervisor#8).
+#[cfg(unix)]
+pub(crate) enum Liveness {
+    /// The connect handshake completed: a live daemon owns the socket.
+    Live,
+    /// The connect failed FAST in a way that proves nothing is listening
+    /// (`ENOENT`/`ECONNREFUSED`): the socket is absent, or a dead owner's stale
+    /// leftover that is safe to unlink / report as "not running".
+    Absent,
+    /// The probe could neither confirm nor rule out a live peer (`TimedOut`
+    /// against a full listen backlog, `EACCES`, or any other ambiguous error).
+    /// Callers MUST treat the peer as potentially live — never unlink its socket
+    /// and never report it absent.
+    Indeterminate(std::io::Error),
+}
+
+/// Classify a probe result. ONLY `NotFound`/`ConnectionRefused` prove absence;
+/// every other error is [`Liveness::Indeterminate`] (fail closed). Kept pure and
+/// separate from the I/O so the whole class is unit-testable without a socket.
+#[cfg(unix)]
+pub(crate) fn classify_liveness(probe: std::io::Result<()>) -> Liveness {
+    match probe {
+        Ok(()) => Liveness::Live,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                Liveness::Absent
+            }
+            _ => Liveness::Indeterminate(e),
+        },
+    }
+}
+
+/// Bounded liveness probe, classified for fail-closed callers. See
+/// [`Liveness`] and [`probe_within_deadline`].
+#[cfg(unix)]
+pub(crate) fn probe_liveness(socket: &Path, timeout: std::time::Duration) -> Liveness {
+    classify_liveness(probe_within_deadline(socket, timeout))
+}
+
 /// Non-Unix stub: the control socket is a Unix-domain transport, so there is no
 /// client to offer off-Unix. Returns `Unsupported` rather than failing to
 /// compile, mirroring the daemon's `cfg(not(unix))` fallbacks.
@@ -1067,6 +1112,41 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(2),
                 "the 300ms budget must bound connect+read even with a full backlog; took {elapsed:?}"
             );
+        }
+
+        // Regression (fail-open probe classification): a bounded liveness probe
+        // must FAIL CLOSED. Only `ECONNREFUSED`/`ENOENT` prove a dead/absent
+        // owner; a `TimedOut` (live peer with a full listen backlog) or any other
+        // ambiguous error must classify as `Indeterminate`, NOT `Absent` — else
+        // startup unlinks a live socket and `status`/`stop` report a wedged daemon
+        // as "not running" (nanobpm/nano-supervisor#8).
+        #[test]
+        fn classify_liveness_fails_closed_on_ambiguous_errors() {
+            use std::io::{Error, ErrorKind};
+            assert!(matches!(classify_liveness(Ok(())), Liveness::Live));
+            // Proven absence: safe to unlink / report not-running.
+            assert!(matches!(
+                classify_liveness(Err(Error::from(ErrorKind::NotFound))),
+                Liveness::Absent
+            ));
+            assert!(matches!(
+                classify_liveness(Err(Error::from(ErrorKind::ConnectionRefused))),
+                Liveness::Absent
+            ));
+            // Ambiguous: a live-but-backlogged daemon surfaces as TimedOut and
+            // MUST NOT be treated as absent.
+            assert!(matches!(
+                classify_liveness(Err(Error::from(ErrorKind::TimedOut))),
+                Liveness::Indeterminate(_)
+            ));
+            assert!(matches!(
+                classify_liveness(Err(Error::from(ErrorKind::WouldBlock))),
+                Liveness::Indeterminate(_)
+            ));
+            assert!(matches!(
+                classify_liveness(Err(Error::from(ErrorKind::PermissionDenied))),
+                Liveness::Indeterminate(_)
+            ));
         }
 
         #[test]

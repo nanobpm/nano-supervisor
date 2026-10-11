@@ -644,6 +644,16 @@ fn write_config(cfg: &ConfigFile) -> Result<()> {
 }
 
 fn normalized_identity(path: &Path) -> PathBuf {
+    // If the full path already exists, canonicalize it DIRECTLY so the final
+    // component's symlinks are resolved too. Walking only the parent (below)
+    // leaves the leaf un-resolved, so `C8CTL_NANO_HOME=/alias` symlinked to
+    // `/real/home` would key a different identity than a daemon spelled
+    // `/real/home` and both could take different startup locks and run slots
+    // against the same home (nanobpm/nano-supervisor#8).
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+
     let mut suffix = Vec::new();
     if let Some(file_name) = path.file_name() {
         suffix.push(file_name.to_os_string());
@@ -1358,20 +1368,25 @@ pub fn assign(profile: &str, capabilities: &str) -> Result<()> {
 // --- supervisor control socket ---------------------------------------------
 
 /// Whether a supervisor daemon is listening on this home's control socket.
-/// Mirrors the Node derivation (`<tmp>/c8ctl-nano-sup-<sha1(home)[:8]>.sock`)
-/// and treats a successful connect as "running".
+/// Mirrors the Node derivation (`<tmp>/c8ctl-nano-sup-<sha1(home)[:8]>.sock`).
 ///
 /// The probe is nonblocking and deadline-bounded, not a raw blocking
 /// `UnixStream::connect`: a live daemon that has stopped accepting (full listen
 /// backlog) would otherwise hang `supervisor status`/`stop`/`start` here before
-/// they ever reach the deadline-aware control client. A bounded probe keeps the
-/// absent-vs-unresponsive distinction (absent fails fast with
-/// `ECONNREFUSED`/`ENOENT`; unresponsive surfaces as `TimedOut`) without wedging
-/// the caller (nanobpm/nano-supervisor#8).
+/// they ever reach the deadline-aware control client. Crucially we FAIL CLOSED:
+/// only a probe that proves absence (`ECONNREFUSED`/`ENOENT`) counts as "not
+/// running"; a `TimedOut` (live-but-backlogged) or any other ambiguous error is
+/// a live-but-unhealthy daemon and is reported as RUNNING, never silently as
+/// absent. A bare `is_ok()` would map `TimedOut` to `false`, so `status`/`stop`
+/// would print "not running" and `start` would launch a second daemon over a
+/// live one (nanobpm/nano-supervisor#8).
 #[cfg(unix)]
 fn supervisor_running(home: &std::path::Path) -> bool {
     let sock = control::socket_path(home);
-    control::probe_within_deadline(&sock, std::time::Duration::from_millis(500)).is_ok()
+    !matches!(
+        control::probe_liveness(&sock, std::time::Duration::from_millis(500)),
+        control::Liveness::Absent
+    )
 }
 
 #[cfg(not(unix))]
@@ -3277,6 +3292,47 @@ mod tests {
         let rel_lock = StateLock::lock_file_for(&relative).unwrap();
         let abs_lock = StateLock::lock_file_for(&absolute).unwrap();
         assert_eq!(rel_lock, abs_lock);
+    }
+
+    // Regression (symlink-alias startup lock): `normalized_identity` previously
+    // canonicalized only the parent and re-appended the raw final component, so a
+    // symlinked state home (`C8CTL_NANO_HOME=/alias` -> `/real/home`) keyed a
+    // DIFFERENT lock than a daemon spelled `/real/home`, letting two daemons take
+    // different startup locks and run slots against the same home. The final
+    // component must be resolved too, so both spellings contend on ONE lock
+    // (nanobpm/nano-supervisor#8).
+    #[cfg(unix)]
+    #[test]
+    fn state_lock_normalizes_symlink_alias_identity() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "c8ctl-nano-alias-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let real = base.join("real-home");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.join("alias-home");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let real_lock = StateLock::lock_file_for(&real).unwrap();
+        let alias_lock = StateLock::lock_file_for(&alias).unwrap();
+        // Also a trailing-slash spelling of the alias must collapse to the same.
+        let alias_slash = StateLock::lock_file_for(&alias.join(".")).unwrap();
+
+        let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            real_lock, alias_lock,
+            "a symlinked state home must take the SAME startup lock as its real target"
+        );
+        assert_eq!(
+            real_lock, alias_slash,
+            "a `.`/trailing-slash spelling of the alias must also collapse to one lock"
+        );
     }
 
     /// Regression (finding `r4182128486`): the lock base must be a single
