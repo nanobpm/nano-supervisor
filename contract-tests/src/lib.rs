@@ -688,8 +688,16 @@ fn classify_home(home: &Path) -> HomeOwnership {
     // owner died and its pid was recycled → positively orphaned. A pid-only
     // marker (older producer) cannot prove a recycle, so it stays Live on a
     // live pid (the conservative direction).
+    //
+    // Compare only a SUCCESSFULLY READ token: a failed `process_start_time`
+    // read returns `None`, and `None != Some(token)` would misclassify a
+    // transient `/proc`/`proc_pidinfo` failure as a recycle and let the sweep
+    // force-stop and delete a concurrently running test's home even though
+    // `kill(pid, 0)` just confirmed its owner is alive (issue #54 review). Only
+    // a read that returns a DIFFERENT token proves the recycle; a read failure
+    // degrades to the liveness-only result (Live).
     if let Some(start) = fields.next().and_then(|f| f.parse::<u64>().ok()) {
-        if process_start_time(pid as u32) != Some(start) {
+        if matches!(process_start_time(pid as u32), Some(cur) if cur != start) {
             return HomeOwnership::Orphaned;
         }
     }
@@ -2638,6 +2646,37 @@ mod unit {
             matches!(classify_home(home), HomeOwnership::Unknown),
             "absent marker => Unknown"
         );
+    }
+
+    // Regression (issue #54 review): the recycle guard must compare only a
+    // SUCCESSFULLY READ start-time token. A failed `process_start_time` read
+    // returns `None`, and `None != Some(token)` would misclassify a transient
+    // `/proc`/`proc_pidinfo` failure as a recycle — letting the sweep force-stop
+    // and delete a concurrently running test's home even though `kill(pid, 0)`
+    // just confirmed its owner is alive. Model the read failure with an
+    // unreadable pid (`u32::MAX`) while the marker's token is real: the guard
+    // expression must NOT fire (it degrades to the liveness-only result).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn classify_home_recycle_guard_ignores_a_failed_start_time_read() {
+        let me = std::process::id();
+        let real = process_start_time(me).expect("own start time readable");
+        // Mirror the fixed guard: only a successfully-read, DIFFERENT token fires.
+        let fires_on_failed_read = matches!(process_start_time(u32::MAX), Some(cur) if cur != real);
+        assert!(
+            !fires_on_failed_read,
+            "a failed start-time read (None) must not satisfy the recycle guard"
+        );
+        // And the guard still fires on a genuinely different, successfully read
+        // token (the recycle it exists to catch).
+        let fires_on_real_recycle =
+            matches!(process_start_time(me), Some(cur) if cur != real.wrapping_add(1));
+        assert!(
+            fires_on_real_recycle,
+            "a successfully-read, different token must still satisfy the recycle guard"
+        );
+        // Sanity: the probe really did fail (returned None) for u32::MAX.
+        assert!(process_start_time(u32::MAX).is_none());
     }
 
     // The startup sweep must remove a *verified orphan* home, not just its stale

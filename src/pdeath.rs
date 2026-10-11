@@ -554,8 +554,17 @@ pub fn owner_watchdog(
         // Owner gone (SIGKILL / timeout / panic=abort — no unwinding, no Drop),
         // owner pid RECYCLED (the start time moved off the captured token), or
         // home removed (TempDir deleted under a live daemon): fire.
+        //
+        // The recycle arm must compare only a SUCCESSFULLY READ token: a failed
+        // `owner_start_time` read returns `None`, and `None != Some(token)` would
+        // misclassify a transient `/proc`/`proc_pidinfo` failure as a recycle and
+        // SIGKILL a daemon whose owner is still alive (issue #54 review). Only a
+        // read that returns a DIFFERENT token proves the pid was recycled; a read
+        // failure degrades this poll to the liveness-plus-home check alone.
         let owner_gone = !pid_alive(owner_pid)
-            || owner_start.is_some_and(|start| owner_start_time(owner_pid) != Some(start));
+            || owner_start.is_some_and(
+                |start| matches!(owner_start_time(owner_pid), Some(cur) if cur != start),
+            );
         if owner_gone || !home.exists() {
             // Re-verify the pid's identity immediately before signalling: the
             // daemon may have exited and its pid been recycled by an unrelated
@@ -1501,10 +1510,15 @@ unsafe fn wait_parent_or_group_gone(
         }
         // Detect PID reuse: the pid answers `kill(_, 0)` but now belongs to a
         // different process incarnation, so the daemon we guard has exited and
-        // its group must be reaped rather than waited on forever.
+        // its group must be reaped rather than waited on forever. Only a
+        // SUCCESSFULLY READ, different start time proves a recycle: a failed
+        // `parent_start_time` read returns `None`, and `None != Some(token)`
+        // would misclassify a transient `/proc` failure as a recycle and reap a
+        // live daemon's group (issue #54 review). Degrade to liveness-only on a
+        // read failure.
         #[cfg(target_os = "linux")]
         if let Some(start) = expected_start {
-            if parent_start_time(parent_pid) != Some(start) {
+            if matches!(parent_start_time(parent_pid), Some(cur) if cur != start) {
                 return true;
             }
         }
@@ -1620,20 +1634,48 @@ mod tests {
         let me = std::process::id();
         let real = owner_start_time(me).expect("own start time readable");
         let forged = real.wrapping_add(1);
-        // Mirror the watchdog's `owner_gone` expression.
-        let owner_gone =
-            !pid_alive(me) || (Some(forged).is_some_and(|s| parent_start_time(me) != Some(s)));
+        // Mirror the watchdog's `owner_gone` expression (post issue #54 review):
+        // only a SUCCESSFULLY READ, different token proves a recycle.
+        let owner_gone = !pid_alive(me)
+            || (Some(forged)
+                .is_some_and(|s| matches!(parent_start_time(me), Some(cur) if cur != s)));
         assert!(
             owner_gone,
             "a start-time mismatch on a live pid must read as owner death (recycled pid)"
         );
         // And the matching token must NOT read as owner death.
-        let owner_gone_ok =
-            !pid_alive(me) || (Some(real).is_some_and(|s| parent_start_time(me) != Some(s)));
+        let owner_gone_ok = !pid_alive(me)
+            || (Some(real).is_some_and(|s| matches!(parent_start_time(me), Some(cur) if cur != s)));
         assert!(
             !owner_gone_ok,
             "the matching token must not read as owner death"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_read_failure_is_not_a_recycle() {
+        // Regression (issue #54 review): a FAILED start-time read returns `None`,
+        // and `None != Some(token)` must NOT read as owner death — otherwise a
+        // transient `/proc` failure SIGKILLs a daemon whose owner is still alive.
+        // Model the read failure by pointing the probe at a pid that cannot be
+        // read (`u32::MAX`), while the captured token is a real one: the
+        // expression must degrade to liveness-only and report the owner NOT gone
+        // on the strength of the (failed) identity read alone.
+        let me = std::process::id();
+        let real = owner_start_time(me).expect("own start time readable");
+        // The identity read fails (None) for an unreadable pid; the owner pid
+        // itself is alive (`me`). Mirror the watchdog expression with the read
+        // failing: no successfully-read-different token => not a recycle.
+        let owner_gone = !pid_alive(me)
+            || (Some(real)
+                .is_some_and(|s| matches!(parent_start_time(u32::MAX), Some(cur) if cur != s)));
+        assert!(
+            !owner_gone,
+            "a failed start-time read (None) must degrade to liveness-only, not read as a recycle"
+        );
+        // Sanity: the probe really did fail (returned None) for u32::MAX.
+        assert!(parent_start_time(u32::MAX).is_none());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1691,20 +1733,43 @@ mod tests {
         let me = std::process::id();
         let real = owner_start_time(me).expect("own start time readable");
         let forged = real.wrapping_add(1);
-        // Mirror the watchdog's `owner_gone` expression.
-        let owner_gone =
-            !pid_alive(me) || (Some(forged).is_some_and(|s| owner_start_time(me) != Some(s)));
+        // Mirror the watchdog's `owner_gone` expression (post issue #54 review):
+        // only a SUCCESSFULLY READ, different token proves a recycle.
+        let owner_gone = !pid_alive(me)
+            || (Some(forged)
+                .is_some_and(|s| matches!(owner_start_time(me), Some(cur) if cur != s)));
         assert!(
             owner_gone,
             "a start-time mismatch on a live pid must read as owner death (recycled pid)"
         );
         // And the matching token must NOT read as owner death.
-        let owner_gone_ok =
-            !pid_alive(me) || (Some(real).is_some_and(|s| owner_start_time(me) != Some(s)));
+        let owner_gone_ok = !pid_alive(me)
+            || (Some(real).is_some_and(|s| matches!(owner_start_time(me), Some(cur) if cur != s)));
         assert!(
             !owner_gone_ok,
             "the matching token must not read as owner death"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_read_failure_is_not_a_recycle() {
+        // Regression (issue #54 review): a FAILED start-time read returns `None`,
+        // and `None != Some(token)` must NOT read as owner death — otherwise a
+        // transient `proc_pidinfo` failure SIGKILLs a daemon whose owner is still
+        // alive. Model the read failure with an unreadable pid (`u32::MAX`) while
+        // the captured token is real: the expression must degrade to liveness-only.
+        let me = std::process::id();
+        let real = owner_start_time(me).expect("own start time readable");
+        let owner_gone = !pid_alive(me)
+            || (Some(real)
+                .is_some_and(|s| matches!(owner_start_time(u32::MAX), Some(cur) if cur != s)));
+        assert!(
+            !owner_gone,
+            "a failed start-time read (None) must degrade to liveness-only, not read as a recycle"
+        );
+        // Sanity: the probe really did fail (returned None) for u32::MAX.
+        assert!(owner_start_time(u32::MAX).is_none());
     }
 
     /// Regression (issue #54 review): the owner watchdog must be spawned into
