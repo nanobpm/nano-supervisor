@@ -2687,7 +2687,14 @@ async fn run_agent(
             // reaches the running ACP turn. Held for the turn's lifetime; it
             // deregisters on drop. Absent the hub, the agent runs unchanged.
             let _hub_session = cfg.hub.as_ref().map(|hub| {
-                let mut session = hub.register_session(key);
+                // Worker identity (instance) + declared capability for presence,
+                // matching the Node emit client's `register {instance, capability}`.
+                let capability = serde_json::json!({
+                    "cognition": cfg.hire.model,
+                    "family": cfg.hire.rank,
+                    "host": crate::daemon::short_hostname(),
+                });
+                let mut session = hub.register_session(&cfg.worker_name, capability, key);
                 if let (Some(transcript), Some(steer)) =
                     (session.transcript_sink(), session.take_steer())
                 {

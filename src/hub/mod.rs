@@ -20,6 +20,7 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod frame;
+pub mod stream;
 pub mod transcript;
 
 pub use client::HubClient;

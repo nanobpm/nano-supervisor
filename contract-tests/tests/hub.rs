@@ -459,31 +459,35 @@ fn invalid_token_corpus_covers_every_token_error_code() {
 
 // --- Live-worker replay seam --------------------------------------------
 
-/// The same corpus is designed to replay against a *running* worker's hub
-/// connection (presence, transcript, steer, relay) once the Rust hub client
-/// (#10) and MVP daemon (#6) exist. That end-to-end path needs a live
-/// supervisor + hub endpoint, which CI does not provide, so — like the engine
-/// tests — it skips cleanly when `NS_HUB_ENDPOINT` is unset.
+/// The real worker↔hub acceptance path (handshake/auth, exact REGISTER/CLAIM/
+/// produce bytes, targeted steer, reconnect ordering, shutdown DEREGISTER) is
+/// now covered **in process** by the hub client's own tests
+/// (`src/hub/client.rs`: `live_connection_handshake_presence_transcript_steer_and_shutdown`
+/// and `live_reconnect_reregisters_before_reclaiming`), which drive the live
+/// `HubClient` against an in-process WebSocket hub.
 ///
-/// The deferred runtime path (hub client + daemon) does not exist yet, so there
-/// is nothing to replay against a real endpoint. Rather than report a green
-/// "live replay" that exercises nothing, an explicitly configured endpoint
-/// **fails loudly** until #6/#10 land: a requested live run that silently does
-/// no work is worse than an honest "not implemented yet".
+/// This remaining seam is narrower: replaying *this* golden corpus against an
+/// **external** running supervisor + hub endpoint, which CI does not provide, so
+/// — like the engine tests — it skips cleanly when `NS_HUB_ENDPOINT` is unset.
+/// Because driving the corpus against a real endpoint still has no harness, an
+/// explicitly configured endpoint **fails loudly** rather than reporting a green
+/// "live replay" that exercises nothing: a requested external run that silently
+/// does no work is worse than an honest "not wired up yet".
 #[test]
 fn replay_corpus_against_live_worker() {
     match std::env::var("NS_HUB_ENDPOINT") {
         Ok(ep) if !ep.is_empty() => {
-            // Seam for #6/#10: connect to `ep`, drive the corpus against the live
-            // worker, and diff its emitted frames against the goldens above.
+            // Seam: connect to `ep`, drive the corpus against the live worker,
+            // and diff its emitted frames against the goldens above. The
+            // in-process equivalent already runs in the hub client crate.
             panic!(
-                "NS_HUB_ENDPOINT={ep} requests a live-worker replay, but the hub client (#10) \
-                 and MVP daemon (#6) do not exist yet, so there is nothing to replay against. \
-                 Unset NS_HUB_ENDPOINT to skip until the deferred runtime path lands."
+                "NS_HUB_ENDPOINT={ep} requests an EXTERNAL live-worker replay, but no harness \
+                 drives this golden corpus against a real endpoint yet (the in-process hub \
+                 acceptance runs in src/hub/client.rs instead). Unset NS_HUB_ENDPOINT to skip."
             );
         }
         _ => eprintln!(
-            "skipping live-worker replay: set NS_HUB_ENDPOINT to run the corpus against a worker"
+            "skipping external live-worker replay: set NS_HUB_ENDPOINT to run the corpus against a worker"
         ),
     }
 }

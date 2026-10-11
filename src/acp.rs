@@ -86,10 +86,12 @@ pub struct Agent {
     /// `execute` on lease loss instead of calling `shutdown`), so descendants the
     /// agent started cannot survive and overlap the job's redelivery.
     group_guard: crate::pdeath::GroupGuard,
-    /// Optional inbound-steer receiver (issue #10): hub-delivered prompt text to
-    /// inject into the running ACP turn as additional `session/prompt` input.
+    /// Optional inbound-steer receiver (issue #10): typed hub-delivered controls
+    /// applied to the running ACP turn — a `prompt` is injected as additional
+    /// `session/prompt` input, a `cancel` is mapped to `session/cancel`, and a
+    /// `permission` outcome is applied to the turn's permission handling.
     /// `None` runs the turn exactly as a hub-less agent does.
-    steer: Option<mpsc::UnboundedReceiver<String>>,
+    steer: Option<mpsc::UnboundedReceiver<crate::hub::control::ControlFrame>>,
 }
 
 impl Agent {
@@ -172,7 +174,7 @@ impl Agent {
     pub fn attach_hub(
         &mut self,
         transcript: mpsc::UnboundedSender<Value>,
-        steer: mpsc::UnboundedReceiver<String>,
+        steer: mpsc::UnboundedReceiver<crate::hub::control::ControlFrame>,
     ) {
         self.shared.lock().unwrap().transcript = Some(transcript);
         self.steer = Some(steer);
@@ -284,25 +286,49 @@ impl Agent {
             .as_str()
             .context("session/new returned no sessionId")?
             .to_string();
-        // Inbound steer (issue #10): while the prompt turn is in flight, inject
-        // each hub-delivered chunk as an additional `session/prompt` on the SAME
-        // session — the agent folds it into the running turn. The injected
+        // Inbound steer (issue #10): while the prompt turn is in flight, apply
+        // each hub-delivered typed control to the SAME session. A `prompt` is
+        // injected as an additional `session/prompt` (the agent folds it into
+        // the running turn); a `cancel` is mapped to the ACP `session/cancel`
+        // notification so it actually interrupts the turn; a `permission`
+        // outcome is advisory here (the client auto-answers permission prompts
+        // under the `yolo` policy, so there is no outstanding request to
+        // re-decide) and is logged rather than silently dropped. The injected
         // prompts use ids far above the turn's own sequence and are never
         // tracked as pending, so their responses are simply ignored and the
         // original turn's response still completes the run.
         let steer_task = self.steer.take().map(|mut rx| {
+            use crate::hub::control::ControlFrame;
             let out = self.out.clone();
             let sid = session_id.clone();
             tokio::spawn(async move {
                 let mut id: u64 = 1 << 32;
-                while let Some(text) = rx.recv().await {
-                    id += 1;
-                    let frame = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "method": "session/prompt",
-                        "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": text }] }
-                    });
+                while let Some(control) = rx.recv().await {
+                    let frame = match control {
+                        ControlFrame::Prompt { text } => {
+                            id += 1;
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "session/prompt",
+                                "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": text }] }
+                            })
+                        }
+                        ControlFrame::Cancel { .. } => json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": { "sessionId": sid }
+                        }),
+                        ControlFrame::Permission {
+                            request_id,
+                            outcome,
+                        } => {
+                            crate::runtime::log(&format!(
+                                "agentic hub: inbound permission {request_id} → {outcome} (advisory; permissions are auto-answered)"
+                            ));
+                            continue;
+                        }
+                    };
                     if out.send(frame).await.is_err() {
                         break;
                     }
