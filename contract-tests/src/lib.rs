@@ -2451,6 +2451,18 @@ mod is_local_tests {
 mod unit {
     use super::*;
 
+    // Issue #54: the four `sweep_*` tests below each stage `ct-home-*`
+    // directories in the shared system temp dir and then call
+    // `sweep_orphaned_daemons()`, which scans *every* `ct-home-*` entry there.
+    // Run in parallel they corrupt one another — a sibling's sweep steals a
+    // test's single-accept answerer, or force-stops/removes a home mid-assertion
+    // (the macOS Node-target flake). Serialize them on one process-wide lock so
+    // each owns the sweep namespace for the whole of its body.
+    fn sweep_serialize_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn socket_path_matches_node_derivation() {
         // sha1("/tmp/ct-b")[:8] cross-checked against the Node plugin.
@@ -2686,6 +2698,10 @@ mod unit {
     fn sweep_removes_verified_orphan_home() {
         use std::os::unix::net::UnixListener;
 
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // An orphaned home: a dead owner pid (a near-max pid no live process
         // holds) and NO control socket. The sweep must remove the whole tree.
         let orphan = tempfile::Builder::new()
@@ -2751,6 +2767,10 @@ mod unit {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sweep_leaves_markerless_home_without_endpoint() {
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // A `ct-home-*` directory with NO owner marker and NO control socket:
         // nothing positively ties it to this harness, so it must be left alone.
         let stray = tempfile::Builder::new()
@@ -2783,6 +2803,10 @@ mod unit {
     fn sweep_removes_markerless_home_with_answered_stop() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
+
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let home = tempfile::Builder::new()
             .prefix("ct-home-")
@@ -2825,6 +2849,10 @@ mod unit {
     #[test]
     fn sweep_leaves_markerless_home_with_stale_socket() {
         use std::os::unix::net::UnixListener;
+
+        let _sweep_guard = sweep_serialize_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let home = tempfile::Builder::new()
             .prefix("ct-home-")
