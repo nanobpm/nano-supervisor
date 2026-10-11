@@ -103,6 +103,22 @@ const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// the whole DEREGISTER snapshot in one pass.
 const DRAIN_BATCH: usize = 256;
 
+/// Fixed cap on the number of completed-job RELEASE frames buffered while the
+/// hub connection is DOWN. A RELEASE retires the hub's ownership of a finished
+/// job; while connected it is enqueued EXEMPT from the buffer bound and drained
+/// promptly, so its count stays tiny. During a long OUTAGE, however, every job
+/// that completes leaves another exempt RELEASE (and an armed drain barrier)
+/// with nothing draining it, so the set would otherwise grow without bound for
+/// the whole outage. Reconnect resync is AUTHORITATIVE for ownership — it
+/// re-derives every live claim from `in_flight` and the hub reconciles against
+/// that snapshot — so a completed job's buffered RELEASE is redundant once a
+/// reconnect happens. We therefore hold the buffered RELEASE set to this fixed
+/// cap during an outage, collapsing the OLDEST completed-ownership RELEASE (and
+/// disarming its orphaned barrier) when a new one would exceed it. The cap is
+/// generous: it only bites during an outage long enough to complete this many
+/// jobs, and a collapsed RELEASE's ownership is re-derived by resync.
+const RELEASE_OUTAGE_CAP: usize = 1024;
+
 /// A buffered frame carrying its precomputed on-wire byte size, so the buffer
 /// can enforce a memory (byte) budget without re-serialising the payload on
 /// every eviction/drain.
@@ -129,6 +145,15 @@ fn presence_stream_id(payload: &Value) -> Option<String> {
     let instance = payload.get("instance").and_then(Value::as_str)?;
     let job_key = payload.get("jobKey").and_then(Value::as_str)?;
     Some(compose_stream_id(instance, job_key))
+}
+
+/// The relay `stream` a buffered transcript `produce` frame (or any lower-lane
+/// frame) belongs to, if it carries one. Control/presence frames and any frame
+/// without a string `stream` return `None`, so they never match a session's
+/// per-stream drain. Used by the per-session RELEASE drain barrier to flush
+/// only the closing session's OWN transcript tail.
+fn frame_stream(frame: &Frame) -> Option<&str> {
+    frame.payload.get("stream").and_then(Value::as_str)
 }
 
 /// Effective count bound for one session's pre-buffer transcript channel,
@@ -282,14 +307,66 @@ impl LaneBuffer {
         Some(bf.frame)
     }
 
-    /// Pop the next NON-control frame (interactive first, then bulk). Used by
-    /// the RELEASE drain barrier to write a session's transcript tail to the
-    /// socket before its RELEASE: control frames are left in place while the
-    /// lower lanes are flushed. Returns `None` when only control frames remain.
-    fn pop_lower_lane(&mut self) -> Option<Frame> {
-        let bf = self.interactive.pop_front().or_else(|| self.bulk.pop_front())?;
+    /// Pop the next lower-lane frame (interactive first, then bulk) whose
+    /// [`frame_stream`] equals `stream`, leaving every OTHER session's frames
+    /// untouched. Used by the per-session RELEASE drain barrier to flush only
+    /// the CLOSING session's own transcript tail ahead of its RELEASE — never
+    /// the global lower-lane backlog, which other live sessions keep refilling
+    /// (draining that globally would let a busy neighbour starve this barrier,
+    /// and block steer/shutdown behind an unbounded flush). Oldest-matching-first
+    /// preserves the stream's own FIFO order. Returns `None` when no buffered
+    /// lower-lane frame belongs to `stream`.
+    fn pop_lower_lane_for_stream(&mut self, stream: &str) -> Option<Frame> {
+        let bf = Self::take_stream_match(&mut self.interactive, stream)
+            .or_else(|| Self::take_stream_match(&mut self.bulk, stream))?;
         self.account_removed(&bf);
         Some(bf.frame)
+    }
+
+    /// Remove and return the oldest frame in `dq` whose [`frame_stream`] matches
+    /// `stream`, preserving the order of the rest. Helper for
+    /// [`LaneBuffer::pop_lower_lane_for_stream`].
+    fn take_stream_match(dq: &mut VecDeque<BufferedFrame>, stream: &str) -> Option<BufferedFrame> {
+        let pos = dq.iter().position(|bf| frame_stream(&bf.frame) == Some(stream))?;
+        dq.remove(pos)
+    }
+
+    /// Append a completed-job RELEASE to the BACK of the control lane during an
+    /// OUTAGE, holding the buffered RELEASE set to `cap` frames. Like
+    /// [`push_back_control_bounded`], the RELEASE itself is EXEMPT from the
+    /// ordinary count/byte bound (it sheds lower-priority traffic, never itself)
+    /// — but to keep completed-ownership replay from growing without bound for
+    /// the whole outage (see [`RELEASE_OUTAGE_CAP`]), when `cap` RELEASE frames
+    /// are already buffered this first collapses the OLDEST one. Reconnect resync
+    /// is authoritative for ownership, so a collapsed RELEASE's retirement is
+    /// re-derived on reconnect. Returns the collapsed RELEASE's stream id (so the
+    /// caller can disarm its now-orphaned drain barrier), or `None` when under
+    /// the cap. `cap == 0` disables collapsing (admit without a bound).
+    fn push_back_release_bounded(&mut self, frame: Frame, cap: usize) -> Option<String> {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        debug_assert_eq!(frame.family, Family::Release);
+        let mut collapsed = None;
+        if cap > 0 {
+            let release_count = self
+                .control
+                .iter()
+                .filter(|bf| bf.frame.family == Family::Release)
+                .count();
+            if release_count >= cap {
+                if let Some(pos) = self
+                    .control
+                    .iter()
+                    .position(|bf| bf.frame.family == Family::Release)
+                {
+                    if let Some(bf) = self.control.remove(pos) {
+                        self.account_removed(&bf);
+                        collapsed = presence_stream_id(&bf.frame.payload);
+                    }
+                }
+            }
+        }
+        self.push_back_control_bounded(frame);
+        collapsed
     }
 
     /// Pop the next CONTROL frame only, leaving the lower (interactive/bulk)
@@ -850,14 +927,49 @@ impl HubClient {
     /// never evicts control), which would silently strand the job's CLAIM on the
     /// hub forever — an unrepairable ownership desync. The exempt admission sheds
     /// lower-priority traffic to make room but never drops the RELEASE itself.
+    ///
+    /// WHILE DISCONNECTED this takes a different admission path: nothing drains,
+    /// so an unbounded exempt RELEASE (plus its armed drain barrier) would
+    /// accumulate for every job that completes during the outage. Because the
+    /// reconnect resync is AUTHORITATIVE for ownership (it re-derives every live
+    /// claim and the hub reconciles against it), a completed job's buffered
+    /// RELEASE is redundant once a reconnect lands, so the buffered RELEASE set
+    /// is held to [`RELEASE_OUTAGE_CAP`] via
+    /// [`LaneBuffer::push_back_release_bounded`] — collapsing the oldest when
+    /// full and disarming its orphaned barrier. The newest RELEASE is still
+    /// admitted exempt. (Until the hub treats resync as authoritative —
+    /// nano-workforce#893 — a RELEASE collapsed during an outage can leave a job
+    /// looking owned until the worker deregisters; ownership is advisory
+    /// visibility only, so this is accepted.)
     fn release_job(&self, instance: &str, job_key: &str) {
         if let Some(jobs) = self.in_flight.lock().unwrap().get_mut(instance) {
             jobs.remove(job_key);
         }
-        self.enqueue_control_exempt(
-            Family::Release,
-            json!({ "instance": instance, "jobKey": job_key }),
-        );
+        let payload = json!({ "instance": instance, "jobKey": job_key });
+        if self.connected.load(Ordering::Relaxed) {
+            // Live connection: enqueue EXEMPT and ordered — `drain`'s per-session
+            // barrier writes the transcript tail before this RELEASE, and the
+            // RELEASE itself is never dropped.
+            self.enqueue_control_exempt(Family::Release, payload);
+            return;
+        }
+        // OUTAGE: nothing is draining, so an unbounded RELEASE+barrier set would
+        // otherwise grow with every completed job for the whole outage. Reconnect
+        // resync is AUTHORITATIVE for ownership (it re-derives every live claim),
+        // so the buffered RELEASE set is bounded under a fixed cap: a new RELEASE
+        // collapses the OLDEST completed-ownership one past the cap (see
+        // `RELEASE_OUTAGE_CAP`). The newest RELEASE is still admitted exempt. The
+        // collapsed stream's orphaned drain barrier is disarmed so armed barriers
+        // stay bounded too.
+        let frame = self.make_frame(Lane::Control, Family::Release, payload);
+        let collapsed = {
+            let mut buf = self.outbound.lock().unwrap();
+            buf.push_back_release_bounded(frame, RELEASE_OUTAGE_CAP)
+        };
+        if let Some(stream) = collapsed {
+            self.disarm_release_barrier(&stream);
+        }
+        self.outbound_notify.notify_one();
     }
 
     /// Arm a session's RELEASE drain barrier: the RELEASE `close` is about to
@@ -1487,13 +1599,16 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                             json!({ "instance": inst, "reason": "shutdown" }),
                         );
                     }
-                    // Terminal path: drain ONLY the control lane (the DEREGISTER
+                    // Terminal path: drain the control lane (the DEREGISTER
                     // snapshot, plus any still-buffered RELEASE/HEARTBEAT) so
                     // every DEREGISTER reaches the socket before the Close,
-                    // WITHOUT blocking shutdown on the lower-lane (bulk
-                    // transcript / interactive steer) backlog. That backlog is
-                    // discarded with the socket, so draining it would only delay
-                    // deregistration by up to WRITE_TIMEOUT per buffered frame.
+                    // WITHOUT blocking shutdown on unrelated lower-lane (bulk
+                    // transcript / interactive steer) backlog. `drain_control`
+                    // still honours each armed RELEASE's barrier — it flushes
+                    // that job's OWN tail before its RELEASE — but any backlog
+                    // not owed to a closing job is discarded with the socket, so
+                    // draining it would only delay deregistration by up to
+                    // WRITE_TIMEOUT per buffered frame.
                     let _ = drain_control(client, &mut write).await;
                     let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
                     break;
@@ -1550,17 +1665,20 @@ async fn drain(
         // socket before the transcript tail that was buffered ahead of it. Since
         // `pop` drains control before bulk, the RELEASE would otherwise win. So
         // when an armed RELEASE is popped while the lower lanes still hold the
-        // tail, FIRST drain those lower-lane frames to the socket (preserving
-        // their order), THEN write the RELEASE. This holds tail-before-RELEASE
-        // on the wire without yielding control-over-bulk priority for any OTHER
-        // frame (a different session's control frame already drained ahead).
+        // tail, FIRST drain THIS SESSION'S OWN buffered tail to the socket
+        // (preserving its order), THEN write the RELEASE. The flush is fenced to
+        // the closing session's own stream, never the global lower-lane queue —
+        // a busy neighbour's transcript cannot starve this barrier, and steer /
+        // shutdown stay serviceable. This holds tail-before-RELEASE on the wire
+        // without yielding control-over-bulk priority for any OTHER frame (a
+        // different session's control frame already drained ahead).
         if frame.family == Family::Release {
             if let ReleaseGate::Defer { stream } = client.release_gate(&frame.payload) {
-                // Write every buffered bulk/interactive frame (the tail) first.
+                // Write this session's own buffered bulk/interactive tail first.
                 // On a write error the connection is torn down: re-buffer the
                 // held RELEASE too (its barrier stays armed) so it is retried on
                 // reconnect AFTER the not-yet-written tail — ordering preserved.
-                if let Err(e) = drain_lower_lanes(client, write, incarnation).await {
+                if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream).await {
                     client.outbound.lock().unwrap().requeue_front(frame);
                     return Err(e);
                 }
@@ -1605,23 +1723,28 @@ async fn drain(
     }
 }
 
-/// Write every buffered NON-control (interactive, then bulk) frame to the
-/// socket, leaving the control lane untouched. Used by the RELEASE drain
-/// barrier: when an armed RELEASE is popped, the session's transcript tail
-/// (buffered in the lower lanes) is flushed to the socket FIRST so the RELEASE
-/// cannot overtake it on the wire. Shares `drain`'s write-timeout/re-buffer
-/// behaviour; a write error tears the connection down (the not-yet-written
-/// frames stay buffered and are retried on reconnect, ahead of the RELEASE,
-/// whose barrier is still armed — so ordering is re-established).
+/// Write the CLOSING session's own buffered NON-control tail (interactive, then
+/// bulk frames whose [`frame_stream`] equals `stream`) to the socket, leaving
+/// the control lane AND every other session's lower-lane frames untouched. Used
+/// by the per-session RELEASE drain barrier: when an armed RELEASE is popped,
+/// that job's transcript tail is flushed to the socket FIRST so the RELEASE
+/// cannot overtake it on the wire. Fencing to `stream` (rather than draining the
+/// whole lower-lane queue) means a busy neighbour's transcript flood can never
+/// starve this barrier or block steer/shutdown behind an unbounded flush. Shares
+/// `drain`'s write-timeout/re-buffer behaviour; a write error tears the
+/// connection down (the not-yet-written frames stay buffered and are retried on
+/// reconnect, ahead of the RELEASE, whose barrier is still armed — so ordering
+/// is re-established).
 async fn drain_lower_lanes(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
     incarnation: u32,
+    stream: &str,
 ) -> anyhow::Result<()> {
     loop {
         let mut frame = {
             let mut buf = client.outbound.lock().unwrap();
-            match buf.pop_lower_lane() {
+            match buf.pop_lower_lane_for_stream(stream) {
                 Some(f) => f,
                 None => return Ok(()),
             }
@@ -1649,23 +1772,32 @@ async fn drain_lower_lanes(
     }
 }
 
-/// Terminal shutdown drain: write ONLY the control lane (the DEREGISTER
-/// snapshot, plus any still-buffered RELEASE/HEARTBEAT) to the socket, then
-/// return so the caller can send the Close. Unlike [`drain`], it deliberately
-/// leaves the lower lanes (bulk transcript, interactive steer) buffered and
-/// UNSENT: a clean shutdown must deregister every worker promptly and must not
-/// block for up to `WRITE_TIMEOUT` per frame on a potentially large bulk/steer
-/// backlog the process is about to discard with the socket anyway.
+/// Terminal shutdown drain: write the control lane (the DEREGISTER snapshot,
+/// plus any still-buffered RELEASE/HEARTBEAT) to the socket, then return so the
+/// caller can send the Close. Unlike [`drain`], it deliberately leaves the bulk
+/// transcript / interactive steer backlog that does NOT belong to a closing
+/// job buffered and UNSENT: a clean shutdown must deregister every worker
+/// promptly and must not block for up to `WRITE_TIMEOUT` per frame on a
+/// potentially large backlog the process is about to discard with the socket
+/// anyway.
 ///
-/// There is no RELEASE drain barrier here — the transcript tail a RELEASE orders
-/// against is exactly the lower-lane backlog being discarded — and no
-/// incarnation re-stamping, since control frames are never transcript `produce`
-/// relays. A write error or timeout ends the drain WITHOUT re-buffering: this is
-/// the terminal path, so there is no reconnect to retry on.
+/// It DOES honour the per-session RELEASE drain barrier, like [`drain`]: when it
+/// pops an armed RELEASE it first flushes THAT job's own transcript tail
+/// ([`drain_lower_lanes`], fenced to the job's stream) so the RELEASE never
+/// reaches the hub ahead of the transcript it orders against. If flushing that
+/// tail fails the connection is already gone — the RELEASE is DROPPED (not sent
+/// ahead of a tail that will never be written); reconnect resync re-derives the
+/// job's ownership (authoritative; nano-workforce#893). A write error or timeout
+/// ends the drain WITHOUT re-buffering: this is the terminal path, so there is
+/// no reconnect to retry on.
 async fn drain_control(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
 ) -> anyhow::Result<()> {
+    // Re-stamp any flushed transcript tail with the current incarnation, exactly
+    // as `drain` does (a tail buffered during the outage would otherwise carry a
+    // stale generation).
+    let incarnation = client.generation.load(Ordering::Relaxed);
     loop {
         let frame = {
             let mut buf = client.outbound.lock().unwrap();
@@ -1674,6 +1806,21 @@ async fn drain_control(
                 None => return Ok(()),
             }
         };
+        // Shutdown tail-before-RELEASE: an armed RELEASE must not reach the
+        // socket ahead of its job's own transcript tail. Flush ONLY that job's
+        // buffered tail first (other sessions' backlog stays discarded). If that
+        // write fails the connection is gone — DROP the RELEASE rather than send
+        // it ahead of a tail that will never be written, and end the terminal
+        // drain (ownership is re-derived by reconnect resync).
+        if frame.family == Family::Release {
+            if let ReleaseGate::Defer { stream } = client.release_gate(&frame.payload) {
+                if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream).await {
+                    client.disarm_release_barrier(&stream);
+                    return Err(e);
+                }
+                client.disarm_release_barrier(&stream);
+            }
+        }
         match encode_frame(&frame) {
             Ok(bytes) => match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
                 Ok(Ok(())) => {}
@@ -3354,6 +3501,272 @@ mod tests {
         assert_eq!(got, ControlFrame::Prompt { text: "steer-me".into() });
 
         drop(session);
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // --- Authoritative-resync RELEASE-barrier fixes (round 12) -----------
+
+    // #6: during an OUTAGE the buffered completed-ownership RELEASE set must be
+    // bounded. `push_back_release_bounded` collapses the OLDEST RELEASE once the
+    // cap is reached (reconnect resync re-derives ownership, so a collapsed one
+    // is redundant) and names its stream so the caller can disarm the orphaned
+    // barrier — while NEVER touching the transcript tail (ownership only).
+    #[test]
+    fn push_back_release_bounded_collapses_oldest_over_cap() {
+        let mut buf = LaneBuffer::with_limits(64, 0);
+        let s0 = compose_stream_id("w", "j0");
+        // A transcript frame the RELEASE cap must never collapse.
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": s0, "chunk": "t" }),
+        ));
+        let rel = |j: &str| {
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": j }),
+            )
+        };
+        assert!(buf.push_back_release_bounded(rel("j0"), 2).is_none());
+        assert!(buf.push_back_release_bounded(rel("j1"), 2).is_none());
+        // Third RELEASE at cap=2 collapses the OLDEST (j0) and names its stream.
+        let collapsed = buf.push_back_release_bounded(rel("j2"), 2);
+        assert_eq!(collapsed.as_deref(), Some(s0.as_str()));
+        let releases: Vec<String> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            releases,
+            vec!["j1".to_string(), "j2".to_string()],
+            "oldest RELEASE collapsed, newest kept, count held at the cap"
+        );
+        assert!(
+            buf.bulk.iter().any(|bf| bf.frame.payload["chunk"] == "t"),
+            "the transcript tail is never collapsed by the RELEASE cap (ownership only)"
+        );
+    }
+
+    // #6 (end-to-end on the client): completing more jobs than the cap while
+    // DISCONNECTED keeps the buffered RELEASE set bounded, and disarms the
+    // orphaned drain barrier of every collapsed RELEASE.
+    #[tokio::test]
+    async fn release_job_bounds_buffered_releases_during_an_outage() {
+        let client = HubClient::spawn(test_config(), &[]); // port 1: never connects
+        assert!(
+            !client.connected.load(Ordering::Relaxed),
+            "precondition: the client is disconnected (outage)"
+        );
+        let first = compose_stream_id("w", "job-0");
+        // Arm a barrier for the oldest job, exactly as `close()` would.
+        client
+            .release_barriers
+            .lock()
+            .unwrap()
+            .insert(first.clone(), ReleaseBarrier { armed: true });
+        for i in 0..RELEASE_OUTAGE_CAP + 5 {
+            client.release_job("w", &format!("job-{i}"));
+        }
+        let releases = client
+            .outbound
+            .lock()
+            .unwrap()
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .count();
+        assert_eq!(
+            releases, RELEASE_OUTAGE_CAP,
+            "the buffered RELEASE set stays bounded during an outage"
+        );
+        assert!(
+            !client.release_barriers.lock().unwrap().contains_key(&first),
+            "a collapsed RELEASE's orphaned drain barrier is disarmed"
+        );
+        client.shutdown().await;
+    }
+
+    // #6 (sibling): a LIVE connection keeps the old behaviour — every RELEASE is
+    // admitted exempt and ordered, with NO outage cap (the cap must only bite
+    // while disconnected, or a busy worker would lose completions it can deliver).
+    #[tokio::test]
+    async fn release_job_is_unbounded_on_a_live_connection() {
+        let client = HubClient::spawn(test_config(), &[]); // never truly connects
+        client.connected.store(true, Ordering::Relaxed); // but drive the live path
+        for i in 0..RELEASE_OUTAGE_CAP + 5 {
+            client.release_job("w", &format!("job-{i}"));
+        }
+        let releases = client
+            .outbound
+            .lock()
+            .unwrap()
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .count();
+        assert_eq!(
+            releases,
+            RELEASE_OUTAGE_CAP + 5,
+            "a live connection keeps every RELEASE (no outage cap applies)"
+        );
+        client.shutdown().await;
+    }
+
+    // #8: the RELEASE drain barrier must be fenced to the CLOSING session's own
+    // queued transcript tail. `pop_lower_lane_for_stream` drains only frames of
+    // the named stream (oldest first), leaving every other session's frames —
+    // and the control lane — untouched, so a busy neighbour cannot starve the
+    // barrier or block steer/shutdown behind an unbounded global flush.
+    #[test]
+    fn pop_lower_lane_for_stream_drains_only_that_stream() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        let a = compose_stream_id("w", "A");
+        let b = compose_stream_id("w", "B");
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            0,
+            json!({ "instance": "w" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            1,
+            json!({ "op": "produce", "stream": a, "chunk": "a1" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            2,
+            json!({ "op": "produce", "stream": b, "chunk": "b1" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            3,
+            json!({ "op": "produce", "stream": a, "chunk": "a2" }),
+        ));
+        // Stream A yields only A's frames, oldest first.
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&a).unwrap().payload["chunk"],
+            "a1"
+        );
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&a).unwrap().payload["chunk"],
+            "a2"
+        );
+        assert!(
+            buf.pop_lower_lane_for_stream(&a).is_none(),
+            "A's tail is fully drained — the barrier stops at its own stream"
+        );
+        // Stream B's frame and the control frame are left in place.
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&b).unwrap().payload["chunk"],
+            "b1"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Register),
+            "a per-stream drain never touches the control lane"
+        );
+    }
+
+    // #3: on the TERMINAL shutdown drain, a job's transcript tail must reach the
+    // socket BEFORE its RELEASE (the RELEASE must never overtake the tail it
+    // orders against). `drain_control` now honours the armed barrier, flushing
+    // the job's own tail first. Driven over a hand-held socket so the test
+    // deterministically exercises `drain_control` rather than the live `drain`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drain_writes_a_jobs_tail_before_its_release() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<(Family, Value)>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send((frame.family, frame.payload)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // The HubClient itself targets a dead port (its own loop never connects),
+        // so the only traffic on the server is from the socket we drive by hand.
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let ws = connect(&cfg).await.expect("connect to the in-process hub");
+        let (mut write, _read) = ws.split();
+
+        let instance = "w-sd3";
+        let job = "job-sd3";
+        let stream = compose_stream_id(instance, job);
+        // Reproduce the shutdown state `close()` leaves: this job's transcript
+        // tail buffered (bulk) behind an ARMED RELEASE (control) still queued.
+        client.release_barriers.lock().unwrap().insert(
+            stream.clone(),
+            ReleaseBarrier { armed: true },
+        );
+        {
+            let mut buf = client.outbound.lock().unwrap();
+            buf.push(Frame::new(
+                Lane::Bulk,
+                Family::Relay,
+                1,
+                json!({ "op": "produce", "stream": stream, "chunk": "tail" }),
+            ));
+            buf.push(Frame::new(
+                Lane::Control,
+                Family::Release,
+                2,
+                json!({ "instance": instance, "jobKey": job }),
+            ));
+        }
+
+        drain_control(&client, &mut write)
+            .await
+            .expect("shutdown drain writes the tail then the RELEASE");
+
+        let mut order: Vec<Family> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_produce = false;
+        let mut saw_release = false;
+        while !(saw_produce && saw_release) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (fam, _payload) = tokio::time::timeout(remaining, frames_rx.recv())
+                .await
+                .expect("timed out awaiting wire frames")
+                .expect("server frame channel closed");
+            order.push(fam);
+            match fam {
+                Family::Relay => saw_produce = true,
+                Family::Release => saw_release = true,
+                _ => {}
+            }
+        }
+        let idx = |f: Family| order.iter().position(|x| *x == f).unwrap();
+        assert!(
+            idx(Family::Relay) < idx(Family::Release),
+            "shutdown must write the transcript tail BEFORE the RELEASE, got {order:?}"
+        );
+        assert!(
+            !client.release_barriers.lock().unwrap().contains_key(&stream),
+            "the barrier is consumed once its RELEASE is written"
+        );
         client.shutdown().await;
         server.abort();
     }
