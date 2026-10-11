@@ -637,8 +637,18 @@ impl HubClient {
                     Some(cap)
                 }
             };
+            // REGISTER and CLAIM are admitted through the capacity-EXEMPT
+            // control path (shedding only lower-priority traffic, never dropping
+            // the presence frame). The ordinary bounded `push` drops a control
+            // newcomer once the control lane is full (control never evicts
+            // control), which for presence is unrepairable on a LIVE connection:
+            // `in_flight` is updated below regardless, resync only re-emits on a
+            // *reconnect*, so a dropped CLAIM on a healthy link streams this
+            // job's transcript/RELEASE for ownership the hub never saw claimed.
+            // Presence is bounded by live instances + in-flight jobs, so
+            // admitting it exempt is safe (same policy as the shutdown snapshot).
             if let Some(cap) = register {
-                buf.push(self.make_frame(
+                buf.push_back_control_bounded(self.make_frame(
                     Lane::Control,
                     Family::Register,
                     json!({ "instance": instance, "capability": cap }),
@@ -652,7 +662,7 @@ impl HubClient {
                 .entry(instance.to_string())
                 .or_default()
                 .insert(job_key.to_string());
-            buf.push(self.make_frame(
+            buf.push_back_control_bounded(self.make_frame(
                 Lane::Control,
                 Family::Claim,
                 json!({ "instance": instance, "jobKey": job_key }),
@@ -1133,7 +1143,16 @@ impl HubSession {
         // await completion on the runtime. Bind the removed handle FIRST so the
         // bridge_tasks MutexGuard drops before the `.await` (a held guard is not
         // `Send` and would make the surrounding `execute` future non-`Send`).
-        let _tx = self.transcript.take();
+        //
+        // Idempotent against a SECOND `close()`: the transcript sender is the
+        // one-shot token for "this session's RELEASE still needs handling". Once
+        // it has been taken (by a prior `close`, or by the Drop-path
+        // `flush_transcript`), the barrier is already armed and the RELEASE
+        // already enqueued — re-running the steps below would arm the barrier a
+        // second time and enqueue a DUPLICATE RELEASE for the same job. Bail out.
+        let Some(_tx) = self.transcript.take() else {
+            return;
+        };
         let flush = self
             .client
             .bridge_tasks
@@ -2677,6 +2696,60 @@ mod tests {
         assert!(
             relay_seq < release_seq,
             "transcript tail (seq {relay_seq}) must be enqueued before RELEASE (seq {release_seq})"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 11): a CLAIM (and REGISTER) must be admitted through the
+    // capacity-EXEMPT control path. On a LIVE connection the ordinary bounded
+    // push drops a control newcomer once the control lane is full (control never
+    // evicts control), and because `in_flight` is updated regardless while the
+    // reconnect resync only re-emits on a *reconnect*, a dropped CLAIM on a
+    // healthy link would stream this job's transcript/RELEASE for ownership the
+    // hub never saw claimed.
+    #[tokio::test]
+    async fn register_and_claim_are_admitted_when_control_lane_is_full() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 2;
+        let client = HubClient::spawn(cfg, &[]);
+        // Saturate the control lane so nothing lower-priority remains to shed.
+        client.enqueue(Lane::Control, Family::Heartbeat, json!({ "n": 1 }));
+        client.enqueue(Lane::Control, Family::Heartbeat, json!({ "n": 2 }));
+        let _session = client.register_session("w-full", capability(), "job-full");
+        let frames = buffered(&client);
+        assert!(
+            frames
+                .iter()
+                .any(|(_, fam, p)| *fam == Family::Register && p["instance"] == "w-full"),
+            "REGISTER must be admitted even when the control lane is full"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(_, fam, p)| *fam == Family::Claim && p["jobKey"] == "job-full"),
+            "CLAIM must be admitted even when the control lane is full"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 11): `close()` must be idempotent. A second `close` (or a
+    // `close` followed by the Drop fallback) must NOT arm the barrier again and
+    // enqueue a DUPLICATE RELEASE for the same job.
+    #[tokio::test]
+    async fn second_close_does_not_enqueue_a_duplicate_release() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-idem", capability(), "job-idem");
+        session.close().await;
+        session.close().await;
+        drop(session);
+        let releases = client
+            .enqueue_log()
+            .into_iter()
+            .filter(|(_, _, f)| *f == Family::Release)
+            .count();
+        assert_eq!(
+            releases, 1,
+            "a job must be RELEASEd exactly once across repeated close/drop"
         );
         client.shutdown().await;
     }

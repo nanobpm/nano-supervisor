@@ -327,6 +327,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 // surfacing the error.
                 abort_slots_and_cleanup(
                     handles,
+                    hub.as_ref(),
                     &shutdown_tx,
                     &sock_path,
                     &state_home.join("supervisor.json"),
@@ -464,10 +465,13 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 /// and leave the bound socket pathname and any published descriptor behind as
 /// stale leftovers. Instead, tell the slots to abort in-flight work, join every
 /// one, and remove the socket + descriptor, so a half-started daemon never
-/// orphans live slots or a stale socket file.
+/// orphans live slots or a stale socket file. The hub client (if any) is also
+/// shut down here — its task holds its own `Arc`, so merely dropping the local
+/// handle would leave it running without ever emitting its DEREGISTER.
 #[cfg(unix)]
 async fn abort_slots_and_cleanup(
     handles: Vec<tokio::task::JoinHandle<()>>,
+    hub: Option<&Arc<crate::hub::HubClient>>,
     shutdown_tx: &watch::Sender<slot::Shutdown>,
     sock_path: &Path,
     descriptor_path: &Path,
@@ -476,6 +480,13 @@ async fn abort_slots_and_cleanup(
     for h in handles {
         h.abort();
         let _ = h.await;
+    }
+    // The hub task holds its own `Arc<HubClient>`, so dropping the local handle
+    // on the fail path would NOT stop it — it would keep running without ever
+    // emitting the clean-shutdown DEREGISTER. Await its shutdown here so a
+    // half-started daemon tears the hub down just like the normal exit path.
+    if let Some(hub) = hub {
+        hub.shutdown().await;
     }
     let _ = std::fs::remove_file(sock_path);
     let _ = std::fs::remove_file(descriptor_path);
@@ -2458,7 +2469,7 @@ mod tests {
             .collect();
         let probes: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
 
-        abort_slots_and_cleanup(handles, &tx, &sock_path, &descriptor_path).await;
+        abort_slots_and_cleanup(handles, None, &tx, &sock_path, &descriptor_path).await;
 
         for p in &probes {
             assert!(p.is_finished(), "every slot must be stopped, not detached");

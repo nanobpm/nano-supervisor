@@ -182,6 +182,24 @@ impl Agent {
     }
 
     async fn request(&mut self, method: &str, params: Value, idle: Duration) -> Result<Value> {
+        self.request_signalling(method, params, idle, None).await
+    }
+
+    /// Like [`request`](Self::request), but fires `on_sent` the instant the
+    /// request frame has been accepted by `out` (before awaiting the response).
+    /// Used to GATE inbound steer behind the original `session/prompt`: a steer
+    /// control delivered while ACP init was still running must never reach `out`
+    /// before the turn it is meant to steer has been enqueued, or a pre-turn
+    /// `cancel` no-ops and an injected `prompt` becomes the FIRST turn (issue
+    /// #10). If the send fails/times out, `on_sent` is dropped un-fired, which
+    /// the waiting steer task observes as a closed channel and declines to run.
+    async fn request_signalling(
+        &mut self,
+        method: &str,
+        params: Value,
+        idle: Duration,
+        on_sent: Option<oneshot::Sender<()>>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = oneshot::channel();
@@ -198,7 +216,13 @@ impl Agent {
             .out
             .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         match tokio::time::timeout(idle, send).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // The request frame is queued ahead of anything the gated steer
+                // task may later enqueue; release the gate so steer can proceed.
+                if let Some(on_sent) = on_sent {
+                    let _ = on_sent.send(());
+                }
+            }
             Ok(Err(_)) => {
                 self.shared.lock().unwrap().pending.remove(&id);
                 bail!("agent stdin closed");
@@ -298,11 +322,21 @@ impl Agent {
         // prompts use ids far above the turn's own sequence and are never
         // tracked as pending, so their responses are simply ignored and the
         // original turn's response still completes the run.
+        // Gate the steer task behind the original prompt: a steer control that
+        // arrived during ACP init must not be written to `out` before the very
+        // `session/prompt` below has been enqueued (see `request_signalling`).
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
         let steer_task = self.steer.take().map(|mut rx| {
             use crate::hub::control::ControlFrame;
             let out = self.out.clone();
             let sid = session_id.clone();
             tokio::spawn(async move {
+                // Wait until the original prompt has been enqueued. A closed gate
+                // (sender dropped without firing) means the prompt send failed or
+                // the turn is being torn down — process no steer in that case.
+                if gate_rx.await.is_err() {
+                    return;
+                }
                 let mut id: u64 = 1 << 32;
                 while let Some(control) = rx.recv().await {
                     let frame = match control {
@@ -337,10 +371,11 @@ impl Agent {
             })
         });
         let done = self
-            .request(
+            .request_signalling(
                 "session/prompt",
                 json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": prompt }] }),
                 idle,
+                Some(gate_tx),
             )
             .await;
         if let Some(task) = steer_task {
