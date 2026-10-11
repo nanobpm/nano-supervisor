@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  # The parity ledger guard resolves the issues its PARITY_GAPS rows cite (issue #59).
+  issues: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -81,6 +83,9 @@ jobs:
       NS_ENGINE_URL: http://localhost:8080
       NANO_NO_UPDATE_NOTIFIER: "1"
       C8CTL_NANO_NO_LAUNCHD: "1"
+      # The parity guard (issue #59) calls `gh api` to assert each PARITY_GAPS
+      # issue is still open; without a token `gh` cannot authenticate.
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
@@ -122,6 +127,9 @@ jobs:
     env:
       NS_TARGET: rust
       NS_ENGINE_URL: http://localhost:8080
+      # The parity guard (issue #59) calls `gh api` to assert each PARITY_GAPS
+      # issue is still open; without a token `gh` cannot authenticate.
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
@@ -139,7 +147,7 @@ jobs:
           cargo test -p contract-tests --locked \
             --test worker_prompt --test worker_env --test worker_result \
             --test worker_lease --test worker_finalize --test worker_selection \
-            --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard --test daemon_leak -- --nocapture
+            --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard --test daemon_leak --test parity -- --nocapture
       - name: fleet CLI contract tests (Rust target)
         # live_status_round_trip stays skipped (needs NS_ALLOW_LIVE_SUPERVISOR=1): CI must not start a real daemon (#40).
         run: |

@@ -51,7 +51,9 @@ Engine-dependent tests read `NS_ENGINE_URL` (default `http://localhost:8080`).
 It refuses anything that is not localhost / 127.0.0.1 unless
 `NS_ALLOW_REMOTE_ENGINE=1` — **never point it at merlin**. When no engine is
 reachable, those tests **skip with a message** (look for `SKIP`), they do not
-fail. The fake-agent and redaction tests run with no engine, so CI stays green.
+fail. A behavior a target has not implemented yet is a **typed XFAIL** (see
+[Parity gaps](#parity-gaps-typed-xfail-issue-60--59)), also not a failure. The
+fake-agent and redaction tests run with no engine, so CI stays green.
 
 ## Issue-numbered worker fixes covered
 
@@ -69,7 +71,37 @@ test. Keep this list current as tests are added:
 | Reclaim / reap sweeps | Startup and periodic sweeps reap stale runs (`--reap-age`, `--reap-interval`, `--keep-runs`) | `worker_sweeps::startup_sweep_reaps_stale_runs` |
 | Disk-space check | `--min-free-mb` is the container disk floor; it does **not** gate host-sandbox runs (Node behaviour) | `worker_sweeps::min_free_mb_does_not_gate_host_runs` |
 | Checkpoint / resume | A job resumes after its worker is killed mid-run | `worker_resume::killed_worker_job_resumes_not_restarts` |
+| AgentInstance producer (issue #59) | A worker records an engine **AgentInstance** for its job (transcript = the durable artifact), not just a local run dir | `worker_resume::job_writes_an_agent_instance_record` |
+| AgentInstance on conflict (jwulf/c8ctl-plugin-nano#289) | When the element instance is **already associated**, the worker adopts the existing AgentInstance and appends its turn instead of retrying a create it cannot win | `worker_resume::agent_instance_creation_conflict_is_adopted_not_retried` |
+| Durable AgentInstance status (jwulf/c8ctl-plugin-nano#274) | The AgentInstance reaches a terminal status even when the process **stays open** (trivially-completing process masks the bug) | `worker_resume::agent_instance_status_is_durable_when_the_process_stays_open` |
 
 Where the Node plugin's observed behavior looks like a bug, the test captures it
 anyway, marks it `// NODE-QUIRK: <issue link>`, and it is raised on issue #1
 rather than silently "fixed" in the test.
+
+## Parity gaps (typed XFAIL, issue #60 / #59)
+
+A behavior a target does **not** implement yet is recorded in `PARITY_GAPS`
+(`contract-tests/src/lib.rs`) with the issue that tracks it, and asserted at the
+call site:
+
+```rust
+let check = /* Ok(()) if the behavior holds, Err(why) if not */;
+assert_parity(expect_parity(target, Some("owner/repo#123"), check), || why);
+```
+
+`expect_parity` turns a failure under a declared gap into `XFAIL` (not a
+regression) and a *pass* under one into `XPASS` — the marker is stale and must go.
+`tests/parity.rs` fails when any `PARITY_GAPS` row cites a **closed** issue, so a
+gap cannot outlive its fix. Look for `XFAIL`/`XPASS`/`SKIP` in `--nocapture`
+output.
+
+| Gap | Target | Issue |
+| --- | --- | --- |
+| No AgentInstance producer yet (job transcript only local) | rust | nanobpm/nano-supervisor#59 |
+| Create conflict (409) is retried, not adopted | node | jwulf/c8ctl-plugin-nano#289 (fixed in 1.70.3) |
+| AgentInstance never reaches a terminal status | node | jwulf/c8ctl-plugin-nano#274 |
+
+#250 (reactivating a terminal AgentInstance re-runs the agent) has **no
+reproducible scenario yet**, so it is deliberately not asserted here; it is a
+follow-up once the engine exposes one.

@@ -1,39 +1,85 @@
-//! **Checkpoint / resume** and **AgentInstance records**.
+//! **Checkpoint / resume**, **AgentInstance transcripts**, and the parity gaps
+//! between the reference producer and the Rust port.
 //!
 //! When a worker is killed mid-job, a fresh worker picks the job up again once
 //! the activation lapses, rather than starting from a clean slate. Along the way
 //! the worker writes AgentInstance records — create and update, and the history
 //! turns for a job. Needs a live engine; skips without one.
+//!
+//! The transcript half of this file is the **contract-first split of issue #59**:
+//! the behaviour the Rust producer must grow is landed here as tests first, with
+//! the Rust target (and, for the reference's own open bugs, the Node target too)
+//! marked through the typed [`contract_tests::expect_parity`] gate. The parent
+//! issue stays open until the Rust target passes with no marker.
 
-use contract_tests::{require_engine_and_target, run_worker_job, skip, Skip, Target};
-use serde_json::json;
+use contract_tests::{
+    assert_parity, bpmn, expect_parity, preassociate_agent_instance, require_engine_and_target,
+    run_worker_job, run_worker_job_with_bpmn, skip, Skip, Target,
+};
+use serde_json::{json, Value};
 
-/// After a job runs, an AgentInstance record exists for it with at least one
-/// history turn — asserted against the ENGINE's AgentInstance read model, not a
-/// worker log line.
+/// The `{role, content:[{contentType:"TEXT", text:…}, …]}` text of one history
+/// turn, concatenated. `None` for a turn that carries no TEXT content.
+fn turn_text(turn: &Value) -> Option<String> {
+    let blocks = turn["content"].as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|b| b["contentType"].as_str() == Some("TEXT"))
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.is_empty()).then_some(text)
+}
+
+/// The roles present in a history, in order — the shape assertions read.
+fn roles(history: &[Value]) -> Vec<String> {
+    history
+        .iter()
+        .map(|t| t["role"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+/// The AgentInstance for a process instance, or a helpful panic. Exactly one
+/// producer-owned instance is expected per job.
+fn sole_agent_instance(engine: &contract_tests::Engine, pik: &str, agent_stderr: &str) -> Value {
+    let instances = engine.agent_instances(pik);
+    assert_eq!(
+        instances.len(),
+        1,
+        "the worker must mint exactly one AgentInstance for process instance {pik}; \
+         the engine has {}.\nworker stderr:\n{agent_stderr}",
+        instances.len()
+    );
+    instances.into_iter().next().unwrap()
+}
+
+/// The instance key as a string, tolerating the engine's numeric encoding.
+fn instance_key(instance: &Value) -> String {
+    instance["agentInstanceKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| instance["agentInstanceKey"].as_i64().map(|k| k.to_string()))
+        .expect("an AgentInstance carries its key")
+}
+
+/// The durable transcript an agent job leaves behind: an ASSISTANT turn carrying
+/// the agent's emitted text — the UPDATE path, on top of the create — plus the
+/// fencing fields the engine records on every turn.
 #[test]
 fn job_writes_an_agent_instance_record() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    // The Rust worker has no AgentInstance/history producer yet (it never calls
-    // createAgentInstance/updateAgentInstance), so the engine-observable record
-    // is pinned for the Node target until the Rust worker grows the producer
-    // (issues #1/#3) — same gate as before, but the assertion below is now the
-    // engine's record, not a stderr substring.
-    if target != Target::Node {
-        skip!("AgentInstance/history recording is deferred for the Rust worker (issues #1/#3)");
-    }
     let outcome = run_worker_job(
         &engine,
         &target,
-        "resume-agentinstance",
+        "resume-transcript",
         &[
-            json!({ "emit": "turn one" }),
+            json!({ "emit": "transcript turn" }),
             json!({ "write_result": { "ok": true } }),
         ],
-        json!({ "prompt": "record me" }),
+        json!({ "prompt": "record the transcript" }),
         &[],
         &[],
     );
@@ -44,47 +90,340 @@ fn job_writes_an_agent_instance_record() {
         outcome.stderr()
     );
 
-    // The durable record: an AgentInstance correlated on this process instance,
-    // carrying at least one AgentHistory turn (the agent's "turn one").
-    let instances = engine.agent_instances(&outcome.process_instance_key);
-    assert!(
-        !instances.is_empty(),
-        "the worker must mint an AgentInstance for the job's process instance \
-         (processInstanceKey {}); the engine has none",
-        outcome.process_instance_key
+    // The whole transcript half of the parity gap: something durable must exist
+    // for the job. Rust has no producer at all (#59), so its marker gates every
+    // assertion below in one place.
+    let has_instance = !engine
+        .agent_instances(&outcome.process_instance_key)
+        .is_empty();
+    assert_parity(
+        expect_parity(
+            target,
+            (target == Target::Rust).then_some("nanobpm/nano-supervisor#59"),
+            has_instance.then_some(()).ok_or_else(|| {
+                format!(
+                    "no AgentInstance for process instance {}",
+                    outcome.process_instance_key
+                )
+            }),
+        ),
+        || {
+            format!(
+                "the worker must mint an AgentInstance for the job's process instance \
+                 ({}); the engine has none.\nworker stderr:\n{}",
+                outcome.process_instance_key,
+                outcome.stderr()
+            )
+        },
     );
-    let key = instances[0]["agentInstanceKey"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            instances[0]["agentInstanceKey"]
-                .as_i64()
-                .map(|k| k.to_string())
-        })
-        .expect("an AgentInstance carries its key");
+    if target == Target::Rust {
+        return; // #59: no record to inspect yet — the marker above already said so.
+    }
+
+    let instance = sole_agent_instance(&engine, &outcome.process_instance_key, &outcome.stderr());
+    let key = instance_key(&instance);
     let history = engine.agent_instance_history(&key);
     assert!(
         !history.is_empty(),
-        "the AgentInstance {key} must have at least one recorded history turn; \
-         the engine has none"
+        "AgentInstance {key} has no history turns"
     );
-    // The opening CONFIGURATION item alone satisfies `!history.is_empty()`, so
-    // also pin the UPDATE path: the agent's emitted "turn one" must be recorded
-    // as an ASSISTANT history turn whose text content carries it. History items
-    // are `{role, content:[{contentType:"TEXT", text:…}, …]}`.
-    let has_assistant_turn = history.iter().any(|turn| {
-        turn["role"].as_str() == Some("ASSISTANT")
-            && turn["content"].as_array().is_some_and(|blocks| {
-                blocks.iter().any(|b| {
-                    b["contentType"].as_str() == Some("TEXT")
-                        && b["text"].as_str().is_some_and(|t| t.contains("turn one"))
-                })
-            })
-    });
+
+    // The opening CONFIGURATION turn carries the job's system prompt and the
+    // derived limits — the definition the engine exposes on the instance too.
+    let config = history
+        .iter()
+        .find(|t| t["role"].as_str() == Some("CONFIGURATION"))
+        .unwrap_or_else(|| panic!("no CONFIGURATION turn; history: {history:#?}"));
+    let config_text = config["systemPrompt"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("");
     assert!(
-        has_assistant_turn,
-        "the AgentInstance {key} history must record the emitted assistant turn \
-         \"turn one\" (role ASSISTANT, TEXT content); history: {history:#?}"
+        config_text.contains("record the transcript"),
+        "the CONFIGURATION turn must carry the job's system prompt; got {config_text:?}\n\
+         history: {history:#?}"
+    );
+    assert!(
+        config["limits"].is_object(),
+        "the CONFIGURATION turn must carry the derived limits; got {:#?}",
+        config["limits"]
+    );
+    assert!(
+        config["jobKey"].is_string() && config["elementInstanceKey"].is_string(),
+        "history turns are fenced by jobKey/elementInstanceKey; got jobKey={:?} eik={:?}",
+        config["jobKey"],
+        config["elementInstanceKey"]
+    );
+
+    // The UPDATE path: the agent's emitted text is appended as an ASSISTANT turn.
+    let assistant = history
+        .iter()
+        .find(|t| t["role"].as_str() == Some("ASSISTANT"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the transcript must record the assistant turn (roles: {:?})\nhistory: {history:#?}",
+                roles(&history)
+            )
+        });
+    let text = turn_text(assistant).unwrap_or_default();
+    assert!(
+        text.contains("transcript turn"),
+        "the ASSISTANT turn must carry the agent's emitted text; got {text:?}"
+    );
+
+    // The instance's own read model: a definition the reference derives from the
+    // agent profile, and a metrics block (the reference's token metrics are
+    // always zero — its recorded #289 parity gap — so only the shape is pinned).
+    assert!(
+        instance["definition"]["systemPrompt"].is_array(),
+        "the instance definition carries the agent's system prompt; got {:#?}",
+        instance["definition"]
+    );
+    assert!(
+        instance["metrics"]["modelCalls"].is_number()
+            || instance["metrics"]["modelCalls"].is_null(),
+        "the instance carries a metrics block; got {:#?}",
+        instance["metrics"]
+    );
+}
+
+/// The reference is expected to leave the AgentInstance `COMPLETED` and the
+/// process instance non-`COMPLETED` — and this is the parity test that will go
+/// **green → red → green** for the Rust port, so it is the issue-#59 gate.
+///
+/// The process is gated (`bpmn::single_task_with_gate`: a parallel `userTask`
+/// holds the instance ACTIVE after the agent job settles). Without that gate the
+/// engine force-completes the process instance — and with it the AgentInstance —
+/// the moment the job completes, masking the producer's own terminal update.
+/// With it, the AgentInstance can only read `COMPLETED` if the producer's
+/// `status:COMPLETED` update actually landed, which is exactly the behaviour
+/// jwulf/c8ctl-plugin-nano#274 says is broken: UPDATE rejects `COMPLETED`, so
+/// every instance strands non-terminal.
+///
+/// Markers: Rust = #59 (no producer at all). Node = the reference's own #274 —
+/// the pinned reference 422s the update and logs "MANUAL RECONCILIATION
+/// REQUIRED", observed live; the marker drops when the pin moves to a plugin
+/// release carrying the #274 fix (issue #58) and the Node target passes.
+#[test]
+fn agent_instance_status_is_durable_when_the_process_stays_open() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    let job_type = engine.unique_type("resume-terminal");
+    let process_id = format!("p-{job_type}");
+    let outcome = run_worker_job_with_bpmn(
+        &engine,
+        &target,
+        &job_type,
+        &bpmn::single_task_with_gate(&process_id, &job_type),
+        &[
+            json!({ "emit": "terminal turn" }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({ "prompt": "settle me" }),
+        &[],
+        &[],
+    );
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "the agent job itself must settle regardless of the transcript; stderr:\n{}",
+        outcome.stderr()
+    );
+    // The gate held: the process instance is still open, so the engine did NOT
+    // force-complete the AgentInstance. (If this is false the test below would
+    // be vacuous — the engine's bookkeeping would produce the COMPLETED.)
+    assert_eq!(
+        engine.process_active(&outcome.process_instance_key),
+        Some(true),
+        "the gated process instance must stay ACTIVE after the agent job settles \
+         (processInstanceKey {}); the gate did not hold, so the status assertion \
+         below would be masked by process completion",
+        outcome.process_instance_key
+    );
+
+    let gap = match target {
+        Target::Rust => Some("nanobpm/nano-supervisor#59"),
+        Target::Node => Some("jwulf/c8ctl-plugin-nano#274"),
+    };
+    let instances = engine.agent_instances(&outcome.process_instance_key);
+    let terminal = match instances.first() {
+        None => Err(format!(
+            "no AgentInstance for process instance {} — the producer never created one",
+            outcome.process_instance_key
+        )),
+        Some(instance) => {
+            let status = instance["status"].as_str().unwrap_or("");
+            if status == "COMPLETED" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the AgentInstance must be COMPLETED once the agent job has settled and \
+                     the process is still open, so no engine bookkeeping can strand it; \
+                     got status={status:?} completionDate={:?}.\n\
+                     worker stderr:\n{}",
+                    instance["completionDate"],
+                    outcome.stderr()
+                ))
+            }
+        }
+    };
+    assert_parity(expect_parity(target, gap, terminal), || {
+        format!(
+            "AgentInstance terminal status is not durable on {target:?}; \
+             worker stderr:\n{}",
+            outcome.stderr()
+        )
+    });
+}
+
+/// A second worker's `createAgentInstance` for an element instance the engine
+/// has **already** associated must be **adopted**, not retried: the conflict is
+/// permanent (`409 "element instance … is already associated with agent instance
+/// …"`), so the worker must resume appending to the existing instance.
+///
+/// This is jwulf/c8ctl-plugin-nano#289. The harness pre-associates an instance
+/// (issue #289's precondition — an element instance that already owns one), then
+/// releases and lets the worker pick the job up. The pinned reference retries the
+/// create futilely and then gives up with **no transcript recorded and no
+/// diagnostic naming the failed precondition**, exactly the #289 report; a
+/// reference carrying the fix adopts the harness instance and appends the
+/// agent's turn to it.
+///
+/// Markers: Node = #289 (needs a plugin release past 1.70.2). Rust = #59 (no
+/// producer at all).
+#[test]
+fn agent_instance_creation_conflict_is_adopted_not_retried() {
+    let (engine, target) = match require_engine_and_target() {
+        Ok(v) => v,
+        Err(Skip(why)) => skip!(why),
+    };
+    if target == Target::Rust {
+        skip!("the Rust worker has no AgentInstance producer yet (nanobpm/nano-supervisor#59)");
+    }
+
+    // A gated process keeps the element instance ACTIVE while the harness
+    // associates it, so the later, competing create really does conflict.
+    let job_type = engine.unique_type("resume-conflict");
+    let process_id = format!("p-{job_type}");
+    let xml = bpmn::single_task_with_gate(&process_id, &job_type);
+    engine.deploy_bpmn(&process_id, &xml).expect("deploy bpmn");
+    let instance = engine
+        .create_instance(&process_id, json!({ "prompt": "adopt me" }))
+        .expect("create instance");
+    let pik = instance["processInstanceKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            instance["processInstanceKey"]
+                .as_i64()
+                .map(|k| k.to_string())
+        })
+        .expect("processInstanceKey");
+
+    // Learn the element instance key by activating the job by hand, then
+    // pre-associate an AgentInstance with it and release the activation so the
+    // worker can pick the SAME element instance up.
+    let activations: Value = engine
+        .http()
+        .post(format!("{}/v2/jobs/activation", engine.url()))
+        .json(&json!({
+            "type": job_type,
+            "timeout": 600000,
+            "maxJobsToActivate": 1,
+            "worker": "contract-test-preassociation",
+            "requestTimeout": 0,
+        }))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .expect("activate the job to learn its element instance key");
+    let job = activations["jobs"]
+        .as_array()
+        .and_then(|jobs| jobs.first())
+        .expect("the gated process has an activatable job");
+    let element_instance_key = job["elementInstanceKey"]
+        .as_str()
+        .expect("the activated job carries elementInstanceKey");
+    let job_key = job["jobKey"].as_str().expect("jobKey");
+    let preassociated = preassociate_agent_instance(
+        &engine,
+        element_instance_key,
+        job_key,
+        "nano-lease:contract-test-preassociation",
+        "pre-associated by the contract harness",
+    );
+    // Release the activation (retries preserved, no backoff) so the worker gets
+    // the job and steps on the pre-associated element instance.
+    engine
+        .http()
+        .post(format!("{}/v2/jobs/{job_key}/failure", engine.url()))
+        .json(&json!({
+            "retries": 3,
+            "retryBackOff": 0,
+            "errorMessage": "contract test: releasing the pre-association activation",
+        }))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .expect("release the pre-association activation");
+
+    let outcome = run_worker_job_with_bpmn(
+        &engine,
+        &target,
+        &job_type,
+        &xml,
+        &[
+            json!({ "emit": "adopted turn" }),
+            json!({ "write_result": { "ok": true } }),
+        ],
+        json!({ "prompt": "adopt me" }),
+        &[],
+        &[],
+    );
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "the job must settle whatever the transcript does; stderr:\n{}",
+        outcome.stderr()
+    );
+
+    // Adopted, not orphaned: the pre-associated instance exists and the agent's
+    // turn was appended to IT (the worker resumed the existing instance rather
+    // than retrying a create it could never win). Marked with the reference's
+    // own #289 for the Node target — the pinned reference retries the permanent
+    // conflict and records nothing, observed live above.
+    let instances = engine.agent_instances(&pik);
+    let history = engine.agent_instance_history(&preassociated);
+    let adopted_turn = history.iter().any(|t| {
+        t["role"].as_str() == Some("ASSISTANT")
+            && turn_text(t).is_some_and(|text| text.contains("adopted turn"))
+    });
+    let adopted = instances.iter().any(|i| instance_key(i) == preassociated);
+    let check = match (adopted, adopted_turn) {
+        (true, true) => Ok(()),
+        (true, false) => Err(format!(
+            "the worker adopted instance {preassociated} but did not append the agent's \
+             turn to it (issue #289: the create is retried instead of adopted, or the \
+             append is refused); history: {history:#?}"
+        )),
+        (false, _) => Err(format!(
+            "the worker did not adopt the pre-associated instance {preassociated} \
+             (issue #289); the process instance now has: {instances:#?}"
+        )),
+    };
+    assert_parity(
+        expect_parity(target, Some("jwulf/c8ctl-plugin-nano#289"), check),
+        || {
+            format!(
+                "AgentInstance creation conflicts must be adopted, not retried \
+                 (jwulf/c8ctl-plugin-nano#289).\nworker stderr:\n{}",
+                outcome.stderr()
+            )
+        },
     );
 }
 
