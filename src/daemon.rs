@@ -199,7 +199,29 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // slot. Enabled only when the `NANO_AGENTIC*` environment configures it;
     // otherwise `None` and the daemon runs with no hub connection, exactly as
     // before. The connection task reconnects on its own and buffers while down.
-    let hub = crate::hub::HubConfig::from_env().map(crate::hub::HubClient::spawn);
+    //
+    // Build the slot identities FIRST so the client can REGISTER every
+    // configured slot at spawn (register-on-connect): each `(worker_name,
+    // capability)` pair is one slot's presence identity, making idle capacity
+    // visible on the hub independently of any job. The capability mirrors what
+    // the slot's ACP arm would declare for a job (`slot.rs`), so a slot's
+    // presence is identical whether it is idle or running.
+    let mut slot_identities: Vec<(String, serde_json::Value)> = Vec::new();
+    for hire in &runnable {
+        for slot_idx in 0..opts.slots {
+            let worker_name = format!("{host}-nanod-{}-{slot_idx}", hire.name);
+            slot_identities.push((
+                worker_name,
+                serde_json::json!({
+                    "cognition": hire.model,
+                    "family": hire.rank,
+                    "host": host,
+                }),
+            ));
+        }
+    }
+    let hub = crate::hub::HubConfig::from_env()
+        .map(|cfg| crate::hub::HubClient::spawn(cfg, &slot_identities));
     // The in-process slots this daemon runs, as (worker id, profile) pairs — the
     // control socket's `status` reply reports each as a worker
     // (nanobpm/nano-supervisor#8).

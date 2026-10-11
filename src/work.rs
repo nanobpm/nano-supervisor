@@ -356,7 +356,19 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         "worker {worker_name} for hire \"{}\" [{}] over job types {job_types:?}",
         hire.name, hire.rank
     ));
-    let hub = crate::hub::HubConfig::from_env().map(crate::hub::HubClient::spawn);
+    // Agentic hub (issue #10): register this worker's single slot identity at
+    // spawn (register-on-connect), so it is visible on the hub even before its
+    // first job. The capability mirrors what the slot's ACP arm declares.
+    let slot_identities = vec![(
+        worker_name.clone(),
+        serde_json::json!({
+            "cognition": hire.model,
+            "family": hire.rank,
+            "host": short_hostname(),
+        }),
+    )];
+    let hub = crate::hub::HubConfig::from_env()
+        .map(|cfg| crate::hub::HubClient::spawn(cfg, &slot_identities));
     let cfg = Arc::new(SlotConfig {
         hire,
         worker_name,

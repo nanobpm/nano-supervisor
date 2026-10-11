@@ -3612,18 +3612,21 @@ mod tests {
     /// The URL points at a dead port so it only ever backs off; the test shuts
     /// it down. Used to exercise `effective_protocol`'s override resolution.
     fn hub_with_protocol(protocol: Option<&str>) -> std::sync::Arc<crate::hub::HubClient> {
-        crate::hub::HubClient::spawn(crate::hub::HubConfig {
-            url: "ws://127.0.0.1:1/na".into(),
-            token: None,
-            secret: None,
-            credential: None,
-            protocol: protocol.map(str::to_string),
-            permission: None,
-            terminal: false,
-            attribution: None,
-            buffer_capacity: 8,
-            buffer_byte_budget: 0,
-        })
+        crate::hub::HubClient::spawn(
+            crate::hub::HubConfig {
+                url: "ws://127.0.0.1:1/na".into(),
+                token: None,
+                secret: None,
+                credential: None,
+                protocol: protocol.map(str::to_string),
+                permission: None,
+                terminal: false,
+                attribution: None,
+                buffer_capacity: 8,
+                buffer_byte_budget: 0,
+            },
+            &[],
+        )
     }
 
     // Finding (round 6): the hub's `NANO_AGENTIC_PROTOCOL` override is resolved
