@@ -584,9 +584,20 @@ fn is_hex_sha(s: &str) -> bool {
 /// world-readable on a default Linux host, so any local process can read the
 /// PAT for the lifetime of the clone/fetch — scrubbing the on-disk
 /// `origin`/`FETCH_HEAD` afterward does not close that live exposure. Supplying
-/// the secret through git's credential-helper protocol keeps it in the child's
-/// environment (`/proc/<pid>/environ`, readable only by the owning user)
-/// instead.
+/// the secret through git's credential-helper protocol keeps it out of argv;
+/// the password is further handed to the helper by **path** — written to a
+/// `0600` file under a private `0700` per-command directory and named in
+/// `NANO_GIT_CRED_FILE` (see [`apply_git_credential`]) — rather than an
+/// environment variable, so it never appears in the git process's
+/// `/proc/<pid>/environ` (which a same-UID process could otherwise read for the
+/// duration of the clone/fetch — #24).
+///
+/// The credential is *parsed* from the remote URL on every platform
+/// ([`split_url_credential`]), but it is only *read* — written to the secret
+/// file — by the Unix [`apply_git_credential`]; the non-Unix stub rejects
+/// it unread. Permit the fields to go unread there so the non-Unix build stays
+/// warning-clean (`-D warnings`).
+#[cfg_attr(not(unix), allow(dead_code))]
 struct GitCredential {
     /// Host (without port) the credential is scoped to, so the helper never
     /// hands the token to a differently-hosted submodule remote.
@@ -2259,8 +2270,11 @@ async fn finalize_git_with_deadline(
                 // checkout, so it must not trust agent-mutable state:
                 //  - `core.hooksPath=/dev/null` disables any `.git/hooks/pre-push`
                 //    (or a redirected hooksPath) the agent planted — a hook would
-                //    otherwise run with `git()`'s env, which carries
-                //    `NANO_GIT_CRED_PASS` for the credential helper.
+                //    otherwise run with `git()`'s env. That env no longer carries
+                //    the credential password (the helper reads it from a 0600
+                //    file), but it still carries `NANO_GIT_CRED_FILE` (the path),
+                //    and a hook racing the helper could read that file, so the
+                //    hook stays disabled.
                 //  - push to the TRUSTED `fetch_url` (the credential-free form of
                 //    the configured `repo.url`), never the agent-rewritable
                 //    `origin` remote in `.git/config` — so the push goes to the
@@ -3004,6 +3018,258 @@ async fn git_with_env(
         .map(|(out, _truncated)| out)
 }
 
+/// Shell credential helper that reads the password from a per-command secret
+/// file — whose path is passed in the non-secret `NANO_GIT_CRED_FILE` env var —
+/// rather than from an environment variable, so the secret never lands in the
+/// git process's `/proc/<pid>/environ` (readable by any process under the same
+/// UID). Host and username are not secret and remain in the environment.
+///
+/// Behaviour: emit the credential only for a `get` on the matching host, and
+/// ignore `store`/`erase` (draining their stdin request). The secret is read by
+/// **opening the file by path** (`cat "$NANO_GIT_CRED_FILE"`). Because every
+/// `cat` opens the file afresh at offset 0, the read is naturally **replayable
+/// across submodule helpers**: a `git clone --recurse-submodules` runs the
+/// superproject's credential `get` and then a *separate* helper process for
+/// each private same-host submodule, and each one re-reads the SAME secret
+/// independently. This path-based read behaves identically on Linux and macOS
+/// — there is no inherited descriptor whose open-file-description offset could
+/// be shared (the macOS `/dev/fd` = `dup` pitfall, Copilot review #62) and no
+/// dependency on `/proc` or `/dev/fd` existing.
+///
+/// The file lives in a private `0700` per-command directory (see
+/// [`cred_secret_file`]) holding a single `0600` file, and the directory is
+/// removed once the git command completes — on every exit path, including
+/// error and cancellation — by the [`CredFile`] guard's `Drop`.
+///
+/// Unix-only: referenced solely by the Unix [`apply_git_credential`] (and its
+/// tests), so gated to avoid a dead-code warning on non-Unix builds.
+#[cfg(unix)]
+const GIT_CRED_HELPER: &str = "!f() { \
+    test \"$1\" = get || exit 0; \
+    h=; \
+    while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
+    test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
+    p=$(cat \"$NANO_GIT_CRED_FILE\"); \
+    printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$p\"; \
+}; f";
+
+/// Guards the per-command credential secret directory. Holds the path of the
+/// private `0700` directory created by [`cred_secret_file`]; its `Drop` removes
+/// the directory (and the `0600` secret file inside) so the secret never
+/// outlives the git command — on every exit path, including a normal return, an
+/// error `?`, or the future being dropped on cancellation/timeout.
+///
+/// Unlike the earlier inherited-FD design, the secret lives on a path the
+/// credential helper opens afresh per `get`, so the guard must stay alive for
+/// the WHOLE command (every submodule helper re-reads the file), not just until
+/// `spawn`. [`git_with_env_capture`] keeps it bound to the end of the function.
+///
+/// Unix-only: the secret-file mechanism is built on `std::os::unix` / `libc`,
+/// which do not exist on other targets.
+#[cfg(unix)]
+struct CredFile {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for CredFile {
+    fn drop(&mut self) {
+        // Best-effort: remove the private 0700 directory and the 0600 secret
+        // file inside. We created and own both (mkdtemp + O_EXCL), so this is a
+        // simple recursive remove of a directory no other UID can have written
+        // to. A failure here cannot be meaningfully handled at drop time; the
+        // directory is under the private temp root and owner-only regardless.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Non-Unix placeholder so [`git_with_env_capture`] can bind and drop the guard
+/// uniformly. The non-Unix [`apply_git_credential`] never returns one (it errors
+/// instead — out-of-band credential delivery is not implemented off Unix), so
+/// this carries no state.
+#[cfg(not(unix))]
+struct CredFile;
+
+/// Write the credential secret to a `0600` file inside a freshly-created,
+/// private `0700` per-command directory, and return the guard that removes that
+/// directory plus the secret file's path.
+///
+/// This is the single, uniform mechanism on **both Linux and macOS**: the
+/// credential helper reads the secret by opening the file path afresh on every
+/// `get`, so each private same-host submodule's separate helper process re-reads
+/// the SAME secret independently (`git clone --recurse-submodules`). A path-based
+/// read starts at offset 0 every time, sidestepping the macOS pitfall where an
+/// inherited `/dev/fd` descriptor is a `dup` that shares the open-file offset
+/// (so a second reader saw EOF), with no `/proc` fallback (Copilot review #62).
+/// It also drops the Linux-only `memfd_create` / POSIX `shm_open` split entirely.
+///
+/// The secret is kept off argv and the environment (only the non-secret file
+/// *path* is exported, in `NANO_GIT_CRED_FILE`). It does touch disk briefly,
+/// but under an owner-only (`0700`) directory holding an owner-only (`0600`)
+/// file, and the [`CredFile`] guard removes the whole directory the moment the
+/// git command finishes (every exit path, including error/cancel). Exposure to
+/// another process under the SAME UID is out of scope: a same-UID process can
+/// already read this process's environment and open descriptors, so it cannot be
+/// defended against here (#62).
+///
+/// Unix-only: built on `libc::mkdtemp` and the unix permission/raw-fd APIs.
+#[cfg(unix)]
+fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // Bound the secret so a malformed job cannot make the daemon buffer an
+    // unbounded credential in memory before writing it. Real git tokens are a
+    // few dozen bytes; 1 MiB is far above any legitimate PAT.
+    const MAX_SECRET: usize = 1 << 20;
+    if secret.len() > MAX_SECRET {
+        return Err(anyhow::anyhow!(
+            "credential password is {} bytes, exceeding the {}-byte bound — refusing \
+             to deliver an unbounded secret",
+            secret.len(),
+            MAX_SECRET
+        ));
+    }
+
+    // mkdtemp(3) creates the directory with mode 0700 regardless of the process
+    // umask, and picks a unique name so concurrent slots never collide. Build a
+    // mutable NUL-terminated template ending in the six `X`s it requires.
+    let mut template = {
+        let mut dir = std::env::temp_dir();
+        dir.push("nano-git-cred-XXXXXX");
+        let mut bytes = dir.into_os_string().into_vec();
+        bytes.push(0);
+        bytes
+    };
+    // SAFETY: `template` is a writable, NUL-terminated buffer whose final
+    // component is `XXXXXX`; mkdtemp replaces those in place and returns the
+    // same pointer (or NULL on failure). We never move the buffer during the
+    // call.
+    let res = unsafe { libc::mkdtemp(template.as_mut_ptr() as *mut libc::c_char) };
+    if res.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .context("creating credential secret directory");
+    }
+    // Drop the trailing NUL before rebuilding the path.
+    template.pop();
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(template));
+
+    // Bind the guard NOW so any fallible step below removes the directory on its
+    // early return (RAII cleanup, not a manual unwind).
+    let guard = CredFile { dir: dir.clone() };
+
+    let file = dir.join("password");
+    // O_CREAT|O_EXCL (`create_new`) so we never follow or overwrite a pre-existing
+    // node; the enclosing 0700 dir is ours and empty, so this always creates.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&file)
+        .context("creating credential secret file")?;
+    // Pin the mode to exactly 0600 regardless of umask (which could only clear
+    // bits from the `mode(0o600)` above, potentially dropping owner-read and
+    // breaking the helper). set_permissions sets the mode unmasked.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .context("setting credential secret file mode")?;
+    f.write_all(secret).context("writing credential secret")?;
+    f.flush().context("flushing credential secret")?;
+
+    Ok((guard, file))
+}
+
+/// The subset of `Command` behaviour [`apply_git_credential`] needs, abstracted
+/// over the async `tokio::process::Command` (production) and the sync
+/// `std::process::Command` (tests) so both receive the identical `-c` args and
+/// credential environment. Mirrors the `UnixCommandExt` pattern in `safecwd`.
+#[cfg(unix)]
+trait CredCommand {
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>);
+    fn env(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>);
+}
+
+#[cfg(unix)]
+impl CredCommand for tokio::process::Command {
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) {
+        self.arg(arg);
+    }
+    fn env(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        self.env(key, val);
+    }
+}
+
+#[cfg(unix)]
+impl CredCommand for std::process::Command {
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) {
+        self.arg(arg);
+    }
+    fn env(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        self.env(key, val);
+    }
+}
+
+/// Configure out-of-band credential delivery on `cmd` so the password reaches
+/// git's credential helper by **path** instead of an environment variable
+/// (closing the same-UID `/proc/<pid>/environ` read; see #24).
+///
+/// - Writes the secret to a `0600` file inside a private `0700` per-command
+///   directory ([`cred_secret_file`]). Because the helper opens the file afresh
+///   on every `get`, the secret is naturally replayable across the separate
+///   helper processes a `git clone --recurse-submodules` spawns per private
+///   same-host submodule — and it behaves identically on Linux and macOS (no
+///   inherited-descriptor offset sharing, no `/proc` or `/dev/fd` dependency).
+/// - Refuses an oversized secret up front (a plain memory sanity bound).
+/// - Injects the `-c credential.helper=` reset + our helper (which must precede
+///   the git subcommand), and sets only the non-secret
+///   `NANO_GIT_CRED_HOST`/`_USER`/`_FILE` in the environment (the last is the
+///   file *path*, not the secret).
+///
+/// Returns a [`CredFile`] guard the caller MUST keep alive for the WHOLE git
+/// command (every submodule helper re-reads the file); its `Drop` removes the
+/// directory on every exit path, including error and cancellation.
+///
+/// Generic over the command type so both the async `tokio::process::Command`
+/// used in production and the sync `std::process::Command` used by the tests
+/// receive the identical configuration (see [`CredCommand`]).
+///
+/// Unix-only: the secret-file mechanism is built on `libc`/`std::os::unix`, and
+/// the `CredCommand` bound exists only under `#[cfg(unix)]`. The
+/// `#[cfg(not(unix))]` stub below keeps non-Unix targets compiling.
+#[cfg(unix)]
+fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Result<CredFile> {
+    let (guard, file) = cred_secret_file(c.password.as_bytes())?;
+
+    cmd.arg("-c");
+    cmd.arg("credential.helper=");
+    cmd.arg("-c");
+    cmd.arg(format!("credential.helper={GIT_CRED_HELPER}"));
+    cmd.env("NANO_GIT_CRED_HOST", &c.host);
+    cmd.env("NANO_GIT_CRED_USER", &c.username);
+    cmd.env("NANO_GIT_CRED_FILE", &file);
+    Ok(guard)
+}
+
+/// Non-Unix stub: out-of-band credential delivery is implemented only for Unix
+/// (the secret file, its permissions, and `mkdtemp` all build on
+/// `std::os::unix`/`libc`). Rather than silently falling back to an environment
+/// variable — re-opening the same-UID `/proc/<pid>/environ` read this code
+/// exists to close (#24) — a non-Unix host fails closed with a clear error,
+/// mirroring how `safecwd`/`main` keep their non-Unix paths explicit. These are
+/// not supported daemon hosts.
+///
+/// Non-generic over the concrete `tokio::process::Command` (the only production
+/// caller, in [`git_with_env_capture`]): the `CredCommand` abstraction exists
+/// only under `#[cfg(unix)]`, so the generic form cannot be named here.
+#[cfg(not(unix))]
+fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredFile> {
+    let _ = c;
+    Err(anyhow::anyhow!(
+        "out-of-band git credential delivery is not supported on this \
+         (non-Unix) platform; cannot provision an authenticated git remote safely"
+    ))
+}
+
 /// Core git runner. Returns `(stdout_tail, stdout_truncated)`; `stdout_truncated`
 /// is `true` when git emitted more than `GIT_STDOUT_TAIL` and leading bytes were
 /// dropped. Most callers go through [`git`]/[`git_with_env`] and ignore the
@@ -3020,27 +3286,28 @@ async fn git_with_env_capture(
     let mut cmd = Command::new("git");
     // A credential is delivered out of band via git's credential-helper
     // protocol so the secret never reaches argv (world-readable
-    // `/proc/<pid>/cmdline`). The helper snippet itself is not secret — it only
-    // names env vars — and is host-scoped so a `--recurse-submodules` fetch to a
-    // different host is never handed this repo's token. The empty
-    // `credential.helper=` first resets any host/global helper so ours is the
-    // only one consulted. These `-c` flags must precede the git subcommand.
-    if let Some(c) = cred {
-        // Read the request on stdin (draining it), emit the credential only for
-        // a `get` on the matching host, and ignore `store`/`erase`.
-        let helper = "!f() { \
-            test \"$1\" = get || exit 0; \
-            h=; \
-            while IFS='=' read -r k v; do test x\"$k\" = xhost && h=${v%%:*}; done; \
-            test x\"$h\" = x\"$NANO_GIT_CRED_HOST\" || exit 0; \
-            printf 'username=%s\\npassword=%s\\n' \"$NANO_GIT_CRED_USER\" \"$NANO_GIT_CRED_PASS\"; \
-        }; f";
-        cmd.arg("-c").arg("credential.helper=");
-        cmd.arg("-c").arg(format!("credential.helper={helper}"));
-        cmd.env("NANO_GIT_CRED_HOST", &c.host);
-        cmd.env("NANO_GIT_CRED_USER", &c.username);
-        cmd.env("NANO_GIT_CRED_PASS", &c.password);
-    }
+    // `/proc/<pid>/cmdline`) NOR the stable `/proc/<pid>/environ` (readable by
+    // any same-UID process — e.g. another slot's agent in host mode). The
+    // password is written to a `0600` file inside a private `0700` per-command
+    // directory, and the helper reads it by path; each credential-helper `get`
+    // opens the file afresh, so a `--recurse-submodules` clone's per-submodule
+    // helpers each re-read the SAME secret identically on Linux and macOS. Only
+    // non-secret fields (host, username, file path) go in the environment. The
+    // helper snippet itself is not secret and is host-scoped so a
+    // `--recurse-submodules` fetch to a different host is never handed this
+    // repo's token. `apply_git_credential` injects the empty
+    // `credential.helper=` (resetting any host/global helper) and ours via the
+    // `-c` flags that must precede the git subcommand; the returned guard owns
+    // the secret directory and removes it on drop (see below) — which is kept
+    // bound until this function returns so the file outlives every submodule
+    // helper, then is cleaned up on every exit path including error/cancel.
+    // Held (via the `_`-prefixed binding) until this function returns so the
+    // secret file outlives every submodule helper; its `Drop` removes the 0700
+    // directory on every exit path. A bare `_` would drop it immediately.
+    let _cred_guard = match cred {
+        Some(c) => Some(apply_git_credential(&mut cmd, c)?),
+        None => None,
+    };
     cmd.args(args);
     // Kill (and reap) the git child if this future is dropped — e.g. when the
     // timeout below fires — so a timed-out clone/fetch can't keep running and
@@ -3112,6 +3379,14 @@ async fn git_with_env_capture(
     #[cfg(unix)]
     crate::pdeath::arm(&mut cmd);
     let mut child = cmd.spawn().context("spawning git")?;
+    // Keep the credential secret directory alive for the WHOLE command: unlike
+    // the earlier inherited-FD design (which the child copied at `spawn` and the
+    // parent could then drop), the helper re-opens the secret *file by path* on
+    // every `get`, so every per-submodule helper a `--recurse-submodules` clone
+    // spawns must still find it. `cred_guard` therefore stays bound until this
+    // function returns; its `Drop` (see [`CredFile`]) removes the 0700 directory
+    // and the 0600 secret file on every exit path — normal return, an error `?`
+    // below, or this future being dropped on timeout/cancellation.
     #[cfg(unix)]
     let gpid = child.id();
     #[cfg(unix)]
@@ -7676,5 +7951,277 @@ mod tests {
             "an incomplete (timed-out) scan must never report a clean push"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    /// A unique temp path base for credential test scratch output files.
+    ///
+    /// Unix-only: used solely by the `cfg(unix)` credential tests, so gated
+    /// to avoid a dead-code warning on non-Unix test builds.
+    #[cfg(unix)]
+    fn cred_scratch_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nano-cred-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Integration test for the file-delivered credential handshake (#24, #62):
+    /// drive a REAL `git credential fill` through [`apply_git_credential`] and
+    /// assert git invokes our helper, which reads the password from the 0600
+    /// secret file (not an env var) and hands it back. Exercises the exact `get`
+    /// handshake a clone/fetch performs against an authenticated remote.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_handshake_delivers_password_by_file() {
+        // Build the secret at runtime so no credential-like literal is stored.
+        let password = format!("s3cr3t-{}-PAT", std::process::id());
+        let cred = GitCredential {
+            host: "example.test".into(),
+            username: "x-access-token".into(),
+            password: password.clone(),
+        };
+        let mut cmd = Command::new("git");
+        // Isolate from the developer's real git config so only OUR injected
+        // helper is consulted (mirrors `git_isolated`).
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        cmd.env("GIT_CONFIG_SYSTEM", "/dev/null");
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        // `apply_git_credential` injects the `-c credential.helper=` reset + our
+        // helper (which must precede the subcommand) and writes the secret file.
+        let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
+        cmd.arg("credential").arg("fill");
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn git credential fill");
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().expect("git stdin");
+            stdin
+                .write_all(b"protocol=https\nhost=example.test\n\n")
+                .await
+                .expect("write credential request");
+            stdin.shutdown().await.expect("close git stdin");
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .expect("await git credential fill");
+        // Keep the secret file alive until git has finished reading it.
+        drop(guard);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "git credential fill failed: {}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            stdout
+        );
+        assert!(
+            stdout.contains("username=x-access-token"),
+            "username missing from filled credential: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("password={password}")),
+            "password (delivered from the secret file) missing from filled \
+             credential: {stdout}"
+        );
+    }
+
+    /// Integration test for the acceptance criteria of #24 and the recursive-
+    /// submodule fix (#62): the password is NOT present in the git process's
+    /// environment (so never in `/proc/<pid>/environ`), yet is readable from the
+    /// secret file; and — because the helper opens the file by PATH afresh on
+    /// each `get` — a repeated `get` REPLAYS the same secret instead of draining.
+    /// This is what lets each private same-host submodule's separate helper
+    /// process authenticate after the superproject's fetch has already run a
+    /// `get`. Path-based reads start at offset 0 every time, so this behaves
+    /// identically on Linux and macOS (no shared inherited-fd offset — the macOS
+    /// `/dev/fd`-is-a-dup pitfall that motivated this redesign).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_password_absent_from_environ_and_replays() {
+        let password = format!("s3cr3t-{}-ENVCHK", std::process::id());
+        let cred = GitCredential {
+            host: "example.test".into(),
+            username: "x-access-token".into(),
+            password: password.clone(),
+        };
+        // Invoke the PRODUCTION helper snippet directly via `sh`, stripping the
+        // leading `!` that is git's "run as shell command" marker.
+        let helper_body = GIT_CRED_HELPER
+            .strip_prefix('!')
+            .expect("helper snippet starts with git's '!' marker");
+        let base = cred_scratch_base("environ");
+        let out1 = base.with_extension("1");
+        let out2 = base.with_extension("2");
+        let env_dump = base.with_extension("env");
+        // On Linux, dump our own environ (NUL-delimited) to prove the secret is
+        // absent. Elsewhere `/proc` does not exist (and the exposure does not),
+        // so skip that half and only exercise the file read + replay.
+        let dump = if cfg!(target_os = "linux") {
+            format!(
+                "tr '\\0' '\\n' < /proc/$$/environ > '{}';",
+                env_dump.display()
+            )
+        } else {
+            String::from(":;")
+        };
+        // Feed the helper a `get` request twice, modelling the superproject's
+        // `get` followed by a submodule's `get`. Both must deliver the SAME
+        // secret (replay), because each `cat` re-opens the file at offset 0.
+        let req = "printf 'protocol=https\\nhost=example.test\\n\\n'";
+        let script = format!(
+            "{dump} {req} | sh -c \"$TEST_HELPER get\" > '{o1}'; \
+             {req} | sh -c \"$TEST_HELPER get\" > '{o2}';",
+            o1 = out1.display(),
+            o2 = out2.display(),
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&script);
+        cmd.env("TEST_HELPER", helper_body);
+        // Configure the secret file + non-secret env (host/user/file path). The
+        // git `-c` args it also appends become inert positional params to
+        // `sh -c`.
+        let guard = apply_git_credential(&mut cmd, &cred).expect("configure credential");
+        let status = tokio::time::timeout(Duration::from_secs(20), cmd.status())
+            .await
+            .expect("helper handshake must not hang")
+            .expect("run sh helper");
+        // Keep the secret file alive until both helper invocations have read it.
+        drop(guard);
+        assert!(status.success(), "helper script exited non-zero");
+
+        let first = std::fs::read_to_string(&out1).expect("first helper output");
+        assert!(
+            first.contains("username=x-access-token")
+                && first.contains(&format!("password={password}")),
+            "first helper invocation must deliver the credential from the file: {first}"
+        );
+        // The recursive-submodule regression: a SECOND `get` (a submodule's
+        // helper) must re-deliver the SAME secret, not drain to an empty EOF.
+        let second = std::fs::read_to_string(&out2).expect("second helper output");
+        assert!(
+            second.contains(&format!("password={password}")),
+            "a repeated helper invocation (a submodule's get) must REPLAY the \
+             secret, not drain it: {second}"
+        );
+
+        if cfg!(target_os = "linux") {
+            let environ = std::fs::read_to_string(&env_dump).expect("environ dump");
+            assert!(
+                !environ.contains(&password),
+                "credential password must never appear in the process environ"
+            );
+            assert!(
+                environ
+                    .lines()
+                    .any(|l| l.starts_with("NANO_GIT_CRED_FILE=")),
+                "only the file path (not the secret) is carried in the environment"
+            );
+        }
+
+        let _ = std::fs::remove_file(&out1);
+        let _ = std::fs::remove_file(&out2);
+        let _ = std::fs::remove_file(&env_dump);
+    }
+
+    /// A password larger than the secret-size bound must be rejected up front
+    /// rather than written unboundedly to the secret file. The bound is a plain
+    /// sanity limit (1 MiB — far above any real PAT). A secret one byte over the
+    /// bound always fails cleanly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_password_is_rejected() {
+        let cred = GitCredential {
+            host: "example.test".into(),
+            username: "x-access-token".into(),
+            // One byte over the 1 MiB bound in `cred_secret_file`.
+            password: "A".repeat((1 << 20) + 1),
+        };
+        let mut cmd = Command::new("git");
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || apply_git_credential(&mut cmd, &cred)),
+        )
+        .await
+        .expect("oversized credential must fail fast")
+        .expect("spawn_blocking join");
+        let err = match res {
+            Ok(_) => panic!("an oversized password must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("exceeding the"),
+            "the rejection should name the size bound: {err}"
+        );
+    }
+
+    /// The secret file must be mode 0600 inside a mode 0700 directory, and hold
+    /// exactly the credential bytes — the owner-only on-disk posture the #62
+    /// scope decision requires when the secret touches disk.
+    #[cfg(unix)]
+    #[test]
+    fn credential_secret_file_has_0600_mode_in_0700_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let secret = format!("s3cr3t-{}-MODE", std::process::id());
+        let (guard, file) =
+            cred_secret_file(secret.as_bytes()).expect("write credential secret file");
+
+        let file_mode = std::fs::metadata(&file)
+            .expect("stat secret file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "credential secret file must be owner read/write only, got {file_mode:o}"
+        );
+
+        let dir_mode = std::fs::metadata(&guard.dir)
+            .expect("stat secret dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "credential secret directory must be owner-only, got {dir_mode:o}"
+        );
+
+        let contents = std::fs::read(&file).expect("read secret file");
+        assert_eq!(
+            contents,
+            secret.as_bytes(),
+            "the secret file must hold exactly the credential bytes"
+        );
+        drop(guard);
+    }
+
+    /// The [`CredFile`] guard must remove the whole secret directory (and the
+    /// secret file inside) on drop, so the credential never outlives the git
+    /// command — on every exit path (#62).
+    #[cfg(unix)]
+    #[test]
+    fn dropping_guard_removes_secret_dir() {
+        let (guard, file) =
+            cred_secret_file(b"s3cr3t-cleanup").expect("write credential secret file");
+        let dir = guard.dir.clone();
+        assert!(
+            file.exists(),
+            "secret file must exist before the guard drops"
+        );
+        assert!(dir.exists(), "secret dir must exist before the guard drops");
+        drop(guard);
+        assert!(
+            !file.exists(),
+            "the secret file must be removed once the guard is dropped"
+        );
+        assert!(
+            !dir.exists(),
+            "the secret directory must be removed once the guard is dropped"
+        );
     }
 }
