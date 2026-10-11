@@ -93,6 +93,15 @@ const STEER_CHANNEL_BOUND: usize = 256;
 /// overtake the transcript tail). Bounded so a wedged bridge can never hang the
 /// dropping task; on timeout the RELEASE proceeds (the tail is best-effort).
 const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum frames `drain` writes to the socket before yielding back to the
+/// connection `select!` loop (finding: a sustained transcript producer must not
+/// keep the outbound buffer non-empty and so starve `read.next()` and
+/// `shutdown.changed()`, which would stop an inbound cancel from ever reaching a
+/// noisy job). After this many writes `drain` re-arms the outbound notify (if
+/// frames remain) and returns, so reads and shutdown stay serviceable while the
+/// backlog still drains promptly. A terminal shutdown drain passes `0` to drain
+/// the whole DEREGISTER snapshot in one pass.
+const DRAIN_BATCH: usize = 256;
 
 /// A buffered frame carrying its precomputed on-wire byte size, so the buffer
 /// can enforce a memory (byte) budget without re-serialising the payload on
@@ -111,6 +120,15 @@ fn frame_bytes(frame: &Frame) -> usize {
         + serde_json::to_string(&frame.payload)
             .map(|s| s.len())
             .unwrap_or(0)
+}
+
+/// Compose the `<instance>/<jobKey>` stream id from a presence frame payload
+/// (`CLAIM`/`RELEASE` both carry `{instance, jobKey}`). `None` when either field
+/// is absent, so a malformed frame never matches a real stream.
+fn presence_stream_id(payload: &Value) -> Option<String> {
+    let instance = payload.get("instance").and_then(Value::as_str)?;
+    let job_key = payload.get("jobKey").and_then(Value::as_str)?;
+    Some(compose_stream_id(instance, job_key))
 }
 
 /// Effective count bound for one session's pre-buffer transcript channel,
@@ -158,6 +176,10 @@ impl LaneBuffer {
 
     fn len(&self) -> usize {
         self.control.len() + self.interactive.len() + self.bulk.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Would admitting `incoming` more bytes still fit the byte budget? A zero
@@ -329,19 +351,63 @@ impl LaneBuffer {
         self.store_front(BufferedFrame { bytes, frame });
     }
 
-    /// Drop every buffered `REGISTER`/`CLAIM` frame from the control lane. The
-    /// (re)connect resync snapshot supersedes them, so leaving the stale ones
-    /// in place would duplicate presence/ownership and let a `CLAIM` buffered
-    /// while disconnected drain ahead of the snapshot's `REGISTER`. Other
-    /// control families (`RELEASE`/`DEREGISTER`/`HEARTBEAT`) are preserved.
+    /// Append a CONTROL frame to the BACK of the control lane, shedding only
+    /// lower-priority (bulk, then interactive) traffic to make room and NEVER
+    /// dropping the control frame itself — the same capacity EXEMPTION as
+    /// [`push_front_control_bounded`], but preserving enqueue order at the tail.
+    /// Used for the shutdown DEREGISTER snapshot: a clean shutdown must emit a
+    /// DEREGISTER for EVERY registered worker, so when the configured capacity is
+    /// smaller than the number of registered slots the ordinary bounded `push`
+    /// (which drops a control newcomer once the control lane fills, since control
+    /// never evicts control) would silently send only a subset. Presence is
+    /// bounded by live instances, so admitting the whole snapshot is safe.
+    fn push_back_control_bounded(&mut self, frame: Frame) {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            let evicted = self.bulk.pop_front().or_else(|| self.interactive.pop_front());
+            match evicted {
+                Some(bf) => self.account_removed(&bf),
+                None => break,
+            }
+        }
+        self.store_back(BufferedFrame { bytes, frame });
+    }
+    /// supersedes presence for live instances + in-flight jobs, so leaving those
+    /// stale frames in place would duplicate presence/ownership and let a
+    /// `CLAIM` buffered while disconnected drain ahead of the snapshot's
+    /// `REGISTER`.
+    ///
+    /// A `CLAIM` WHOSE STREAM HAS A PENDING `RELEASE` IS KEPT: that is a job
+    /// which started and finished during the outage. `release_job` has already
+    /// removed it from `in_flight`, so the resync snapshot CANNOT recreate its
+    /// `CLAIM`; dropping the buffered one would send the preserved transcript
+    /// and the `RELEASE` without the prerequisite ownership frame, desyncing the
+    /// hub (a `RELEASE`/transcript for a job it never saw claimed). Preserving
+    /// the `CLAIM` keeps the whole `CLAIM → tail → RELEASE` sequence intact.
+    /// Other control families (`RELEASE`/`DEREGISTER`/`HEARTBEAT`) are preserved.
     fn drop_control_presence(&mut self) {
+        // Streams with a buffered RELEASE: their CLAIM is for a completed job
+        // the snapshot cannot rebuild, so it must survive this prune.
+        let pending_release: HashSet<String> = self
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .filter_map(|bf| presence_stream_id(&bf.frame.payload))
+            .collect();
         let mut freed = 0;
         self.control.retain(|bf| {
-            let keep = !matches!(bf.frame.family, Family::Register | Family::Claim);
-            if !keep {
+            let drop_it = match bf.frame.family {
+                Family::Register => true,
+                Family::Claim => presence_stream_id(&bf.frame.payload)
+                    .map(|s| !pending_release.contains(&s))
+                    .unwrap_or(true),
+                _ => false,
+            };
+            if drop_it {
                 freed += bf.bytes;
             }
-            keep
+            !drop_it
         });
         self.bytes = self.bytes.saturating_sub(freed);
     }
@@ -615,17 +681,21 @@ impl HubClient {
             // Signal completion (ignore a gone waiter).
             let _ = done_tx.send(());
         });
-        // Detach the JoinHandle (the flush uses `done_rx`, not the handle).
-        drop(bridge_handle);
-        // Track the flush handle under a UNIQUE session id (not the stream id,
-        // which a later session for the same job would reuse and so could steal
-        // this session's flush handle), so this session's drop flushes exactly
-        // its own bridge before RELEASE.
+        // Retain the bridge's JoinHandle (do NOT detach it): `close` aborts and
+        // joins it on a flush timeout so a wedged bridge cannot keep producing
+        // transcript AFTER the RELEASE. Track the flush handle under a UNIQUE
+        // session id (not the stream id, which a later session for the same job
+        // would reuse and so could steal this session's flush handle), so this
+        // session's drop flushes exactly its own bridge before RELEASE.
         let session_id = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
-        self.bridge_tasks
-            .lock()
-            .unwrap()
-            .insert(session_id, BridgeFlush { close_tx, done_rx });
+        self.bridge_tasks.lock().unwrap().insert(
+            session_id,
+            BridgeFlush {
+                close_tx,
+                done_rx,
+                handle: bridge_handle,
+            },
+        );
         // Arm the RELEASE drain barrier for this session, keyed by its stream id
         // (the identity a drained RELEASE carries). `close` arms it before
         // enqueueing the RELEASE; `drain` then flushes the transcript tail to
@@ -706,6 +776,20 @@ impl HubClient {
     fn enqueue(&self, lane: Lane, family: Family, payload: Value) {
         let frame = self.make_frame(lane, family, payload);
         self.outbound.lock().unwrap().push(frame);
+        self.outbound_notify.notify_one();
+    }
+
+    /// Enqueue a CONTROL frame EXEMPT from the buffer bound (see
+    /// [`LaneBuffer::push_back_control_bounded`]): it sheds lower-priority
+    /// traffic to make room but is never itself dropped. Used for the shutdown
+    /// DEREGISTER snapshot so a clean shutdown deregisters every worker even when
+    /// capacity is smaller than the number of registered slots.
+    fn enqueue_control_exempt(&self, family: Family, payload: Value) {
+        let frame = self.make_frame(Lane::Control, family, payload);
+        self.outbound
+            .lock()
+            .unwrap()
+            .push_back_control_bounded(frame);
         self.outbound_notify.notify_one();
     }
 
@@ -915,9 +999,15 @@ impl HubClient {
 /// `done_rx` is a Tokio oneshot so the preferred async [`HubSession::close`] can
 /// await it WITHOUT parking a runtime worker thread; the synchronous `Drop`
 /// fallback never waits on it (it only signals `close_tx`).
+///
+/// `handle` is the bridge task's `JoinHandle`, retained (NOT detached) so
+/// `close` can ABORT-AND-JOIN the bridge if the flush times out: a detached,
+/// still-running bridge could otherwise keep enqueuing transcript chunks AFTER
+/// `close` has armed and enqueued the RELEASE, breaking tail-before-RELEASE.
 struct BridgeFlush {
     close_tx: watch::Sender<bool>,
     done_rx: tokio::sync::oneshot::Receiver<()>,
+    handle: JoinHandle<()>,
 }
 
 /// A per-session RELEASE drain barrier (finding: a job's RELEASE must not
@@ -1009,8 +1099,25 @@ impl HubSession {
             .unwrap()
             .remove(&self.session_id);
         if let Some(flush) = flush {
-            let _ = flush.close_tx.send(true);
-            let _ = timeout(TRANSCRIPT_FLUSH_TIMEOUT, flush.done_rx).await;
+            let BridgeFlush {
+                close_tx,
+                done_rx,
+                handle,
+            } = flush;
+            let _ = close_tx.send(true);
+            if timeout(TRANSCRIPT_FLUSH_TIMEOUT, done_rx).await.is_err() {
+                // The bridge did not finish flushing within the timeout. ABORT it
+                // so it is guaranteed to enqueue NO further transcript chunks:
+                // otherwise the detached-but-live bridge (its biased `recv` branch
+                // can stay ready) would keep producing while we arm and enqueue
+                // the RELEASE below, and those chunks would reach the socket AFTER
+                // the RELEASE — breaking tail-before-RELEASE. Transcript loss on
+                // this wedged-bridge path is accepted and documented.
+                handle.abort();
+            }
+            // Join the (finished or aborted) task so it is provably stopped and
+            // can produce nothing more before we enqueue the RELEASE.
+            let _ = handle.await;
         }
         // Arm the drain barrier BEFORE enqueueing the RELEASE: the RELEASE must
         // be deferred at the socket until the transcript tail already buffered
@@ -1042,8 +1149,12 @@ impl HubSession {
         else {
             return; // already flushed by `close`, or never attached
         };
-        // Signal the bridge to finish; do NOT wait (see the doc comment).
+        // Signal the bridge to finish; do NOT wait (see the doc comment). ABORT
+        // the task too so a wedged bridge cannot keep producing transcript after
+        // this drop's best-effort RELEASE — abort only schedules cancellation
+        // (it does not block the way joining would), so `Drop` stays non-parking.
         let _ = flush.close_tx.send(true);
+        flush.handle.abort();
     }
 }
 
@@ -1253,7 +1364,7 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
     loop {
         tokio::select! {
             _ = client.outbound_notify.notified() => {
-                if drain(client, &mut write).await.is_err() { break; }
+                if drain(client, &mut write, DRAIN_BATCH).await.is_err() { break; }
             }
             _ = heartbeat.tick() => {
                 // One heartbeat per registered worker instance. Snapshot the
@@ -1266,7 +1377,7 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                 for inst in insts {
                     client.enqueue(Lane::Control, Family::Heartbeat, json!({ "instance": inst }));
                 }
-                if drain(client, &mut write).await.is_err() { break; }
+                if drain(client, &mut write, DRAIN_BATCH).await.is_err() { break; }
             }
             incoming = read.next() => {
                 match incoming {
@@ -1301,17 +1412,25 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                 if *shutdown.borrow() {
                     // Best-effort graceful deregister of every worker before exit.
                     // Snapshot keys first (see the heartbeat note) to keep the
-                    // outbound → instances lock order.
+                    // outbound → instances lock order. Enqueue EXEMPT from the
+                    // buffer bound so a clean shutdown sends a DEREGISTER for
+                    // every registered worker even when the configured capacity
+                    // is smaller than the number of registered slots (the bounded
+                    // `enqueue` would drop the overflow, since control never
+                    // evicts control).
                     let insts: Vec<String> =
                         client.instances.lock().unwrap().keys().cloned().collect();
                     for inst in insts {
-                        client.enqueue(
-                            Lane::Control,
+                        client.enqueue_control_exempt(
                             Family::Deregister,
                             json!({ "instance": inst, "reason": "shutdown" }),
                         );
                     }
-                    let _ = drain(client, &mut write).await;
+                    // Terminal path: drain the WHOLE buffer in one pass (batch 0 =
+                    // unbounded) so every DEREGISTER reaches the socket before the
+                    // Close — a bounded batch could exit with DEREGISTERs still
+                    // buffered.
+                    let _ = drain(client, &mut write, 0).await;
                     let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
                     break;
                 }
@@ -1331,9 +1450,16 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
 /// then writes the RELEASE — so a job's transcript tail is always on the wire
 /// before its RELEASE. On a reconnect the not-yet-sent tail is re-buffered ahead
 /// of the still-armed RELEASE, so the ordering is re-established.
+///
+/// BOUNDED BATCH: `batch_limit` caps how many frames are written before `drain`
+/// yields back to the connection `select!` loop (re-arming the outbound notify
+/// if frames remain), so a sustained producer cannot keep `read.next()` and
+/// `shutdown.changed()` from being polled. `0` means unbounded (the terminal
+/// shutdown drain, which must flush the whole DEREGISTER snapshot in one pass).
 async fn drain(
     client: &Arc<HubClient>,
     write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+    batch_limit: usize,
 ) -> anyhow::Result<()> {
     // The incarnation fences a transcript producer to the connection that
     // generated it. It is stamped HERE — at drain on the live socket — not at
@@ -1343,6 +1469,7 @@ async fn drain(
     // on the new socket would fail to fence the stale producer. Re-stamping at
     // drain guarantees every relay produce frame carries the CURRENT generation.
     let incarnation = client.generation.load(Ordering::Relaxed);
+    let mut written = 0usize;
     loop {
         let mut frame = {
             let mut buf = client.outbound.lock().unwrap();
@@ -1400,6 +1527,16 @@ async fn drain(
             }
             // An unserialisable/too-large frame is dropped, not retried forever.
             Err(_) => continue,
+        }
+        written += 1;
+        if batch_limit != 0 && written >= batch_limit {
+            // Yield back to the `select!` loop so reads and shutdown stay
+            // serviceable under a sustained producer. Re-arm the notify if the
+            // backlog is non-empty so the next loop iteration re-enters `drain`.
+            if !client.outbound.lock().unwrap().is_empty() {
+                client.outbound_notify.notify_one();
+            }
+            return Ok(());
         }
     }
 }
@@ -2694,6 +2831,250 @@ mod tests {
             idx(Family::Relay) < idx(Family::Release),
             "RELEASE must wait for the transcript tail even with control frames queued, got {order:?}"
         );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // Finding 1 (round 9): the reconnect presence prune must NOT drop a CLAIM
+    // for a job that STARTED AND FINISHED during the outage. Such a job has a
+    // buffered CLAIM, transcript tail, and RELEASE, and `release_job` already
+    // removed it from `in_flight` — so the resync snapshot cannot recreate its
+    // CLAIM. Dropping the buffered CLAIM would ship the RELEASE/transcript with
+    // no prerequisite ownership frame, desyncing the hub. A CLAIM for a still
+    // live job (no buffered RELEASE) IS pruned — the snapshot rebuilds it — as
+    // is every REGISTER.
+    #[test]
+    fn drop_control_presence_keeps_claim_paired_with_a_pending_release() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        // Live job on w: REGISTER + CLAIM, no RELEASE -> both pruned.
+        buf.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "w" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "w", "jobKey": "live" }),
+        ));
+        // Completed-during-outage job on w: CLAIM + RELEASE -> CLAIM survives.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            3,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            4,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        buf.drop_control_presence();
+        let claims: Vec<&Value> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Claim)
+            .map(|bf| &bf.frame.payload)
+            .collect();
+        assert_eq!(claims.len(), 1, "only the completed job's CLAIM survives the prune");
+        assert_eq!(
+            claims[0]["jobKey"], "done",
+            "the preserved CLAIM is the one paired with a buffered RELEASE"
+        );
+        assert!(
+            buf.control.iter().any(|bf| bf.frame.family == Family::Release),
+            "the buffered RELEASE is preserved (its CLAIM→tail→RELEASE stays intact)"
+        );
+        assert!(
+            !buf.control.iter().any(|bf| bf.frame.family == Family::Register),
+            "every REGISTER is pruned — the resync snapshot rebuilds it"
+        );
+    }
+
+    // Finding 3 (round 9): the shutdown DEREGISTER snapshot must be exempt from
+    // the control bound. With a capacity smaller than the registered-slot count,
+    // the ordinary bounded `push` drops control newcomers once the control lane
+    // fills (control never evicts control), so only a subset would DEREGISTER.
+    // The exempt back-push admits the whole snapshot.
+    #[test]
+    fn deregister_snapshot_is_exempt_from_the_control_bound() {
+        let mut exempt = LaneBuffer::with_limits(2, 0);
+        for i in 0..5u32 {
+            exempt.push_back_control_bounded(Frame::new(
+                Lane::Control,
+                Family::Deregister,
+                i,
+                json!({ "instance": format!("w-{i}"), "reason": "shutdown" }),
+            ));
+        }
+        assert_eq!(
+            exempt.control.len(),
+            5,
+            "every DEREGISTER is admitted despite a capacity of 2"
+        );
+        // Contrast: the ordinary bounded push drops the control overflow.
+        let mut bounded = LaneBuffer::with_limits(2, 0);
+        for i in 0..5u32 {
+            bounded.push(Frame::new(
+                Lane::Control,
+                Family::Deregister,
+                i,
+                json!({ "instance": format!("w-{i}"), "reason": "shutdown" }),
+            ));
+        }
+        assert_eq!(
+            bounded.control.len(),
+            2,
+            "the bounded push drops the control overflow once the lane is full"
+        );
+    }
+
+    // Finding 3 (round 9), end-to-end: a worker with MORE registered slots than
+    // the buffer capacity must still DEREGISTER every slot on shutdown. Before
+    // the exempt back-push, the surplus DEREGISTERs were dropped on the floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_deregisters_every_slot_even_below_capacity() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<(Family, Value)>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send((frame.family, frame.payload)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        cfg.buffer_capacity = 1; // far smaller than the slot count below
+        let slots: Vec<(String, Value)> =
+            (0..4).map(|i| (format!("w-{i}"), capability())).collect();
+        let client = HubClient::spawn(cfg, &slots);
+
+        // Wait until all four slots have REGISTERed on the wire (connection up).
+        let mut registered = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registered.len() < 4 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, frames_rx.recv()).await {
+                Ok(Some((Family::Register, p))) => {
+                    registered.insert(p["instance"].as_str().unwrap().to_string());
+                }
+                Ok(Some(_)) => {}
+                _ => panic!("timed out before all slots REGISTERed, saw {registered:?}"),
+            }
+        }
+
+        client.shutdown().await;
+
+        // Every slot must now DEREGISTER, despite the capacity-1 control lane.
+        let mut deregistered = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while deregistered.len() < 4 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, frames_rx.recv()).await {
+                Ok(Some((Family::Deregister, p))) => {
+                    deregistered.insert(p["instance"].as_str().unwrap().to_string());
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert_eq!(
+            deregistered.len(),
+            4,
+            "every slot must be DEREGISTERed at shutdown, got {deregistered:?}"
+        );
+        server.abort();
+    }
+
+    // Finding 4 (round 9): the outbound drain must yield a bounded batch so a
+    // sustained transcript producer cannot starve `read.next()`. With an
+    // UNBOUNDED drain the notified branch loops as long as the buffer keeps
+    // refilling, so an inbound steer frame on the socket is never polled and the
+    // session is never steered. The bounded batch returns to the `select!` loop
+    // between batches, so inbound routing stays responsive even under a flood.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_routing_stays_responsive_under_a_transcript_flood() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let steer_stream = compose_stream_id("w-flood", "job-flood");
+        let steer_stream_srv = steer_stream.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The server drains the socket fast and, on the first CLAIM, sends a
+        // targeted inbound steer for this session's stream — then keeps reading.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (mut write, mut read) = ws.split();
+            let mut steered = false;
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Binary(bytes) = msg {
+                    if let Ok(frame) = decode_frame(&bytes) {
+                        if frame.family == Family::Claim && !steered {
+                            steered = true;
+                            let relay = Frame::new(
+                                Lane::Interactive,
+                                Family::Relay,
+                                0,
+                                json!({
+                                    "stream": steer_stream_srv,
+                                    "offset": 0,
+                                    "chunk": "steer-me",
+                                }),
+                            );
+                            let _ = write
+                                .send(Message::Binary(encode_frame(&relay).unwrap()))
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        cfg.buffer_capacity = 4096;
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-flood", capability(), "job-flood");
+        let mut steer = session.take_steer().expect("steer receiver");
+
+        // A sustained producer that keeps the outbound buffer saturated: it
+        // enqueues directly (no bridge back-pressure) in a tight loop, so the
+        // buffer is continuously non-empty until `stop` is set.
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_client = client.clone();
+        let producer_stop = stop.clone();
+        let producer = tokio::spawn(async move {
+            while !producer_stop.load(Ordering::Relaxed) {
+                producer_client.enqueue(
+                    Lane::Bulk,
+                    Family::Relay,
+                    json!({ "op": "produce", "stream": "w-flood/job-flood", "chunk": "x" }),
+                );
+            }
+        });
+
+        // The inbound steer must reach THIS session despite the ongoing flood —
+        // only a bounded drain yields the select loop back to `read.next()`.
+        let got = tokio::time::timeout(Duration::from_secs(10), steer.recv()).await;
+        stop.store(true, Ordering::Relaxed);
+        let _ = producer.await;
+        let got = got
+            .expect("inbound steer was starved by the transcript flood (drain did not yield)")
+            .expect("steer channel closed");
+        assert_eq!(got, ControlFrame::Prompt { text: "steer-me".into() });
+
+        drop(session);
         client.shutdown().await;
         server.abort();
     }

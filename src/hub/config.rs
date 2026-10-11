@@ -35,8 +35,11 @@ pub struct HubConfig {
     /// A bearer secret sent as `Authorization: Bearer …` on the upgrade
     /// (`NANO_AGENTIC_SECRET`).
     pub secret: Option<String>,
-    /// An opaque credential echoed in the presence payload
-    /// (`NANO_AGENTIC_CREDENTIAL`).
+    /// An opaque credential (`NANO_AGENTIC_CREDENTIAL`) sent as the `capability`
+    /// query parameter on the WebSocket upgrade URL (see `authenticated_url`).
+    /// It is NOT included in the REGISTER/presence `capability` payload
+    /// (`capability_payload` never adds it), so operators should not expect it
+    /// in presence frames.
     pub credential: Option<String>,
     /// The worker's harness-protocol override (`NANO_AGENTIC_PROTOCOL`), e.g.
     /// `pipe` or `acp`. This is NOT a WebSocket subprotocol: it is applied when
