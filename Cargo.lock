@@ -1182,6 +1182,7 @@ dependencies = [
  "camunda-orchestration-sdk",
  "clap",
  "fs2",
+ "futures-util",
  "libc",
  "reqwest",
  "ryu",
@@ -1190,6 +1191,7 @@ dependencies = [
  "sha1",
  "shlex 1.3.0",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

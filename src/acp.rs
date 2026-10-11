@@ -59,6 +59,11 @@ struct Shared {
     effective_turns: usize,
     permissions_granted: usize,
     last_activity: Option<Instant>,
+    /// Optional live sink for raw ACP `session/update` objects (issue #10): when
+    /// a job runs under the agentic hub, every update is forwarded here so the
+    /// hub session can bridge it to a transcript frame. `None` keeps the agent's
+    /// behaviour identical to a hub-less run.
+    transcript: Option<mpsc::UnboundedSender<Value>>,
 }
 
 pub struct Agent {
@@ -81,6 +86,10 @@ pub struct Agent {
     /// `execute` on lease loss instead of calling `shutdown`), so descendants the
     /// agent started cannot survive and overlap the job's redelivery.
     group_guard: crate::pdeath::GroupGuard,
+    /// Optional inbound-steer receiver (issue #10): hub-delivered prompt text to
+    /// inject into the running ACP turn as additional `session/prompt` input.
+    /// `None` runs the turn exactly as a hub-less agent does.
+    steer: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 impl Agent {
@@ -152,7 +161,21 @@ impl Agent {
             shared,
             next_id: 1,
             group_guard,
+            steer: None,
         })
+    }
+
+    /// Attach the hub session's sinks (issue #10) before `run`: `transcript`
+    /// receives every ACP `session/update` for live bridging, and `steer`
+    /// delivers hub-inbound prompt text to inject into the running turn. A
+    /// hub-less run never calls this and behaves identically.
+    pub fn attach_hub(
+        &mut self,
+        transcript: mpsc::UnboundedSender<Value>,
+        steer: mpsc::UnboundedReceiver<String>,
+    ) {
+        self.shared.lock().unwrap().transcript = Some(transcript);
+        self.steer = Some(steer);
     }
 
     async fn request(&mut self, method: &str, params: Value, idle: Duration) -> Result<Value> {
@@ -261,14 +284,42 @@ impl Agent {
             .as_str()
             .context("session/new returned no sessionId")?
             .to_string();
+        // Inbound steer (issue #10): while the prompt turn is in flight, inject
+        // each hub-delivered chunk as an additional `session/prompt` on the SAME
+        // session — the agent folds it into the running turn. The injected
+        // prompts use ids far above the turn's own sequence and are never
+        // tracked as pending, so their responses are simply ignored and the
+        // original turn's response still completes the run.
+        let steer_task = self.steer.take().map(|mut rx| {
+            let out = self.out.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                let mut id: u64 = 1 << 32;
+                while let Some(text) = rx.recv().await {
+                    id += 1;
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "session/prompt",
+                        "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": text }] }
+                    });
+                    if out.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
         let done = self
             .request(
                 "session/prompt",
                 json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": prompt }] }),
                 idle,
             )
-            .await
-            .context("ACP session/prompt")?;
+            .await;
+        if let Some(task) = steer_task {
+            task.abort();
+        }
+        let done = done.context("ACP session/prompt")?;
         let s = self.shared.lock().unwrap();
         Ok(Outcome {
             stop_reason: done["stopReason"].as_str().unwrap_or("unknown").to_string(),
@@ -606,6 +657,13 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
         (Some("session/update"), None) => {
             s.updates += 1;
             let update = &msg["params"]["update"];
+            // Live transcript bridge (issue #10): forward the raw update to the
+            // hub session, if one is attached, BEFORE the local accounting below.
+            // An unbounded send never blocks under the shared lock; a closed
+            // receiver (the session ended) just drops the update.
+            if let Some(tx) = &s.transcript {
+                let _ = tx.send(update.clone());
+            }
             // Count effective transcript turns / valid plans the Node way, BEFORE
             // the narrower match below (which only tracks message text and tool
             // calls): `updates` alone overcounts ignored/intermediate updates.

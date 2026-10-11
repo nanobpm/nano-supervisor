@@ -356,6 +356,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         "worker {worker_name} for hire \"{}\" [{}] over job types {job_types:?}",
         hire.name, hire.rank
     ));
+    let hub = crate::hub::HubConfig::from_env().map(crate::hub::HubClient::spawn);
     let cfg = Arc::new(SlotConfig {
         hire,
         worker_name,
@@ -372,6 +373,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         keep_runs: opts.keep_runs,
         connection: decision.pin.clone(),
         connection_profile: decision.profile.clone(),
+        hub: hub.clone(),
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));
@@ -417,6 +419,11 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         }
     }
     reaper.abort();
+    // Stop the agentic hub (issue #10) before cleanup: deregister and let its
+    // connection task exit. A never-configured hub is `None` and a no-op.
+    if let Some(hub) = &hub {
+        hub.shutdown();
+    }
     // Drop this worker's namespace on a clean exit, unless `--keep-runs`. Only
     // remove it when EMPTY: `execute` intentionally retains failed run dirs for
     // post-mortem and age-based reaping, so a recursive delete here would erase

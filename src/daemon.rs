@@ -195,6 +195,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
+    // Agentic hub (issue #10): one WebSocket per daemon, shared across every
+    // slot. Enabled only when the `NANO_AGENTIC*` environment configures it;
+    // otherwise `None` and the daemon runs with no hub connection, exactly as
+    // before. The connection task reconnects on its own and buffers while down.
+    let hub = crate::hub::HubConfig::from_env().map(crate::hub::HubClient::spawn);
     // The in-process slots this daemon runs, as (worker id, profile) pairs — the
     // control socket's `status` reply reports each as a worker
     // (nanobpm/nano-supervisor#8).
@@ -225,6 +230,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 keep_runs: false,
                 connection: decision.pin.clone(),
                 connection_profile: decision.profile.clone(),
+                hub: hub.clone(),
             });
             // Issue #41 sanity guard: judge each SLOT's own job-type matrix, not
             // the daemon-wide aggregate `all_types` the shared `jobs` was built
@@ -402,6 +408,12 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let fatal = settled == slot::Shutdown::Fatal;
     if fatal && reason != slot::Shutdown::Fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); the fatal escalation arrived during the drain — exiting non-zero");
+    }
+
+    // Stop the agentic hub (issue #10): deregister the worker and let its
+    // connection task exit. Best-effort — a never-connected hub is a no-op.
+    if let Some(hub) = &hub {
+        hub.shutdown();
     }
 
     // Tear the control socket down: stop accepting, remove the socket file and

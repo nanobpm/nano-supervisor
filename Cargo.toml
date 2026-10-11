@@ -50,6 +50,12 @@ ryu = "1"
 # mutual exclusion) and the lock file never persists under the state home.)
 fs2 = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs", "net"] }
+# Worker-side agentic-hub client (issue #10): one WebSocket per daemon,
+# multiplexed across all slots. Pinned to the SDK's already-locked versions so
+# `--locked` stays satisfied without pulling a new TLS stack (default features,
+# `ws://`); a `wss://` endpoint needs the crate's TLS feature, a follow-up.
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).
 [target.'cfg(unix)'.dependencies]

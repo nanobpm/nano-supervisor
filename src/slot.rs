@@ -136,6 +136,11 @@ pub struct SlotConfig {
     /// The pinned connection fully resolved, when it names a c8ctl profile —
     /// the seed content for the agent's isolated `profiles.json`.
     pub connection_profile: Option<crate::profile::Profile>,
+    /// The shared agentic-hub client (issue #10), when `NANO_AGENTIC` enabled it.
+    /// One connection per daemon is multiplexed across all slots; each job opens
+    /// a session on it for presence, live transcript, and inbound steer. `None`
+    /// runs every job exactly as before, with no hub connection.
+    pub hub: Option<std::sync::Arc<crate::hub::HubClient>>,
 }
 
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
@@ -2677,6 +2682,19 @@ async fn run_agent(
                     }
                 }
             };
+            // Agentic hub (issue #10): open a session for this job so its
+            // presence and live transcript appear on the hub and inbound steer
+            // reaches the running ACP turn. Held for the turn's lifetime; it
+            // deregisters on drop. Absent the hub, the agent runs unchanged.
+            let _hub_session = cfg.hub.as_ref().map(|hub| {
+                let mut session = hub.register_session(key);
+                if let (Some(transcript), Some(steer)) =
+                    (session.transcript_sink(), session.take_steer())
+                {
+                    agent.attach_hub(transcript, steer);
+                }
+                session
+            });
             // Name the pinned directory for the log line, recovered through
             // the fd so a post-prepare rename cannot put a stale pathname in
             // the log; fall back to the raw handle debug if it cannot be read.
@@ -3545,6 +3563,7 @@ mod tests {
                 base_url: Some("http://merlin:8080".into()),
                 ..Default::default()
             }),
+            hub: None,
         }
     }
 

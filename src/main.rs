@@ -12,6 +12,7 @@ mod daemon;
 mod engine;
 mod envelope;
 mod fleet;
+mod hub;
 mod jobs;
 mod pdeath;
 mod pin;
