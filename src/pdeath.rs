@@ -333,6 +333,19 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
     // expose the engine/OAuth secrets to a same-user reader of
     // `/proc/<watchdog-pid>/environ` (the same hardening `spawn_watchdog` uses).
     cmd.env_clear();
+    // Detach the watchdog into its OWN process group (pid == pgid). The daemon
+    // is *not* its own group leader — it inherits the test runner's / invoking
+    // shell's foreground group — so without this the watchdog shares that group
+    // and a terminal Ctrl-C delivers SIGINT to it too. The watchdog installs no
+    // SIGINT handler, so it would die with the group *before* observing the
+    // owner's death, and the orphaned daemon would lose its guaranteed reaper
+    // exactly when the fallback matters (issue #54 review). In its own group it
+    // is out of the foreground group's signal fan-out and survives to reap the
+    // daemon. This mirrors how agents are launched (`process_group(0)`).
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1534,6 +1547,62 @@ mod tests {
             !owner_gone_ok,
             "the matching token must not read as owner death"
         );
+    }
+
+    /// Regression (issue #54 review): the owner watchdog must be spawned into
+    /// its OWN process group, not left in the daemon's (the test runner's /
+    /// shell's foreground) group. The daemon is not its own group leader, so a
+    /// terminal Ctrl-C fans SIGINT out to the whole foreground group — and a
+    /// watchdog that shares it would die before reaping the orphaned daemon,
+    /// defeating the fallback exactly when it is needed. `spawn_owner_watchdog`
+    /// therefore sets `process_group(0)`, so the watchdog's pgid must equal its
+    /// own pid (it leads its own group) and must differ from ours.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owner_watchdog_leads_its_own_process_group() {
+        let home = std::env::temp_dir().join(format!(
+            "nano-owner-wd-pgid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        // The owner is ourselves (alive for the whole test), so the spawned
+        // watchdog stays alive polling until we reap it — giving us a live child
+        // whose process group we can inspect.
+        let pid =
+            spawn_owner_watchdog(std::process::id(), home.clone()).expect("watchdog spawns");
+        // SAFETY: a single async-signal-safe libc call reading our own group.
+        let our_pgid = unsafe { libc::getpgid(0) };
+        // SAFETY: same, reading the watchdog child's group by pid.
+        let wd_pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert!(
+            wd_pgid >= 0,
+            "getpgid(watchdog) must succeed for the live child"
+        );
+        let wd_pgid = wd_pgid as u32;
+        assert_eq!(
+            wd_pgid, pid,
+            "the owner watchdog must lead its own process group (pgid == pid)"
+        );
+        assert_ne!(
+            wd_pgid, our_pgid as u32,
+            "the owner watchdog must not share the daemon/test group"
+        );
+        // Cleanup: kill + reap the watchdog and drop the temp home.
+        // SAFETY: signalling a child we just spawned.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        // Reap via a blocking wait on the pid (it is our child).
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own child.
+        unsafe {
+            libc::waitpid(pid as libc::pid_t, &mut status, 0);
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

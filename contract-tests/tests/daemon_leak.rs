@@ -19,20 +19,24 @@
 //! These tests are **engine-free** and drive the real binary's hidden
 //! `__owner-watchdog` subcommand directly, exactly as `pdeath_guard.rs` drives
 //! `__reap-watchdog`. They are **Rust-pinned** (the owner watchdog is the Rust
-//! port's mechanism) and **unix-only** (the reaper signals a process).
+//! port's mechanism) and gated to **Linux/macOS only** — the same target set as
+//! the `owner_watchdog` implementation (`src/pdeath.rs`), which is a deliberate
+//! no-op on every other Unix. On FreeBSD and the rest the watchdog does nothing,
+//! so these tests would time out waiting for a reaper that never fires rather
+//! than skip; gating the target set keeps them green there.
 
 mod common;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{Command, Stdio};
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use contract_tests::{skip, Target};
 
 /// The Rust binary under test (`$NS_BIN`, default `target/debug/nano-supervisor`).
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bin() -> String {
     std::env::var("NS_BIN").unwrap_or_else(|_| "target/debug/nano-supervisor".to_string())
 }
@@ -40,7 +44,7 @@ fn bin() -> String {
 /// Spawn a long-lived `sleep` in its OWN process group (pid == pgid), used only
 /// as the *group host* for the daemon stand-in below — never as the daemon
 /// itself. Returns (child, pgid). Killed+reaped by the caller.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_group_host() -> (std::process::Child, u32) {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("sleep");
@@ -60,7 +64,7 @@ fn spawn_group_host() -> (std::process::Child, u32) {
 /// (child, pid). A group-targeted `kill(-pid)` would miss this process; only a
 /// pid-targeted kill reaps it — which is exactly what the watchdog must do. The
 /// child is killed+reaped by the caller on every path.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_daemon_in_group(pgid: u32) -> (std::process::Child, u32) {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("sleep");
@@ -79,7 +83,7 @@ fn spawn_daemon_in_group(pgid: u32) -> (std::process::Child, u32) {
 /// Spawn a short-lived stand-in for the owning test process. The watchdog waits
 /// on this pid; killing it below is what trips the watchdog, exactly as a
 /// SIGKILLed `cargo test` trips it in production.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_owner() -> (std::process::Child, u32) {
     let child = Command::new("sleep")
         .arg("60")
@@ -93,7 +97,7 @@ fn spawn_owner() -> (std::process::Child, u32) {
 }
 
 /// True while `pid` names a live process.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
@@ -102,7 +106,7 @@ fn pid_alive(pid: u32) -> bool {
 /// reaps its child (e.g. via `try_wait`) on each pass so a SIGKILLed child does
 /// not linger as a zombie that still answers `kill(_,0)`; `eventually` itself
 /// only evaluates `cond` and takes no reaping parameter.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn eventually<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -120,7 +124,7 @@ fn eventually<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
 /// another group (pid != pgid — the real daemon's situation) and for the test
 /// with a short-lived child we SIGKILL; the watchdog must then SIGKILL the daemon
 /// *by pid* even though nothing unwound and the daemon leads no group of its own.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn daemon_is_reaped_when_the_owning_test_is_killed() {
     if Target::from_env() != Target::Rust {
@@ -179,7 +183,7 @@ fn daemon_is_reaped_when_the_owning_test_is_killed() {
 /// The watchdog must also fire when the test's `C8CTL_NANO_HOME` disappears out
 /// from under a still-live owner — the `TempDir`-removed case, which catches a
 /// recycled owner pid the liveness probe alone would miss.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn daemon_is_reaped_when_its_home_disappears() {
     if Target::from_env() != Target::Rust {
@@ -235,7 +239,7 @@ fn daemon_is_reaped_when_its_home_disappears() {
 /// The watchdog must NOT fire while the owner is alive and the home exists — a
 /// live test's daemon is left alone. It exits on its own (without firing) once
 /// the supervised daemon has terminated normally.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn live_owner_daemon_is_left_alone() {
     if Target::from_env() != Target::Rust {
