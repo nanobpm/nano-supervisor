@@ -827,7 +827,7 @@ impl HubClient {
             instance: instance.to_string(),
             job_key: job_key.to_string(),
             stream,
-            session_id: 0,
+            session_id: None,
             transcript: None,
             steer: Some(steer_rx),
             released: false,
@@ -910,7 +910,7 @@ impl HubClient {
                 handle: bridge_handle,
             },
         );
-        session.session_id = session_id;
+        session.session_id = Some(session_id);
         session.transcript = Some(updates_tx);
     }
 
@@ -1334,8 +1334,13 @@ pub struct HubSession {
     stream: String,
     /// Unique per-session key into `HubClient::bridge_tasks` (NOT the stream
     /// id, which a later session for the same job would reuse), so this drop
-    /// flushes exactly its own transcript bridge.
-    session_id: u64,
+    /// flushes exactly its own transcript bridge. `None` until `spawn_bridge`
+    /// allocates one at the first `open_turn`: a session whose agent fails
+    /// before any turn owns NO bridge, and the sentinel-free `Option` makes it
+    /// impossible for its `close`/`Drop` to remove `bridge_tasks[0]` — the first
+    /// REAL id `next_session_seq` hands out — and steal another session's flush
+    /// handle. Every removal is guarded on `Some`.
+    session_id: Option<u64>,
     transcript: Option<mpsc::Sender<Value>>,
     steer: Option<mpsc::Receiver<ControlFrame>>,
     /// True once the job's RELEASE has been enqueued (by `close`, or by the
@@ -1423,12 +1428,16 @@ impl HubSession {
         let Some(_tx) = self.transcript.take() else {
             return; // no live bridge (already detached, or never opened)
         };
-        let flush = self
-            .client
-            .bridge_tasks
-            .lock()
-            .unwrap()
-            .remove(&self.session_id);
+        // Remove only the bridge THIS session owns. `session_id` is `None` when
+        // no turn ever opened (agent failed first), so a never-bridged session
+        // removes nothing — it cannot steal another session's flush handle.
+        let flush = self.session_id.and_then(|id| {
+            self.client
+                .bridge_tasks
+                .lock()
+                .unwrap()
+                .remove(&id)
+        });
         if let Some(flush) = flush {
             let BridgeFlush {
                 close_tx,
@@ -1478,12 +1487,17 @@ impl HubSession {
         // `transcript` may already be `None` (a nudge turn's `detach_turn` took
         // it); the bridge handle is then already gone too and this is a no-op.
         let _tx = self.transcript.take();
-        let flush = self
-            .client
-            .bridge_tasks
-            .lock()
-            .unwrap()
-            .remove(&self.session_id);
+        // Remove only the bridge THIS session actually owns (guard on `Some`):
+        // a session that never opened a turn has `session_id == None` and must
+        // not remove `bridge_tasks[0]`, which is the FIRST real id and belongs
+        // to another live session.
+        let flush = self.session_id.and_then(|id| {
+            self.client
+                .bridge_tasks
+                .lock()
+                .unwrap()
+                .remove(&id)
+        });
         if let Some(flush) = flush {
             let BridgeFlush {
                 close_tx,
@@ -1526,13 +1540,16 @@ impl HubSession {
     /// best-effort on this fallback path; `close` is what preserves it.
     fn flush_transcript(&mut self) {
         let _tx = self.transcript.take();
-        let Some(flush) = self
-            .client
-            .bridge_tasks
-            .lock()
-            .unwrap()
-            .remove(&self.session_id)
-        else {
+        // Guard on `Some`: a session whose agent failed before `open_turn` owns
+        // no bridge (`session_id == None`), so it must remove NOTHING — removing
+        // by a sentinel id would steal the first real session's flush handle.
+        let Some(flush) = self.session_id.and_then(|id| {
+            self.client
+                .bridge_tasks
+                .lock()
+                .unwrap()
+                .remove(&id)
+        }) else {
             return; // already flushed by `close`, or never attached
         };
         // Signal the bridge to finish; do NOT wait (see the doc comment). ABORT
@@ -2619,6 +2636,74 @@ mod tests {
             "restored receiver is lent to the next turn"
         );
         session.close().await;
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn never_bridged_session_close_does_not_steal_another_sessions_bridge() {
+        // Regression for the sentinel-session-id finding: `register_session` used
+        // to set `session_id = 0`, which is ALSO the first real id
+        // `next_session_seq` hands out. A session whose agent fails before
+        // `open_turn` therefore kept the sentinel, and its `close`/`Drop` did
+        // `bridge_tasks.remove(&0)` — stealing the FIRST active session's flush
+        // handle. With `Option<u64>`, a never-bridged session owns NO bridge and
+        // must remove nothing.
+        let client = HubClient::spawn(test_config(), &[]);
+        let _ = buffered(&client);
+
+        // Session A opens a turn: it owns the FIRST real bridge (id 0).
+        let mut active = client.register_session("w-a", capability(), "job-a");
+        let _ = buffered(&client);
+        let (_sink_a, _steer_a) = active.open_turn().expect("active session opens a turn");
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            1,
+            "the active session owns exactly one bridge"
+        );
+
+        // Session B is registered but its agent fails BEFORE any `open_turn`, so
+        // it never spawns a bridge (`session_id` stays `None`).
+        let mut failed = client.register_session("w-b", capability(), "job-b");
+        let _ = buffered(&client);
+        assert!(
+            failed.session_id.is_none(),
+            "a session that never opened a turn owns no bridge id"
+        );
+
+        // Closing the failed session must NOT remove the active session's
+        // bridge. Pre-fix this removed bridge_tasks[0] via the sentinel.
+        failed.close().await;
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            1,
+            "closing a never-bridged session must not steal the active session's bridge"
+        );
+        assert!(
+            client
+                .bridge_tasks
+                .lock()
+                .unwrap()
+                .contains_key(&active.session_id.expect("active session has a bridge id")),
+            "the active session's own bridge is still tracked"
+        );
+
+        // Same guarantee on the Drop fallback path (a panic-unwind drop of a
+        // never-bridged session).
+        let failed2 = client.register_session("w-c", capability(), "job-c");
+        let _ = buffered(&client);
+        drop(failed2);
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            1,
+            "dropping a never-bridged session must not steal the active session's bridge"
+        );
+
+        active.close().await;
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            0,
+            "the active session's own close still flushes exactly its own bridge"
+        );
         client.shutdown().await;
     }
 

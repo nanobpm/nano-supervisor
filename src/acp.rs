@@ -88,10 +88,13 @@ pub struct Agent {
     /// agent started cannot survive and overlap the job's redelivery.
     group_guard: crate::pdeath::GroupGuard,
     /// Optional inbound-steer receiver (issue #10): typed hub-delivered controls
-    /// applied to the running ACP turn — a `prompt` is injected as additional
-    /// `session/prompt` input, a `cancel` is mapped to `session/cancel`, and a
-    /// `permission` outcome is applied to the turn's permission handling.
-    /// `None` runs the turn exactly as a hub-less agent does.
+    /// applied to the running ACP turn. SUPPORTED CONTRACT: `prompt` and `cancel`
+    /// ONLY — a `prompt` is injected as additional `session/prompt` input and a
+    /// `cancel` is mapped to `session/cancel`. A `permission` steer is NOT
+    /// routed: this client auto-answers every ACP `session/request_permission`
+    /// itself under the `yolo` policy, so there is never an outstanding request
+    /// for a hub outcome to resolve; the steer task logs and drops it (see
+    /// [`Agent::run`]). `None` runs the turn exactly as a hub-less agent does.
     steer: Option<mpsc::Receiver<crate::hub::control::ControlFrame>>,
 }
 
