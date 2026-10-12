@@ -315,12 +315,21 @@ impl Agent {
         // each hub-delivered typed control to the SAME session. A `prompt` is
         // injected as an additional `session/prompt` (the agent folds it into
         // the running turn); a `cancel` is mapped to the ACP `session/cancel`
-        // notification so it actually interrupts the turn; a `permission`
-        // outcome is advisory here (the client auto-answers permission prompts
-        // under the `yolo` policy, so there is no outstanding request to
-        // re-decide) and is logged rather than silently dropped. The injected
-        // prompts use ids far above the turn's own sequence and are never
-        // tracked as pending, so their responses are simply ignored and the
+        // notification so it actually interrupts the turn.
+        //
+        // SUPPORTED STEER CONTRACT (this PR): `prompt` and `cancel` ONLY.
+        // `permission` is explicitly NOT part of the supported steer contract:
+        // this client answers every ACP `session/request_permission` itself,
+        // immediately and unconditionally, under the `yolo` policy (see
+        // `handle_message`/`permission_choice`). There is therefore never an
+        // outstanding agent permission request for a hub `permission` outcome to
+        // resolve, so the outcome cannot affect the active turn. Rather than
+        // silently swallow it, a `permission` steer is logged loudly as
+        // unsupported-and-dropped (see below). Routing a hub permission decision
+        // back into ACP is a deliberate follow-up, not claimed by this PR.
+        //
+        // The injected prompts use ids far above the turn's own sequence and are
+        // never tracked as pending, so their responses are simply ignored and the
         // original turn's response still completes the run.
         // Gate the steer task behind the original prompt: a steer control that
         // arrived during ACP init must not be written to `out` before the very
@@ -358,8 +367,14 @@ impl Agent {
                             request_id,
                             outcome,
                         } => {
+                            // `permission` is NOT in the supported steer
+                            // contract (see the steer-task doc above): this
+                            // client auto-answers every ACP permission request
+                            // under `yolo`, so no hub outcome can re-decide an
+                            // outstanding request. Log loudly and drop — never
+                            // silently swallow an unsupported steer.
                             crate::runtime::log(&format!(
-                                "agentic hub: inbound permission {request_id} → {outcome} (advisory; permissions are auto-answered)"
+                                "agentic hub: dropping inbound permission steer {request_id} → {outcome}: permission is not in the supported steer contract (ACP permissions are auto-answered under yolo)"
                             ));
                             continue;
                         }

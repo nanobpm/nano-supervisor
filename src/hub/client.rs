@@ -660,7 +660,9 @@ impl HubClient {
             client.config.buffer_capacity,
             slot_count,
             if client.config.terminal {
-                ", terminal relay on"
+                // The mode is configured but the relay transport is not wired
+                // in this PR, so it is parsed but not advertised/relayed.
+                ", terminal relay configured (transport pending)"
             } else {
                 ""
             }
@@ -865,8 +867,15 @@ impl HubClient {
                 obj.entry("attribution")
                     .or_insert_with(|| Value::String(attr.clone()));
             }
-            obj.entry("terminal")
-                .or_insert_with(|| Value::Bool(self.config.terminal));
+            // Advertise `terminal: false` unconditionally for now: the PTY/pipe
+            // terminal relay transport is NOT wired in this PR (hub sessions
+            // attach only in the ACP branch, and the pipe runner closes stdin
+            // after the initial payload and only captures stdout), so reporting
+            // `config.terminal` here would tell the hub a terminal is available
+            // while no PTY input/output can be relayed. The `NANO_AGENTIC_TERMINAL`
+            // mode is still parsed/validated in config, but it is intentionally
+            // NOT surfaced as a capability until the relay follow-up lands.
+            obj.entry("terminal").or_insert_with(|| Value::Bool(false));
             obj.entry("runtime")
                 .or_insert_with(|| Value::String("nano-supervisor".into()));
         }
@@ -942,15 +951,32 @@ impl HubClient {
     /// looking owned until the worker deregisters; ownership is advisory
     /// visibility only, so this is accepted.)
     fn release_job(&self, instance: &str, job_key: &str) {
+        let payload = json!({ "instance": instance, "jobKey": job_key });
+        // Hold the SINGLE outbound lock across BOTH the `in_flight` removal and
+        // the RELEASE admission, so the pair is atomic with respect to
+        // `resync_presence` (which takes the same lock while it snapshots
+        // `in_flight` and prunes/replaces buffered presence). This is the same
+        // atomic pattern `register_session` uses for its CLAIM. Without it, a
+        // reconnect resync landing in the gap — after the job is removed from
+        // `in_flight` but before its RELEASE is queued — would snapshot the job
+        // as finished and `drop_control_presence` would delete its buffered
+        // CLAIM, leaving the hub to receive transcript/RELEASE for an ownership
+        // it never saw. Lock order is always outbound → in_flight, so no
+        // deadlock. (`connected` is read inside the lock: a stale `true` at
+        // worst takes the exempt live path, which is safe because the resync
+        // itself runs under this same lock and therefore cannot interleave.)
+        let mut buf = self.outbound.lock().unwrap();
         if let Some(jobs) = self.in_flight.lock().unwrap().get_mut(instance) {
             jobs.remove(job_key);
         }
-        let payload = json!({ "instance": instance, "jobKey": job_key });
         if self.connected.load(Ordering::Relaxed) {
             // Live connection: enqueue EXEMPT and ordered — `drain`'s per-session
             // barrier writes the transcript tail before this RELEASE, and the
             // RELEASE itself is never dropped.
-            self.enqueue_control_exempt(Family::Release, payload);
+            let frame = self.make_frame(Lane::Control, Family::Release, payload);
+            buf.push_back_control_bounded(frame);
+            drop(buf);
+            self.outbound_notify.notify_one();
             return;
         }
         // OUTAGE: nothing is draining, so an unbounded RELEASE+barrier set would
@@ -962,10 +988,8 @@ impl HubClient {
         // collapsed stream's orphaned drain barrier is disarmed so armed barriers
         // stay bounded too.
         let frame = self.make_frame(Lane::Control, Family::Release, payload);
-        let collapsed = {
-            let mut buf = self.outbound.lock().unwrap();
-            buf.push_back_release_bounded(frame, RELEASE_OUTAGE_CAP)
-        };
+        let collapsed = buf.push_back_release_bounded(frame, RELEASE_OUTAGE_CAP);
+        drop(buf);
         if let Some(stream) = collapsed {
             self.disarm_release_barrier(&stream);
         }
@@ -3675,6 +3699,52 @@ mod tests {
             RELEASE_OUTAGE_CAP + 5,
             "a live connection keeps every RELEASE (no outage cap applies)"
         );
+        client.shutdown().await;
+    }
+
+    // #7 (round 13): `release_job` removes the job from `in_flight` AND enqueues
+    // its RELEASE under the SINGLE outbound lock, so the pair is atomic with
+    // respect to a concurrent `resync_presence` (which snapshots `in_flight` and
+    // prunes/replaces buffered presence under the same lock). A resync that lands
+    // in the gap must never observe the job as finished and prune its CLAIM while
+    // the RELEASE has not yet been queued — that would leave the hub holding a
+    // RELEASE for an ownership it never saw. This test drives the live path and
+    // asserts the CLAIM is still buffered alongside the RELEASE (i.e. the resync
+    // could not have pruned it mid-release).
+    #[tokio::test]
+    async fn release_job_is_atomic_with_resync_presence() {
+        let client = HubClient::spawn(test_config(), &[]);
+        client.connected.store(true, Ordering::Relaxed); // live path
+        let _session = client.register_session("w", capability(), "job-1");
+        // Sanity: the CLAIM is buffered for the in-flight job.
+        assert!(
+            client
+                .outbound
+                .lock()
+                .unwrap()
+                .control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "precondition: CLAIM buffered for the live job"
+        );
+        // Complete the job. Under the fix this is one atomic outbound-locked
+        // step; a concurrent resync cannot interleave between the in_flight
+        // removal and the RELEASE enqueue.
+        client.release_job("w", "job-1");
+        let buf = client.outbound.lock().unwrap();
+        let has_claim = buf
+            .control
+            .iter()
+            .any(|bf| bf.frame.family == Family::Claim);
+        let has_release = buf
+            .control
+            .iter()
+            .any(|bf| bf.frame.family == Family::Release);
+        assert!(
+            has_claim && has_release,
+            "CLAIM and RELEASE stay paired: a resync cannot prune the CLAIM before the RELEASE is queued"
+        );
+        drop(buf);
         client.shutdown().await;
     }
 
