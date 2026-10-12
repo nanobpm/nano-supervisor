@@ -196,9 +196,11 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
     // Agentic hub (issue #10): one WebSocket per daemon, shared across every
-    // slot. Enabled only when the `NANO_AGENTIC*` environment configures it;
-    // otherwise `None` and the daemon runs with no hub connection, exactly as
-    // before. The connection task reconnects on its own and buffers while down.
+    // slot. `HubConfig::from_env()` enables it by default (local-first) and
+    // returns `None` only when `NANO_AGENTIC` is an explicit off value
+    // (`off`/`0`/`false`/`no`); with the hub off the daemon runs with no
+    // connection, exactly as before. The connection task reconnects on its own
+    // and buffers while down.
     //
     // Build the slot identities FIRST so the client can REGISTER every
     // configured slot at spawn (register-on-connect): each `(worker_name,
@@ -213,8 +215,8 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
             slot_identities.push((
                 worker_name,
                 serde_json::json!({
-                    "cognition": hire.model,
-                    "family": hire.rank,
+                    "cognition": hire.rank,
+                    "family": hire.model,
                     "host": host,
                 }),
             ));

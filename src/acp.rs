@@ -169,16 +169,18 @@ impl Agent {
     }
 
     /// Attach the hub session's sinks (issue #10) before `run`: `transcript`
-    /// receives every ACP `session/update` for live bridging, and `steer`
-    /// delivers hub-inbound prompt text to inject into the running turn. A
-    /// hub-less run never calls this and behaves identically.
+    /// receives every ACP `session/update` for live bridging, and `steer` (when
+    /// this turn holds it) delivers hub-inbound prompt text to inject into the
+    /// running turn. A hub-less run never calls this and behaves identically.
+    /// `steer` is `None` on a job's second (result-nudge) turn: the steer
+    /// receiver is job-keyed and the first turn's steer task already holds it.
     pub fn attach_hub(
         &mut self,
         transcript: mpsc::Sender<Value>,
-        steer: mpsc::Receiver<crate::hub::control::ControlFrame>,
+        steer: Option<mpsc::Receiver<crate::hub::control::ControlFrame>>,
     ) {
         self.shared.lock().unwrap().transcript = Some(transcript);
-        self.steer = Some(steer);
+        self.steer = steer;
     }
 
     async fn request(&mut self, method: &str, params: Value, idle: Duration) -> Result<Value> {

@@ -28,4 +28,5 @@ pub mod stream;
 pub mod transcript;
 
 pub use client::HubClient;
+pub use client::HubSession;
 pub use config::HubConfig;

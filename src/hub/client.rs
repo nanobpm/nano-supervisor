@@ -110,6 +110,13 @@ const MAX_STEER_CHUNK_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRA
 /// overtake the transcript tail). Bounded so a wedged bridge can never hang the
 /// dropping task; on timeout the RELEASE proceeds (the tail is best-effort).
 const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// The harness-protocol version this worker advertises on REGISTER
+/// (`capability.harnessProtocol`). nano-workforce (#802) treats an absent
+/// version as a stale harness and can refuse routing under its stale-harness
+/// policy, so presence must carry it. Single source of truth, mirroring the
+/// reference Node worker's `HARNESS_PROTOCOL_VERSION` (issue #272); bump it
+/// when the harness's ACP/relay contract changes.
+pub(crate) const HARNESS_PROTOCOL_VERSION: u32 = 1;
 /// Maximum frames `drain` writes to the socket before yielding back to the
 /// connection `select!` loop (finding: a sustained transcript producer must not
 /// keep the outbound buffer non-empty and so starve `read.next()` and
@@ -806,6 +813,35 @@ impl HubClient {
         }
         self.outbound_notify.notify_one();
 
+        // Arm the RELEASE drain barrier for this session, keyed by its stream id
+        // (the identity a drained RELEASE carries). `close` arms it before
+        // enqueueing the RELEASE; `drain` then flushes the transcript tail to
+        // the socket before writing that RELEASE.
+        self.release_barriers
+            .lock()
+            .unwrap()
+            .insert(stream.clone(), ReleaseBarrier::default());
+
+        HubSession {
+            client: self.clone(),
+            instance: instance.to_string(),
+            job_key: job_key.to_string(),
+            stream,
+            session_id: 0,
+            transcript: None,
+            steer: Some(steer_rx),
+            released: false,
+        }
+    }
+
+    /// Spawn the transcript bridge for one turn of `session` and store the
+    /// resulting sender + flush handle on it. A session is opened once per JOB
+    /// but bridges once per ACP TURN (the first turn and, on a result-nudge, the
+    /// second): each turn gets a fresh bounded updates channel and bridge task,
+    /// while the CLAIM/presence/RELEASE lifecycle stays job-level. Idempotent
+    /// per turn — `HubSession::open_turn` calls this only after the prior turn's
+    /// bridge has been detached.
+    fn spawn_bridge(self: &Arc<Self>, session: &mut HubSession) {
         // Bridge ACP updates → transcript produce frames on a dedicated task.
         // A *bounded* channel: it fronts the already-byte-bounded outbound
         // buffer, so an unbounded (or loosely count-bounded) one here would let a
@@ -816,7 +852,7 @@ impl HubClient {
         let channel_bound = transcript_channel_bound(self.config.buffer_byte_budget);
         let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(channel_bound);
         let bridge_client = self.clone();
-        let bridge_stream = stream.clone();
+        let bridge_stream = session.stream.clone();
         // The bridge drains updates until EITHER the channel closes (all senders
         // dropped) OR the session's drop signals a flush, whichever first — then
         // it finishes and notifies the (synchronous) flush waiter. The flush
@@ -874,24 +910,8 @@ impl HubClient {
                 handle: bridge_handle,
             },
         );
-        // Arm the RELEASE drain barrier for this session, keyed by its stream id
-        // (the identity a drained RELEASE carries). `close` arms it before
-        // enqueueing the RELEASE; `drain` then flushes the transcript tail to
-        // the socket before writing that RELEASE.
-        self.release_barriers
-            .lock()
-            .unwrap()
-            .insert(stream.clone(), ReleaseBarrier::default());
-
-        HubSession {
-            client: self.clone(),
-            instance: instance.to_string(),
-            job_key: job_key.to_string(),
-            stream,
-            session_id,
-            transcript: Some(updates_tx),
-            steer: Some(steer_rx),
-        }
+        session.session_id = session_id;
+        session.transcript = Some(updates_tx);
     }
 
     /// Stop the hub: signal the connection task to deregister and exit, then
@@ -935,6 +955,12 @@ impl HubClient {
             obj.entry("terminal").or_insert_with(|| Value::Bool(false));
             obj.entry("runtime")
                 .or_insert_with(|| Value::String("nano-supervisor".into()));
+            // Advertise the harness-protocol version (issue #272) so
+            // nano-workforce (#802) does not flag this worker "stale harness"
+            // (absent => stale). Sourced from the single shared constant so the
+            // slot-supplied value and this default can never diverge.
+            obj.entry("harnessProtocol")
+                .or_insert_with(|| Value::from(HARNESS_PROTOCOL_VERSION));
         }
         cap
     }
@@ -1312,21 +1338,102 @@ pub struct HubSession {
     session_id: u64,
     transcript: Option<mpsc::Sender<Value>>,
     steer: Option<mpsc::Receiver<ControlFrame>>,
+    /// True once the job's RELEASE has been enqueued (by `close`, or by the
+    /// `Drop` fallback). Guards against a double-RELEASE when `close` runs after
+    /// `detach_turn` has already taken the transcript sender (so the sender can
+    /// no longer serve as the "already released" token).
+    released: bool,
 }
 
 impl HubSession {
-    /// The sink the ACP agent forwards each `session/update` to. Taken once.
-    /// Bounded: on overflow the ACP side drops the update rather than blocking.
+    /// The sink the ACP agent forwards each `session/update` to. Lazily opens
+    /// this turn's transcript bridge on first call (a session opened by
+    /// `register_session` has no bridge until a turn starts). Bounded: on
+    /// overflow the ACP side drops the update rather than blocking. Test-only:
+    /// production attaches a turn via [`open_turn`](Self::open_turn).
+    #[cfg(test)]
     pub fn transcript_sink(&mut self) -> Option<mpsc::Sender<Value>> {
+        if self.transcript.is_none() {
+            let client = self.client.clone();
+            client.spawn_bridge(self);
+        }
         self.transcript.clone()
     }
 
     /// The inbound-steer receiver handed to the ACP agent so a hub-delivered
     /// control is applied to the running turn. Taken once. Bounded: on overflow
-    /// `route_inbound` drops the control rather than growing memory.
+    /// `route_inbound` drops the control rather than growing memory. Test-only:
+    /// production takes steer via [`open_turn`](Self::open_turn).
+    #[cfg(test)]
     pub fn take_steer(&mut self) -> Option<mpsc::Receiver<ControlFrame>> {
         self.steer.take()
     }
+
+    /// Begin an ACP turn on this job-level session: spawn a fresh transcript
+    /// bridge and hand the agent its sink, plus this session's steer receiver on
+    /// the FIRST turn that asks for it.
+    ///
+    /// A session is opened once per JOB (`register_session`) but a job can run
+    /// TWO ACP turns — the first run and, on a result-nudge, a second — and each
+    /// turn needs a live bridge while the job's CLAIM/presence/RELEASE lifecycle
+    /// stays job-level. Keeping one session across both turns (the Node worker's
+    /// per-job `relaySession`) means the second turn reuses the same stream and
+    /// CLAIM rather than re-registering: a fresh `register_session` per turn
+    /// would re-CLAIM an already-claimed job and overwrite the stream-keyed
+    /// RELEASE barrier, letting the second turn's RELEASE/transcript overtake
+    /// the first turn's tail.
+    ///
+    /// Returns `(transcript_sink, steer)`. The transcript sink is re-created per
+    /// turn (the prior turn's bridge was detached by [`detach_turn`](Self::detach_turn)).
+    /// The steer receiver is job-keyed (steer routes by stream) and is handed
+    /// out once: the first turn's steer task keeps it for the job's lifetime, so
+    /// a later turn gets `None` for steer (its steer still reaches the running
+    /// first-turn task, which is correct — there is only ever one live turn).
+    pub fn open_turn(&mut self) -> Option<(mpsc::Sender<Value>, Option<mpsc::Receiver<ControlFrame>>)> {
+        // Clone the `Arc` first so the `&mut self` borrow (for `spawn_bridge`
+        // and the field reads) does not conflict with borrowing `self.client`.
+        let client = self.client.clone();
+        client.spawn_bridge(self);
+        let transcript = self.transcript.clone()?;
+        let steer = self.steer.take();
+        Some((transcript, steer))
+    }
+
+    /// End an ACP turn WITHOUT releasing the job: flush this turn's transcript
+    /// tail into the outbound buffer and detach the bridge, leaving the CLAIM
+    /// and RELEASE barrier intact for the next turn (or for `close`/`Drop` to
+    /// release). Awaits the bridge drain on the runtime (never parks a worker
+    /// thread); bounded by `TRANSCRIPT_FLUSH_TIMEOUT`. After this, `transcript`
+    /// is `None`, so a later `close` still releases the job exactly once.
+    pub async fn detach_turn(&mut self) {
+        // Take the sender so the bridge sees the channel close and drains.
+        let Some(_tx) = self.transcript.take() else {
+            return; // no live bridge (already detached, or never opened)
+        };
+        let flush = self
+            .client
+            .bridge_tasks
+            .lock()
+            .unwrap()
+            .remove(&self.session_id);
+        if let Some(flush) = flush {
+            let BridgeFlush {
+                close_tx,
+                done_rx,
+                handle,
+            } = flush;
+            let _ = close_tx.send(true);
+            if timeout(TRANSCRIPT_FLUSH_TIMEOUT, done_rx).await.is_err() {
+                // Wedged bridge: abort so it can enqueue no further chunks.
+                handle.abort();
+            }
+            let _ = handle.await;
+        }
+        // NOTE: no `arm_release_barrier` and no `release_job` here — the job
+        // stays CLAIMed; the tail is buffered for the NEXT turn's bridge (or
+        // the final `close`) to flush ahead of the single job-level RELEASE.
+    }
+
     /// Asynchronously flush this session's transcript tail all the way toward
     /// the socket, then enqueue the job's RELEASE behind a drain barrier so it
     /// cannot overtake that tail on the wire. Steps: (1) close the bridge input
@@ -1338,24 +1445,26 @@ impl HubSession {
     /// (RELEASE) drains before the bulk lane. This is the PREFERRED close path:
     /// it awaits on the runtime, so (unlike `Drop`) it never parks a Tokio worker
     /// thread. Bounded by `TRANSCRIPT_FLUSH_TIMEOUT` so a wedged bridge can never
-    /// hang the caller. Idempotent: after it runs, `Drop` finds the barrier
-    /// already armed and does not re-enqueue the RELEASE.
+    /// hang the caller. Idempotent: after it runs, `released` is set and `Drop`
+    /// finds the barrier already armed, so neither re-enqueues the RELEASE.
     pub async fn close(&mut self) {
+        // Idempotent against a SECOND `close()` (or a `close` after a `Drop`
+        // fallback already released): once the RELEASE is enqueued, `released`
+        // is set — re-running would enqueue a DUPLICATE RELEASE for the same
+        // job. Bail out. (The transcript sender can NOT be this guard: a
+        // `detach_turn` after a result-nudge turn takes it without releasing.)
+        if self.released {
+            return;
+        }
+        self.released = true;
         // Take the sender so no new update is accepted, remove the bridge handle
         // (so Drop's fallback is a no-op), signal the bridge to finish, then
         // await completion on the runtime. Bind the removed handle FIRST so the
         // bridge_tasks MutexGuard drops before the `.await` (a held guard is not
         // `Send` and would make the surrounding `execute` future non-`Send`).
-        //
-        // Idempotent against a SECOND `close()`: the transcript sender is the
-        // one-shot token for "this session's RELEASE still needs handling". Once
-        // it has been taken (by a prior `close`, or by the Drop-path
-        // `flush_transcript`), the barrier is already armed and the RELEASE
-        // already enqueued — re-running the steps below would arm the barrier a
-        // second time and enqueue a DUPLICATE RELEASE for the same job. Bail out.
-        let Some(_tx) = self.transcript.take() else {
-            return;
-        };
+        // `transcript` may already be `None` (a nudge turn's `detach_turn` took
+        // it); the bridge handle is then already gone too and this is a no-op.
+        let _tx = self.transcript.take();
         let flush = self
             .client
             .bridge_tasks
@@ -1430,29 +1539,22 @@ impl Drop for HubSession {
         self.flush_transcript();
         self.client.sessions.lock().unwrap().remove(&self.stream);
         // RELEASE the job — but ONLY if `close` did not already do so. `close`
-        // arms this session's barrier before enqueueing its RELEASE; a barrier
-        // still present but UNARMED here means the session was dropped without a
-        // close (e.g. a panic unwind), so RELEASE best-effort with no drain
-        // barrier (the bridge tail was not awaited). If the barrier is armed or
-        // gone, `close`/`drain` already handled the RELEASE — a no-op. The
-        // in_flight removal is idempotent.
-        let needs_release = matches!(
-            self.client
-                .release_barriers
-                .lock()
-                .unwrap()
-                .get(&self.stream),
-            Some(ReleaseBarrier { armed: false })
-        );
-        if needs_release {
-            // Disarm so a double-drop cannot re-RELEASE, then release.
-            self.client
-                .release_barriers
-                .lock()
-                .unwrap()
-                .remove(&self.stream);
-            self.client.release_job(&self.instance, &self.job_key);
+        // sets `released` before enqueueing; a session dropped without a `close`
+        // (e.g. a panic unwind) has `released == false`, so RELEASE best-effort
+        // with no drain barrier (the bridge tail was not awaited). The in_flight
+        // removal is idempotent.
+        if self.released {
+            return;
         }
+        self.released = true;
+        // Disarm the (unarmed) barrier so a later stale lookup cannot fire, then
+        // release. `drain`/`close` treat an armed-or-gone barrier as handled.
+        self.client
+            .release_barriers
+            .lock()
+            .unwrap()
+            .remove(&self.stream);
+        self.client.release_job(&self.instance, &self.job_key);
     }
 }
 
@@ -2411,6 +2513,60 @@ mod tests {
             parse_stream_id(stream),
             Some(("w-9".to_string(), "job-9".to_string()))
         );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_advertises_harness_protocol_version() {
+        // nano-workforce (#802) flags a worker with no `harnessProtocol` as a
+        // stale harness and can refuse routing; the REGISTER capability must
+        // carry the shared version constant (issue #272).
+        let client = HubClient::spawn(test_config(), &[]);
+        let _session = client.register_session("w-proto", capability(), "job-proto");
+        let frames = buffered(&client);
+        let register = frames
+            .iter()
+            .find(|(_, family, _)| *family == Family::Register)
+            .expect("a REGISTER frame was enqueued");
+        assert_eq!(
+            register.2["capability"]["harnessProtocol"],
+            json!(HARNESS_PROTOCOL_VERSION),
+            "REGISTER capability carries the harness-protocol version"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_session_claims_and_releases_once_across_two_turns() {
+        // A job runs its first ACP turn and, on a result-nudge, a SECOND turn on
+        // the SAME session. The job must be CLAIMed once and RELEASEd once
+        // across both turns — re-registering per turn would double-CLAIM and
+        // overwrite the stream-keyed RELEASE barrier (the finding this guards).
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-2t", capability(), "job-2t");
+        let _ = buffered(&client); // discard the initial register/claim
+
+        // First turn: open + detach (flush tail, no release).
+        let (sink1, _steer1) = session.open_turn().expect("first turn opens");
+        sink1.try_send(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t1"}})).unwrap();
+        session.detach_turn().await;
+
+        // Second (nudge) turn on the SAME session: open + detach again.
+        let (sink2, steer2) = session.open_turn().expect("second turn opens");
+        sink2.try_send(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t2"}})).unwrap();
+        session.detach_turn().await;
+        // Steer is job-keyed and held by the first turn's task, so the nudge
+        // turn gets no second receiver.
+        assert!(steer2.is_none(), "steer receiver is handed out once per job");
+
+        // Close the job: exactly one RELEASE total, enqueued on close. Use the
+        // non-draining enqueue log (the buffer still holds the transcript tail).
+        session.close().await;
+        let log = client.enqueue_log();
+        let claims = log.iter().filter(|(_, _, f)| *f == Family::Claim).count();
+        let releases = log.iter().filter(|(_, _, f)| *f == Family::Release).count();
+        assert_eq!(claims, 0, "no second CLAIM after the initial registration");
+        assert_eq!(releases, 1, "exactly one RELEASE for the job across both turns");
         client.shutdown().await;
     }
 

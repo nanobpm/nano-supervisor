@@ -2353,9 +2353,36 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // on the override path.
     let acp = effective_protocol(&cfg) == Protocol::Acp;
 
+    // Agentic hub (issue #10): open ONE session for this job, shared across the
+    // first turn and any result-nudge turn (the Node worker's per-job
+    // `relaySession`). Opening it here — not per `run_agent` call — means the
+    // job is CLAIMed exactly once and RELEASEd exactly once (on `close` below),
+    // so the nudge turn reuses the same stream + CLAIM instead of re-registering
+    // and overwriting the stream-keyed RELEASE barrier. Absent the hub, this is
+    // `None` and both turns run unchanged.
+    let mut hub_session = cfg.hub.as_ref().map(|hub| {
+        // Worker identity (instance) + declared capability for presence,
+        // matching the Node emit client's `register {instance, capability}`
+        // (`cognition` = hire rank, `family` = hire model).
+        let capability = serde_json::json!({
+            "cognition": cfg.hire.rank,
+            "family": cfg.hire.model,
+            "host": crate::daemon::short_hostname(),
+        });
+        hub.register_session(&cfg.worker_name, capability, &key)
+    });
+
     // First turn: every protocol receives the JSON job payload (Node's
     // `buildAgentStdin` — ACP delivers it verbatim as the `session/prompt` text).
-    let first = run_agent(&cfg, &key, &agent_cwd, &payload.to_string(), &agent_env).await;
+    let first = run_agent(
+        &cfg,
+        &key,
+        &agent_cwd,
+        &payload.to_string(),
+        &agent_env,
+        hub_session.as_mut(),
+    )
+    .await;
 
     // Result-nudge (Node #678): a clean run that produced output but no usable
     // result gets exactly ONE bounded "emit your result now" turn, in a fresh
@@ -2387,7 +2414,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         } else {
             nudge_payload(&payload, &nudge_text).to_string()
         };
-        let nudge = run_agent(&cfg, &key, &agent_cwd, &stdin, &agent_env).await;
+        let nudge = run_agent(&cfg, &key, &agent_cwd, &stdin, &agent_env, hub_session.as_mut()).await;
         if let Some(e) = &nudge.error {
             log(&format!("job {key}: re-emit nudge rerun failed — {e}"));
         }
@@ -2428,6 +2455,17 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
                 "re-emit nudge did not recover one"
             }
         ));
+    }
+
+    // Agentic hub (issue #10): both turns are done — close the job's session.
+    // This flushes the final turn's transcript tail on the runtime (bounded,
+    // non-parking) and enqueues the job's single RELEASE behind its drain
+    // barrier, so the RELEASE never overtakes the tail on the wire. After this
+    // the session's `Drop` is a no-op (the barrier is already armed). Opened
+    // once before the first turn and shared across the nudge, the job is thus
+    // CLAIMed once and RELEASEd once.
+    if let Some(session) = hub_session.as_mut() {
+        session.close().await;
     }
 
     // Read the agent's structured result, selecting the first EFFECTIVE source
@@ -2692,6 +2730,7 @@ async fn run_agent(
     cwd: &crate::safecwd::CwdHandle,
     stdin: &str,
     env: &[(String, String)],
+    hub_session: Option<&mut crate::hub::HubSession>,
 ) -> RunResult {
     // `NANO_AGENTIC_PROTOCOL` is a harness-protocol override (the referenced
     // worker's `pipe`/`acp` selector), not a WebSocket subprotocol. Resolve it
@@ -2716,26 +2755,21 @@ async fn run_agent(
                     }
                 }
             };
-            // Agentic hub (issue #10): open a session for this job so its
-            // presence and live transcript appear on the hub and inbound steer
-            // reaches the running ACP turn. Held for the turn's lifetime; it
-            // deregisters on drop. Absent the hub, the agent runs unchanged.
-            let mut hub_session = cfg.hub.as_ref().map(|hub| {
-                // Worker identity (instance) + declared capability for presence,
-                // matching the Node emit client's `register {instance, capability}`.
-                let capability = serde_json::json!({
-                    "cognition": cfg.hire.model,
-                    "family": cfg.hire.rank,
-                    "host": crate::daemon::short_hostname(),
-                });
-                let mut session = hub.register_session(&cfg.worker_name, capability, key);
-                if let (Some(transcript), Some(steer)) =
-                    (session.transcript_sink(), session.take_steer())
-                {
+            // Agentic hub (issue #10): attach this turn to the job's session so
+            // its live transcript appears on the hub and inbound steer reaches
+            // the running ACP turn. The session is opened ONCE per job by the
+            // caller (`execute`) and shared across both the first run and any
+            // result-nudge turn (the Node worker's per-job relaySession), so the
+            // job is CLAIMed/RELEASEd exactly once and its stream-keyed RELEASE
+            // barrier is never overwritten by a second registration. This opens
+            // a fresh transcript bridge for THIS turn; `detach_turn` below
+            // flushes its tail without releasing the job.
+            let mut hub_session = hub_session;
+            if let Some(session) = hub_session.as_mut() {
+                if let Some((transcript, steer)) = session.open_turn() {
                     agent.attach_hub(transcript, steer);
                 }
-                session
-            });
+            }
             // Name the pinned directory for the log line, recovered through
             // the fd so a post-prepare rename cannot put a stale pathname in
             // the log; fall back to the raw handle debug if it cannot be read.
@@ -2750,13 +2784,15 @@ async fn run_agent(
             ));
             let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
             agent.shutdown().await;
-            // Flush this session's transcript tail on the runtime (bounded)
-            // BEFORE it deregisters, so the RELEASE enqueued on drop never
-            // overtakes the tail. This async close awaits the bridge drain
-            // without parking a Tokio worker thread; `HubSession::drop` stays
-            // nonblocking as a best-effort fallback for paths that skip it.
+            // Flush THIS turn's transcript tail on the runtime (bounded) WITHOUT
+            // releasing the job: the session is job-level and shared with any
+            // result-nudge turn, so the RELEASE is enqueued only when the caller
+            // (`execute`) closes the session after the final turn. `detach_turn`
+            // awaits the bridge drain without parking a Tokio worker thread, so
+            // this turn's tail is buffered ahead of the next turn (or the single
+            // job-level RELEASE), preserving tail-before-RELEASE on the wire.
             if let Some(session) = hub_session.as_mut() {
-                session.close().await;
+                session.detach_turn().await;
             }
             match out {
                 Ok(o) => {

@@ -362,8 +362,8 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
     let slot_identities = vec![(
         worker_name.clone(),
         serde_json::json!({
-            "cognition": hire.model,
-            "family": hire.rank,
+            "cognition": hire.rank,
+            "family": hire.model,
             "host": short_hostname(),
         }),
     )];
