@@ -3,9 +3,11 @@
 //! (jwulf/c8ctl-plugin-nano) reads, so a Rust-run daemon and a Node-run worker
 //! are configured identically.
 //!
-//! The hub is OFF unless `NANO_AGENTIC` is truthy AND `NANO_AGENTIC_URL` names
-//! an endpoint: a daemon with neither set behaves exactly as before (no socket,
-//! no presence), so enabling the hub is purely additive.
+//! Local-first: the hub is ON BY DEFAULT and `NANO_AGENTIC` is an OPT-OUT — only
+//! an explicit off value (`off`/`0`/`false`/`no`) disables it. With no secure
+//! identity configured the worker joins in LOCAL mode (the well-known
+//! [`LOCAL_AGENTIC_TOKEN`]); `NANO_AGENTIC_URL` names the app's HTTP(S) base and
+//! is normalised to the `ws(s)://…/agentic` channel endpoint.
 
 use std::env;
 
@@ -23,11 +25,29 @@ pub const DEFAULT_BUFFER_CAPACITY: usize = 1024;
 /// Overridable with `NANO_AGENTIC_BUFFER_BYTES`.
 pub const DEFAULT_BUFFER_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
+/// The well-known identity token for LOCAL agentic visibility (security
+/// opt-in). Nano is local-first: a worker with no `NANO_AGENTIC_SECRET` joins
+/// the visibility channel with zero configuration by presenting this constant,
+/// well-known LOCAL token — NOT a secret. Kept in lock-step with the reference
+/// Node plugin (`c8ctl-plugin.js` `LOCAL_AGENTIC_TOKEN`) and the hub
+/// (`nano-workforce` `app/agentic/channel.ts`), which honours this token from
+/// any origin on a trusted LAN. Never used in SECURE mode (a real
+/// `NANO_AGENTIC_SECRET`).
+pub const LOCAL_AGENTIC_TOKEN: &str = "nano-local";
+
+/// The default app base URL when `NANO_AGENTIC_URL` is unset. The reference
+/// worker defers to the engine its jobs run on (profile `restAddress` →
+/// localhost); this worker has no persisted engine profile here, so it falls
+/// back to the same localhost default.
+pub const DEFAULT_AGENTIC_BASE: &str = "http://localhost:8080";
+
 /// Resolved hub configuration. Absent (`from_env` → `None`) means the hub is
 /// disabled and the daemon runs without any hub connection.
 #[derive(Debug, Clone)]
 pub struct HubConfig {
-    /// The WebSocket endpoint, e.g. `ws://127.0.0.1:8787/agentic`.
+    /// The WebSocket channel endpoint, normalised from the `NANO_AGENTIC_URL`
+    /// HTTP(S) base by [`HubConfig::from_env`] (e.g. `http://localhost:8080` →
+    /// `ws://localhost:8080/agentic`).
     pub url: String,
     /// The deprecated identity-token alias (`NANO_AGENTIC_TOKEN`). The current
     /// shared identity is `secret` (`NANO_AGENTIC_SECRET`); this is used only
@@ -46,11 +66,6 @@ pub struct HubConfig {
     /// (`capability_payload` never adds it), so operators should not expect it
     /// in presence frames.
     pub credential: Option<String>,
-    /// The worker's harness-protocol override (`NANO_AGENTIC_PROTOCOL`), e.g.
-    /// `pipe` or `acp`. This is NOT a WebSocket subprotocol: it is applied when
-    /// resolving the hire protocol (see [`HubConfig::hire_protocol_override`])
-    /// and is never sent on the wire.
-    pub protocol: Option<String>,
     /// The permission policy the worker advertises (`NANO_AGENTIC_PERMISSION`).
     pub permission: Option<String>,
     /// Whether the terminal relay (PTY agents) is enabled
@@ -68,14 +83,42 @@ pub struct HubConfig {
     pub buffer_byte_budget: usize,
 }
 
-/// Is an environment flag truthy the way the Node launcher treats it? `1`,
-/// `true`, `yes`, `on` (case-insensitive) enable; everything else (including
-/// unset, empty, `0`, `false`) disables.
-pub fn env_truthy(value: &str) -> bool {
+/// Is `NANO_AGENTIC` an explicit OFF value? The reference worker treats it as an
+/// opt-OUT, not a required on-switch: visibility is on by default and only
+/// `off`/`0`/`false`/`no` (case-insensitive) disable it. Any other value —
+/// including a truthy one or a typo — leaves it enabled.
+fn env_off(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
+        "0" | "off" | "false" | "no"
     )
+}
+
+/// Normalise the `NANO_AGENTIC_URL` app base to the WebSocket channel endpoint,
+/// mirroring the reference worker's `buildAgenticUrl`: `http`→`ws`,
+/// `https`→`wss`, any base path preserved, and the same-port channel path
+/// `/agentic` appended. A value already on `ws`/`wss` is re-anchored to
+/// `/agentic` the same way; any other scheme is returned unchanged so the
+/// connector surfaces a clear unsupported-scheme error rather than a silently
+/// mangled URL.
+fn agentic_channel_url(base: &str) -> String {
+    let trimmed = base.trim();
+    let (rest, scheme_ws) = if let Some(r) = trimmed.strip_prefix("http://") {
+        (r, "ws://")
+    } else if let Some(r) = trimmed.strip_prefix("https://") {
+        (r, "wss://")
+    } else if let Some(r) = trimmed.strip_prefix("ws://") {
+        (r, "ws://")
+    } else if let Some(r) = trimmed.strip_prefix("wss://") {
+        (r, "wss://")
+    } else {
+        return trimmed.to_string();
+    };
+    // Split off any query/fragment so the path join does not corrupt them; the
+    // channel carries its own auth query params, so they are dropped here.
+    let host_path = rest.split(['?', '#']).next().unwrap_or(rest);
+    let joined = format!("{scheme_ws}{host_path}");
+    format!("{}/agentic", joined.trim_end_matches('/'))
 }
 
 fn non_empty(key: &str) -> Option<String> {
@@ -113,17 +156,25 @@ fn validate_mode(raw: Option<String>, allowed: &[&str]) -> Option<String> {
 }
 
 impl HubConfig {
-    /// Resolve the hub configuration from the process environment. Returns
-    /// `None` (hub disabled) unless `NANO_AGENTIC` is truthy and
-    /// `NANO_AGENTIC_URL` is a non-empty endpoint.
+    /// Resolve the hub configuration from the process environment. Local-first:
+    /// the hub is ON BY DEFAULT and `NANO_AGENTIC` is an OPT-OUT — this returns
+    /// `None` (hub disabled) only when `NANO_AGENTIC` is an explicit off value
+    /// (`off`/`0`/`false`/`no`). With no secure identity configured the worker
+    /// joins in LOCAL mode (the well-known [`LOCAL_AGENTIC_TOKEN`]); a credential
+    /// set without a secret is meaningless and is ignored (LOCAL mode).
     pub fn from_env() -> Option<HubConfig> {
-        let enabled = env::var("NANO_AGENTIC")
-            .ok()
-            .is_some_and(|v| env_truthy(&v));
-        if !enabled {
-            return None;
+        // Opt-out, not opt-in: only an explicit off value disables visibility.
+        if let Some(v) = env::var("NANO_AGENTIC").ok().as_deref() {
+            if env_off(v) {
+                return None;
+            }
         }
-        let url = non_empty("NANO_AGENTIC_URL")?;
+        // `NANO_AGENTIC_URL` is the app's HTTP(S) base; normalise it to the
+        // `ws(s)://…/agentic` channel endpoint. Unset defers to the localhost
+        // default (the reference worker defers to its engine's profile base).
+        let url = agentic_channel_url(
+            &non_empty("NANO_AGENTIC_URL").unwrap_or_else(|| DEFAULT_AGENTIC_BASE.to_string()),
+        );
         let buffer_capacity = env::var("NANO_AGENTIC_BUFFER_CAPACITY")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -134,12 +185,23 @@ impl HubConfig {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_BUFFER_BYTE_BUDGET);
+        let secret = non_empty("NANO_AGENTIC_SECRET");
+        let token = non_empty("NANO_AGENTIC_TOKEN");
+        let credential = non_empty("NANO_AGENTIC_CREDENTIAL");
+        // SECURE mode: a real shared secret (or its deprecated TOKEN alias) is
+        // the identity. LOCAL mode (default): no secure identity, so present the
+        // well-known LOCAL token; a credential set without a secret is ignored.
+        let secure = secret.is_some() || token.is_some();
+        let (token, credential) = if secure {
+            (token, credential)
+        } else {
+            (Some(LOCAL_AGENTIC_TOKEN.to_string()), None)
+        };
         Some(HubConfig {
             url,
-            token: non_empty("NANO_AGENTIC_TOKEN"),
-            secret: non_empty("NANO_AGENTIC_SECRET"),
-            credential: non_empty("NANO_AGENTIC_CREDENTIAL"),
-            protocol: non_empty("NANO_AGENTIC_PROTOCOL"),
+            token,
+            secret,
+            credential,
             // Validate against the closed permission vocabulary: an invalid
             // override (a typo like `YOLOO`) must fall through to the
             // hire/default policy, not be advertised verbatim as a real policy.
@@ -154,15 +216,6 @@ impl HubConfig {
             buffer_byte_budget,
         })
     }
-
-    /// The harness-protocol override named by `NANO_AGENTIC_PROTOCOL`, if any.
-    /// This is the referenced worker's override for the hire protocol (`pipe` or
-    /// `acp`) — distinct from a WebSocket subprotocol, so it is applied when
-    /// resolving the hire protocol and never sent as a `Sec-WebSocket-Protocol`
-    /// header. Returns the trimmed override, or `None` when unset/empty.
-    pub fn hire_protocol_override(&self) -> Option<&str> {
-        self.protocol.as_deref().map(str::trim).filter(|s| !s.is_empty())
-    }
 }
 
 #[cfg(test)]
@@ -170,13 +223,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truthy_matches_the_node_launcher_vocabulary() {
-        for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
-            assert!(env_truthy(v), "{v:?} should be truthy");
+    fn off_switch_matches_the_reference_opt_out_vocabulary() {
+        // Only the explicit off values disable visibility (opt-OUT).
+        for v in ["0", "off", "false", "no", "OFF", " False ", "No"] {
+            assert!(env_off(v), "{v:?} should disable the hub");
         }
-        for v in ["", "0", "false", "no", "off", "enable"] {
-            assert!(!env_truthy(v), "{v:?} should be falsy");
+        // Anything else — truthy values, typos, empty — leaves it enabled.
+        for v in ["", "1", "true", "yes", "on", "enable", "offf", "garbage"] {
+            assert!(!env_off(v), "{v:?} should NOT disable the hub");
         }
+    }
+
+    #[test]
+    fn agentic_channel_url_normalises_http_base_to_ws_endpoint() {
+        // http→ws, /agentic appended (the documented config).
+        assert_eq!(
+            agentic_channel_url("http://localhost:8080"),
+            "ws://localhost:8080/agentic"
+        );
+        // https→wss, base path preserved, trailing slashes collapsed.
+        assert_eq!(
+            agentic_channel_url("https://app.example.com/base/"),
+            "wss://app.example.com/base/agentic"
+        );
+        // An already-ws base is re-anchored to /agentic.
+        assert_eq!(
+            agentic_channel_url("ws://127.0.0.1:8787"),
+            "ws://127.0.0.1:8787/agentic"
+        );
+        // A base query/fragment is dropped (the channel carries its own auth).
+        assert_eq!(
+            agentic_channel_url("http://h:1/base?x=1#frag"),
+            "ws://h:1/base/agentic"
+        );
+        // An unsupported scheme is returned unchanged so the connector surfaces
+        // a clear unsupported-scheme error rather than a mangled URL.
+        assert_eq!(agentic_channel_url("ftp://x/y"), "ftp://x/y");
     }
 
     #[test]

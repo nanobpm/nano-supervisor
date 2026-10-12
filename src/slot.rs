@@ -141,6 +141,12 @@ pub struct SlotConfig {
     /// a session on it for presence, live transcript, and inbound steer. `None`
     /// runs every job exactly as before, with no hub connection.
     pub hub: Option<std::sync::Arc<crate::hub::HubClient>>,
+    /// The `NANO_AGENTIC_PROTOCOL` harness override (`pipe`/`acp`), resolved
+    /// INDEPENDENTLY of the hub connection: it is a work-time harness override
+    /// (the reference worker applies it with or without visibility enabled), so
+    /// it must reach protocol dispatch even when `hub` is `None`. `None` means
+    /// no override — the hire's configured protocol stands.
+    pub protocol_override: Option<String>,
 }
 
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
@@ -2661,16 +2667,18 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     Ok(settle)
 }
 
-/// Resolve the EFFECTIVE harness protocol for this hire: the hub's
-/// `NANO_AGENTIC_PROTOCOL` override (`pipe`/`acp`) when present and recognised,
-/// otherwise the hire's configured protocol. Resolved in ONE place so every
-/// consumer — `run_agent`'s dispatch and the caller's result-nudge encoding —
-/// agrees on the protocol under an override (an unrecognised value is ignored,
-/// so the configured protocol stands).
+/// Resolve the EFFECTIVE harness protocol for this hire: the `NANO_AGENTIC_PROTOCOL`
+/// override (`pipe`/`acp`) when present and recognised, otherwise the hire's
+/// configured protocol. Resolved in ONE place so every consumer — `run_agent`'s
+/// dispatch and the caller's result-nudge encoding — agrees on the protocol under
+/// an override (an unrecognised value is ignored, so the configured protocol
+/// stands). The override is a work-time harness selector, NOT a hub setting: it
+/// is read from `SlotConfig::protocol_override`, which is populated independently
+/// of the optional hub client, so it applies even when visibility is off or has
+/// no URL (matching the reference worker).
 fn effective_protocol(cfg: &SlotConfig) -> Protocol {
-    cfg.hub
-        .as_ref()
-        .and_then(|hub| hub.config().hire_protocol_override())
+    cfg.protocol_override
+        .as_deref()
         .and_then(crate::state::Protocol::parse_override)
         .unwrap_or(cfg.hire.protocol)
 }
@@ -3605,64 +3613,47 @@ mod tests {
                 ..Default::default()
             }),
             hub: None,
+            protocol_override: None,
         }
     }
 
-    /// Spawn a hub client whose `NANO_AGENTIC_PROTOCOL` override is `protocol`.
-    /// The URL points at a dead port so it only ever backs off; the test shuts
-    /// it down. Used to exercise `effective_protocol`'s override resolution.
-    fn hub_with_protocol(protocol: Option<&str>) -> std::sync::Arc<crate::hub::HubClient> {
-        crate::hub::HubClient::spawn(
-            crate::hub::HubConfig {
-                url: "ws://127.0.0.1:1/na".into(),
-                token: None,
-                secret: None,
-                credential: None,
-                protocol: protocol.map(str::to_string),
-                permission: None,
-                terminal: false,
-                attribution: None,
-                buffer_capacity: 8,
-                buffer_byte_budget: 0,
-            },
-            &[],
-        )
-    }
-
-    // Finding (round 6): the hub's `NANO_AGENTIC_PROTOCOL` override is resolved
-    // in ONE place, so `run_agent`'s dispatch and the result-nudge caller never
-    // disagree about the effective protocol. Without a hub the hire protocol
-    // stands; a recognised override flips it both ways; an unrecognised one is
-    // ignored.
+    // Finding (round 6): the `NANO_AGENTIC_PROTOCOL` override is resolved in ONE
+    // place, so `run_agent`'s dispatch and the result-nudge caller never disagree
+    // about the effective protocol. A recognised override flips the hire protocol
+    // both ways; an unrecognised one is ignored. Finding (round 16): the override
+    // is a work-time harness selector resolved INDEPENDENTLY of the hub client,
+    // so it applies even when no hub is configured (`hub: None`).
     #[tokio::test]
-    async fn effective_protocol_honours_the_hub_override() {
-        // No hub: the hire's configured protocol stands.
+    async fn effective_protocol_honours_the_override() {
+        // No override: the hire's configured protocol stands.
         let mut c = cfg();
         c.hire.protocol = Protocol::Pipe;
         assert_eq!(effective_protocol(&c), Protocol::Pipe);
         c.hire.protocol = Protocol::Acp;
         assert_eq!(effective_protocol(&c), Protocol::Acp);
 
-        // Override pipe -> acp (flips a Pipe hire).
+        // Override pipe -> acp (flips a Pipe hire) — with NO hub configured,
+        // proving the override is independent of the hub connection.
         let mut c = cfg();
         c.hire.protocol = Protocol::Pipe;
-        c.hub = Some(hub_with_protocol(Some("acp")));
+        c.hub = None;
+        c.protocol_override = Some("acp".into());
         assert_eq!(effective_protocol(&c), Protocol::Acp);
-        c.hub.as_ref().unwrap().shutdown().await;
 
-        // Override acp -> pipe (flips an Acp hire).
+        // Override acp -> pipe (flips an Acp hire), still hub-less.
         let mut c = cfg();
         c.hire.protocol = Protocol::Acp;
-        c.hub = Some(hub_with_protocol(Some("pipe")));
+        c.hub = None;
+        c.protocol_override = Some("pipe".into());
         assert_eq!(effective_protocol(&c), Protocol::Pipe);
-        c.hub.as_ref().unwrap().shutdown().await;
 
         // Unrecognised / empty override is ignored: the hire protocol stands.
         let mut c = cfg();
         c.hire.protocol = Protocol::Acp;
-        c.hub = Some(hub_with_protocol(Some("garbage")));
+        c.protocol_override = Some("garbage".into());
         assert_eq!(effective_protocol(&c), Protocol::Acp);
-        c.hub.as_ref().unwrap().shutdown().await;
+        c.protocol_override = Some(String::new());
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
     }
 
     /// A hermetic, unique `result.json` path for a `build_agent_env` test.

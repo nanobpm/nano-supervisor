@@ -253,6 +253,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 connection: decision.pin.clone(),
                 connection_profile: decision.profile.clone(),
                 hub: hub.clone(),
+                protocol_override: std::env::var("NANO_AGENTIC_PROTOCOL").ok(),
             });
             // Issue #41 sanity guard: judge each SLOT's own job-type matrix, not
             // the daemon-wide aggregate `all_types` the shared `jobs` was built

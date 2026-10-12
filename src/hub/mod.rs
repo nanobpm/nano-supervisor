@@ -16,8 +16,9 @@
 //! and both pass the same cross-repo golden corpus.
 //!
 //! Configuration comes entirely from the `NANO_AGENTIC*` environment
-//! ([`config::HubConfig::from_env`]); with it unset the daemon runs exactly as
-//! before, so the hub is purely additive.
+//! ([`config::HubConfig::from_env`]). Local-first: the hub is ON BY DEFAULT and
+//! `NANO_AGENTIC` is an opt-OUT (only `off`/`0`/`false`/`no` disables it); with
+//! no secure identity the worker joins in LOCAL mode.
 
 pub mod client;
 pub mod config;

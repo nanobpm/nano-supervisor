@@ -386,6 +386,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         connection: decision.pin.clone(),
         connection_profile: decision.profile.clone(),
         hub: hub.clone(),
+        protocol_override: std::env::var("NANO_AGENTIC_PROTOCOL").ok(),
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));

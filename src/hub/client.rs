@@ -370,11 +370,16 @@ impl LaneBuffer {
     /// ordinary count/byte bound (it sheds lower-priority traffic, never itself)
     /// — but to keep completed-ownership replay from growing without bound for
     /// the whole outage (see [`RELEASE_OUTAGE_CAP`]), when `cap` RELEASE frames
-    /// are already buffered this first collapses the OLDEST one. Reconnect resync
-    /// is authoritative for ownership, so a collapsed RELEASE's retirement is
-    /// re-derived on reconnect. Returns the collapsed RELEASE's stream id (so the
-    /// caller can disarm its now-orphaned drain barrier), or `None` when under
-    /// the cap. `cap == 0` disables collapsing (admit without a bound).
+    /// are already buffered this first collapses the OLDEST one. The collapse
+    /// removes the completed ownership record as a UNIT — the RELEASE AND its
+    /// matching CLAIM — because the CLAIM alone would be orphaned: every job that
+    /// starts and completes during a prolonged outage would otherwise leave one
+    /// historical CLAIM behind, so the "bounded" outage buffer still grew without
+    /// limit. Reconnect resync is authoritative for ownership, so a collapsed
+    /// CLAIM+RELEASE pair is re-derived on reconnect. Returns the collapsed
+    /// RELEASE's stream id (so the caller can disarm its now-orphaned drain
+    /// barrier), or `None` when under the cap. `cap == 0` disables collapsing
+    /// (admit without a bound).
     fn push_back_release_bounded(&mut self, frame: Frame, cap: usize) -> Option<String> {
         debug_assert_eq!(frame.lane, Lane::Control);
         debug_assert_eq!(frame.family, Family::Release);
@@ -394,6 +399,21 @@ impl LaneBuffer {
                     if let Some(bf) = self.control.remove(pos) {
                         self.account_removed(&bf);
                         collapsed = presence_stream_id(&bf.frame.payload);
+                    }
+                    // Compact the completed ownership record as a unit: drop the
+                    // matching CLAIM too, or it stays orphaned (its RELEASE is
+                    // gone) and the outage buffer grows one CLAIM per completed
+                    // job without bound.
+                    if let Some(stream) = collapsed.as_deref() {
+                        if let Some(cpos) = self.control.iter().position(|bf| {
+                            bf.frame.family == Family::Claim
+                                && presence_stream_id(&bf.frame.payload).as_deref()
+                                    == Some(stream)
+                        }) {
+                            if let Some(cf) = self.control.remove(cpos) {
+                                self.account_removed(&cf);
+                            }
+                        }
                     }
                 }
             }
@@ -917,14 +937,6 @@ impl HubClient {
                 .or_insert_with(|| Value::String("nano-supervisor".into()));
         }
         cap
-    }
-
-    /// The resolved hub configuration this client was spawned with. Exposed so
-    /// a slot can honour the `NANO_AGENTIC_PROTOCOL` harness override when
-    /// resolving a job's hire protocol (it is a harness setting, not a wire
-    /// subprotocol — see [`HubConfig::hire_protocol_override`]).
-    pub fn config(&self) -> &HubConfig {
-        &self.config
     }
 
     /// Build a frame with the next monotonic sequence number (but do not
@@ -1620,7 +1632,7 @@ async fn connect(config: &HubConfig) -> anyhow::Result<WsStream> {
     // as a `Sec-WebSocket-Protocol` header. It names the worker's *harness*
     // override (`pipe`/`acp`), not a WebSocket subprotocol; presenting it as one
     // can make a configured hub handshake fail. It is applied when resolving the
-    // hire protocol (see `HubConfig::hire_protocol_override`), never on the wire.
+    // hire protocol (via `SlotConfig::protocol_override`), never on the wire.
     let (stream, _response) = tokio_tungstenite::connect_async(url).await?;
     Ok(stream)
 }
@@ -2007,7 +2019,6 @@ mod tests {
             token: Some("implementation.ci.fix#red".into()),
             secret: None,
             credential: None,
-            protocol: None,
             permission: Some("yolo".into()),
             terminal: false,
             attribution: Some("nano".into()),
@@ -3823,6 +3834,57 @@ mod tests {
             buf.bulk.iter().any(|bf| bf.frame.payload["chunk"] == "t"),
             "the transcript tail is never collapsed by the RELEASE cap (ownership only)"
         );
+    }
+
+    // Finding (round 16): collapsing the oldest outage RELEASE must also compact
+    // its matching CLAIM — the CLAIM is capacity-exempt like the RELEASE, so
+    // leaving it orphaned let the "bounded" outage buffer grow one CLAIM per
+    // completed job without limit.
+    #[test]
+    fn push_back_release_bounded_compacts_the_matching_claim() {
+        let mut buf = LaneBuffer::with_limits(64, 0);
+        let claim = |j: &str| {
+            Frame::new(
+                Lane::Control,
+                Family::Claim,
+                0,
+                json!({ "instance": "w", "jobKey": j }),
+            )
+        };
+        let rel = |j: &str| {
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": j }),
+            )
+        };
+        // Two in-flight jobs: CLAIM then RELEASE each (cap=2).
+        buf.push(claim("j0"));
+        buf.push(rel("j0"));
+        buf.push(claim("j1"));
+        buf.push(rel("j1"));
+        // A third job completes over the cap: it collapses j0's RELEASE AND CLAIM.
+        buf.push(claim("j2"));
+        assert!(buf.push_back_release_bounded(rel("j2"), 2).is_some());
+        let claims: Vec<String> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Claim)
+            .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            claims,
+            vec!["j1".to_string(), "j2".to_string()],
+            "the collapsed RELEASE's CLAIM is compacted with it — no orphaned CLAIM left behind"
+        );
+        let releases: Vec<String> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(releases, vec!["j1".to_string(), "j2".to_string()]);
     }
 
     // #6 (end-to-end on the client): completing more jobs than the cap while
