@@ -3,9 +3,12 @@
 //! The daemon opens ONE WebSocket to the agentic hub, multiplexed across all
 //! slots, and makes a Rust-run job observable exactly like a Node-run one:
 //! live **presence**, a live **transcript** (the agent's ACP `session/update`
-//! stream bridged to the shared `@nanobpm/agentic` wire), **inbound steer**
-//! injected into the running ACP turn, and — for PTY agents — a **terminal
-//! relay**.
+//! stream bridged to the shared `@nanobpm/agentic` wire), and **inbound steer**
+//! (prompt / cancel) injected into the running ACP turn.
+//!
+//! A PTY **terminal relay** is NOT wired in this PR: the pipe/PTY transport is
+//! a follow-up, so [`client`] always advertises `terminal: false` in its
+//! capability payload rather than promise an unavailable capability.
 //!
 //! The wire codec here ([`frame`], [`control`], [`transcript`]) is the live
 //! twin of the conformance suite's codec in `contract-tests/src/hub/` (issue

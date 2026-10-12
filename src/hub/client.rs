@@ -88,6 +88,20 @@ const MAX_TRANSCRIPT_UPDATE_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_A
 /// bounded and `route_inbound` drops the control on overflow rather than
 /// blocking the socket read loop.
 const STEER_CHANNEL_BOUND: usize = 256;
+/// Upper bound on a single inbound steer chunk's bytes. The count cap above
+/// bounds only how many controls queue, not their memory: each queued
+/// [`ControlFrame::Prompt`] owns its chunk `String`, and the WebSocket read
+/// applies no `max_message_size`, so without a per-chunk cap a hub could retain
+/// `STEER_CHANNEL_BOUND` arbitrarily large payloads per active session
+/// (256 × unbounded). Capping the chunk at the source — in `route_inbound`,
+/// BEFORE it is decoded/cloned into a frame — makes the channel's worst-case
+/// memory `STEER_CHANNEL_BOUND × MAX_STEER_CHUNK_BYTES` (≈ 256 KiB) regardless
+/// of the inbound WebSocket frame size. An over-large chunk is dropped (fail
+/// closed) rather than truncated: a partial steer is a corrupted instruction,
+/// and the legacy raw-byte path would otherwise forward a silently-cut prefix.
+/// 1 KiB is far above any legitimate steer (a prompt line, a cancel reason, a
+/// permission outcome) and mirrors the conformance corpus's largest control.
+const MAX_STEER_CHUNK_BYTES: usize = 1024;
 /// Ceiling on how long `HubSession::drop` waits for the transcript bridge to
 /// drain its accepted updates before RELEASE (finding: RELEASE must not
 /// overtake the transcript tail). Bounded so a wedged bridge can never hang the
@@ -1154,6 +1168,14 @@ impl HubClient {
         let Some(chunk) = payload.get("chunk").and_then(Value::as_str) else {
             return;
         };
+        // Byte-bound the chunk BEFORE it is decoded/cloned into a `ControlFrame`
+        // (which owns its text): the steer channel is only count-bounded, so an
+        // unbounded chunk lets a hub retain `STEER_CHANNEL_BOUND` huge payloads
+        // per session. Drop an over-large chunk (fail closed) rather than
+        // truncate it into a silently-corrupted steer.
+        if chunk.len() > MAX_STEER_CHUNK_BYTES {
+            return;
+        }
         // The stream id MUST parse to a single `(instance, jobKey)` ref; a
         // structurally-invalid id off the wire is dropped rather than guessed at.
         if parse_stream_id(stream).is_none() {
@@ -2806,6 +2828,46 @@ mod tests {
         assert!(
             drained <= STEER_CHANNEL_BOUND,
             "steer channel grew past its bound: {drained} > {STEER_CHANNEL_BOUND}"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 14): the steer channel is only count-bounded, so without a
+    // per-chunk byte cap a hub could retain `STEER_CHANNEL_BOUND` arbitrarily
+    // large chunk strings per session. `route_inbound` must drop an over-large
+    // chunk (fail closed) BEFORE it is decoded into a `ControlFrame`, while a
+    // chunk at the bound still routes.
+    #[tokio::test]
+    async fn inbound_steer_chunk_is_byte_bounded() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-sbb", capability(), "job-sbb");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-sbb", "job-sbb");
+        // An over-large chunk (one byte past the cap) must be dropped, not
+        // queued — even though the channel has count capacity to spare.
+        let oversized = "x".repeat(MAX_STEER_CHUNK_BYTES + 1);
+        client.route_inbound(&json!({
+            "stream": stream,
+            "offset": 0,
+            "chunk": oversized,
+        }));
+        assert!(
+            steer.try_recv().is_err(),
+            "an over-large steer chunk must be dropped, not queued"
+        );
+        // A chunk exactly at the bound still routes as a legacy prompt.
+        let at_bound = "y".repeat(MAX_STEER_CHUNK_BYTES);
+        client.route_inbound(&json!({
+            "stream": stream,
+            "offset": 0,
+            "chunk": at_bound,
+        }));
+        let got = steer.try_recv().expect("at-bound chunk routes");
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "y".repeat(MAX_STEER_CHUNK_BYTES)
+            }
         );
         client.shutdown().await;
     }

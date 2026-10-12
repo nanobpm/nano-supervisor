@@ -459,20 +459,23 @@ fn invalid_token_corpus_covers_every_token_error_code() {
 
 // --- Live-worker replay seam --------------------------------------------
 
-/// The real worker↔hub acceptance path (handshake/auth, exact REGISTER/CLAIM/
-/// produce bytes, targeted steer, reconnect ordering, shutdown DEREGISTER) is
-/// now covered **in process** by the hub client's own tests
-/// (`src/hub/client.rs`: `live_connection_handshake_presence_transcript_steer_and_shutdown`
-/// and `live_reconnect_reregisters_before_reclaiming`), which drive the live
-/// `HubClient` against an in-process WebSocket hub.
+/// The real worker↔hub path (handshake/auth, REGISTER/CLAIM/produce, targeted
+/// steer, reconnect ordering, shutdown DEREGISTER) is exercised **in process**
+/// by the hub client's own tests (`src/hub/client.rs`:
+/// `live_connection_handshake_presence_transcript_steer_and_shutdown` and
+/// `live_reconnect_reregisters_before_reclaiming`), which drive the live
+/// `HubClient` against an in-process WebSocket hub. Those are **smoke tests**:
+/// they decode the emitted frames and assert selected payload fields — they do
+/// NOT establish byte-exact equality against this golden corpus.
 ///
-/// This remaining seam is narrower: replaying *this* golden corpus against an
-/// **external** running supervisor + hub endpoint, which CI does not provide, so
-/// — like the engine tests — it skips cleanly when `NS_HUB_ENDPOINT` is unset.
-/// Because driving the corpus against a real endpoint still has no harness, an
-/// explicitly configured endpoint **fails loudly** rather than reporting a green
-/// "live replay" that exercises nothing: a requested external run that silently
-/// does no work is worse than an honest "not wired up yet".
+/// The byte-exact acceptance gap stays open here: replaying *this* golden
+/// corpus against an **external** running supervisor + hub endpoint, which CI
+/// does not provide, so — like the engine tests — it skips cleanly when
+/// `NS_HUB_ENDPOINT` is unset. Because driving the corpus against a real
+/// endpoint still has no harness, an explicitly configured endpoint **fails
+/// loudly** rather than reporting a green "live replay" that exercises nothing:
+/// a requested external run that silently does no work is worse than an honest
+/// "not wired up yet".
 #[test]
 fn replay_corpus_against_live_worker() {
     match std::env::var("NS_HUB_ENDPOINT") {
