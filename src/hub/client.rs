@@ -634,6 +634,15 @@ pub struct HubClient {
     bridge_tasks: Mutex<HashMap<u64, BridgeFlush>>,
     /// Allocates the unique per-session key for `bridge_tasks`.
     next_session_seq: AtomicU64,
+    /// Number of LIVE transcript bridges (one per active ACP turn). Used to
+    /// partition the configured transcript byte budget across sessions so the
+    /// SUM of every session's pre-buffer channel stays within
+    /// `buffer_byte_budget` instead of each session claiming the full budget
+    /// (which, with an unbounded `--slots`, let a multi-slot daemon retain
+    /// `budget × active sessions`). Incremented in [`HubClient::spawn_bridge`]
+    /// and decremented wherever a bridge is torn down (`detach_turn`, `close`,
+    /// `flush_transcript`).
+    active_bridges: AtomicU64,
     /// Per-session RELEASE drain barriers, keyed by the session's composed
     /// **stream id** (`<instance>/<jobKey>`) — the same identity a drained
     /// RELEASE frame carries, so `drain` can look the barrier up directly.
@@ -699,6 +708,7 @@ impl HubClient {
             conn_task: Mutex::new(None),
             bridge_tasks: Mutex::new(HashMap::new()),
             next_session_seq: AtomicU64::new(0),
+            active_bridges: AtomicU64::new(0),
             release_barriers: Mutex::new(HashMap::new()),
             rng: AtomicU64::new(seed_rng()),
         });
@@ -849,7 +859,27 @@ impl HubClient {
         // memory cap. The bound is derived from the configured byte budget (see
         // `transcript_channel_bound`), not the flat count ceiling, so this
         // pre-buffer queue's own worst case stays within the documented budget.
-        let channel_bound = transcript_channel_bound(self.config.buffer_byte_budget);
+        //
+        // The budget is PARTITIONED across live bridges: each session's channel
+        // worst case is `budget / active_sessions`, so the SUM of every session's
+        // pre-buffer stays within `buffer_byte_budget` rather than each session
+        // claiming the full budget (with an unbounded `--slots`, `budget ×
+        // sessions` could retain gigabytes). Count this bridge (registered below)
+        // in the divisor so N live bridges share the budget N ways.
+        let active = self.active_bridges.fetch_add(1, Ordering::Relaxed) + 1;
+        // A configured budget of 0 means the outbound byte cap is DISABLED, so
+        // each session falls back to the flat count ceiling (unchanged). A
+        // NON-zero budget that integer-divides to 0 (more live bridges than
+        // budget bytes) must NOT take that disabled path — it would hand every
+        // session the full ceiling. Clamp the per-session share to ≥1 byte so
+        // `transcript_channel_bound` yields its minimum (1 item): the floor for
+        // a tiny budget under many sessions, still far under `active × ceiling`.
+        let per_session_budget = if self.config.buffer_byte_budget == 0 {
+            0
+        } else {
+            (self.config.buffer_byte_budget / active.max(1) as usize).max(1)
+        };
+        let channel_bound = transcript_channel_bound(per_session_budget);
         let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(channel_bound);
         let bridge_client = self.clone();
         let bridge_stream = session.stream.clone();
@@ -1105,6 +1135,28 @@ impl HubClient {
     /// RELEASE (so a late duplicate or a reconnect resync does not re-defer).
     fn disarm_release_barrier(&self, stream: &str) {
         self.release_barriers.lock().unwrap().remove(stream);
+    }
+
+    /// Remove the bridge flush handle for `id` and decrement the live-bridge
+    /// counter that partitions the transcript byte budget. Returns the handle so
+    /// the caller can signal/join/abort it. A `None` `id` (a session that never
+    /// opened a turn) removes nothing and leaves the counter untouched — it owns
+    /// no bridge. The decrement is paired with the `fetch_add` in
+    /// [`HubClient::spawn_bridge`], so it happens exactly once per removed bridge
+    /// and only when a bridge was actually present (a missing entry means the
+    /// counter was already decremented by an earlier teardown).
+    fn remove_bridge(&self, id: Option<u64>) -> Option<BridgeFlush> {
+        let removed = id.and_then(|id| self.bridge_tasks.lock().unwrap().remove(&id));
+        if removed.is_some() {
+            // Saturating: a counter underflow would only follow a bookkeeping
+            // bug, and it must never panic a session teardown path.
+            self.active_bridges
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
+        }
+        removed
     }
 
     /// Test-only probe recording the order frames are enqueued (their `seq`),
@@ -1431,13 +1483,8 @@ impl HubSession {
         // Remove only the bridge THIS session owns. `session_id` is `None` when
         // no turn ever opened (agent failed first), so a never-bridged session
         // removes nothing — it cannot steal another session's flush handle.
-        let flush = self.session_id.and_then(|id| {
-            self.client
-                .bridge_tasks
-                .lock()
-                .unwrap()
-                .remove(&id)
-        });
+        // `remove_bridge` also decrements the live-bridge budget divisor.
+        let flush = self.client.remove_bridge(self.session_id);
         if let Some(flush) = flush {
             let BridgeFlush {
                 close_tx,
@@ -1490,14 +1537,9 @@ impl HubSession {
         // Remove only the bridge THIS session actually owns (guard on `Some`):
         // a session that never opened a turn has `session_id == None` and must
         // not remove `bridge_tasks[0]`, which is the FIRST real id and belongs
-        // to another live session.
-        let flush = self.session_id.and_then(|id| {
-            self.client
-                .bridge_tasks
-                .lock()
-                .unwrap()
-                .remove(&id)
-        });
+        // to another live session. `remove_bridge` also decrements the
+        // live-bridge budget divisor.
+        let flush = self.client.remove_bridge(self.session_id);
         if let Some(flush) = flush {
             let BridgeFlush {
                 close_tx,
@@ -1543,13 +1585,8 @@ impl HubSession {
         // Guard on `Some`: a session whose agent failed before `open_turn` owns
         // no bridge (`session_id == None`), so it must remove NOTHING — removing
         // by a sentinel id would steal the first real session's flush handle.
-        let Some(flush) = self.session_id.and_then(|id| {
-            self.client
-                .bridge_tasks
-                .lock()
-                .unwrap()
-                .remove(&id)
-        }) else {
+        // `remove_bridge` also decrements the live-bridge budget divisor.
+        let Some(flush) = self.client.remove_bridge(self.session_id) else {
             return; // already flushed by `close`, or never attached
         };
         // Signal the bridge to finish; do NOT wait (see the doc comment). ABORT
@@ -3145,6 +3182,84 @@ mod tests {
         let mut session = client.register_session("w-bb", capability(), "job-bb");
         let sink = session.transcript_sink().expect("transcript sink");
         assert_eq!(sink.max_capacity(), 8);
+        client.shutdown().await;
+    }
+
+    // Finding (round 20): the transcript byte budget is partitioned across LIVE
+    // sessions, not granted in full to each. With an unbounded `--slots`, giving
+    // every session the whole budget lets a multi-slot daemon retain
+    // `budget × active sessions` (gigabytes) before the globally bounded
+    // outbound buffer ever bites. Two concurrent sessions must share the budget
+    // (each gets `budget / 2`), and once one session's bridge detaches a new
+    // session must see the full budget again.
+    #[tokio::test]
+    async fn transcript_budget_is_partitioned_across_active_sessions() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB => 8 items when alone
+        let client = HubClient::spawn(cfg, &[]);
+
+        // First session alone: the full 8-item budget.
+        let mut s1 = client.register_session("w-p1", capability(), "job-p1");
+        let sink1 = s1.transcript_sink().expect("s1 transcript sink");
+        assert_eq!(sink1.max_capacity(), 8, "sole session gets the full budget");
+
+        // Second concurrent session: the budget is halved across the two live
+        // bridges (8 MiB / 2 = 4 MiB => 4 items each), so their SUM stays within
+        // the configured budget instead of doubling it.
+        let mut s2 = client.register_session("w-p2", capability(), "job-p2");
+        let sink2 = s2.transcript_sink().expect("s2 transcript sink");
+        assert_eq!(sink2.max_capacity(), 4, "two sessions share the budget");
+
+        // After s1's bridge detaches, a fresh session is the only live bridge
+        // again and sees the full budget.
+        s1.detach_turn().await;
+        let mut s3 = client.register_session("w-p3", capability(), "job-p3");
+        let sink3 = s3.transcript_sink().expect("s3 transcript sink");
+        assert_eq!(
+            sink3.max_capacity(),
+            4,
+            "s2 still live, so s3 shares the budget with it"
+        );
+        s2.detach_turn().await;
+        s3.detach_turn().await;
+        let mut s4 = client.register_session("w-p4", capability(), "job-p4");
+        let sink4 = s4.transcript_sink().expect("s4 transcript sink");
+        assert_eq!(
+            sink4.max_capacity(),
+            8,
+            "with all prior bridges detached, a new session gets the full budget"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 20), edge case: a NON-zero budget that integer-divides to 0
+    // (more live bridges than budget bytes) must NOT fall into the disabled
+    // (`0`) path, which would hand every session the full count ceiling. Each
+    // session is clamped to the 1-item floor instead, so a tiny budget under
+    // many sessions still bounds each channel rather than multiplying the
+    // ceiling by the session count.
+    #[tokio::test]
+    async fn transcript_budget_partition_never_falls_into_disabled_path() {
+        let mut cfg = test_config();
+        // 1 byte of budget: a single session divides to 1 byte => 1 item
+        // (transcript_channel_bound clamps a sub-1 MiB budget to 1).
+        cfg.buffer_byte_budget = 1;
+        let client = HubClient::spawn(cfg, &[]);
+        let mut s1 = client.register_session("w-t1", capability(), "job-t1");
+        assert_eq!(
+            s1.transcript_sink().expect("s1 sink").max_capacity(),
+            1,
+            "a sub-1 MiB budget clamps to the 1-item floor, not the ceiling"
+        );
+        // A second session divides 1 byte by 2 => 0 bytes each. Without the
+        // floor clamp that 0 would mean "disabled" => the full count ceiling
+        // (1024); the clamp keeps it at the 1-item floor.
+        let mut s2 = client.register_session("w-t2", capability(), "job-t2");
+        assert_eq!(
+            s2.transcript_sink().expect("s2 sink").max_capacity(),
+            1,
+            "partitioning to 0 bytes stays at the floor, never the disabled ceiling"
+        );
         client.shutdown().await;
     }
 

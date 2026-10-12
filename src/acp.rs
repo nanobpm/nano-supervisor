@@ -410,7 +410,21 @@ impl Agent {
                             continue;
                         }
                     };
-                    if out.send(frame).await.is_err() {
+                    // Race the send against the turn's stop signal, exactly as
+                    // the receive path above does: `out` is bounded
+                    // (`OUT_CHANNEL_CAP`), so when the agent stops reading stdin
+                    // `write_loop` stalls and this send can block forever. A
+                    // blocked send could not observe `steer_stop_rx`, and
+                    // `Agent::run` awaits this task after the prompt finishes —
+                    // so the slot would hang past its idle timeout. Losing the
+                    // race (stop fired, or the send failed) ends the turn's
+                    // steer loop; the receiver is still returned below so the
+                    // next turn stays steerable.
+                    let sent = tokio::select! {
+                        r = out.send(frame) => r.is_ok(),
+                        _ = &mut steer_stop_rx => false,
+                    };
+                    if !sent {
                         break;
                     }
                 }
