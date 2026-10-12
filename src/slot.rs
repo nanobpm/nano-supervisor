@@ -2360,10 +2360,20 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // so the nudge turn reuses the same stream + CLAIM instead of re-registering
     // and overwriting the stream-keyed RELEASE barrier. Absent the hub, this is
     // `None` and both turns run unchanged.
-    let mut hub_session = cfg.hub.as_ref().map(|hub| {
+    //
+    // Gate on the EFFECTIVE `acp` protocol: only ACP turns attach a transcript
+    // bridge or steer (see `run_agent`), so a `Protocol::Pipe` job has nothing
+    // to relay. CLAIMing a session for a pipe job would make a default pipe job
+    // appear owned on the hub with no transcript/steer ever flowing — the
+    // pipe/PTY relay adapter is deferred scope (#10). Skip the session entirely
+    // until it exists.
+    let mut hub_session = cfg.hub.as_ref().filter(|_| acp).map(|hub| {
         // Worker identity (instance) + declared capability for presence,
         // matching the Node emit client's `register {instance, capability}`
-        // (`cognition` = hire rank, `family` = hire model).
+        // (`cognition` = hire rank, `family` = hire model). Gated by
+        // `should_register_hub_session` (ACP-only); `acp` here is that same
+        // effective-protocol flag computed above.
+        debug_assert_eq!(acp, should_register_hub_session(&cfg));
         let capability = serde_json::json!({
             "cognition": cfg.hire.rank,
             "family": cfg.hire.model,
@@ -2721,6 +2731,17 @@ fn effective_protocol(cfg: &SlotConfig) -> Protocol {
         .unwrap_or(cfg.hire.protocol)
 }
 
+/// Whether to open (and CLAIM) a job-level hub session for this job. True only
+/// when the hub is configured AND the effective protocol is ACP: only ACP turns
+/// attach a transcript bridge or steer, so a `Protocol::Pipe` job has nothing to
+/// relay. CLAIMing a session for a pipe job would make a default pipe job appear
+/// owned on the hub with no transcript/steer ever flowing — the pipe/PTY relay
+/// adapter is deferred scope (#10). Gating here keeps ownership honest until it
+/// exists.
+fn should_register_hub_session(cfg: &SlotConfig) -> bool {
+    cfg.hub.is_some() && effective_protocol(cfg) == Protocol::Acp
+}
+
 /// Run the hired agent once with `stdin` (the ACP prompt text, or the pipe
 /// harness's stdin) and report what happened. Never errors: a harness failure is
 /// a failed [`RunResult`], settled by the caller.
@@ -2783,6 +2804,9 @@ async fn run_agent(
                 whereami
             ));
             let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
+            // Reclaim the job-keyed steer receiver BEFORE `shutdown` consumes
+            // the agent, so it can be returned to the session for the next turn.
+            let steer_back = agent.take_steer();
             agent.shutdown().await;
             // Flush THIS turn's transcript tail on the runtime (bounded) WITHOUT
             // releasing the job: the session is job-level and shared with any
@@ -2791,7 +2815,9 @@ async fn run_agent(
             // awaits the bridge drain without parking a Tokio worker thread, so
             // this turn's tail is buffered ahead of the next turn (or the single
             // job-level RELEASE), preserving tail-before-RELEASE on the wire.
+            // Returning the steer receiver first keeps the next turn steerable.
             if let Some(session) = hub_session.as_mut() {
+                session.restore_steer(steer_back);
                 session.detach_turn().await;
             }
             match out {
@@ -3690,6 +3716,74 @@ mod tests {
         assert_eq!(effective_protocol(&c), Protocol::Acp);
         c.protocol_override = Some(String::new());
         assert_eq!(effective_protocol(&c), Protocol::Acp);
+    }
+
+    // Finding (round 18): a hub session is opened/CLAIMed ONLY for ACP jobs. A
+    // `Protocol::Pipe` job attaches no transcript or steer in `run_agent`, so
+    // CLAIMing it would make a default pipe job appear owned on the hub with no
+    // relay flowing — the pipe/PTY relay adapter is deferred scope (#10). The
+    // gate keys on the EFFECTIVE protocol, so a `pipe → acp` override opens a
+    // session and an `acp → pipe` override does not.
+    #[tokio::test]
+    async fn hub_session_is_opened_only_for_acp_jobs() {
+        fn hub() -> std::sync::Arc<crate::hub::HubClient> {
+            let hub_cfg = crate::hub::HubConfig {
+                url: "ws://127.0.0.1:1/agentic".into(),
+                token: Some("t".into()),
+                secret: None,
+                credential: None,
+                permission: Some("yolo".into()),
+                terminal: false,
+                attribution: Some("nano".into()),
+                buffer_capacity: 8,
+                buffer_byte_budget: 0,
+            };
+            crate::hub::HubClient::spawn(hub_cfg, &[])
+        }
+
+        // No hub → never, regardless of protocol.
+        let mut c = cfg();
+        c.hub = None;
+        c.hire.protocol = Protocol::Acp;
+        assert!(!should_register_hub_session(&c), "no hub, no session");
+
+        // Hub + Pipe hire → gated OFF (nothing to relay yet).
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Pipe;
+        assert!(
+            !should_register_hub_session(&c),
+            "pipe job must not CLAIM a hub session"
+        );
+
+        // Hub + ACP hire → ON.
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Acp;
+        assert!(
+            should_register_hub_session(&c),
+            "acp job opens a hub session"
+        );
+
+        // Override wins: pipe hire forced to acp → ON.
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Pipe;
+        c.protocol_override = Some("acp".into());
+        assert!(
+            should_register_hub_session(&c),
+            "pipe→acp override opens a session"
+        );
+
+        // Override wins the other way: acp hire forced to pipe → OFF.
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Acp;
+        c.protocol_override = Some("pipe".into());
+        assert!(
+            !should_register_hub_session(&c),
+            "acp→pipe override suppresses the session"
+        );
     }
 
     /// A hermetic, unique `result.json` path for a `build_agent_env` test.

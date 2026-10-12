@@ -1385,10 +1385,12 @@ impl HubSession {
     ///
     /// Returns `(transcript_sink, steer)`. The transcript sink is re-created per
     /// turn (the prior turn's bridge was detached by [`detach_turn`](Self::detach_turn)).
-    /// The steer receiver is job-keyed (steer routes by stream) and is handed
-    /// out once: the first turn's steer task keeps it for the job's lifetime, so
-    /// a later turn gets `None` for steer (its steer still reaches the running
-    /// first-turn task, which is correct — there is only ever one live turn).
+    /// The steer receiver is job-keyed (steer routes by stream) and is lent to
+    /// the active turn: the turn's steer task keeps it while it runs, then
+    /// [`run`](crate::acp::Agent::run) recovers it on turn end and the caller
+    /// returns it via [`restore_steer`](Self::restore_steer), so a later
+    /// result-nudge turn gets it again and stays steerable. If a prior turn did
+    /// not return it, a later turn gets `None`.
     pub fn open_turn(&mut self) -> Option<(mpsc::Sender<Value>, Option<mpsc::Receiver<ControlFrame>>)> {
         // Clone the `Arc` first so the `&mut self` borrow (for `spawn_bridge`
         // and the field reads) does not conflict with borrowing `self.client`.
@@ -1397,6 +1399,17 @@ impl HubSession {
         let transcript = self.transcript.clone()?;
         let steer = self.steer.take();
         Some((transcript, steer))
+    }
+
+    /// Return the job-keyed steer receiver reclaimed from a finished turn so the
+    /// NEXT turn (a result-nudge) can be steered too. A no-op when the turn
+    /// recovered nothing (`None`) — e.g. a hub-less run or a turn that was torn
+    /// down before it ever held the receiver — so it never clobbers a receiver
+    /// already resident in the session.
+    pub fn restore_steer(&mut self, steer: Option<mpsc::Receiver<ControlFrame>>) {
+        if steer.is_some() {
+            self.steer = steer;
+        }
     }
 
     /// End an ACP turn WITHOUT releasing the job: flush this turn's transcript
@@ -2547,17 +2560,20 @@ mod tests {
         let _ = buffered(&client); // discard the initial register/claim
 
         // First turn: open + detach (flush tail, no release).
-        let (sink1, _steer1) = session.open_turn().expect("first turn opens");
+        let (sink1, steer1) = session.open_turn().expect("first turn opens");
         sink1.try_send(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t1"}})).unwrap();
         session.detach_turn().await;
+        // The turn returns the job-keyed steer receiver (as `Agent::run` does via
+        // `take_steer`); hand it back so the nudge turn stays steerable.
+        session.restore_steer(steer1);
 
         // Second (nudge) turn on the SAME session: open + detach again.
         let (sink2, steer2) = session.open_turn().expect("second turn opens");
         sink2.try_send(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t2"}})).unwrap();
         session.detach_turn().await;
-        // Steer is job-keyed and held by the first turn's task, so the nudge
-        // turn gets no second receiver.
-        assert!(steer2.is_none(), "steer receiver is handed out once per job");
+        // Steer is preserved across turns: the restored receiver is lent to the
+        // nudge turn, so the second ACP turn remains steerable.
+        assert!(steer2.is_some(), "steer receiver is preserved for the nudge turn");
 
         // Close the job: exactly one RELEASE total, enqueued on close. Use the
         // non-draining enqueue log (the buffer still holds the transcript tail).
@@ -2567,6 +2583,42 @@ mod tests {
         let releases = log.iter().filter(|(_, _, f)| *f == Family::Release).count();
         assert_eq!(claims, 0, "no second CLAIM after the initial registration");
         assert_eq!(releases, 1, "exactly one RELEASE for the job across both turns");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restore_steer_preserves_receiver_and_ignores_none() {
+        // A turn hands the job-keyed steer receiver back via `restore_steer`.
+        // Restoring `Some` makes the next `open_turn` steerable again; restoring
+        // `None` (a hub-less/torn-down turn recovered nothing) must NOT clobber a
+        // receiver already resident in the session.
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-rs", capability(), "job-rs");
+        let _ = buffered(&client);
+
+        // Take the receiver out (as `open_turn` does for a turn).
+        let (_sink, steer) = session.open_turn().expect("first turn opens");
+        assert!(steer.is_some(), "first turn receives the steer receiver");
+        session.detach_turn().await;
+
+        // A turn that recovered nothing must not wipe the (currently absent)
+        // receiver into existence, nor overwrite a present one.
+        session.restore_steer(None);
+        let (_sink2, steer_after_none) = session.open_turn().expect("turn opens");
+        assert!(
+            steer_after_none.is_none(),
+            "restore_steer(None) is a no-op — no phantom receiver appears"
+        );
+        session.detach_turn().await;
+
+        // Returning the real receiver makes the next turn steerable again.
+        session.restore_steer(steer);
+        let (_sink3, steer_restored) = session.open_turn().expect("turn opens");
+        assert!(
+            steer_restored.is_some(),
+            "restored receiver is lent to the next turn"
+        );
+        session.close().await;
         client.shutdown().await;
     }
 

@@ -172,8 +172,10 @@ impl Agent {
     /// receives every ACP `session/update` for live bridging, and `steer` (when
     /// this turn holds it) delivers hub-inbound prompt text to inject into the
     /// running turn. A hub-less run never calls this and behaves identically.
-    /// `steer` is `None` on a job's second (result-nudge) turn: the steer
-    /// receiver is job-keyed and the first turn's steer task already holds it.
+    /// The steer receiver is job-keyed and shared across a job's turns: `run`
+    /// recovers it when the turn ends (rather than dropping it), and the caller
+    /// hands it back to the session via [`take_steer`](Self::take_steer) so a
+    /// later result-nudge turn stays steerable.
     pub fn attach_hub(
         &mut self,
         transcript: mpsc::Sender<Value>,
@@ -181,6 +183,13 @@ impl Agent {
     ) {
         self.shared.lock().unwrap().transcript = Some(transcript);
         self.steer = steer;
+    }
+
+    /// Reclaim the steer receiver after a turn so the caller can return it to
+    /// the job's session for the next turn. `run` stores the recovered receiver
+    /// in `self.steer` when the turn ends; this hands ownership back out.
+    pub fn take_steer(&mut self) -> Option<mpsc::Receiver<crate::hub::control::ControlFrame>> {
+        self.steer.take()
     }
 
     async fn request(&mut self, method: &str, params: Value, idle: Duration) -> Result<Value> {
@@ -337,19 +346,36 @@ impl Agent {
         // arrived during ACP init must not be written to `out` before the very
         // `session/prompt` below has been enqueued (see `request_signalling`).
         let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        // Turn-scoped stop signal: at turn end we signal the steer task to
+        // break and RETURN its receiver, instead of `abort()`ing it (which would
+        // DROP the receiver). The steer receiver is job-keyed and shared across
+        // a job's turns (first run + result-nudge); dropping it after the first
+        // turn would leave a second ACP turn unsteerable — prompt/cancel frames
+        // sent during the nudge would hit a closed channel and be discarded.
+        let (steer_stop_tx, mut steer_stop_rx) = oneshot::channel::<()>();
         let steer_task = self.steer.take().map(|mut rx| {
             use crate::hub::control::ControlFrame;
             let out = self.out.clone();
             let sid = session_id.clone();
             tokio::spawn(async move {
-                // Wait until the original prompt has been enqueued. A closed gate
-                // (sender dropped without firing) means the prompt send failed or
-                // the turn is being torn down — process no steer in that case.
-                if gate_rx.await.is_err() {
-                    return;
+                // Wait until the original prompt has been enqueued, or the turn
+                // ends first. A closed gate (sender dropped without firing) means
+                // the prompt send failed or the turn is being torn down — process
+                // no steer, but STILL return the receiver so the next turn stays
+                // steerable.
+                tokio::select! {
+                    g = gate_rx => { if g.is_err() { return Some(rx); } }
+                    _ = &mut steer_stop_rx => return Some(rx),
                 }
                 let mut id: u64 = 1 << 32;
-                while let Some(control) = rx.recv().await {
+                loop {
+                    let control = tokio::select! {
+                        c = rx.recv() => match c {
+                            Some(c) => c,
+                            None => break, // steer channel closed by the hub
+                        },
+                        _ = &mut steer_stop_rx => break, // turn ended
+                    };
                     let frame = match control {
                         ControlFrame::Prompt { text } => {
                             id += 1;
@@ -385,6 +411,7 @@ impl Agent {
                         break;
                     }
                 }
+                Some(rx)
             })
         });
         let done = self
@@ -395,9 +422,17 @@ impl Agent {
                 Some(gate_tx),
             )
             .await;
-        if let Some(task) = steer_task {
-            task.abort();
-        }
+        // End the steer task gracefully and RECOVER its receiver so the job's
+        // next ACP turn (a result-nudge) can be steered too. `abort()` would
+        // drop the receiver; instead we signal it to stop and `await` the handle
+        // for the returned receiver, then stash it back in `self.steer` for the
+        // caller to hand to the session (`take_steer`).
+        self.steer = if let Some(task) = steer_task {
+            let _ = steer_stop_tx.send(());
+            task.await.ok().flatten()
+        } else {
+            None
+        };
         let done = done.context("ACP session/prompt")?;
         let s = self.shared.lock().unwrap();
         Ok(Outcome {
