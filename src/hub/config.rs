@@ -29,11 +29,16 @@ pub const DEFAULT_BUFFER_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub struct HubConfig {
     /// The WebSocket endpoint, e.g. `ws://127.0.0.1:8787/agentic`.
     pub url: String,
-    /// The routing token this worker presents (`NANO_AGENTIC_TOKEN`), e.g.
-    /// `implementation.ci.fix#red`. Optional: an endpoint may assign one.
+    /// The deprecated identity-token alias (`NANO_AGENTIC_TOKEN`). The current
+    /// shared identity is `secret` (`NANO_AGENTIC_SECRET`); this is used only
+    /// when `secret` is unset. Whichever resolves is carried as the `?token=`
+    /// query param on the upgrade URL (see `authenticated_url`/`identity_token`).
     pub token: Option<String>,
-    /// A bearer secret sent as `Authorization: Bearer …` on the upgrade
-    /// (`NANO_AGENTIC_SECRET`).
+    /// The shared-secret identity this worker presents (`NANO_AGENTIC_SECRET`).
+    /// It is the current, preferred identity and is sent as the `?token=` query
+    /// param on the upgrade URL — the same slot the hub's shared-secret
+    /// authenticator reads — NOT as an `Authorization` header. `token`
+    /// (`NANO_AGENTIC_TOKEN`) is only a deprecated fallback when this is unset.
     pub secret: Option<String>,
     /// An opaque credential (`NANO_AGENTIC_CREDENTIAL`) sent as the `capability`
     /// query parameter on the WebSocket upgrade URL (see `authenticated_url`).

@@ -40,9 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::hub::config::HubConfig;
 use crate::hub::control::{parse_inbound_relay_chunk, ControlFrame};
@@ -82,26 +80,31 @@ const TRANSCRIPT_CHANNEL_BOUND: usize = 1024;
 /// `MAX_ACP_FRAME` and lets [`transcript_channel_bound`] translate the byte
 /// budget into a worst-case item count for the pre-buffer queue.
 const MAX_TRANSCRIPT_UPDATE_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRAME
-/// Bound on each session's inbound-steer channel. A hub delivering controls
-/// faster than the ACP turn consumes them (e.g. while setup or the agent is
-/// stalled) must not grow daemon memory without limit, so the channel is
-/// bounded and `route_inbound` drops the control on overflow rather than
-/// blocking the socket read loop.
+/// Count ceiling on each session's inbound-steer channel. A hub delivering
+/// controls faster than the ACP turn consumes them (e.g. while setup or the
+/// agent is stalled) must not grow daemon memory without limit, so the channel
+/// is bounded and `route_inbound` drops the control on overflow rather than
+/// blocking the socket read loop. Like the transcript pre-buffer, the EFFECTIVE
+/// per-session bound is the smaller of this and a byte-derived bound (see
+/// [`steer_channel_bound`]), so the queue's worst-case memory is held to the
+/// configured byte budget instead of `256 × MAX_STEER_CHUNK_BYTES`.
 const STEER_CHANNEL_BOUND: usize = 256;
-/// Upper bound on a single inbound steer chunk's bytes. The count cap above
-/// bounds only how many controls queue, not their memory: each queued
-/// [`ControlFrame::Prompt`] owns its chunk `String`, and the WebSocket read
-/// applies no `max_message_size`, so without a per-chunk cap a hub could retain
-/// `STEER_CHANNEL_BOUND` arbitrarily large payloads per active session
-/// (256 × unbounded). Capping the chunk at the source — in `route_inbound`,
-/// BEFORE it is decoded/cloned into a frame — makes the channel's worst-case
-/// memory `STEER_CHANNEL_BOUND × MAX_STEER_CHUNK_BYTES` (≈ 256 KiB) regardless
-/// of the inbound WebSocket frame size. An over-large chunk is dropped (fail
-/// closed) rather than truncated: a partial steer is a corrupted instruction,
-/// and the legacy raw-byte path would otherwise forward a silently-cut prefix.
-/// 1 KiB is far above any legitimate steer (a prompt line, a cancel reason, a
-/// permission outcome) and mirrors the conformance corpus's largest control.
-const MAX_STEER_CHUNK_BYTES: usize = 1024;
+/// Upper bound on a single inbound steer chunk's bytes, mirroring
+/// [`MAX_TRANSCRIPT_UPDATE_BYTES`] / `acp::MAX_ACP_FRAME`: the ACP side already
+/// caps each JSON-RPC line (hence each steer the agent can act on) at ~1 MiB, so
+/// that same frame budget — NOT the conformance corpus's size, which is not a
+/// protocol maximum — is the right ceiling for an inbound control. It bounds the
+/// memory a single queued [`ControlFrame::Prompt`] (which owns its chunk
+/// `String`) can hold, since the WebSocket read applies no `max_message_size`;
+/// combined with the byte-derived channel depth ([`steer_channel_bound`]) the
+/// channel's worst-case memory is the configured `buffer_byte_budget`. A chunk
+/// past this cap is dropped (fail closed) rather than truncated — a partial
+/// steer is a corrupted instruction, and the legacy raw-byte path would
+/// otherwise forward a silently-cut prefix — and the drop is logged (see
+/// `route_inbound`) rather than silent, so an operator can observe a rejected
+/// over-large control. Legitimate steering prompts (a prompt body, a cancel
+/// reason, a permission outcome) sit far below 1 MiB.
+const MAX_STEER_CHUNK_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRAME
 /// Ceiling on how long `HubSession::drop` waits for the transcript bridge to
 /// drain its accepted updates before RELEASE (finding: RELEASE must not
 /// overtake the transcript tail). Bounded so a wedged bridge can never hang the
@@ -184,6 +187,22 @@ fn transcript_channel_bound(byte_budget: usize) -> usize {
         return TRANSCRIPT_CHANNEL_BOUND;
     }
     (byte_budget / MAX_TRANSCRIPT_UPDATE_BYTES).clamp(1, TRANSCRIPT_CHANNEL_BOUND)
+}
+
+/// Effective count bound for one session's inbound-steer channel, derived from
+/// the same configured byte budget as [`transcript_channel_bound`]. Each queued
+/// control is capped to [`MAX_STEER_CHUNK_BYTES`] by `route_inbound`, so capping
+/// the channel at `byte_budget / MAX_STEER_CHUNK_BYTES` holds its worst-case
+/// memory to the configured `buffer_byte_budget` instead of
+/// `STEER_CHANNEL_BOUND × MAX_STEER_CHUNK_BYTES`. A disabled byte budget (`0`)
+/// falls back to the flat count ceiling, and the result is clamped to
+/// `1..=STEER_CHANNEL_BOUND` so a tiny budget still admits one control and a
+/// large one never exceeds the ceiling.
+fn steer_channel_bound(byte_budget: usize) -> usize {
+    if byte_budget == 0 {
+        return STEER_CHANNEL_BOUND;
+    }
+    (byte_budget / MAX_STEER_CHUNK_BYTES).clamp(1, STEER_CHANNEL_BOUND)
 }
 
 /// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a shared
@@ -697,9 +716,13 @@ impl HubClient {
         job_key: &str,
     ) -> HubSession {
         let stream = compose_stream_id(instance, job_key);
-        // Bounded (see `STEER_CHANNEL_BOUND`): a hub delivering steer faster
-        // than the turn consumes it must not grow memory without limit.
-        let (steer_tx, steer_rx) = mpsc::channel::<ControlFrame>(STEER_CHANNEL_BOUND);
+        // Bounded by BOTH count and memory: the effective depth is the smaller
+        // of `STEER_CHANNEL_BOUND` and a byte-derived bound (see
+        // `steer_channel_bound`), so a hub delivering steer faster than the turn
+        // consumes it can neither queue unbounded controls nor grow memory past
+        // the configured `buffer_byte_budget`.
+        let steer_bound = steer_channel_bound(self.config.buffer_byte_budget);
+        let (steer_tx, steer_rx) = mpsc::channel::<ControlFrame>(steer_bound);
         self.sessions
             .lock()
             .unwrap()
@@ -1170,10 +1193,20 @@ impl HubClient {
         };
         // Byte-bound the chunk BEFORE it is decoded/cloned into a `ControlFrame`
         // (which owns its text): the steer channel is only count-bounded, so an
-        // unbounded chunk lets a hub retain `STEER_CHANNEL_BOUND` huge payloads
-        // per session. Drop an over-large chunk (fail closed) rather than
-        // truncate it into a silently-corrupted steer.
+        // unbounded chunk lets a hub retain its depth in huge payloads per
+        // session. Drop an over-large chunk (fail closed) rather than truncate it
+        // into a silently-corrupted steer, and LOG the drop so a rejected control
+        // is observable rather than vanishing — the cap mirrors the ACP frame
+        // budget, far above any legitimate steer.
         if chunk.len() > MAX_STEER_CHUNK_BYTES {
+            // Log only the integer sizes, never the hub-controlled `stream`/chunk
+            // text: `log` writes straight to stderr, so interpolating untrusted
+            // bytes would let a hostile hub inject terminal escapes/newlines.
+            log(&format!(
+                "agentic hub: dropped oversized inbound steer chunk ({} bytes > {} cap)",
+                chunk.len(),
+                MAX_STEER_CHUNK_BYTES
+            ));
             return;
         }
         // The stream id MUST parse to a single `(instance, jobKey)` ref; a
@@ -1511,15 +1544,35 @@ async fn connection_loop(client: Arc<HubClient>, mut shutdown: watch::Receiver<b
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// The identity token this worker presents on the upgrade URL's `token` query
+/// parameter. The shared-secret authenticator (`sharedSecretAuthenticator` on
+/// the hub, mirrored by the Node worker) reads one `?token=` value as the
+/// worker's identity, so the two identity envs collapse to a single wire slot:
+/// `NANO_AGENTIC_SECRET` is the current name and takes precedence, while
+/// `NANO_AGENTIC_TOKEN` is only its deprecated alias and is used only when
+/// SECRET is unset. Sending SECRET on a separate `Authorization` header (as an
+/// earlier revision did) left the documented secure config — SECRET set, TOKEN
+/// unset — with NO `?token=` at all, so the hub rejected it before any
+/// `register`. Returning SECRET-first here keeps parity with the reference
+/// client, which carries exactly this resolved identity as `?token=`.
+fn identity_token(config: &HubConfig) -> Option<&str> {
+    config
+        .secret
+        .as_deref()
+        .or(config.token.as_deref())
+        .filter(|s| !s.is_empty())
+}
+
 /// Build the authenticated channel URL. The hub's shared-secret authenticator
 /// reads the identity `token` and capability `credential` as **query params on
 /// the upgrade URL** (the same `?token=…&capability=…` the Node worker sends),
 /// so they MUST be on the URL before the handshake — a payload-only token is
-/// rejected before any `register` can be read. The bearer `secret` is still
-/// carried as an `Authorization` header when configured.
+/// rejected before any `register` can be read. The identity is resolved SECRET
+/// first, then the deprecated TOKEN alias (see [`identity_token`]); there is no
+/// separate `Authorization` header, matching the reference client.
 fn authenticated_url(config: &HubConfig) -> String {
     let mut params: Vec<(&str, &str)> = Vec::new();
-    if let Some(token) = &config.token {
+    if let Some(token) = identity_token(config) {
         params.push(("token", token));
     }
     if let Some(credential) = &config.credential {
@@ -1558,19 +1611,17 @@ fn percent_encode_query(value: &str) -> String {
 
 async fn connect(config: &HubConfig) -> anyhow::Result<WsStream> {
     let url = authenticated_url(config);
-    let mut request = url.as_str().into_client_request()?;
-    if let Some(secret) = &config.secret {
-        request.headers_mut().insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {secret}"))?,
-        );
-    }
+    // The identity is carried on the `?token=` query param (see
+    // `authenticated_url`/`identity_token`), exactly as the reference client
+    // sends it — NOT on a separate `Authorization` header, which the hub does
+    // not read and which left a SECRET-only secure config unauthenticated.
+    //
     // NOTE: `config.protocol` (`NANO_AGENTIC_PROTOCOL`) is deliberately NOT sent
     // as a `Sec-WebSocket-Protocol` header. It names the worker's *harness*
     // override (`pipe`/`acp`), not a WebSocket subprotocol; presenting it as one
     // can make a configured hub handshake fail. It is applied when resolving the
     // hire protocol (see `HubConfig::hire_protocol_override`), never on the wire.
-    let (stream, _response) = tokio_tungstenite::connect_async(request).await?;
+    let (stream, _response) = tokio_tungstenite::connect_async(url).await?;
     Ok(stream)
 }
 
@@ -2375,6 +2426,49 @@ mod tests {
         assert_eq!(authenticated_url(&cfg), "ws://host/agentic?v=1&token=tok");
     }
 
+    // Finding (round 15): `NANO_AGENTIC_SECRET` is the current shared identity
+    // and the hub reads it from the `?token=` query param; `NANO_AGENTIC_TOKEN`
+    // is only a deprecated alias. A SECRET-only secure config (the documented
+    // one) MUST still produce a `?token=`, and SECRET MUST win when both are set
+    // — otherwise the hub rejects the worker before `register`.
+    #[test]
+    fn identity_token_prefers_secret_over_token_alias() {
+        let mut cfg = test_config();
+        cfg.secret = Some("the-secret".into());
+        cfg.token = Some("legacy-alias".into());
+        assert_eq!(identity_token(&cfg), Some("the-secret"));
+        // SECRET unset: fall back to the deprecated TOKEN alias.
+        cfg.secret = None;
+        assert_eq!(identity_token(&cfg), Some("legacy-alias"));
+        // Neither set: no identity to present.
+        cfg.token = None;
+        assert_eq!(identity_token(&cfg), None);
+        // Empty strings are not an identity.
+        cfg.secret = Some(String::new());
+        cfg.token = Some(String::new());
+        assert_eq!(identity_token(&cfg), None);
+    }
+
+    #[test]
+    fn authenticated_url_carries_secret_identity_as_token_param() {
+        let mut cfg = test_config();
+        cfg.url = "ws://host:8787/agentic".into();
+        // The documented secure config: SECRET set, TOKEN unset.
+        cfg.secret = Some("sh/secret#1".into());
+        cfg.token = None;
+        cfg.credential = None;
+        assert_eq!(
+            authenticated_url(&cfg),
+            "ws://host:8787/agentic?token=sh%2Fsecret%231"
+        );
+        // When both are set, SECRET (not the deprecated TOKEN alias) is on `?token=`.
+        cfg.token = Some("legacy".into());
+        assert_eq!(
+            authenticated_url(&cfg),
+            "ws://host:8787/agentic?token=sh%2Fsecret%231"
+        );
+    }
+
     #[tokio::test]
     async fn jitter_spans_the_half_delay_with_real_entropy() {
         let client = HubClient::spawn(test_config(), &[]);
@@ -2747,6 +2841,38 @@ mod tests {
         let mut session = client.register_session("w-bb", capability(), "job-bb");
         let sink = session.transcript_sink().expect("transcript sink");
         assert_eq!(sink.max_capacity(), 8);
+        client.shutdown().await;
+    }
+
+    // Finding (round 15): the inbound-steer channel is byte-aware the same way
+    // the transcript pre-buffer is. A flat 256-item count bound (each control up
+    // to ~1 MiB) could hold ~256 MiB before the byte budget bites, so
+    // `steer_channel_bound` derives the item count from the byte budget.
+    #[test]
+    fn steer_channel_bound_derives_from_byte_budget() {
+        // Disabled byte budget (0) falls back to the flat count ceiling.
+        assert_eq!(steer_channel_bound(0), STEER_CHANNEL_BOUND);
+        // 64 MiB / 1 MiB = 64 controls (bounds worst-case memory to the budget).
+        assert_eq!(steer_channel_bound(64 * 1024 * 1024), 64);
+        // A tiny-but-nonzero budget still admits at least one control.
+        assert_eq!(steer_channel_bound(1), 1);
+        assert_eq!(steer_channel_bound(MAX_STEER_CHUNK_BYTES - 1), 1);
+        // A huge budget is clamped to the count ceiling, never above it.
+        assert_eq!(steer_channel_bound(usize::MAX), STEER_CHANNEL_BOUND);
+    }
+
+    // Finding (round 15): a session's steer channel capacity actually follows
+    // the configured byte budget, not the flat ceiling — so the queued-control
+    // worst-case memory stays bounded by `buffer_byte_budget` even though each
+    // control may be up to `MAX_STEER_CHUNK_BYTES`.
+    #[tokio::test]
+    async fn steer_channel_capacity_follows_byte_budget() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB => 8 controls
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-sbc", capability(), "job-sbc");
+        let steer = session.take_steer().expect("steer receiver");
+        assert_eq!(steer.max_capacity(), 8);
         client.shutdown().await;
     }
 
