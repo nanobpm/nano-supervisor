@@ -322,10 +322,16 @@ impl LaneBuffer {
             // Bulk may only evict bulk.
             Lane::Bulk => self.bulk.pop_front(),
             // Interactive may evict bulk, then interactive — never control.
-            Lane::Interactive => self.bulk.pop_front().or_else(|| self.interactive.pop_front()),
+            Lane::Interactive => self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front()),
             // Control may shed lower-priority traffic (bulk, then interactive)
             // to make room, but NEVER another control frame (see above).
-            Lane::Control => self.bulk.pop_front().or_else(|| self.interactive.pop_front()),
+            Lane::Control => self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front()),
         };
         match evicted {
             Some(bf) => {
@@ -367,7 +373,9 @@ impl LaneBuffer {
     /// `stream`, preserving the order of the rest. Helper for
     /// [`LaneBuffer::pop_lower_lane_for_stream`].
     fn take_stream_match(dq: &mut VecDeque<BufferedFrame>, stream: &str) -> Option<BufferedFrame> {
-        let pos = dq.iter().position(|bf| frame_stream(&bf.frame) == Some(stream))?;
+        let pos = dq
+            .iter()
+            .position(|bf| frame_stream(&bf.frame) == Some(stream))?;
         dq.remove(pos)
     }
 
@@ -414,8 +422,7 @@ impl LaneBuffer {
                     if let Some(stream) = collapsed.as_deref() {
                         if let Some(cpos) = self.control.iter().position(|bf| {
                             bf.frame.family == Family::Claim
-                                && presence_stream_id(&bf.frame.payload).as_deref()
-                                    == Some(stream)
+                                && presence_stream_id(&bf.frame.payload).as_deref() == Some(stream)
                         }) {
                             if let Some(cf) = self.control.remove(cpos) {
                                 self.account_removed(&cf);
@@ -511,7 +518,10 @@ impl LaneBuffer {
             // frames remain, stop evicting (presence is EXEMPT from the bound —
             // see the doc comment) and prepend anyway: the snapshot is bounded
             // by live instances+jobs, never by the configured buffer limits.
-            let evicted = self.bulk.pop_front().or_else(|| self.interactive.pop_front());
+            let evicted = self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front());
             match evicted {
                 Some(bf) => self.account_removed(&bf),
                 None => break,
@@ -534,7 +544,10 @@ impl LaneBuffer {
         debug_assert_eq!(frame.lane, Lane::Control);
         let bytes = frame_bytes(&frame);
         while self.len() >= self.capacity || !self.bytes_fit(bytes) {
-            let evicted = self.bulk.pop_front().or_else(|| self.interactive.pop_front());
+            let evicted = self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front());
             match evicted {
                 Some(bf) => self.account_removed(&bf),
                 None => break,
@@ -716,10 +729,8 @@ impl HubClient {
         // Done after the Arc is built because `capability_payload` reads config.
         {
             let mut insts = client.instances.lock().unwrap();
-            let seeded: Vec<(String, Value)> = insts
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let seeded: Vec<(String, Value)> =
+                insts.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             for (instance, cap) in seeded {
                 insts.insert(instance, client.capability_payload(cap));
             }
@@ -1197,19 +1208,57 @@ impl HubClient {
         // sequence numbers. Reversed, so the capacity-aware re-admission below
         // lands the snapshot in its intended front order (REGISTER…, CLAIM…).
         let mut snapshot: Vec<Frame> = Vec::new();
-        for (inst, cap) in self.instances.lock().unwrap().iter() {
-            snapshot.push(self.make_frame(
-                Lane::Control,
-                Family::Register,
-                json!({ "instance": inst, "capability": cap }),
-            ));
-        }
-        for (inst, jobs) in self.in_flight.lock().unwrap().iter() {
-            for job_key in jobs {
+        // Covered worker instances, captured once so the REGISTER, per-job CLAIM,
+        // and per-instance snapshot CLAIM sections below all reflect the SAME set
+        // (and so `instances` and `in_flight` are never locked nested, preserving
+        // the flat outbound → leaf lock order).
+        let instance_names: Vec<String> = {
+            let instances = self.instances.lock().unwrap();
+            for (inst, cap) in instances.iter() {
+                snapshot.push(self.make_frame(
+                    Lane::Control,
+                    Family::Register,
+                    json!({ "instance": inst, "capability": cap }),
+                ));
+            }
+            instances.keys().cloned().collect()
+        };
+        // Per-job CLAIMs: the `{instance, jobKey}` ownership frames the hub's
+        // pinned per-job validator accepts (one per live job). Kept for normal
+        // claim/release semantics AND re-asserted here.
+        {
+            let in_flight = self.in_flight.lock().unwrap();
+            for (inst, jobs) in in_flight.iter() {
+                for job_key in jobs {
+                    snapshot.push(self.make_frame(
+                        Lane::Control,
+                        Family::Claim,
+                        json!({ "instance": inst, "jobKey": job_key }),
+                    ));
+                }
+            }
+            // Per-instance snapshot CLAIM: a `{instance, jobKeys: [...]}` frame.
+            // The PRESENCE of `jobKeys` is the discriminant the hub routes to its
+            // authoritative `ClaimRegistry.replaceInstance(instance, jobKeys)` —
+            // it REPLACES that instance's entire ownership set with exactly the
+            // listed jobs, so it closes each reconnect's resync authoritatively.
+            // Emitted for EVERY covered instance INCLUDING the empty set: an
+            // empty `jobKeys` means "owns nothing now" and is what drops a claim
+            // we did NOT re-assert (e.g. a RELEASE lost during the outage). An
+            // instance we omit would keep its stale claims additively — the bug
+            // this supplements the per-job CLAIMs to fix (nano-workforce#894).
+            // Every element is a non-empty job key (in_flight only holds claimed
+            // jobs); a snapshot ALONE carries no `jobKey`, so it never collides
+            // with the per-job validator (the hub validates the union locally).
+            for inst in &instance_names {
+                let job_keys: Vec<&String> = in_flight
+                    .get(inst)
+                    .map(|jobs| jobs.iter().collect())
+                    .unwrap_or_default();
                 snapshot.push(self.make_frame(
                     Lane::Control,
                     Family::Claim,
-                    json!({ "instance": inst, "jobKey": job_key }),
+                    json!({ "instance": inst, "jobKeys": job_keys }),
                 ));
             }
         }
@@ -1448,7 +1497,9 @@ impl HubSession {
     /// returns it via [`restore_steer`](Self::restore_steer), so a later
     /// result-nudge turn gets it again and stays steerable. If a prior turn did
     /// not return it, a later turn gets `None`.
-    pub fn open_turn(&mut self) -> Option<(mpsc::Sender<Value>, Option<mpsc::Receiver<ControlFrame>>)> {
+    pub fn open_turn(
+        &mut self,
+    ) -> Option<(mpsc::Sender<Value>, Option<mpsc::Receiver<ControlFrame>>)> {
         // Clone the `Arc` first so the `&mut self` borrow (for `spawn_bridge`
         // and the field reads) does not conflict with borrowing `self.client`.
         let client = self.client.clone();
@@ -2238,7 +2289,10 @@ mod tests {
         }
         let frames = buffered(&client);
         // Both control frames survive; only bulk was shed.
-        let controls = frames.iter().filter(|(l, _, _)| *l == Lane::Control).count();
+        let controls = frames
+            .iter()
+            .filter(|(l, _, _)| *l == Lane::Control)
+            .count();
         assert_eq!(controls, 2, "control frames must not be evicted by bulk");
         client.shutdown().await;
     }
@@ -2269,7 +2323,10 @@ mod tests {
         buf.push(Frame::new(Lane::Bulk, Family::Relay, 4, json!({ "n": 4 })));
         assert_eq!(buf.len(), 2, "buffer back at capacity before the retry");
         buf.push_front(popped);
-        assert!(buf.len() <= 2, "retry re-admission must honour the count cap");
+        assert!(
+            buf.len() <= 2,
+            "retry re-admission must honour the count cap"
+        );
     }
 
     #[test]
@@ -2283,7 +2340,10 @@ mod tests {
         buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 2 })));
         buf.push(Frame::new(Lane::Bulk, Family::Relay, 3, json!({ "n": 3 })));
         buf.push_front(popped);
-        assert!(buf.bytes <= one * 2, "retry re-admission must honour the byte budget");
+        assert!(
+            buf.bytes <= one * 2,
+            "retry re-admission must honour the byte budget"
+        );
     }
 
     #[test]
@@ -2292,8 +2352,18 @@ mod tests {
         // low-priority retry is dropped rather than displacing control frames.
         let mut buf = LaneBuffer::with_limits(2, 0);
         let popped = Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 }));
-        buf.push(Frame::new(Lane::Control, Family::Register, 2, json!({ "instance": "w" })));
-        buf.push(Frame::new(Lane::Control, Family::Claim, 3, json!({ "instance": "w" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            2,
+            json!({ "instance": "w" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            3,
+            json!({ "instance": "w" }),
+        ));
         assert_eq!(buf.len(), 2);
         buf.push_front(popped);
         assert_eq!(buf.len(), 2, "bulk retry dropped; control preserved");
@@ -2310,13 +2380,17 @@ mod tests {
     // `enqueue_control_exempt`/`release_job`) must keep it instead.
     #[test]
     fn release_survives_a_full_control_lane() {
-        let has_release =
-            |buf: &LaneBuffer| buf.iter_frames().any(|f| f.family == Family::Release);
+        let has_release = |buf: &LaneBuffer| buf.iter_frames().any(|f| f.family == Family::Release);
 
         // Baseline (red without the fix): the ordinary bounded `push` DROPS the
         // RELEASE when the control lane is already at capacity.
         let mut dropped = LaneBuffer::with_limits(2, 0);
-        dropped.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "a" })));
+        dropped.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "a" }),
+        ));
         dropped.push(Frame::new(
             Lane::Control,
             Family::Claim,
@@ -2334,7 +2408,12 @@ mod tests {
         // The fix: exempt admission sheds lower lanes (none here) but never
         // drops the RELEASE itself, so the ownership-retiring frame survives.
         let mut kept = LaneBuffer::with_limits(2, 0);
-        kept.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "a" })));
+        kept.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "a" }),
+        ));
         kept.push(Frame::new(
             Lane::Control,
             Family::Claim,
@@ -2357,7 +2436,12 @@ mod tests {
     #[test]
     fn requeue_front_preserves_must_deliver_control() {
         let mut buf = LaneBuffer::with_limits(2, 0);
-        buf.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "a" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "a" }),
+        ));
         buf.push(Frame::new(
             Lane::Control,
             Family::Claim,
@@ -2402,14 +2486,30 @@ mod tests {
     #[test]
     fn pop_control_drains_only_the_control_lane() {
         let mut buf = LaneBuffer::with_limits(100, 0);
-        buf.push(Frame::new(Lane::Control, Family::Deregister, 1, json!({ "instance": "a" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Deregister,
+            1,
+            json!({ "instance": "a" }),
+        ));
         buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 1 })));
-        buf.push(Frame::new(Lane::Control, Family::Deregister, 3, json!({ "instance": "b" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Deregister,
+            3,
+            json!({ "instance": "b" }),
+        ));
         buf.push(Frame::new(Lane::Bulk, Family::Relay, 4, json!({ "n": 2 })));
 
         // Yields ONLY the control frames (DEREGISTERs), in order...
-        assert_eq!(buf.pop_control().map(|f| f.family), Some(Family::Deregister));
-        assert_eq!(buf.pop_control().map(|f| f.family), Some(Family::Deregister));
+        assert_eq!(
+            buf.pop_control().map(|f| f.family),
+            Some(Family::Deregister)
+        );
+        assert_eq!(
+            buf.pop_control().map(|f| f.family),
+            Some(Family::Deregister)
+        );
         assert!(buf.pop_control().is_none(), "no control frames left");
         // ...leaving the two bulk (transcript) frames buffered to be discarded
         // with the socket rather than blocking the shutdown.
@@ -2427,11 +2527,25 @@ mod tests {
     #[test]
     fn control_push_never_evicts_control() {
         let mut buf = LaneBuffer::with_limits(1, 0);
-        buf.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "w" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "w" }),
+        ));
         // Capacity 1 and already holding a control frame: a second control frame
         // must NOT evict the REGISTER — it is dropped on the floor instead.
-        buf.push(Frame::new(Lane::Control, Family::Claim, 2, json!({ "instance": "w", "jobKey": "j" })));
-        assert_eq!(buf.len(), 1, "a full control-only buffer drops the newcomer");
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "w", "jobKey": "j" }),
+        ));
+        assert_eq!(
+            buf.len(),
+            1,
+            "a full control-only buffer drops the newcomer"
+        );
         assert_eq!(
             buf.control.len(),
             1,
@@ -2450,7 +2564,12 @@ mod tests {
         // — only control-vs-control eviction is forbidden.
         let mut buf = LaneBuffer::with_limits(1, 0);
         buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
-        buf.push(Frame::new(Lane::Control, Family::Register, 2, json!({ "instance": "w" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            2,
+            json!({ "instance": "w" }),
+        ));
         assert_eq!(buf.len(), 1);
         assert_eq!(
             buf.control.len(),
@@ -2508,7 +2627,12 @@ mod tests {
         let stream = compose_stream_id("w-7", "job-7");
         client.route_inbound(&json!({ "stream": stream, "offset": 0, "chunk": "do the thing" }));
         let got = steer.recv().await.expect("steer delivered");
-        assert_eq!(got, ControlFrame::Prompt { text: "do the thing".into() });
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "do the thing".into()
+            }
+        );
         client.shutdown().await;
     }
 
@@ -2522,7 +2646,10 @@ mod tests {
         client.route_inbound(&json!({ "stream": foreign, "offset": 0, "chunk": "nope" }));
         // And a structurally-invalid stream id is dropped too.
         client.route_inbound(&json!({ "stream": "garbage", "offset": 0, "chunk": "nope" }));
-        assert!(steer.try_recv().is_err(), "foreign stream must not be routed here");
+        assert!(
+            steer.try_recv().is_err(),
+            "foreign stream must not be routed here"
+        );
         client.shutdown().await;
     }
 
@@ -2538,7 +2665,12 @@ mod tests {
             "chunk": r#"{"nanoControlFrame":1,"kind":"cancel","reason":"stop"}"#,
         }));
         let got = steer.recv().await.expect("steer delivered");
-        assert_eq!(got, ControlFrame::Cancel { reason: Some("stop".into()) });
+        assert_eq!(
+            got,
+            ControlFrame::Cancel {
+                reason: Some("stop".into())
+            }
+        );
         client.shutdown().await;
     }
 
@@ -2627,7 +2759,10 @@ mod tests {
         session.detach_turn().await;
         // Steer is preserved across turns: the restored receiver is lent to the
         // nudge turn, so the second ACP turn remains steerable.
-        assert!(steer2.is_some(), "steer receiver is preserved for the nudge turn");
+        assert!(
+            steer2.is_some(),
+            "steer receiver is preserved for the nudge turn"
+        );
 
         // Close the job: exactly one RELEASE total, enqueued on close. Use the
         // non-draining enqueue log (the buffer still holds the transcript tail).
@@ -2636,7 +2771,10 @@ mod tests {
         let claims = log.iter().filter(|(_, _, f)| *f == Family::Claim).count();
         let releases = log.iter().filter(|(_, _, f)| *f == Family::Release).count();
         assert_eq!(claims, 0, "no second CLAIM after the initial registration");
-        assert_eq!(releases, 1, "exactly one RELEASE for the job across both turns");
+        assert_eq!(
+            releases, 1,
+            "exactly one RELEASE for the job across both turns"
+        );
         client.shutdown().await;
     }
 
@@ -2823,7 +2961,11 @@ mod tests {
             seen.insert(j.as_millis());
         }
         // A real RNG produces many distinct delays, not one lockstep value.
-        assert!(seen.len() > 8, "jitter is not varying: {} distinct", seen.len());
+        assert!(
+            seen.len() > 8,
+            "jitter is not varying: {} distinct",
+            seen.len()
+        );
         client.shutdown().await;
     }
 
@@ -2835,12 +2977,14 @@ mod tests {
     /// and shutdown emits a DEREGISTER. This closes the issue-#5 live-worker
     /// acceptance seam that the contract-test corpus only panics on.
     #[tokio::test]
+    // The `accept_hdr_async` callback must return `Result<Response, ErrorResponse>`;
+    // `ErrorResponse` is large but the type is imposed by tokio-tungstenite, so
+    // boxing it is impossible — allow the lint for this externally-dictated shape.
+    #[allow(clippy::result_large_err)]
     async fn live_connection_handshake_presence_transcript_steer_and_shutdown() {
         use tokio::net::TcpListener;
         use tokio_tungstenite::accept_hdr_async;
-        use tokio_tungstenite::tungstenite::handshake::server::{
-            ErrorResponse, Request, Response,
-        };
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2903,7 +3047,10 @@ mod tests {
             .await
             .expect("handshake did not arrive")
             .expect("uri channel closed");
-        assert!(uri.contains("token=tkn%231"), "upgrade URL missing token: {uri}");
+        assert!(
+            uri.contains("token=tkn%231"),
+            "upgrade URL missing token: {uri}"
+        );
         assert!(
             uri.contains("capability=cap%2F1"),
             "upgrade URL missing capability: {uri}"
@@ -2931,14 +3078,20 @@ mod tests {
             order.push(fam);
             match fam {
                 Family::Register => reg = Some(payload),
-                Family::Claim => claim = Some(payload),
+                // Capture the per-job CLAIM (carries `jobKey`); the resync also
+                // emits a per-instance snapshot CLAIM (`jobKeys`, no `jobKey`),
+                // which this ownership assertion skips.
+                Family::Claim if payload.get("jobKey").is_some() => claim = Some(payload),
                 Family::Relay => produce = Some(payload),
                 _ => {}
             }
         }
         let reg = reg.unwrap();
         assert_eq!(reg["instance"], "w-live");
-        assert!(reg["capability"].is_object(), "REGISTER capability must be an object");
+        assert!(
+            reg["capability"].is_object(),
+            "REGISTER capability must be an object"
+        );
         let claim = claim.unwrap();
         assert_eq!(claim["instance"], "w-live");
         assert_eq!(claim["jobKey"], "job-live");
@@ -2956,7 +3109,12 @@ mod tests {
             .await
             .expect("steer timed out")
             .expect("steer channel closed");
-        assert_eq!(got, ControlFrame::Prompt { text: "steer-me".into() });
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "steer-me".into()
+            }
+        );
 
         // Shutdown deregisters the worker instance.
         drop(session);
@@ -3055,8 +3213,16 @@ mod tests {
         let mut cfg = test_config();
         cfg.buffer_capacity = 2;
         let client = HubClient::spawn(cfg, &[]);
-        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w", "n": 1 }));
-        client.enqueue(Lane::Control, Family::Claim, json!({ "instance": "w", "n": 2 }));
+        client.enqueue(
+            Lane::Control,
+            Family::Register,
+            json!({ "instance": "w", "n": 1 }),
+        );
+        client.enqueue(
+            Lane::Control,
+            Family::Claim,
+            json!({ "instance": "w", "n": 2 }),
+        );
         // Buffer is now full of control. A bulk push must be dropped on the floor.
         client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": 3 }));
         let frames = buffered(&client);
@@ -3129,14 +3295,93 @@ mod tests {
             .iter()
             .filter(|(_, f, _)| *f == Family::Register)
             .count();
-        let claims = frames.iter().filter(|(_, f, _)| *f == Family::Claim).count();
+        let per_job_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKey").is_some())
+            .count();
+        let snapshot_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKeys").is_some())
+            .count();
         assert_eq!(registers, 1, "REGISTER must not be duplicated by resync");
-        assert_eq!(claims, 1, "CLAIM must not be duplicated by resync");
+        assert_eq!(
+            per_job_claims, 1,
+            "per-job CLAIM must not be duplicated by resync"
+        );
+        assert_eq!(
+            snapshot_claims, 1,
+            "exactly one snapshot CLAIM per covered instance"
+        );
         let reg_pos = frames.iter().position(|(_, f, _)| *f == Family::Register);
         let claim_pos = frames.iter().position(|(_, f, _)| *f == Family::Claim);
         assert!(
             reg_pos < claim_pos,
             "REGISTER must drain before CLAIM after resync"
+        );
+        client.shutdown().await;
+    }
+
+    // Round-20 escalation (human-directed, nano-workforce#894): the reconnect
+    // resync must additionally emit ONE per-instance snapshot CLAIM
+    // `{instance, jobKeys: [...]}` for EVERY covered instance — including an idle
+    // slot (empty `jobKeys`), which authoritatively drops any stale claim not
+    // re-asserted. `jobKeys` carries exactly the instance's live job set and the
+    // snapshot never carries a `jobKey` (so the hub's per-job validator and the
+    // snapshot union never collide).
+    #[tokio::test]
+    async fn resync_emits_per_instance_snapshot_claim_including_idle_slot() {
+        // One idle pre-seeded slot (no job) + one slot that runs a job.
+        let client = HubClient::spawn(test_config(), &[("w-idle".to_string(), capability())]);
+        let _session = client.register_session("w-busy", capability(), "job-x");
+        client.resync_presence();
+        let frames = buffered(&client);
+        let snapshots: Vec<&Value> = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKeys").is_some())
+            .map(|(_, _, p)| p)
+            .collect();
+        // Exactly one snapshot per covered instance (idle + busy), no more.
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "one snapshot CLAIM per covered instance (idle + busy)"
+        );
+        // Every snapshot's `jobKeys` is an array of NON-EMPTY job-key strings and
+        // never carries a per-job `jobKey` alongside it.
+        for snap in &snapshots {
+            assert!(snap.get("jobKey").is_none(), "snapshot carries no jobKey");
+            let jobs = snap["jobKeys"].as_array().expect("jobKeys is an array");
+            assert!(
+                jobs.iter()
+                    .all(|j| j.as_str().is_some_and(|s| !s.is_empty())),
+                "every jobKeys element is a non-empty string"
+            );
+        }
+        // The idle slot resyncs with the EMPTY set (owns nothing now); the busy
+        // slot resyncs with exactly its live job.
+        let idle = snapshots
+            .iter()
+            .find(|p| p["instance"] == "w-idle")
+            .expect("idle slot has a snapshot");
+        assert_eq!(
+            idle["jobKeys"].as_array().unwrap().len(),
+            0,
+            "idle slot snapshot carries the empty jobKeys set"
+        );
+        let busy = snapshots
+            .iter()
+            .find(|p| p["instance"] == "w-busy")
+            .expect("busy slot has a snapshot");
+        let busy_jobs: Vec<&str> = busy["jobKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            busy_jobs,
+            ["job-x"],
+            "busy slot snapshot carries its live job"
         );
         client.shutdown().await;
     }
@@ -3616,7 +3861,12 @@ mod tests {
         // A genuine delivery (integer offset) IS routed.
         client.route_inbound(&json!({ "stream": stream, "offset": 7, "chunk": chunk }));
         let got = steer.recv().await.expect("valid delivery must be routed");
-        assert_eq!(got, ControlFrame::Cancel { reason: Some("x".into()) });
+        assert_eq!(
+            got,
+            ControlFrame::Cancel {
+                reason: Some("x".into())
+            }
+        );
         client.shutdown().await;
     }
 
@@ -3701,16 +3951,27 @@ mod tests {
         resyncer.await.unwrap();
         // One final resync establishes a clean, fully-rebuilt presence snapshot.
         client.resync_presence();
-        let frames = client.enqueue_log();
+        let frames = buffered(&client);
         let registers = frames
             .iter()
-            .filter(|(_, _, f)| *f == Family::Register)
+            .filter(|(_, f, _)| *f == Family::Register)
             .count();
-        let claims = frames.iter().filter(|(_, _, f)| *f == Family::Claim).count();
+        let per_job_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKey").is_some())
+            .count();
+        let snapshot_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKeys").is_some())
+            .count();
         assert_eq!(registers, 1, "exactly one REGISTER for the single instance");
         assert_eq!(
-            claims, 200,
-            "every registered job must retain its CLAIM after concurrent resync, got {claims}"
+            per_job_claims, 200,
+            "every registered job must retain its per-job CLAIM after concurrent resync, got {per_job_claims}"
+        );
+        assert_eq!(
+            snapshot_claims, 1,
+            "exactly one snapshot CLAIM for the single instance"
         );
         drop(sessions);
         client.shutdown().await;
@@ -3732,11 +3993,18 @@ mod tests {
             ],
         );
         // No register_session call at all: both slots are already present.
-        let insts = client.instances.lock().unwrap();
-        assert!(insts.contains_key("host-nanod-a-0"), "slot 0 must be pre-registered");
-        assert!(insts.contains_key("host-nanod-a-1"), "slot 1 must be pre-registered");
-        assert_eq!(insts.len(), 2, "exactly the two configured slots");
-        drop(insts);
+        {
+            let insts = client.instances.lock().unwrap();
+            assert!(
+                insts.contains_key("host-nanod-a-0"),
+                "slot 0 must be pre-registered"
+            );
+            assert!(
+                insts.contains_key("host-nanod-a-1"),
+                "slot 1 must be pre-registered"
+            );
+            assert_eq!(insts.len(), 2, "exactly the two configured slots");
+        }
         // The resync snapshot (what the first connect sends) covers both slots.
         client.resync_presence();
         let frames = buffered(&client);
@@ -3757,10 +4025,7 @@ mod tests {
     // re-REGISTERed (it is already present from spawn) — only CLAIMed.
     #[tokio::test]
     async fn job_on_preregistered_slot_claims_without_reregistering() {
-        let client = HubClient::spawn(
-            test_config(),
-            &[("w-idle".to_string(), capability())],
-        );
+        let client = HubClient::spawn(test_config(), &[("w-idle".to_string(), capability())]);
         let _ = buffered(&client); // discard the spawn-time REGISTER
         let _session = client.register_session("w-idle", capability(), "job-1");
         let frames = buffered(&client);
@@ -3921,7 +4186,11 @@ mod tests {
         .unwrap();
         // Queue an unrelated control frame (a heartbeat) BEFORE closing, so the
         // control lane is non-empty when the RELEASE is enqueued.
-        client.enqueue(Lane::Control, Family::Heartbeat, json!({ "instance": "w-ord2" }));
+        client.enqueue(
+            Lane::Control,
+            Family::Heartbeat,
+            json!({ "instance": "w-ord2" }),
+        );
         session.close().await;
         drop(session);
         let _ = accept_tx.send(());
@@ -3964,7 +4233,12 @@ mod tests {
     fn drop_control_presence_keeps_claim_paired_with_a_pending_release() {
         let mut buf = LaneBuffer::with_limits(16, 0);
         // Live job on w: REGISTER + CLAIM, no RELEASE -> both pruned.
-        buf.push(Frame::new(Lane::Control, Family::Register, 1, json!({ "instance": "w" })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "w" }),
+        ));
         buf.push(Frame::new(
             Lane::Control,
             Family::Claim,
@@ -3991,17 +4265,25 @@ mod tests {
             .filter(|bf| bf.frame.family == Family::Claim)
             .map(|bf| &bf.frame.payload)
             .collect();
-        assert_eq!(claims.len(), 1, "only the completed job's CLAIM survives the prune");
+        assert_eq!(
+            claims.len(),
+            1,
+            "only the completed job's CLAIM survives the prune"
+        );
         assert_eq!(
             claims[0]["jobKey"], "done",
             "the preserved CLAIM is the one paired with a buffered RELEASE"
         );
         assert!(
-            buf.control.iter().any(|bf| bf.frame.family == Family::Release),
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
             "the buffered RELEASE is preserved (its CLAIM→tail→RELEASE stays intact)"
         );
         assert!(
-            !buf.control.iter().any(|bf| bf.frame.family == Family::Register),
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Register),
             "every REGISTER is pruned — the resync snapshot rebuilds it"
         );
     }
@@ -4189,7 +4471,12 @@ mod tests {
         let got = got
             .expect("inbound steer was starved by the transcript flood (drain did not yield)")
             .expect("steer channel closed");
-        assert_eq!(got, ControlFrame::Prompt { text: "steer-me".into() });
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "steer-me".into()
+            }
+        );
 
         drop(session);
         client.shutdown().await;
@@ -4389,20 +4676,21 @@ mod tests {
         // step; a concurrent resync cannot interleave between the in_flight
         // removal and the RELEASE enqueue.
         client.release_job("w", "job-1");
-        let buf = client.outbound.lock().unwrap();
-        let has_claim = buf
-            .control
-            .iter()
-            .any(|bf| bf.frame.family == Family::Claim);
-        let has_release = buf
-            .control
-            .iter()
-            .any(|bf| bf.frame.family == Family::Release);
-        assert!(
-            has_claim && has_release,
-            "CLAIM and RELEASE stay paired: a resync cannot prune the CLAIM before the RELEASE is queued"
-        );
-        drop(buf);
+        {
+            let buf = client.outbound.lock().unwrap();
+            let has_claim = buf
+                .control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim);
+            let has_release = buf
+                .control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release);
+            assert!(
+                has_claim && has_release,
+                "CLAIM and RELEASE stay paired: a resync cannot prune the CLAIM before the RELEASE is queued"
+            );
+        }
         client.shutdown().await;
     }
 
@@ -4505,10 +4793,11 @@ mod tests {
         let stream = compose_stream_id(instance, job);
         // Reproduce the shutdown state `close()` leaves: this job's transcript
         // tail buffered (bulk) behind an ARMED RELEASE (control) still queued.
-        client.release_barriers.lock().unwrap().insert(
-            stream.clone(),
-            ReleaseBarrier { armed: true },
-        );
+        client
+            .release_barriers
+            .lock()
+            .unwrap()
+            .insert(stream.clone(), ReleaseBarrier { armed: true });
         {
             let mut buf = client.outbound.lock().unwrap();
             buf.push(Frame::new(
@@ -4552,7 +4841,11 @@ mod tests {
             "shutdown must write the transcript tail BEFORE the RELEASE, got {order:?}"
         );
         assert!(
-            !client.release_barriers.lock().unwrap().contains_key(&stream),
+            !client
+                .release_barriers
+                .lock()
+                .unwrap()
+                .contains_key(&stream),
             "the barrier is consumed once its RELEASE is written"
         );
         client.shutdown().await;
@@ -4669,7 +4962,11 @@ mod tests {
             "the final pass flushes the remaining tail, then the RELEASE, got {rest:?}"
         );
         assert!(
-            !client.release_barriers.lock().unwrap().contains_key(&stream),
+            !client
+                .release_barriers
+                .lock()
+                .unwrap()
+                .contains_key(&stream),
             "the barrier is consumed once the whole tail and the RELEASE are written"
         );
 

@@ -2424,7 +2424,15 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         } else {
             nudge_payload(&payload, &nudge_text).to_string()
         };
-        let nudge = run_agent(&cfg, &key, &agent_cwd, &stdin, &agent_env, hub_session.as_mut()).await;
+        let nudge = run_agent(
+            &cfg,
+            &key,
+            &agent_cwd,
+            &stdin,
+            &agent_env,
+            hub_session.as_mut(),
+        )
+        .await;
         if let Some(e) = &nudge.error {
             log(&format!("job {key}: re-emit nudge rerun failed — {e}"));
         }

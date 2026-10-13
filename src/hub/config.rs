@@ -295,7 +295,9 @@ mod tests {
         // `pipe` is a valid mode but disables the relay; the old truthy parse
         // (regression under test) wrongly treated BOTH documented values as
         // false, and any truthy-looking value as true.
-        for v in ["pipe", "PIPE", "", "true", "1", "yes", "on", "ptyy", "garbage"] {
+        for v in [
+            "pipe", "PIPE", "", "true", "1", "yes", "on", "ptyy", "garbage",
+        ] {
             assert!(!pty(v), "{v:?} should NOT enable the terminal relay");
         }
     }

@@ -18,7 +18,12 @@
 /// job key stringified. The length prefix counts UTF-16 code units of
 /// `instance`, matching JS `instance.length`.
 pub fn compose_stream_id(instance: &str, stream: &str) -> String {
-    format!("{}:{}/{}", instance.encode_utf16().count(), instance, stream)
+    format!(
+        "{}:{}/{}",
+        instance.encode_utf16().count(),
+        instance,
+        stream
+    )
 }
 
 /// The exact inverse of [`compose_stream_id`]: decode `"<N>:<instance>/<stream>"`
@@ -85,7 +90,10 @@ mod tests {
         // "😀" is one code point but two UTF-16 code units, so the prefix is 2.
         let id = compose_stream_id("😀", "9");
         assert_eq!(id, "2:😀/9");
-        assert_eq!(parse_stream_id(&id), Some(("😀".to_string(), "9".to_string())));
+        assert_eq!(
+            parse_stream_id(&id),
+            Some(("😀".to_string(), "9".to_string()))
+        );
     }
 
     #[test]
