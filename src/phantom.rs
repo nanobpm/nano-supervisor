@@ -991,33 +991,38 @@ mod tests {
     fn classify_does_not_flag_a_symlink_that_escapes_tmp() {
         // Regression for the retained-lexical-form false positive: an EXISTING
         // symlink that lives under a temp root but points OUTSIDE it must not be
-        // flagged. Its canonical identity is the target (`/srv/state`-like), so
-        // keeping the lexical `/tmp/...` spelling as a second identity would
-        // falsely match the temp root. One path has one identity.
+        // flagged. Its canonical identity is the target (`real`), so keeping the
+        // lexical `temp/...` spelling as a second identity would falsely match the
+        // temp root. One path has one identity.
+        //
+        // Build a self-contained base with sibling `temp` and `real` dirs and
+        // classify ONLY against the synthetic `temp` root. The earlier version
+        // derived `real` from the process cwd and classified against the system
+        // temp roots, which silently broke when the checkout itself lived under a
+        // temp root (e.g. CI running from `/tmp`): `real` then canonicalized under
+        // temp and the "must not flag" assertion flipped. Anchoring `real` as a
+        // sibling of the synthetic root makes the test independent of where the
+        // checkout runs.
         let _guard = crate::cwd_test_guard();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        // A real target OUTSIDE every temp root, under a unique non-temp dir.
-        let real = std::env::current_dir().expect("cwd").join(format!(
-            "c8ctl-nano-escape-real-{}-{nanos}",
-            std::process::id()
-        ));
-        // A symlink to it parked under the system temp dir.
-        let link = std::env::temp_dir().join(format!(
-            "c8ctl-nano-escape-link-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&real).expect("create real dir outside temp");
+        let base =
+            std::env::temp_dir().join(format!("c8ctl-nano-escape-{}-{nanos}", std::process::id()));
+        let temp_root = base.join("temp");
+        let real = base.join("real");
+        let link = temp_root.join("link");
+        std::fs::create_dir_all(&temp_root).expect("create synthetic temp root");
+        std::fs::create_dir_all(&real).expect("create real dir (sibling of temp)");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&real, &link).expect("create escaping symlink");
-        // Classify against the temp roots: the link's lexical spelling is under
-        // temp, but its canonical identity (the real dir) is not.
-        let roots = temp_roots();
+        // Classify against the synthetic temp root only: the link's lexical
+        // spelling is under it, but its canonical identity (the sibling `real`)
+        // is not.
+        let roots = vec![temp_root.clone()];
         let reasons = classify(Some(&link), &roots, None);
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !reasons
                 .iter()

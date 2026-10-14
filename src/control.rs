@@ -310,13 +310,29 @@ pub fn request_with_timeout(
     let mut reader = BufReader::new(&stream);
     let mut frames = Vec::new();
     let mut line: Vec<u8> = Vec::new();
+    // Cumulative byte budget across the WHOLE response. Capping a single frame at
+    // `MAX_FRAME_BYTES` alone does not bound memory: a peer can stream many valid
+    // sub-limit non-final frames, each retained in `frames`, until the aggregate
+    // exhausts memory before the deadline fires. Track the running total and the
+    // frame count, and fail closed once either budget is spent.
+    let mut total_bytes: usize = 0;
     loop {
         // Re-arm the read timeout with only the budget still left on the fixed
         // deadline, so total blocking time cannot exceed `timeout` no matter how
         // many partial/blank frames the peer emits.
         let budget = remaining(deadline)?;
         stream.set_read_timeout(Some(budget))?;
-        match read_frame_chunk(&mut reader, &mut line, deadline)? {
+        // Hand the chunk reader the smaller of the per-frame cap and whatever is
+        // left of the cumulative response budget, so neither one frame nor the
+        // aggregate can grow without bound. A spent budget fails fast.
+        let frame_cap = MAX_FRAME_BYTES.min(MAX_RESPONSE_BYTES.saturating_sub(total_bytes));
+        if frame_cap == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control response exceeded the cumulative byte budget without a final frame",
+            ));
+        }
+        match read_frame_chunk(&mut reader, &mut line, deadline, frame_cap)? {
             // Peer closed before a terminal `final:true` frame: the reply is
             // incomplete (the daemon crashed or was cut off mid-response), so
             // surface it as an error rather than returning partial frames that a
@@ -328,6 +344,9 @@ pub fn request_with_timeout(
                 ));
             }
             FrameRead::Frame => {
+                // Count every frame's bytes toward the cumulative budget, blank
+                // or not, so a peer cannot evade it by flooding empty lines.
+                total_bytes = total_bytes.saturating_add(line.len());
                 // `line` is one whole NDJSON frame (through the newline), so a
                 // UTF-8 code point is never split across reads here.
                 let text = String::from_utf8_lossy(&line);
@@ -346,6 +365,16 @@ pub fn request_with_timeout(
                     // which the arms above correctly surface as a failure.
                     if is_final {
                         return Ok(frames);
+                    }
+                    // Bound the frame COUNT too: many tiny valid sub-limit frames
+                    // stay under the byte budget individually yet grow `frames`
+                    // without bound. A legitimate reply is a handful of frames, so
+                    // a peer past this cap without a terminal frame is hostile.
+                    if frames.len() >= MAX_RESPONSE_FRAMES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "control response exceeded the maximum frame count without a final frame",
+                        ));
                     }
                 }
             }
@@ -369,19 +398,40 @@ enum FrameRead {
 #[cfg(unix)]
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// The largest cumulative size, in bytes, of a whole control response (summed
+/// across every frame, blank or not). A legitimate reply is a few small JSON
+/// objects, so bounding a single frame is not enough: a peer that streams many
+/// valid sub-`MAX_FRAME_BYTES` non-final frames would otherwise grow the
+/// retained `frames` without bound. Capping the aggregate fails such a flood
+/// closed well before it can exhaust memory.
+#[cfg(unix)]
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The largest number of frames accepted in one control response. Even under the
+/// byte budget, a peer can pack many tiny valid frames; a real reply is only a
+/// handful (an interim `draining`/`status` pair plus a terminal frame), so a
+/// response past this count without a terminal frame is hostile.
+#[cfg(unix)]
+const MAX_RESPONSE_FRAMES: usize = 1024;
+
 /// Read toward one complete `\n`-terminated frame, appending to `line`, in
 /// bounded chunks. Unlike `BufRead::read_until` — which blocks in a single call
 /// until the delimiter arrives and is therefore bounded only by the socket's
 /// *idle* timeout — this re-checks the absolute `deadline` after every chunk, so
 /// a peer that continuously trickles newline-free bytes cannot hold the exchange
 /// open past it, and a frame that never terminates is rejected once it exceeds
-/// [`MAX_FRAME_BYTES`]. Returns [`FrameRead::Frame`] once `line` holds a whole
-/// frame, or [`FrameRead::Eof`] when the peer closes mid-frame.
+/// `frame_cap`. `frame_cap` is the caller's remaining byte budget for this frame
+/// (the lesser of the per-frame cap and the cumulative response budget), and the
+/// limit is enforced **after** each append — so a newline arriving in the very
+/// chunk that overruns `frame_cap` is rejected, not accepted. Returns
+/// [`FrameRead::Frame`] once `line` holds a whole frame, or [`FrameRead::Eof`]
+/// when the peer closes mid-frame.
 #[cfg(unix)]
 fn read_frame_chunk(
     reader: &mut std::io::BufReader<&std::os::unix::net::UnixStream>,
     line: &mut Vec<u8>,
     deadline: std::time::Instant,
+    frame_cap: usize,
 ) -> std::io::Result<FrameRead> {
     use std::io::BufRead;
 
@@ -399,10 +449,10 @@ fn read_frame_chunk(
         }
         // Bound the frame size: a peer that never sends a newline would otherwise
         // grow `line` without bound.
-        if line.len() >= MAX_FRAME_BYTES {
+        if line.len() >= frame_cap {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "control frame exceeded the maximum size without a terminator",
+                "control frame exceeded its size budget without a terminator",
             ));
         }
         // Read at most one bounded chunk. `BufReader` may already hold buffered
@@ -420,6 +470,16 @@ fn read_frame_chunk(
                 line.extend_from_slice(&buf[..take]);
                 let found_newline = buf[..take].contains(&b'\n');
                 reader.consume(take);
+                // Enforce the cap AFTER appending, so a newline arriving in the
+                // very chunk that overruns `frame_cap` is rejected rather than
+                // accepted — the pre-append check alone would let an over-budget
+                // but newline-terminated chunk through.
+                if line.len() > frame_cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "control frame exceeded its size budget",
+                    ));
+                }
                 if found_newline {
                     return Ok(FrameRead::Frame);
                 }
@@ -1216,6 +1276,108 @@ mod tests {
                 err.kind(),
                 std::io::ErrorKind::InvalidData,
                 "an over-cap frame must surface as InvalidData, got {err:?}"
+            );
+        }
+
+        // A peer can stream MANY valid, sub-`MAX_FRAME_BYTES` NON-final frames:
+        // each clears the per-frame cap, but they accumulate in `frames` without
+        // bound. The cumulative frame-count/byte budget must fail such a flood
+        // closed instead of buffering until OOM. Red-first: before the budget was
+        // added this loop never terminated (no final frame, no per-frame cap hit).
+        #[test]
+        fn request_with_timeout_bounds_a_cumulative_frame_flood() {
+            let sock = temp_sock("flood");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Stream well past the frame-count cap, each a valid tiny
+                    // non-final frame, and never a terminal frame.
+                    let frame = b"{\"type\":\"x\",\"final\":false}\n";
+                    for _ in 0..(MAX_RESPONSE_FRAMES + 16) {
+                        if stream.write_all(frame).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_secs(10),
+            )
+            .expect_err("a non-terminating frame flood must be rejected");
+
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "a frame flood must surface as InvalidData, got {err:?}"
+            );
+        }
+
+        // The size cap must be enforced AFTER appending, not only before: a
+        // newline arriving in the very chunk that pushes the frame past the cap
+        // must be rejected, not accepted. Red-first: the pre-append-only check
+        // let an over-cap but newline-terminated chunk through as a valid frame.
+        #[test]
+        fn request_with_timeout_rejects_a_newline_terminated_over_cap_frame() {
+            let sock = temp_sock("overcap");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Fill the buffer to just UNDER the per-frame cap with no
+                    // newline, so the pre-append check cannot fire...
+                    let body = vec![b'x'; MAX_FRAME_BYTES - 256];
+                    if stream.write_all(&body).is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // ...then deliver a chunk whose terminating newline crosses
+                    // the cap. The pre-append-only check would accept this frame.
+                    let mut tail = vec![b'y'; 512];
+                    tail.push(b'\n');
+                    let _ = stream.write_all(&tail);
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_secs(10),
+            )
+            .expect_err("a newline-terminated over-cap frame must be rejected");
+
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "an over-cap frame (even newline-terminated) must surface as InvalidData, got {err:?}"
             );
         }
 
