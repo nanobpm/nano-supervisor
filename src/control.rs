@@ -253,7 +253,7 @@ pub fn request_with_timeout(
     req: &Value,
     timeout: std::time::Duration,
 ) -> std::io::Result<Vec<Value>> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufReader, Write};
     use std::time::Instant;
 
     if timeout.is_zero() {
@@ -298,6 +298,15 @@ pub fn request_with_timeout(
     (&stream).write_all(encode_frame(req).as_bytes())?;
     (&stream).flush()?;
 
+    // Read frames with a chunk-at-a-time loop rather than `BufRead::read_until`.
+    // `read_until` blocks in ONE call until the delimiter arrives, so it is bounded
+    // only by the socket's *idle* read timeout — and a peer that continuously
+    // trickles newline-free bytes keeps that timer from ever firing while the
+    // buffer grows without bound (a hang AND an unbounded-memory class). Reading
+    // bounded chunks and re-checking the absolute deadline after each one closes
+    // both holes: total blocking time is capped by `deadline` no matter how the
+    // peer paces its bytes, and a frame that never terminates is rejected once it
+    // exceeds `MAX_FRAME_BYTES`.
     let mut reader = BufReader::new(&stream);
     let mut frames = Vec::new();
     let mut line: Vec<u8> = Vec::new();
@@ -307,19 +316,18 @@ pub fn request_with_timeout(
         // many partial/blank frames the peer emits.
         let budget = remaining(deadline)?;
         stream.set_read_timeout(Some(budget))?;
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        match read_frame_chunk(&mut reader, &mut line, deadline)? {
             // Peer closed before a terminal `final:true` frame: the reply is
             // incomplete (the daemon crashed or was cut off mid-response), so
             // surface it as an error rather than returning partial frames that a
             // caller could mistake for a successful answer.
-            Ok(0) => {
+            FrameRead::Eof => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "control socket closed before a final frame (incomplete response)",
                 ));
             }
-            Ok(_) => {
+            FrameRead::Frame => {
                 // `line` is one whole NDJSON frame (through the newline), so a
                 // UTF-8 code point is never split across reads here.
                 let text = String::from_utf8_lossy(&line);
@@ -341,14 +349,89 @@ pub fn request_with_timeout(
                     }
                 }
             }
+        }
+    }
+}
+
+/// The outcome of one [`read_frame_chunk`] call.
+#[cfg(unix)]
+enum FrameRead {
+    /// A complete `\n`-terminated frame was appended to the line buffer.
+    Frame,
+    /// The peer closed the stream before a terminal frame could be read.
+    Eof,
+}
+
+/// The largest single NDJSON frame accepted from a control peer. A status reply
+/// is a small JSON object, so a frame that grows past this bound without a
+/// newline is a hostile or wedged peer flooding the socket, not a legitimate
+/// answer — reject it rather than letting the buffer grow without bound.
+#[cfg(unix)]
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Read toward one complete `\n`-terminated frame, appending to `line`, in
+/// bounded chunks. Unlike `BufRead::read_until` — which blocks in a single call
+/// until the delimiter arrives and is therefore bounded only by the socket's
+/// *idle* timeout — this re-checks the absolute `deadline` after every chunk, so
+/// a peer that continuously trickles newline-free bytes cannot hold the exchange
+/// open past it, and a frame that never terminates is rejected once it exceeds
+/// [`MAX_FRAME_BYTES`]. Returns [`FrameRead::Frame`] once `line` holds a whole
+/// frame, or [`FrameRead::Eof`] when the peer closes mid-frame.
+#[cfg(unix)]
+fn read_frame_chunk(
+    reader: &mut std::io::BufReader<&std::os::unix::net::UnixStream>,
+    line: &mut Vec<u8>,
+    deadline: std::time::Instant,
+) -> std::io::Result<FrameRead> {
+    use std::io::BufRead;
+
+    line.clear();
+    loop {
+        // Enforce the absolute deadline between chunks. A trickling peer resets
+        // the socket's idle read timeout with every byte, so without this check a
+        // continuous newline-free drip would keep one frame's read alive past the
+        // caller's budget.
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "control request exceeded its overall deadline mid-frame",
+            ));
+        }
+        // Bound the frame size: a peer that never sends a newline would otherwise
+        // grow `line` without bound.
+        if line.len() >= MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control frame exceeded the maximum size without a terminator",
+            ));
+        }
+        // Read at most one bounded chunk. `BufReader` may already hold buffered
+        // bytes; `fill_buf`+`consume` drains those without an extra syscall.
+        let available = reader.fill_buf();
+        match available {
+            Ok([]) => return Ok(FrameRead::Eof),
+            Ok(buf) => {
+                // Take only up to the next newline (inclusive) or the buffer end,
+                // leaving any following frame buffered for the next call.
+                let take = match buf.iter().position(|&b| b == b'\n') {
+                    Some(pos) => pos + 1,
+                    None => buf.len(),
+                };
+                line.extend_from_slice(&buf[..take]);
+                let found_newline = buf[..take].contains(&b'\n');
+                reader.consume(take);
+                if found_newline {
+                    return Ok(FrameRead::Frame);
+                }
+                // No newline yet: loop to re-check the deadline and read more.
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // No terminal frame has been parsed (we would have returned
-                // above otherwise), so the response is incomplete: surface the
-                // timeout rather than letting the caller mistake a partial reply
-                // for success.
+                // No terminal frame has been parsed, so the response is
+                // incomplete: surface the timeout rather than letting the caller
+                // mistake a partial reply for success.
                 return Err(e);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1016,6 +1099,123 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(2),
                 "the 300ms overall budget must bound the exchange, not the server's ~3s \
                  drip window; took {elapsed:?}"
+            );
+        }
+
+        // Regression (unbounded mid-frame read): a peer that continuously trickles
+        // NEWLINE-FREE bytes defeats a `read_until`-based loop, because that one
+        // blocking call is bounded only by the socket's *idle* read timeout and
+        // each arriving byte resets it — the exchange hangs past the overall
+        // deadline while the line buffer grows without bound. The chunk-at-a-time
+        // reader re-checks the absolute deadline between chunks, so the drip is
+        // cut off at the budget.
+        #[test]
+        fn request_with_timeout_bounds_a_newline_free_trickler() {
+            let sock = temp_sock("trk");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Trickle one newline-free byte every 20ms for ~5s, never
+                    // terminating a frame: every byte keeps an idle read timer
+                    // from firing, so only an absolute mid-frame deadline can end
+                    // the exchange.
+                    for _ in 0..250 {
+                        if stream.write_all(b"x").is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                        if release_rx
+                            .recv_timeout(std::time::Duration::from_millis(20))
+                            .is_ok()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let start = std::time::Instant::now();
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_millis(300),
+            )
+            .expect_err("a newline-free trickler must hit the overall deadline");
+            let elapsed = start.elapsed();
+
+            let _ = release_tx.send(());
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert!(
+                err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock,
+                "the mid-frame deadline must surface as a timeout, got {err:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "the 300ms budget must bound the exchange, not the server's ~5s \
+                 trickle window; took {elapsed:?}"
+            );
+        }
+
+        // Regression (unbounded frame buffer): a peer that streams an endless
+        // newline-free frame must be rejected once the frame exceeds
+        // `MAX_FRAME_BYTES`, rather than growing the line buffer without bound.
+        // Use a generous budget so the size cap — not the deadline — is what
+        // fires.
+        #[test]
+        fn request_with_timeout_rejects_an_oversized_frame() {
+            let sock = temp_sock("big");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Blast a large newline-free payload (well over the 1 MiB cap)
+                    // and keep the socket open; the reader must give up at the cap.
+                    let chunk = [b'x'; 65536];
+                    for _ in 0..64 {
+                        if stream.write_all(&chunk).is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                    }
+                    // Hold the connection open briefly so the reader is not
+                    // rescued by an EOF before the size cap fires.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_secs(10),
+            )
+            .expect_err("an oversized newline-free frame must be rejected");
+
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "an over-cap frame must surface as InvalidData, got {err:?}"
             );
         }
 

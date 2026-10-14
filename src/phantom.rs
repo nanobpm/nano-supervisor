@@ -217,6 +217,22 @@ fn path_under_any(path: &Path, roots: &[PathBuf]) -> bool {
         .any(|root| normalized_identity(root).is_some_and(|r| path.starts_with(r)))
 }
 
+/// Whether a discovered peer's recovered `peer_home` is the SAME filesystem
+/// identity as the caller's already-normalized `current_identity`. Two
+/// equivalent spellings or a symlink alias of one home hash to different control
+/// socket names, so the socket-path filter cannot exclude the caller's own
+/// daemon when `status` is invoked through an alias — comparing normalized
+/// identities can. Returns `false` unless BOTH identities resolve: a peer with
+/// no recoverable home (or an unstatable caller home) cannot be proven to be the
+/// caller, so it is kept rather than silently dropped.
+#[cfg(unix)]
+fn is_same_home_identity(peer_home: Option<&Path>, current_identity: Option<&Path>) -> bool {
+    match (peer_home.and_then(normalized_identity), current_identity) {
+        (Some(peer), Some(current)) => peer == current,
+        _ => false,
+    }
+}
+
 /// The throwaway temp roots a daemon's state home is matched against. The socket
 /// directory (`std::env::temp_dir()`) alone is insufficient: on macOS it is a
 /// per-user `/var/folders/...` path, so a home an agent run parked at the
@@ -304,6 +320,14 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
     let temp = std::env::temp_dir();
     let roots = temp_roots();
     let current_sock = crate::control::socket_path(current_home);
+    // The caller's own home canonical filesystem identity. `socket_path` hashes
+    // the raw home *spelling*, so an equivalent spelling or symlink alias of the
+    // same home derives a DIFFERENT socket name and is therefore NOT excluded by
+    // the `path == current_sock` filter below — yet it is the same daemon, which
+    // would then be discovered and rendered as an "other" (potentially phantom)
+    // supervisor. Capture the normalized identity once so each inspected peer can
+    // be discarded when its recovered home resolves to the same identity.
+    let current_home_identity = normalized_identity(current_home);
     let mut out = Vec::new();
 
     let entries = match std::fs::read_dir(&temp) {
@@ -355,11 +379,18 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
             crate::control::Liveness::Live | crate::control::Liveness::Indeterminate(_) => {}
         }
 
-        out.push(inspect_supervisor(
-            path,
-            &roots,
-            remaining(deadline).min(STATUS_BUDGET),
-        ));
+        let inspected = inspect_supervisor(path, &roots, remaining(deadline).min(STATUS_BUDGET));
+
+        // Self-exclusion by home identity, not just socket path. The socket-path
+        // filter above misses an equivalent spelling/symlink alias of the caller's
+        // own home (it hashes the raw spelling), so after inspection also discard
+        // a peer whose recovered home has the same normalized filesystem identity
+        // as `current_home` — that peer IS this daemon, not an "other" supervisor.
+        if is_same_home_identity(inspected.home.as_deref(), current_home_identity.as_deref()) {
+            continue;
+        }
+
+        out.push(inspected);
     }
 
     // Deterministic order (phantoms first, then by socket path) so the rendering
@@ -993,6 +1024,57 @@ mod tests {
                 .any(|r| matches!(r, PhantomReason::HomeUnderTmp(_))),
             "a symlink whose canonical target escapes temp must NOT flag: {reasons:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_same_home_identity_matches_a_symlink_alias() {
+        // Regression (self-exclusion via alias): `socket_path` hashes the raw home
+        // spelling, so invoking `status` through a symlink alias of the daemon's
+        // home derives a DIFFERENT socket name and escapes the `path ==
+        // current_sock` filter — the daemon would then list itself as an "other"
+        // (potentially phantom) supervisor. The identity comparison must recognise
+        // the alias as the same home.
+        let _guard = crate::cwd_test_guard();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let real = std::env::temp_dir().join(format!(
+            "c8ctl-nano-selfid-real-{}-{nanos}",
+            std::process::id()
+        ));
+        let link = std::env::temp_dir().join(format!(
+            "c8ctl-nano-selfid-link-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&real).expect("create real home");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink alias");
+
+        let current_identity = normalized_identity(&link);
+        // The peer reports its home via the canonical spelling; the caller came in
+        // through the alias. They must compare equal.
+        let matched = is_same_home_identity(Some(&real), current_identity.as_deref());
+
+        // A genuinely different home must NOT match.
+        let other = std::env::temp_dir().join(format!(
+            "c8ctl-nano-selfid-other-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&other).expect("create other home");
+        let other_matched = is_same_home_identity(Some(&other), current_identity.as_deref());
+
+        // A peer with no recoverable home cannot be proven to be the caller.
+        let none_matched = is_same_home_identity(None, current_identity.as_deref());
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&other);
+
+        assert!(matched, "a symlink alias of the same home must match");
+        assert!(!other_matched, "a different home must not match");
+        assert!(!none_matched, "an unrecoverable peer home must not match");
     }
 
     #[test]
