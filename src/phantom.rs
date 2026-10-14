@@ -82,11 +82,19 @@ impl DiscoveredSupervisor {
 /// without a live daemon:
 ///
 /// * a working directory that no longer exists → [`PhantomReason::DeletedCwd`];
-/// * a state home under `temp_dir` → [`PhantomReason::HomeUnderTmp`].
+/// * a state home under any throwaway temp root → [`PhantomReason::HomeUnderTmp`].
 ///
-/// Both signals can apply at once (a `/tmp` home whose run dir was also wiped),
-/// so every matching reason is returned rather than the first.
-pub fn classify(home: Option<&Path>, temp_dir: &Path, cwd: Option<&Cwd>) -> Vec<PhantomReason> {
+/// `temp_roots` is the set of throwaway roots a home is matched against (see
+/// [`temp_roots`]): the socket dir alone is not enough, because on macOS it is a
+/// per-user `/var/folders/...` path while the incident signature parks a home at
+/// the platform-canonical `/tmp`. Both signals can apply at once (a `/tmp` home
+/// whose run dir was also wiped), so every matching reason is returned rather
+/// than the first.
+pub fn classify(
+    home: Option<&Path>,
+    temp_roots: &[PathBuf],
+    cwd: Option<&Cwd>,
+) -> Vec<PhantomReason> {
     let mut reasons = Vec::new();
     if let Some(cwd) = cwd {
         if !cwd.exists {
@@ -94,22 +102,87 @@ pub fn classify(home: Option<&Path>, temp_dir: &Path, cwd: Option<&Cwd>) -> Vec<
         }
     }
     if let Some(home) = home {
-        if path_under(home, temp_dir) {
+        if path_under_any(home, temp_roots) {
             reasons.push(PhantomReason::HomeUnderTmp(home.to_path_buf()));
         }
     }
     reasons
 }
 
-/// Whether `path` is the same as, or nested under, `root`. Both are expected to
-/// be absolute (the control-socket temp dir and a daemon's recovered state home
-/// always are); a relative or empty `root` matches nothing so a misread never
-/// flags a legitimate home.
-fn path_under(path: &Path, root: &Path) -> bool {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
+/// Normalized absolute forms of `path` used for identity-based containment.
+/// `Path::starts_with` is purely lexical, so an unnormalized `/tmp/../home/x`
+/// would spuriously match `/tmp` and a symlinked alias into the temp tree would
+/// evade it. We therefore compare *resolved* identities: the canonical path when
+/// it still exists on disk (resolving `..` and symlinks), plus a lexical
+/// normalization (resolving `.`/`..` without touching the filesystem) as an
+/// explicit fallback for a home that has since disappeared. A non-absolute or
+/// empty result is dropped so a misread can never match a root.
+fn normalized_forms(path: &Path) -> Vec<PathBuf> {
+    let mut forms = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_absolute() && !forms.contains(&p) {
+            forms.push(p);
+        }
+    };
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        push(canon);
+    }
+    push(lexical_normalize(path));
+    forms
+}
+
+/// Resolve `.` and `..` components purely lexically, without consulting the
+/// filesystem (so it still works for a path that no longer exists). `..` pops the
+/// accumulated tail; a leading root is preserved.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `path` resolves to the same as, or nested under, any of `roots`,
+/// comparing normalized filesystem identities ([`normalized_forms`]) rather than
+/// raw lexical prefixes. A relative or empty root (or candidate) matches nothing,
+/// so a misread never flags a legitimate home.
+fn path_under_any(path: &Path, roots: &[PathBuf]) -> bool {
+    let path_forms = normalized_forms(path);
+    if path_forms.is_empty() {
         return false;
     }
-    path.starts_with(root)
+    roots.iter().any(|root| {
+        normalized_forms(root)
+            .iter()
+            .any(|r| path_forms.iter().any(|p| p.starts_with(r)))
+    })
+}
+
+/// The throwaway temp roots a daemon's state home is matched against. The socket
+/// directory (`std::env::temp_dir()`) alone is insufficient: on macOS it is a
+/// per-user `/var/folders/...` path, so a home an agent run parked at the
+/// platform-canonical `/tmp/nshome` — the exact incident signature #42 targets —
+/// would go unflagged. Enumerate every well-known throwaway root so a home under
+/// any of them is classified regardless of which the launching run used;
+/// [`path_under_any`] additionally folds in each root's canonical alias (e.g.
+/// `/tmp` → `/private/tmp` on macOS).
+#[cfg(unix)]
+fn temp_roots() -> Vec<PathBuf> {
+    let mut roots = vec![std::env::temp_dir()];
+    for p in ["/tmp", "/private/tmp", "/var/tmp"] {
+        let p = PathBuf::from(p);
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
+    roots
 }
 
 /// Recover a daemon's state home from its `status` `logFile`, which the daemon
@@ -168,8 +241,8 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
     // a status request, so N wedged/phantom sockets would otherwise stack into
     // ~N × (probe + status) of serial blocking — precisely when an operator runs
     // `supervisor status` for fleet hygiene. Cap the whole sweep so a host
-    // littered with stale sockets cannot stall status; on exhaustion the
-    // remaining candidates are reported unresponsive rather than probed.
+    // littered with stale sockets cannot stall status; on exhaustion we stop the
+    // best-effort sweep rather than reporting unprobed candidates.
     const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
     const PROBE_BUDGET: Duration = Duration::from_millis(500);
     const STATUS_BUDGET: Duration = Duration::from_secs(2);
@@ -177,6 +250,7 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
     let remaining = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
 
     let temp = std::env::temp_dir();
+    let roots = temp_roots();
     let current_sock = crate::control::socket_path(current_home);
     let mut out = Vec::new();
 
@@ -196,18 +270,15 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
 
         let budget = remaining(deadline);
         if budget.is_zero() {
-            // Deadline exhausted: still surface the socket (a live entry must not
-            // silently vanish) but skip the network probes, marking it
-            // unresponsive so status stays within its latency budget.
-            out.push(DiscoveredSupervisor {
-                socket: path,
-                pid: None,
-                home: None,
-                cwd: None,
-                reasons: Vec::new(),
-                responsive: false,
-            });
-            continue;
+            // Deadline exhausted. We cannot distinguish a live supervisor from a
+            // stale leftover socket (or even a same-named regular file) without a
+            // probe, and the budget forbids probing — so reporting these as
+            // running "unresponsive" supervisors would fabricate results that
+            // contradict the stale-socket filtering below. Stop the sweep instead:
+            // a best-effort hygiene overlay under-reports rather than invents a
+            // phantom. Remaining candidates share the exhausted deadline, so
+            // `break` (not `continue`) is correct.
+            break;
         }
 
         // A stale leftover socket (connect refused / absent) belongs to a dead
@@ -222,7 +293,7 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
 
         out.push(inspect_supervisor(
             path,
-            &temp,
+            &roots,
             remaining(deadline).min(STATUS_BUDGET),
         ));
     }
@@ -250,7 +321,7 @@ pub fn discover_other_supervisors(_current_home: &Path) -> Vec<DiscoveredSupervi
 #[cfg(unix)]
 fn inspect_supervisor(
     socket: PathBuf,
-    temp_dir: &Path,
+    temp_roots: &[PathBuf],
     status_budget: std::time::Duration,
 ) -> DiscoveredSupervisor {
     let reply = crate::control::request_with_timeout(
@@ -295,7 +366,7 @@ fn inspect_supervisor(
     // against the daemon's own working directory — the base the daemon itself
     // resolved it against — so a temp-backed relative home is still classified.
     let home = home.map(|h| resolve_home(h, cwd.as_ref()));
-    let reasons = classify(home.as_deref(), temp_dir, cwd.as_ref());
+    let reasons = classify(home.as_deref(), temp_roots, cwd.as_ref());
 
     DiscoveredSupervisor {
         socket,
@@ -332,25 +403,29 @@ fn process_cwd(pid: u32) -> Option<Cwd> {
     // literal " (deleted)" suffix to the target when that directory has been
     // unlinked — the exact deleted-run-dir signature #40 leaves behind.
     let target = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    // Check the FULL kernel-reported path first. If it exists verbatim it is a
+    // live directory — even one whose real name literally ends in " (deleted)".
+    // Only when that exact path is absent AND carries the kernel's " (deleted)"
+    // marker is the cwd genuinely unlinked; then strip the marker to recover the
+    // real (now-gone) directory name. Checking the stripped sibling instead would
+    // misread a live `foo (deleted)` dir (whose sibling `foo` usually does not
+    // exist) as a deleted cwd.
+    if target.exists() {
+        return Some(Cwd {
+            path: target,
+            exists: true,
+        });
+    }
     let s = target.to_string_lossy();
     if let Some(stripped) = s.strip_suffix(" (deleted)") {
-        // Linux appends the literal " (deleted)" marker to an unlinked cwd, but a
-        // LIVE directory whose real name ends in " (deleted)" is reported with
-        // the same literal text. Distinguish them: only when the stripped path is
-        // actually gone is this the kernel's deletion marker; if it still exists,
-        // the suffix is part of the real (live) name and must not flag the
-        // supervisor.
-        if !Path::new(stripped).exists() {
-            return Some(Cwd {
-                path: PathBuf::from(stripped),
-                exists: false,
-            });
-        }
+        return Some(Cwd {
+            path: PathBuf::from(stripped),
+            exists: false,
+        });
     }
-    let exists = target.exists();
     Some(Cwd {
         path: target,
-        exists,
+        exists: false,
     })
 }
 
@@ -453,6 +528,13 @@ pub fn render(supervisors: &[DiscoveredSupervisor]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The throwaway temp roots used by the pure-`classify` unit tests. Mirrors
+    /// what `temp_roots()` supplies in production, pinned to `/tmp` so the tests
+    /// are platform-independent.
+    fn tmp_roots() -> Vec<PathBuf> {
+        vec![PathBuf::from("/tmp")]
+    }
+
     #[test]
     fn classify_flags_deleted_cwd() {
         let cwd = Cwd {
@@ -461,7 +543,7 @@ mod tests {
         };
         let reasons = classify(
             Some(Path::new("/home/u/.local/state/c8ctl-nano")),
-            Path::new("/tmp"),
+            &tmp_roots(),
             Some(&cwd),
         );
         assert_eq!(
@@ -479,7 +561,7 @@ mod tests {
         };
         let reasons = classify(
             Some(Path::new("/tmp/nshome-Elnn")),
-            Path::new("/tmp"),
+            &tmp_roots(),
             Some(&cwd),
         );
         assert_eq!(
@@ -499,7 +581,7 @@ mod tests {
         };
         let reasons = classify(
             Some(Path::new("/tmp/nano-probe2")),
-            Path::new("/tmp"),
+            &tmp_roots(),
             Some(&cwd),
         );
         assert_eq!(
@@ -519,7 +601,7 @@ mod tests {
         };
         let reasons = classify(
             Some(Path::new("/home/u/.local/state/c8ctl-nano")),
-            Path::new("/tmp"),
+            &tmp_roots(),
             Some(&cwd),
         );
         assert!(
@@ -530,7 +612,7 @@ mod tests {
 
     #[test]
     fn classify_without_cwd_still_checks_home() {
-        let reasons = classify(Some(Path::new("/tmp/nshome-nbQk")), Path::new("/tmp"), None);
+        let reasons = classify(Some(Path::new("/tmp/nshome-nbQk")), &tmp_roots(), None);
         assert_eq!(
             reasons,
             vec![PhantomReason::HomeUnderTmp(PathBuf::from(
@@ -546,7 +628,7 @@ mod tests {
             path: PathBuf::from("/gone"),
             exists: false,
         };
-        let reasons = classify(None, Path::new("/tmp"), Some(&cwd));
+        let reasons = classify(None, &tmp_roots(), Some(&cwd));
         assert_eq!(
             reasons,
             vec![PhantomReason::DeletedCwd(PathBuf::from("/gone"))]
@@ -643,7 +725,7 @@ mod tests {
             exists: true,
         };
         let home = resolve_home(PathBuf::from("nshome"), Some(&cwd));
-        let reasons = classify(Some(&home), Path::new("/tmp"), Some(&cwd));
+        let reasons = classify(Some(&home), &tmp_roots(), Some(&cwd));
         assert!(
             reasons
                 .iter()
@@ -653,13 +735,98 @@ mod tests {
     }
 
     #[test]
-    fn path_under_handles_edges() {
-        assert!(path_under(Path::new("/tmp/x"), Path::new("/tmp")));
-        assert!(path_under(Path::new("/tmp"), Path::new("/tmp")));
-        assert!(!path_under(Path::new("/home/u"), Path::new("/tmp")));
+    fn path_under_any_handles_edges() {
+        let tmp = tmp_roots();
+        assert!(path_under_any(Path::new("/tmp/x"), &tmp));
+        assert!(path_under_any(Path::new("/tmp"), &tmp));
+        assert!(!path_under_any(Path::new("/home/u"), &tmp));
         // A relative or empty root never matches, so a misread cannot flag a home.
-        assert!(!path_under(Path::new("/tmp/x"), Path::new("")));
-        assert!(!path_under(Path::new("/tmp/x"), Path::new("relative")));
+        assert!(!path_under_any(Path::new("/tmp/x"), &[PathBuf::from("")]));
+        assert!(!path_under_any(
+            Path::new("/tmp/x"),
+            &[PathBuf::from("relative")]
+        ));
+        // A relative candidate path never matches either.
+        assert!(!path_under_any(Path::new("relative/x"), &tmp));
+    }
+
+    #[test]
+    fn path_under_any_is_not_fooled_by_dotdot() {
+        // `starts_with` is lexical: an un-normalized `/tmp/../home/...` textually
+        // begins with `/tmp` but resolves OUTSIDE it, so it must NOT be flagged.
+        assert!(!path_under_any(
+            Path::new("/tmp/../home/user/state"),
+            &tmp_roots()
+        ));
+        // ...while a genuinely nested (but `.`/`..`-laden) path still matches.
+        assert!(path_under_any(Path::new("/tmp/./a/../b"), &tmp_roots()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_flags_home_via_symlink_into_tmp() {
+        // A home that is a symlink whose target resolves under a temp root must be
+        // flagged: `normalized_forms` canonicalizes the live path, so the alias
+        // cannot evade the classifier.
+        let _guard = crate::cwd_test_guard();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let real =
+            std::env::temp_dir().join(format!("c8ctl-nano-symreal-{}-{nanos}", std::process::id()));
+        let link =
+            std::env::temp_dir().join(format!("c8ctl-nano-symlink-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&real).expect("create real home");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink home");
+        // Classify against a root that does NOT lexically contain the link path,
+        // but whose canonical identity does (the system temp dir itself).
+        let roots = vec![std::env::temp_dir()];
+        let reasons = classify(Some(&link), &roots, None);
+        let flagged = reasons
+            .iter()
+            .any(|r| matches!(r, PhantomReason::HomeUnderTmp(_)));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+        assert!(
+            flagged,
+            "a symlinked home resolving under the temp dir must flag: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn classify_flags_literal_tmp_home_regardless_of_socket_dir() {
+        // Finding: on macOS the socket dir is `/var/folders/...`, so classifying
+        // against it alone would miss a home literally under `/tmp`. The root set
+        // must include the platform throwaway roots so `/tmp/nshome` is flagged
+        // even when the socket dir is elsewhere.
+        let roots = vec![
+            PathBuf::from("/var/folders/ab/cd/T"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/private/tmp"),
+        ];
+        let reasons = classify(Some(Path::new("/tmp/nshome")), &roots, None);
+        assert_eq!(
+            reasons,
+            vec![PhantomReason::HomeUnderTmp(PathBuf::from("/tmp/nshome"))],
+            "a literal /tmp home must flag even when the socket dir is a /var/folders path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_roots_includes_the_platform_throwaway_roots() {
+        let roots = temp_roots();
+        assert!(
+            roots.contains(&std::env::temp_dir()),
+            "the socket dir must be a root: {roots:?}"
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/tmp")),
+            "the canonical /tmp must be a root: {roots:?}"
+        );
     }
 
     #[test]
@@ -702,29 +869,18 @@ mod tests {
         assert!(render(&[]).is_empty());
     }
 
-    /// Serialize the cwd-manipulating test: `std::env::set_current_dir` is
-    /// process-wide, so it must not run concurrently with any other test that
-    /// reads `/proc/self/cwd`.
-    #[cfg(target_os = "linux")]
-    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     /// A genuinely deleted cwd IS flagged: chdir into a dir, remove it, and
-    /// `/proc/self/cwd` reports `<path> (deleted)` with the stripped path gone.
-    /// This is the regression for the deletion-marker handling: the stripped path
-    /// no longer exists, so the suffix is the kernel's marker and the supervisor
-    /// is flagged. (The converse — a *live* dir whose name ends in the marker —
-    /// cannot be exercised deterministically here: pointing this process's cwd at
-    /// a real " (deleted)" dir races the parallel test below, which momentarily
-    /// deletes its own cwd and would be misread through the shared `/proc/self`.)
+    /// `/proc/self/cwd` reports `<path> (deleted)` with the full marked path gone.
+    /// This is the regression for the deletion-marker handling: the full target no
+    /// longer exists, so the suffix is the kernel's marker and the supervisor is
+    /// flagged. Holds the repository-wide [`crate::cwd_test_guard`] (not a private
+    /// mutex) so it serializes against every other cwd-sensitive test in the crate
+    /// — including `fleet.rs` and the live-marker converse below — which all read
+    /// or mutate the single process-wide cwd.
     #[cfg(target_os = "linux")]
     #[test]
     fn process_cwd_flags_a_genuinely_deleted_dir() {
-        let _guard = cwd_lock();
+        let _guard = crate::cwd_test_guard();
         let base = std::env::temp_dir().join(format!(
             "c8ctl-nano-gone-cwd-{}-{}",
             std::process::id(),
@@ -744,6 +900,44 @@ mod tests {
         let cwd = cwd.expect("read own deleted cwd");
         assert!(!cwd.exists, "a deleted cwd must be flagged: {cwd:?}");
         assert_eq!(cwd.path, base, "the stripped (original) path is reported");
+    }
+
+    /// The converse of the deletion-marker handling: a LIVE directory whose real
+    /// name literally ends in ` (deleted)` must NOT be flagged. Because the full
+    /// `/proc/self/cwd` target still exists on disk, `process_cwd` must report it
+    /// as live rather than stripping the suffix and misreading it as a deleted
+    /// cwd. Sharing [`crate::cwd_test_guard`] with the deletion test above makes
+    /// this deterministic: the two cwd mutations can no longer interleave through
+    /// the shared `/proc/self`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cwd_keeps_a_live_dir_named_like_the_marker() {
+        let _guard = crate::cwd_test_guard();
+        let base = std::env::temp_dir().join(format!(
+            "c8ctl-nano-live-{}-{} (deleted)",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).expect("create live dir ending in the marker");
+        let original = std::env::current_dir().expect("current dir");
+
+        std::env::set_current_dir(&base).expect("chdir into the live marker dir");
+        let cwd = process_cwd(std::process::id());
+        std::env::set_current_dir(&original).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let cwd = cwd.expect("read own live cwd");
+        assert!(
+            cwd.exists,
+            "a live dir whose name ends in ' (deleted)' must not be flagged: {cwd:?}"
+        );
+        assert_eq!(
+            cwd.path, base,
+            "the full (un-stripped) path is reported for a live marker-named dir"
+        );
     }
 
     /// Socket-level tests for `inspect_supervisor` against a scripted fake peer.
@@ -795,8 +989,11 @@ mod tests {
                 "err",
                 serde_json::json!({"ok": false, "error": "unknown op", "final": true}),
             );
-            let sup =
-                inspect_supervisor(sock, Path::new("/tmp"), std::time::Duration::from_secs(2));
+            let sup = inspect_supervisor(
+                sock,
+                &[PathBuf::from("/tmp")],
+                std::time::Duration::from_secs(2),
+            );
             assert!(
                 !sup.responsive,
                 "a protocol error frame must not mark the supervisor responsive: {sup:?}"
@@ -828,8 +1025,11 @@ mod tests {
                     "final": true
                 }),
             );
-            let sup =
-                inspect_supervisor(sock, Path::new("/tmp"), std::time::Duration::from_secs(2));
+            let sup = inspect_supervisor(
+                sock,
+                &[PathBuf::from("/tmp")],
+                std::time::Duration::from_secs(2),
+            );
             assert!(
                 sup.responsive,
                 "a clean status frame is responsive: {sup:?}"

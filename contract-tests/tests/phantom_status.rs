@@ -115,8 +115,16 @@ fn status_lists_and_flags_a_phantom_supervisor() {
         return;
     }
 
-    // The caller's own home (no daemon of its own) — it must not list itself.
+    // The caller's own home. We bind a *real* fake supervisor at its derived
+    // control socket (below) so that, were the self-exclusion absent, discovery
+    // would enumerate and list the caller itself — which the final assertion
+    // forbids. Without this socket the self-exclusion check is vacuous (there is
+    // nothing at the caller's home for discovery to mistakenly list), so the
+    // assertion would pass even if `path == current_sock` were removed.
     let me = TempHome::with_target(target);
+    // A live supervisor bound at the caller's OWN derived socket. Discovery must
+    // suppress it via the `path == current_sock` self-exclusion, never list it.
+    let me_daemon = FakeSupervisor::start(me.path());
 
     // A phantom lives under the system temp dir, the same place the control
     // sockets and this test's `ct-home-*` homes live, so its `logFile`-derived
@@ -156,11 +164,14 @@ fn status_lists_and_flags_a_phantom_supervisor() {
         "the /tmp-home supervisor must be flagged PHANTOM; line was: {flagged}"
     );
 
-    // The caller must never flag itself as one of the "other" supervisors.
+    // The caller must never flag itself as one of the "other" supervisors, even
+    // though a live supervisor is bound at its own socket (`me_daemon`): the
+    // self-exclusion must suppress it.
     assert!(
         !stdout.contains(&me.path().display().to_string()),
         "status must not list the caller's own home as another supervisor; got:\n{stdout}"
     );
 
     drop(fake);
+    drop(me_daemon);
 }
