@@ -1121,6 +1121,13 @@ pub enum Parity {
     Pass,
     /// The target does not implement it yet, and an open issue tracks the gap.
     Xfail,
+    /// The target passes despite a marker expecting failure: the gap is fixed, so
+    /// the marker is stale and must be dropped. Distinct from [`Parity::Xfail`]
+    /// so [`assert_parity`] can FAIL loudly — an XPASS returned as `Xfail` passes
+    /// the assertion, and its only signal (a stderr line) is hidden by Cargo's
+    /// test-output capture on passing tests, letting a stale marker silently
+    /// survive to waive a later regression.
+    Xpass,
     /// A target the marker does not name disagrees with the assertion.
     Fail,
 }
@@ -1139,7 +1146,7 @@ pub enum Parity {
 /// tracking it. Membership is by exact pair, so a marker that names a real
 /// issue but on the wrong target still fails.
 ///
-/// - `check` returns `Ok(())` with a `gap`: `Xfail` — an XPASS. The
+/// - `check` returns `Ok(())` with a `gap`: `Xpass` — an XPASS. The
 ///   implementation caught up, so the marker is stale and must be dropped.
 /// - `check` returns `Err(..)` with a `gap`: `Xfail` — the expected failure.
 /// - `check` returns `Ok(())` with no `gap`: `Pass`.
@@ -1169,17 +1176,28 @@ pub fn expect_parity(target: Target, gap: Option<&str>, check: Result<(), String
         }
         (Some(issue), Ok(())) => {
             eprintln!("XPASS {target:?}: {issue} is fixed — drop this parity marker");
-            Parity::Xfail
+            Parity::Xpass
         }
     }
 }
 
 /// Assert parity: panic with `why` unless `verdict` is [`Parity::Pass`] or
-/// [`Parity::Xfail`]. Composability note — callers that need to *read* the
-/// verdict (e.g. to skip a follow-on assertion) should match on it directly.
+/// [`Parity::Xfail`]. An [`Parity::Xpass`] also panics: the gap it names is
+/// fixed, so the marker is stale and must be dropped — failing loudly (rather
+/// than passing on a hidden stderr line) is what stops a stale marker from
+/// silently waiving a later regression. Composability note — callers that need
+/// to *read* the verdict (e.g. to skip a follow-on assertion) should match on it
+/// directly.
 pub fn assert_parity(verdict: Parity, why: impl FnOnce() -> String) {
     if verdict == Parity::Fail {
         panic!("{}", why());
+    }
+    if verdict == Parity::Xpass {
+        panic!(
+            "XPASS: the parity gap is fixed, so its marker is stale — drop the \
+             `expect_parity` marker and its PARITY_GAPS row ({})",
+            why()
+        );
     }
 }
 
@@ -3195,20 +3213,27 @@ mod parity_tests {
             expect_parity(Target::Rust, RUST_GAP, Err("not yet".into())),
             Parity::Xfail
         );
-        // The implementation caught up while the marker stayed: still reported as
-        // Xfail (so the call site can proceed), with an XPASS warning the author
-        // must act on.
-        assert_eq!(expect_parity(Target::Rust, RUST_GAP, Ok(())), Parity::Xfail);
+        // The implementation caught up while the marker stayed: a distinct XPASS
+        // verdict (NOT Xfail) so `assert_parity` fails loudly — the stale marker
+        // must be dropped, and a hidden stderr line is not a sufficient signal.
+        assert_eq!(expect_parity(Target::Rust, RUST_GAP, Ok(())), Parity::Xpass);
     }
 
     #[test]
-    fn assert_parity_panics_only_on_fail() {
+    fn assert_parity_panics_on_fail_and_xpass() {
         assert_parity(Parity::Pass, || "unused".to_string());
         assert_parity(Parity::Xfail, || "unused".to_string());
         let panicked = std::panic::catch_unwind(|| {
             assert_parity(Parity::Fail, || "expected failure".to_string())
         });
         assert!(panicked.is_err(), "Parity::Fail must panic");
+        let xpass_panicked = std::panic::catch_unwind(|| {
+            assert_parity(Parity::Xpass, || "stale marker".to_string())
+        });
+        assert!(
+            xpass_panicked.is_err(),
+            "Parity::Xpass must panic (a stale marker fails loudly)"
+        );
     }
 
     #[test]
