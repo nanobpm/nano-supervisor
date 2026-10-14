@@ -261,7 +261,12 @@ pub(crate) fn group_has_live_member(pgid: u32) -> bool {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let read = std::fs::read_to_string(format!("/proc/{name}/stat"));
+        // Read raw bytes, not a `String`: a process can set an arbitrary
+        // non-UTF-8 byte sequence as its `comm`, and `read_to_string` would then
+        // fail the whole scan with `InvalidData` for one unrelated process. The
+        // fields we parse (state, pgrp) are ASCII in the suffix after the final
+        // ')', so classify the bytes directly.
+        let read = std::fs::read(format!("/proc/{name}/stat"));
         match classify_proc_stat(read.as_deref().map_err(std::io::Error::kind), pgid) {
             MemberVerdict::LiveMember => return true,
             MemberVerdict::Skip => continue,
@@ -294,8 +299,12 @@ enum MemberVerdict {
 /// Classify one `/proc/<pid>/stat` read against `pgid`. Pure so the fail-safe
 /// contract — only a *process-gone* (`NotFound`) read error is `Skip`; any other
 /// read error is `Unknown` (never silently dropped) — is unit-tested directly.
+///
+/// Takes the raw file **bytes**: a process can set an arbitrary non-UTF-8 `comm`,
+/// so the scan must not require UTF-8. Only the suffix after the final ')' is
+/// parsed, and the fields there (state, pgrp) are ASCII.
 #[cfg(target_os = "linux")]
-fn classify_proc_stat(read: Result<&str, std::io::ErrorKind>, pgid: u32) -> MemberVerdict {
+fn classify_proc_stat(read: Result<&[u8], std::io::ErrorKind>, pgid: u32) -> MemberVerdict {
     let stat = match read {
         Ok(stat) => stat,
         // The process exited between the readdir and this read: it is gone, so it
@@ -305,17 +314,23 @@ fn classify_proc_stat(read: Result<&str, std::io::ErrorKind>, pgid: u32) -> Memb
         // failure, not proof of absence.
         Err(_) => return MemberVerdict::Unknown,
     };
-    // `comm` (field 2) may contain spaces and parentheses, so parse from just
-    // past the final ')': field 3 (state) is the first token, field 5 (pgrp)
-    // the third.
-    let Some(rparen) = stat.rfind(')') else {
+    // `comm` (field 2) may contain spaces, parentheses, and arbitrary non-UTF-8
+    // bytes, so parse from just past the final ')': field 3 (state) is the first
+    // whitespace-separated token, field 5 (pgrp) the third. Both are ASCII.
+    let Some(rparen) = stat.iter().rposition(|&b| b == b')') else {
         return MemberVerdict::Skip;
     };
-    let mut fields = stat[rparen + 1..].split_whitespace();
+    let mut fields = stat[rparen + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|t| !t.is_empty());
     let state = fields.next();
     let _ppid = fields.next();
-    let pgrp = fields.next().and_then(|s| s.parse::<u32>().ok());
-    if pgrp == Some(pgid) && !matches!(state, Some("Z") | Some("X") | Some("x")) {
+    let pgrp = fields
+        .next()
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .and_then(|s| s.parse::<u32>().ok());
+    let live = !matches!(state, Some(b"Z") | Some(b"X") | Some(b"x"));
+    if pgrp == Some(pgid) && live {
         MemberVerdict::LiveMember
     } else {
         MemberVerdict::Skip
@@ -1272,10 +1287,25 @@ pub(crate) async fn terminate_group_and_reap(
                 // failure (the scan task panicked) is treated as "still a live
                 // member", so the grace loop keeps waiting rather than breaking
                 // early — the fail-safe direction.
-                let has_live_member =
-                    tokio::task::spawn_blocking(move || group_has_live_member(pgid))
-                        .await
-                        .unwrap_or(true);
+                //
+                // Bound the wait by the grace remaining: awaiting an unbounded
+                // `spawn_blocking` job before checking `deadline` would break the
+                // "poll up to `grace`, then SIGKILL" contract if the blocking pool
+                // is saturated or the system-wide `/proc` scan stalls, letting a
+                // TERM-resistant group survive arbitrarily past the deadline. A
+                // timeout conservatively means "live", so the deadline branch
+                // below fires the SIGKILL as soon as `grace` is exhausted.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let has_live_member = tokio::time::timeout(
+                    remaining,
+                    tokio::task::spawn_blocking(move || group_has_live_member(pgid)),
+                )
+                .await
+                // `Err(_)` = the scan did not finish within the remaining grace:
+                // treat as "still a live member" so the deadline branch SIGKILLs.
+                .unwrap_or(Ok(true))
+                // `Err(_)` = the scan task panicked: fail safe as "live" too.
+                .unwrap_or(true);
                 if !has_live_member {
                     if guard.still_ours() {
                         sigkill_group(pgid);
@@ -2418,21 +2448,44 @@ mod tests {
         }
         // A readable, non-zombie member of the group is detected.
         assert_eq!(
-            classify_proc_stat(Ok("999 (wo rk) R 1 1234 1234 0 -1"), 1234),
+            classify_proc_stat(Ok(b"999 (wo rk) R 1 1234 1234 0 -1"), 1234),
             MemberVerdict::LiveMember,
             "a live member of the target pgid counts"
         );
         // A zombie of the group is not a live member.
         assert_eq!(
-            classify_proc_stat(Ok("999 (wo rk) Z 1 1234 1234 0 -1"), 1234),
+            classify_proc_stat(Ok(b"999 (wo rk) Z 1 1234 1234 0 -1"), 1234),
             MemberVerdict::Skip,
             "a zombie of the group is not a live member"
         );
         // A live process in a different group is skipped.
         assert_eq!(
-            classify_proc_stat(Ok("999 (wo rk) R 1 5678 5678 0 -1"), 1234),
+            classify_proc_stat(Ok(b"999 (wo rk) R 1 5678 5678 0 -1"), 1234),
             MemberVerdict::Skip,
             "a live process in another group does not count"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_proc_stat_tolerates_non_utf8_comm() {
+        // A process can set an arbitrary non-UTF-8 byte sequence as its `comm`
+        // (field 2). The scan must still parse the ASCII state/pgrp suffix after
+        // the final ')' — a `read_to_string` would fail the whole scan with
+        // `InvalidData` and restore the full grace delay on every clean shutdown.
+        // 0xFF and 0x80 are not valid UTF-8.
+        let stat = b"999 (\xFF\x80 bad name) R 1 1234 1234 0 -1";
+        assert_eq!(
+            classify_proc_stat(Ok(stat), 1234),
+            MemberVerdict::LiveMember,
+            "a non-UTF-8 comm must not defeat parsing of the ASCII suffix"
+        );
+        // Same, but a zombie in the target group.
+        let stat = b"999 (\xFF\x80 bad name) Z 1 1234 1234 0 -1";
+        assert_eq!(
+            classify_proc_stat(Ok(stat), 1234),
+            MemberVerdict::Skip,
+            "a non-UTF-8 zombie of the group is still not a live member"
         );
     }
 
