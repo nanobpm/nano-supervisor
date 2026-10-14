@@ -147,9 +147,11 @@ pub fn c8ctl_plugins_dir() -> Option<PathBuf> {
 fn plugins_dir_under(data_dir: &Path) -> Option<PathBuf> {
     let dir = data_dir.join("plugins");
     // `metadata` follows a symlink: an operator may legitimately keep their
-    // plugins dir as a link. Only link it in when it resolves to a directory.
+    // plugins dir as a link. Only link it in when it resolves to a directory
+    // AND we can produce an absolute target for it — fail closed (omit the
+    // link) rather than ever seed a relative, dangling one.
     match std::fs::metadata(&dir) {
-        Ok(m) if m.is_dir() => Some(absolutize(dir)),
+        Ok(m) if m.is_dir() => absolutize(dir),
         _ => None,
     }
 }
@@ -157,18 +159,23 @@ fn plugins_dir_under(data_dir: &Path) -> Option<PathBuf> {
 /// Make `path` absolute so it is safe to store as a symlink *target*: a relative
 /// target is resolved relative to the LINK's parent dir, not the worker's cwd.
 /// The path is known to exist (the caller checked `metadata`), so
-/// `canonicalize` yields an absolute, symlink-resolved path; if that ever fails
-/// we still never return a relative path — fall back to joining the cwd.
-fn absolutize(path: PathBuf) -> PathBuf {
+/// `canonicalize` normally yields an absolute, symlink-resolved path. This is
+/// fallible on purpose: when `canonicalize` fails and `path` is relative, the
+/// only way to absolutize is via the cwd, which can itself be gone (e.g. the
+/// worker's cwd was removed — relative `metadata` can still succeed through the
+/// cwd handle while both `canonicalize` and `current_dir` fail). In that case we
+/// return `None` so the caller omits the link entirely; we NEVER hand back a
+/// relative path, which would resolve against the link's parent and dangle.
+fn absolutize(path: PathBuf) -> Option<PathBuf> {
     if let Ok(canon) = std::fs::canonicalize(&path) {
-        return canon;
+        return Some(canon);
     }
     if path.is_absolute() {
-        return path;
+        return Some(path);
     }
     match std::env::current_dir() {
-        Ok(cwd) => cwd.join(path),
-        Err(_) => path,
+        Ok(cwd) => Some(cwd.join(path)),
+        Err(_) => None,
     }
 }
 
@@ -897,11 +904,12 @@ UN1CCiHPvqDsiGUoCf+ajydjBPrOo+S8rBIR1HlMUnLMojMp7kExWF0rXdkjvyic\n\
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `absolutize` never returns a relative path, even for a path that does not
-    /// exist (so `canonicalize` fails and the cwd-join fallback runs).
+    /// `absolutize` never returns a relative path: it yields an absolute path or
+    /// `None`, never a relative one that would dangle as a symlink target.
     #[test]
     fn absolutize_never_returns_a_relative_path() {
-        let out = absolutize(PathBuf::from("does/not/exist/plugins"));
+        let out = absolutize(PathBuf::from("does/not/exist/plugins"))
+            .expect("with a live cwd, a relative path absolutizes via cwd-join");
         assert!(
             out.is_absolute(),
             "absolutize must always return an absolute path, got {}",
@@ -912,6 +920,11 @@ UN1CCiHPvqDsiGUoCf+ajydjBPrOo+S8rBIR1HlMUnLMojMp7kExWF0rXdkjvyic\n\
             "the relative tail must be preserved under the cwd, got {}",
             out.display()
         );
+        // An already-absolute non-existent path (canonicalize fails) stays
+        // absolute rather than being rejected.
+        let abs_in = std::env::temp_dir().join("nano-absolutize-nonexistent");
+        let abs_out = absolutize(abs_in.clone()).expect("absolute input stays absolute");
+        assert_eq!(abs_out, abs_in);
     }
 
     /// Minimal relative-path computation (avoids a dependency): express `target`
