@@ -1458,6 +1458,7 @@ pub fn supervisor(op: SupervisorOp) -> Result<()> {
 fn supervisor_status(home: &std::path::Path) -> Result<()> {
     if !supervisor_running(home) {
         println!("Supervisor not running");
+        print_other_supervisors(home);
         return Ok(());
     }
     let sock = control::socket_path(home);
@@ -1494,6 +1495,7 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
                 }
                 None => println!("Supervisor running"),
             }
+            print_other_supervisors(home);
             Ok(())
         }
         // The socket vanished between the probe and the request (a genuine race
@@ -1504,9 +1506,21 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
         // (nanobpm/nano-supervisor#8).
         Err(e) if is_daemon_absent(&e) => {
             println!("Supervisor not running");
+            print_other_supervisors(home);
             Ok(())
         }
         Err(e) => Err(e).context("querying the supervisor control socket"),
+    }
+}
+
+/// Fleet-hygiene overlay for `supervisor status` (nanobpm/nano-supervisor#42):
+/// list the *other* supervisors running on the host and flag the phantoms a
+/// torn-down agent run can leave behind (cwd a deleted run dir, or home under
+/// `/tmp`). Best-effort — a discovery hiccup prints nothing rather than failing
+/// the status command.
+fn print_other_supervisors(home: &std::path::Path) {
+    for line in crate::phantom::render(&crate::phantom::discover_other_supervisors(home)) {
+        println!("{line}");
     }
 }
 

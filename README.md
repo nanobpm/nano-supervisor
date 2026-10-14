@@ -12,6 +12,12 @@ Standalone Rust supervisor and job workers for Nano BPM coding agents (replaces 
   (`supervisor.sock`) speaks the Node daemon's NDJSON protocol, so a Node client
   can drive a Rust daemon and vice-versa (`src/control.rs`,
   [`contract-tests/fixtures/socket-protocol.md`](contract-tests/fixtures/socket-protocol.md)).
+  `status` also lists the *other* supervisors running on the host and flags
+  **phantoms** — ones whose working directory is a deleted run dir, or whose
+  state home sits under the system temp dir (`/tmp`) — so a stray fleet a
+  misbehaving agent run left behind is visible to triage (`src/phantom.rs`,
+  nanobpm/nano-supervisor#42; the structural containment that stops agents from
+  creating them is #40).
 - `nano-supervisor work <hire>` — one worker for a hired profile, the Rust
   `c8 nano work <profile>`. See [`spike/README.md`](spike/README.md).
 
