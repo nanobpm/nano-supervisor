@@ -138,9 +138,22 @@ pub fn home_from_log_file(log_file: &Path) -> Option<PathBuf> {
 }
 
 /// Whether a temp-dir entry name is a supervisor control socket
-/// (`c8ctl-nano-sup-<hash>.sock`).
+/// (`c8ctl-nano-sup-<hash>.sock`). [`crate::control::socket_path`] derives the
+/// `<hash>` as exactly eight lowercase hex characters (`sha1(home)[:8]`), so the
+/// shape is pinned, not a loose prefix/suffix: an unrelated live socket such as
+/// `c8ctl-nano-sup-debug.sock` must fail closed here rather than be probed and
+/// reported as a supervisor.
 fn is_supervisor_socket_name(name: &str) -> bool {
-    name.starts_with("c8ctl-nano-sup-") && name.ends_with(".sock")
+    let Some(hash) = name
+        .strip_prefix("c8ctl-nano-sup-")
+        .and_then(|n| n.strip_suffix(".sock"))
+    else {
+        return false;
+    };
+    hash.len() == 8
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Discover the *other* supervisors running on this host (every one except the
@@ -149,7 +162,19 @@ fn is_supervisor_socket_name(name: &str) -> bool {
 /// make `supervisor status` fail).
 #[cfg(unix)]
 pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervisor> {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    // One overall discovery deadline. Each candidate costs a liveness probe plus
+    // a status request, so N wedged/phantom sockets would otherwise stack into
+    // ~N × (probe + status) of serial blocking — precisely when an operator runs
+    // `supervisor status` for fleet hygiene. Cap the whole sweep so a host
+    // littered with stale sockets cannot stall status; on exhaustion the
+    // remaining candidates are reported unresponsive rather than probed.
+    const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+    const PROBE_BUDGET: Duration = Duration::from_millis(500);
+    const STATUS_BUDGET: Duration = Duration::from_secs(2);
+    let deadline = Instant::now() + DISCOVERY_BUDGET;
+    let remaining = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
 
     let temp = std::env::temp_dir();
     let current_sock = crate::control::socket_path(current_home);
@@ -169,16 +194,37 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
             continue;
         }
 
+        let budget = remaining(deadline);
+        if budget.is_zero() {
+            // Deadline exhausted: still surface the socket (a live entry must not
+            // silently vanish) but skip the network probes, marking it
+            // unresponsive so status stays within its latency budget.
+            out.push(DiscoveredSupervisor {
+                socket: path,
+                pid: None,
+                home: None,
+                cwd: None,
+                reasons: Vec::new(),
+                responsive: false,
+            });
+            continue;
+        }
+
         // A stale leftover socket (connect refused / absent) belongs to a dead
         // owner — not a running supervisor — so it is not a phantom to report.
         // Anything else (live, or an indeterminate backlogged peer) is a running
-        // supervisor we must surface.
-        match crate::control::probe_liveness(&path, Duration::from_millis(500)) {
+        // supervisor we must surface. Each probe is capped by the time still left
+        // on the overall deadline, so a slow peer cannot overrun the sweep.
+        match crate::control::probe_liveness(&path, budget.min(PROBE_BUDGET)) {
             crate::control::Liveness::Absent => continue,
             crate::control::Liveness::Live | crate::control::Liveness::Indeterminate(_) => {}
         }
 
-        out.push(inspect_supervisor(path, &temp));
+        out.push(inspect_supervisor(
+            path,
+            &temp,
+            remaining(deadline).min(STATUS_BUDGET),
+        ));
     }
 
     // Deterministic order (phantoms first, then by socket path) so the rendering
@@ -199,15 +245,18 @@ pub fn discover_other_supervisors(_current_home: &Path) -> Vec<DiscoveredSupervi
 }
 
 /// Query one live control socket for its `status`, recover its home and cwd, and
-/// classify it.
+/// classify it. `status_budget` bounds the status request so the caller's overall
+/// discovery deadline is honoured across candidates.
 #[cfg(unix)]
-fn inspect_supervisor(socket: PathBuf, temp_dir: &Path) -> DiscoveredSupervisor {
-    use std::time::Duration;
-
+fn inspect_supervisor(
+    socket: PathBuf,
+    temp_dir: &Path,
+    status_budget: std::time::Duration,
+) -> DiscoveredSupervisor {
     let reply = crate::control::request_with_timeout(
         &socket,
         &serde_json::json!({ "op": "status" }),
-        Duration::from_secs(2),
+        status_budget,
     );
     let frame = reply.ok().and_then(|frames| {
         frames
@@ -217,18 +266,35 @@ fn inspect_supervisor(socket: PathBuf, temp_dir: &Path) -> DiscoveredSupervisor 
             .cloned()
     });
 
+    // A protocol-level error frame (`{ok:false,error,…,final:true}`) is NOT a
+    // healthy status answer: the daemon answered but rejected the op. The normal
+    // status path surfaces the same frame as a failure (`fleet.rs`
+    // `terminal_frame_error`), so it must not mark the endpoint responsive here —
+    // otherwise an erroring daemon renders as a healthy-looking `pid ?`
+    // supervisor. Only a non-error terminal frame counts as responsive.
+    let is_protocol_error = frame
+        .as_ref()
+        .and_then(|f| f.get("ok"))
+        .and_then(|v| v.as_bool())
+        == Some(false);
+
     let (pid, home) = match &frame {
-        Some(f) => {
+        Some(f) if !is_protocol_error => {
             let pid = f["daemon"]["pid"].as_u64().map(|p| p as u32);
             let home = f["daemon"]["logFile"]
                 .as_str()
                 .and_then(|lf| home_from_log_file(Path::new(lf)));
             (pid, home)
         }
-        None => (None, None),
+        _ => (None, None),
     };
-    let responsive = frame.is_some();
+    let responsive = frame.is_some() && !is_protocol_error;
     let cwd = pid.and_then(process_cwd);
+    // A relative `logFile` (a daemon launched with a relative `C8CTL_NANO_HOME`)
+    // yields a relative home that `path_under` would never flag. Resolve it
+    // against the daemon's own working directory — the base the daemon itself
+    // resolved it against — so a temp-backed relative home is still classified.
+    let home = home.map(|h| resolve_home(h, cwd.as_ref()));
     let reasons = classify(home.as_deref(), temp_dir, cwd.as_ref());
 
     DiscoveredSupervisor {
@@ -238,6 +304,21 @@ fn inspect_supervisor(socket: PathBuf, temp_dir: &Path) -> DiscoveredSupervisor 
         cwd,
         reasons,
         responsive,
+    }
+}
+
+/// Resolve a daemon's recovered state home to an absolute path. A daemon that
+/// published a relative `logFile` (relative `C8CTL_NANO_HOME`) built it from its
+/// own working directory, so anchor the relative home at that cwd; an absolute
+/// home (or an unreadable cwd) is returned unchanged.
+#[cfg(unix)]
+fn resolve_home(home: PathBuf, cwd: Option<&Cwd>) -> PathBuf {
+    if home.is_absolute() {
+        return home;
+    }
+    match cwd {
+        Some(c) if !c.path.as_os_str().is_empty() => c.path.join(&home),
+        _ => home,
     }
 }
 
@@ -253,10 +334,18 @@ fn process_cwd(pid: u32) -> Option<Cwd> {
     let target = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     let s = target.to_string_lossy();
     if let Some(stripped) = s.strip_suffix(" (deleted)") {
-        return Some(Cwd {
-            path: PathBuf::from(stripped),
-            exists: false,
-        });
+        // Linux appends the literal " (deleted)" marker to an unlinked cwd, but a
+        // LIVE directory whose real name ends in " (deleted)" is reported with
+        // the same literal text. Distinguish them: only when the stripped path is
+        // actually gone is this the kernel's deletion marker; if it still exists,
+        // the suffix is part of the real (live) name and must not flag the
+        // supervisor.
+        if !Path::new(stripped).exists() {
+            return Some(Cwd {
+                path: PathBuf::from(stripped),
+                exists: false,
+            });
+        }
     }
     let exists = target.exists();
     Some(Cwd {
@@ -500,6 +589,70 @@ mod tests {
     }
 
     #[test]
+    fn socket_name_filter_requires_the_exact_hash_shape() {
+        // `control::socket_path` emits exactly eight lowercase hex chars; anything
+        // else between the prefix and suffix is an unrelated socket that must fail
+        // closed (not be probed and reported as a supervisor).
+        // Wrong length.
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-57425ec.sock")); // 7
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-57425ec9aa.sock")); // 10
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-.sock")); // empty
+                                                                     // Non-hex / uppercase.
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-57425EC9.sock"));
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-57425ecg.sock"));
+        // An arbitrary live socket that merely shares the prefix/suffix.
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-debug.sock"));
+        assert!(!is_supervisor_socket_name("c8ctl-nano-sup-debug.sock.sock"));
+        // The genuine shape still passes (digits and a-f).
+        assert!(is_supervisor_socket_name("c8ctl-nano-sup-01234567.sock"));
+        assert!(is_supervisor_socket_name("c8ctl-nano-sup-abcdefab.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_home_anchors_a_relative_home_at_the_daemon_cwd() {
+        let cwd = Cwd {
+            path: PathBuf::from("/tmp"),
+            exists: true,
+        };
+        // A daemon launched from /tmp with a relative home resolves under /tmp.
+        assert_eq!(
+            resolve_home(PathBuf::from("nshome"), Some(&cwd)),
+            PathBuf::from("/tmp/nshome"),
+            "a relative home must resolve against the daemon's cwd"
+        );
+        // An absolute home is returned unchanged.
+        assert_eq!(
+            resolve_home(PathBuf::from("/var/lib/nshome"), Some(&cwd)),
+            PathBuf::from("/var/lib/nshome")
+        );
+        // No cwd to anchor against: the relative home is returned unchanged (the
+        // classifier then simply cannot flag it rather than guessing a base).
+        assert_eq!(
+            resolve_home(PathBuf::from("nshome"), None),
+            PathBuf::from("nshome")
+        );
+    }
+
+    #[test]
+    fn relative_home_resolved_against_tmp_cwd_is_flagged() {
+        // The classification half of the relative-home fix: once `resolve_home`
+        // anchors a relative home at a /tmp cwd, `classify` must flag it.
+        let cwd = Cwd {
+            path: PathBuf::from("/tmp"),
+            exists: true,
+        };
+        let home = resolve_home(PathBuf::from("nshome"), Some(&cwd));
+        let reasons = classify(Some(&home), Path::new("/tmp"), Some(&cwd));
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, PhantomReason::HomeUnderTmp(_))),
+            "a relative home resolved under /tmp must flag: {reasons:?}"
+        );
+    }
+
+    #[test]
     fn path_under_handles_edges() {
         assert!(path_under(Path::new("/tmp/x"), Path::new("/tmp")));
         assert!(path_under(Path::new("/tmp"), Path::new("/tmp")));
@@ -547,5 +700,144 @@ mod tests {
     #[test]
     fn render_empty_when_no_others() {
         assert!(render(&[]).is_empty());
+    }
+
+    /// Serialize the cwd-manipulating test: `std::env::set_current_dir` is
+    /// process-wide, so it must not run concurrently with any other test that
+    /// reads `/proc/self/cwd`.
+    #[cfg(target_os = "linux")]
+    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A genuinely deleted cwd IS flagged: chdir into a dir, remove it, and
+    /// `/proc/self/cwd` reports `<path> (deleted)` with the stripped path gone.
+    /// This is the regression for the deletion-marker handling: the stripped path
+    /// no longer exists, so the suffix is the kernel's marker and the supervisor
+    /// is flagged. (The converse — a *live* dir whose name ends in the marker —
+    /// cannot be exercised deterministically here: pointing this process's cwd at
+    /// a real " (deleted)" dir races the parallel test below, which momentarily
+    /// deletes its own cwd and would be misread through the shared `/proc/self`.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cwd_flags_a_genuinely_deleted_dir() {
+        let _guard = cwd_lock();
+        let base = std::env::temp_dir().join(format!(
+            "c8ctl-nano-gone-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).expect("create dir to delete");
+        let original = std::env::current_dir().expect("current dir");
+
+        std::env::set_current_dir(&base).expect("chdir into dir");
+        std::fs::remove_dir_all(&base).expect("delete the cwd out from under the process");
+        let cwd = process_cwd(std::process::id());
+        std::env::set_current_dir(&original).expect("restore cwd");
+
+        let cwd = cwd.expect("read own deleted cwd");
+        assert!(!cwd.exists, "a deleted cwd must be flagged: {cwd:?}");
+        assert_eq!(cwd.path, base, "the stripped (original) path is reported");
+    }
+
+    /// Socket-level tests for `inspect_supervisor` against a scripted fake peer.
+    #[cfg(unix)]
+    mod inspect {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        /// Serve one connection that replies with `frame`, returning the socket
+        /// path. The server thread is detached (the test asserts on the reply,
+        /// not on a clean shutdown).
+        fn serve_frame(tag: &str, frame: serde_json::Value) -> PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let sock = std::env::temp_dir()
+                .join(format!("nst-inspect-{tag}-{}-{nanos}", std::process::id()));
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind inspect test socket");
+            let path = sock.clone();
+            let body = frame.to_string();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    // Drain the request line, then answer with the scripted frame.
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.write_all(b"\n");
+                    let _ = stream.flush();
+                }
+                let _ = std::fs::remove_file(&path);
+            });
+            sock
+        }
+
+        /// A terminal PROTOCOL ERROR frame (`{ok:false,error,…,final:true}`) must
+        /// NOT mark the endpoint responsive: the daemon answered but rejected the
+        /// op, exactly as `fleet.rs::terminal_frame_error` surfaces it as a
+        /// failure. Rendering must show `[unresponsive]`, never a healthy `pid ?`.
+        #[test]
+        fn protocol_error_frame_is_not_responsive() {
+            let sock = serve_frame(
+                "err",
+                serde_json::json!({"ok": false, "error": "unknown op", "final": true}),
+            );
+            let sup =
+                inspect_supervisor(sock, Path::new("/tmp"), std::time::Duration::from_secs(2));
+            assert!(
+                !sup.responsive,
+                "a protocol error frame must not mark the supervisor responsive: {sup:?}"
+            );
+            assert_eq!(
+                sup.pid, None,
+                "no daemon descriptor is read from an error frame"
+            );
+            assert_eq!(sup.home, None);
+            let lines = render(&[sup]);
+            assert!(
+                lines.iter().any(|l| l.contains("[unresponsive]")),
+                "an erroring endpoint must render unresponsive: {lines:?}"
+            );
+        }
+
+        /// A clean terminal status frame IS responsive and reads pid + home.
+        #[test]
+        fn ok_status_frame_is_responsive() {
+            let sock = serve_frame(
+                "ok",
+                serde_json::json!({
+                    "ok": true,
+                    "type": "status",
+                    "daemon": {
+                        "pid": 424242,
+                        "logFile": "/tmp/nshome-x/logs/supervisor/daemon.log"
+                    },
+                    "final": true
+                }),
+            );
+            let sup =
+                inspect_supervisor(sock, Path::new("/tmp"), std::time::Duration::from_secs(2));
+            assert!(
+                sup.responsive,
+                "a clean status frame is responsive: {sup:?}"
+            );
+            assert_eq!(sup.pid, Some(424242));
+            assert_eq!(sup.home, Some(PathBuf::from("/tmp/nshome-x")));
+            // The /tmp home flags it as a phantom.
+            assert!(sup.is_phantom(), "a /tmp home must flag: {sup:?}");
+        }
     }
 }

@@ -144,7 +144,7 @@ jobs:
         # live_status_round_trip stays skipped (needs NS_ALLOW_LIVE_SUPERVISOR=1): CI must not start a real daemon (#40).
         run: |
           export NS_BIN="$PWD/target/debug/nano-supervisor"
-          cargo test -p contract-tests --locked --test cli --test state --test socket -- --nocapture
+          cargo test -p contract-tests --locked --test cli --test state --test socket --test phantom_status -- --nocapture
 
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:
