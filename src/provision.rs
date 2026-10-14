@@ -3203,6 +3203,26 @@ struct CredFile;
 /// already read this process's environment and open descriptors, so it cannot be
 /// defended against here (#62).
 ///
+/// Resolve the system temp root (`std::env::temp_dir()`) to an ABSOLUTE path
+/// before it is used to build a path handed to a child process.
+///
+/// `std::env::temp_dir()` honours a relative `TMPDIR` (e.g. `tmp`) verbatim, so
+/// it can return a relative path. The children we hand these temp-derived paths
+/// to — `gh` (via `GH_CONFIG_DIR`) and git's credential helper (via
+/// `NANO_GIT_CRED_FILE`) — run with a DIFFERENT working directory (the agent
+/// workspace), and resolve a relative path against *that* cwd. A relative temp
+/// root would therefore miss the private supervisor-owned directory and resolve
+/// against an agent-controlled location in the checkout — handing the child
+/// agent-planted config or secret instead of ours. Absolutize up front (against
+/// the daemon's own cwd, the same cwd `mkdtemp` creates under) and **fail
+/// closed** if resolution fails, so no child ever sees a relative,
+/// workspace-resolvable config/secret path.
+fn absolute_temp_root() -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir();
+    std::path::absolute(&dir)
+        .with_context(|| format!("resolving the system temp root {dir:?} to an absolute path"))
+}
+
 /// Unix-only: built on `libc::mkdtemp` and the unix permission/raw-fd APIs.
 #[cfg(unix)]
 fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
@@ -3227,7 +3247,7 @@ fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
     // umask, and picks a unique name so concurrent slots never collide. Build a
     // mutable NUL-terminated template ending in the six `X`s it requires.
     let mut template = {
-        let mut dir = std::env::temp_dir();
+        let mut dir = absolute_temp_root()?;
         dir.push("nano-git-cred-XXXXXX");
         let mut bytes = dir.into_os_string().into_vec();
         bytes.push(0);
@@ -4456,7 +4476,7 @@ impl GhConfigGuard {
     fn create() -> Result<GhConfigGuard> {
         use std::os::unix::ffi::OsStringExt;
         let mut template = {
-            let mut dir = std::env::temp_dir();
+            let mut dir = absolute_temp_root()?;
             dir.push("nano-gh-config-XXXXXX");
             let mut bytes = dir.into_os_string().into_vec();
             bytes.push(0);
@@ -9864,5 +9884,125 @@ mod tests {
             !dir.exists(),
             "the secret directory must be removed once the guard is dropped"
         );
+    }
+
+    /// Serializes tests that mutate the process-wide `TMPDIR` env var and the
+    /// process cwd (both global side effects), restoring the prior values on
+    /// drop. A plain `std::sync::Mutex` because the guarded constructors are
+    /// synchronous.
+    #[cfg(unix)]
+    static TMPDIR_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores `TMPDIR` and the process cwd to their pre-test values on drop,
+    /// so a relative-`TMPDIR` regression test never leaks that global state
+    /// into another test even on an early `?`/panic.
+    #[cfg(unix)]
+    struct TmpdirCwdGuard {
+        tmpdir: Option<std::ffi::OsString>,
+        cwd: std::path::PathBuf,
+    }
+    #[cfg(unix)]
+    impl Drop for TmpdirCwdGuard {
+        fn drop(&mut self) {
+            // Restore cwd FIRST: the saved absolute `TMPDIR` restore below is
+            // unaffected by cwd, but leaving a bogus cwd set would break any
+            // later test that reads it.
+            let _ = std::env::set_current_dir(&self.cwd);
+            match &self.tmpdir {
+                Some(v) => std::env::set_var("TMPDIR", v),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
+    }
+
+    /// Regression: a RELATIVE `TMPDIR` (e.g. `reltmp`) must not yield a relative
+    /// private directory. `std::env::temp_dir()` honours a relative `TMPDIR`
+    /// verbatim, and the children we hand these paths to (`gh` via
+    /// `GH_CONFIG_DIR`, git's credential helper via `NANO_GIT_CRED_FILE`) run
+    /// with a DIFFERENT cwd (the agent workspace) — so a relative path would
+    /// resolve against agent-controlled locations. Both the `gh` config guard
+    /// and the credential-secret file must produce ABSOLUTE paths, and those
+    /// paths must still resolve to the real private directory from a child whose
+    /// cwd differs from the daemon's.
+    #[cfg(unix)]
+    #[test]
+    fn relative_tmpdir_yields_absolute_child_resolvable_paths() {
+        let _lock = TMPDIR_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // An absolute sandbox we control, and a DIFFERENT absolute dir to run a
+        // child from, so "resolves from a child with a different cwd" is real.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base = std::path::absolute(std::env::temp_dir())
+            .expect("absolute temp root for test base")
+            .join(format!("nano-reltmp-base-{uniq}"));
+        let other = base.join("other-cwd");
+        let reltmp = base.join("reltmp");
+        std::fs::create_dir_all(&reltmp).expect("create relative TMPDIR target");
+        std::fs::create_dir_all(&other).expect("create alternate child cwd");
+
+        let guard = TmpdirCwdGuard {
+            tmpdir: std::env::var_os("TMPDIR"),
+            cwd: std::env::current_dir().expect("save cwd"),
+        };
+        // Daemon-side cwd is `base`; `TMPDIR` is the RELATIVE name `reltmp`.
+        std::env::set_current_dir(&base).expect("enter sandbox cwd");
+        std::env::set_var("TMPDIR", "reltmp");
+
+        // The helper itself must absolutize a relative TMPDIR.
+        let resolved = absolute_temp_root().expect("absolute_temp_root resolves relative TMPDIR");
+        assert!(
+            resolved.is_absolute(),
+            "absolute_temp_root must return an absolute path, got {resolved:?}"
+        );
+
+        // gh config guard: path must be absolute, not resolved against a child cwd.
+        let gh = GhConfigGuard::create().expect("create gh config dir under relative TMPDIR");
+        let gh_path = gh.path().to_path_buf();
+        assert!(
+            gh_path.is_absolute(),
+            "GH_CONFIG_DIR must be absolute even under a relative TMPDIR, got {gh_path:?}"
+        );
+        assert!(
+            gh_path.exists(),
+            "the private gh config dir must actually exist at its absolute path"
+        );
+
+        // Credential secret file: path must be absolute and child-resolvable.
+        let (cred, cred_file) =
+            cred_secret_file(b"reltmp-secret").expect("create cred file under relative TMPDIR");
+        assert!(
+            cred_file.is_absolute(),
+            "NANO_GIT_CRED_FILE must be absolute even under a relative TMPDIR, got {cred_file:?}"
+        );
+
+        // Resolve both paths from a child whose cwd is `other` (NOT the daemon
+        // cwd `base`). An absolute path resolves identically regardless of cwd;
+        // the pre-fix relative path would have been looked up under `other` and
+        // missed the real private directory.
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"test -d "$GH_CONFIG_DIR" && test "reltmp-secret" = "$(cat "$NANO_GIT_CRED_FILE")""#)
+            .current_dir(&other)
+            .env("GH_CONFIG_DIR", &gh_path)
+            .env("NANO_GIT_CRED_FILE", &cred_file)
+            .status()
+            .expect("spawn child to resolve paths from a different cwd");
+        assert!(
+            ok.success(),
+            "absolute GH_CONFIG_DIR and NANO_GIT_CRED_FILE must resolve from a child with a \
+             different cwd than the daemon"
+        );
+
+        drop(cred);
+        drop(gh);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
