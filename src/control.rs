@@ -332,7 +332,7 @@ pub fn request_with_timeout(
                 "control response exceeded the cumulative byte budget without a final frame",
             ));
         }
-        match read_frame_chunk(&mut reader, &mut line, deadline, frame_cap)? {
+        match read_frame_chunk(&stream, &mut reader, &mut line, deadline, frame_cap)? {
             // Peer closed before a terminal `final:true` frame: the reply is
             // incomplete (the daemon crashed or was cut off mid-response), so
             // surface it as an error rather than returning partial frames that a
@@ -428,6 +428,7 @@ const MAX_RESPONSE_FRAMES: usize = 1024;
 /// when the peer closes mid-frame.
 #[cfg(unix)]
 fn read_frame_chunk(
+    stream: &std::os::unix::net::UnixStream,
     reader: &mut std::io::BufReader<&std::os::unix::net::UnixStream>,
     line: &mut Vec<u8>,
     deadline: std::time::Instant,
@@ -455,6 +456,24 @@ fn read_frame_chunk(
                 "control frame exceeded its size budget without a terminator",
             ));
         }
+        // Re-arm the socket read timeout with only the budget still left on the
+        // absolute deadline BEFORE this blocking read. The caller arms it once per
+        // frame, but a peer that delivers a partial chunk just before the deadline
+        // and then goes silent would otherwise let THIS `fill_buf` block for the
+        // whole per-frame budget again — nearly doubling the advertised deadline.
+        // Arming from `deadline - now` on every blocking read keeps total blocking
+        // time capped by `deadline` no matter how the peer paces its bytes. The
+        // deadline check above guarantees the remaining budget is non-zero, so this
+        // never installs `Some(0)` ("block forever").
+        let budget = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control request exceeded its overall deadline mid-frame",
+                )
+            })?;
+        stream.set_read_timeout(Some(budget))?;
         // Read at most one bounded chunk. `BufReader` may already hold buffered
         // bytes; `fill_buf`+`consume` drains those without an extra syscall.
         let available = reader.fill_buf();
@@ -1225,6 +1244,75 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(2),
                 "the 300ms budget must bound the exchange, not the server's ~5s \
                  trickle window; took {elapsed:?}"
+            );
+        }
+
+        // Regression (stale read timeout across a frame's blocking reads): the
+        // socket read timeout was armed ONCE per frame, so a peer that delivers a
+        // partial newline-free chunk just before the deadline and then goes silent
+        // lets the NEXT blocking `fill_buf` wait out the whole per-frame budget
+        // again — nearly doubling the advertised deadline. Re-arming the timeout
+        // from `deadline - now` before every blocking read keeps the silent tail
+        // bounded by the original budget, not by a fresh one.
+        #[test]
+        fn request_with_timeout_bounds_a_partial_chunk_then_silence() {
+            let sock = temp_sock("pps");
+            let _ = std::fs::remove_file(&sock);
+            let listener = UnixListener::bind(&sock).expect("bind test socket");
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    while let Ok(1) = stream.read(&mut byte) {
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    // Wait until JUST BEFORE the client's 300ms deadline, then
+                    // deliver ONE partial newline-free chunk (so the client's
+                    // `fill_buf` returns data without a terminator) and go SILENT.
+                    // This is the overrun shape: the stale per-frame timeout was
+                    // armed at frame start (~t=0) for the full 300ms, so the
+                    // `fill_buf` that starts at ~t=280ms would — un-fixed — block
+                    // until ~t=580ms, nearly doubling the deadline. Re-arming from
+                    // `deadline - now` before that read caps the silent tail at the
+                    // ~20ms still left, so the exchange ends at ~300ms.
+                    std::thread::sleep(std::time::Duration::from_millis(280));
+                    if stream.write_all(b"{\"partial\":").is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    // Stay connected (no EOF) but send nothing more, well past any
+                    // reasonable deadline, until the test releases us.
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                }
+            });
+
+            let start = std::time::Instant::now();
+            let err = request_with_timeout(
+                &sock,
+                &json!({ "op": "status" }),
+                std::time::Duration::from_millis(300),
+            )
+            .expect_err("a partial chunk followed by silence must hit the deadline");
+            let elapsed = start.elapsed();
+
+            let _ = release_tx.send(());
+            handle.join().ok();
+            let _ = std::fs::remove_file(&sock);
+
+            assert!(
+                err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock,
+                "the silent tail must surface as a timeout, got {err:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(450),
+                "the 300ms budget must bound the silent tail; a stale per-frame \
+                 timeout would let the read starting at ~280ms block until ~580ms \
+                 (nearly double), while a re-armed timeout ends it at ~300ms; \
+                 took {elapsed:?}"
             );
         }
 
