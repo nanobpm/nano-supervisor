@@ -2460,8 +2460,18 @@ async fn finalize_git_with_deadline(
     // exactly as Node does.
     if reconcile_gate(allow_pr, out.push_failed) {
         if let Some(branch) = &prep.working_branch {
+            // Cap this BEST-EFFORT lookup at 30s (the decision on #49: the Node
+            // plugin's `reconcileAgentPr` runs `gh pr list` with a 30s timeout),
+            // never the full per-command git budget (`remaining!()` is bounded by
+            // the git timeout, which defaults to 120s). A stalled `gh` must not
+            // hold an otherwise-completed job and its slot for the whole git
+            // timeout. `remaining!()` first, so an expired overall deadline still
+            // collapses the lookup to the ~1ns fail-closed budget rather than
+            // reviving a full 30s.
+            let lookup_budget = remaining!().min(Duration::from_secs(30));
             out.pr = Some(
-                reconcile_agent_pr(workspace, &repo.provider, &repo.url, branch, remaining!()).await,
+                reconcile_agent_pr(workspace, &repo.provider, &repo.url, branch, lookup_budget)
+                    .await,
             );
         }
     }
@@ -3834,9 +3844,19 @@ async fn reconcile_agent_pr(
     // The token the worker uses for clone/push: the userinfo lifted out of the
     // trusted `repo.url`. `gh` is handed it via `GH_TOKEN`/`GH_ENTERPRISE_TOKEN`
     // (see `gh_auth_env`); absent one, the anonymous path scrubs every ambient
-    // gh credential.
+    // gh credential. The token is the userinfo PASSWORD for the `user:pass@`
+    // form, but the USERNAME for the token-as-username `https://<pat>@host`
+    // form (`split_url_credential` leaves the password empty there) — reading
+    // only the password would hand `gh` an empty token and clear every auth
+    // source, so fall back to the username when the password is empty.
     let (_fetch_url, cred) = trusted_fetch_source(repo_url);
-    let token = cred.as_ref().map(|c| c.password.as_str());
+    let token = cred.as_ref().map(|c| {
+        if c.password.is_empty() {
+            c.username.as_str()
+        } else {
+            c.password.as_str()
+        }
+    });
     // When the configured `repo.url` resolves to a GitHub `[host/]owner/repo`,
     // pin `gh` to it with `-R` so the token-bearing lookup targets a repository
     // chosen from SUPERVISOR-controlled state, never the agent-mutable `origin`
@@ -4029,7 +4049,6 @@ fn trusted_cli_from(
     program: &str,
     raw_path: &std::ffi::OsStr,
 ) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     // Drop empty ("" — a leading/trailing/`::` gap, which `execvp` treats as the
     // cwd) and every relative entry (".", "bin", "../x"): only an absolute
@@ -4049,15 +4068,46 @@ fn trusted_cli_from(
     }
     for dir in &dirs {
         let candidate = dir.join(program);
-        // A regular, executable file (follows symlinks, which only point within
-        // these trusted absolute dirs). Non-files / non-executables are skipped.
-        if let Ok(md) = std::fs::metadata(&candidate) {
-            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
-                return Ok((candidate, sanitized));
-            }
+        // A regular file the DAEMON can actually execute. An execute BIT for any
+        // user is not sufficient: for a non-root daemon a daemon-owned file with
+        // mode `0601` (owner rw-, other --x) passes a `mode & 0o111` check but
+        // `execvp` fails it with EACCES, and a real `PATH` search would skip it
+        // and fall through to a LATER executable on the path. Returning that
+        // absolute path here would pre-empt the fallback and break the spawn even
+        // when a usable binary exists in a later dir. `access(X_OK)` asks the
+        // kernel for the EFFECTIVE credential's execute permission (it is
+        // euid/egid-aware, so it answers "can THIS daemon execute it"), matching
+        // the spawn exactly and skipping the EACCES tease. Root is unaffected
+        // (the kernel grants root X_OK when any execute bit is set).
+        if executable_by_daemon(&candidate) {
+            return Ok((candidate, sanitized));
         }
     }
     bail!("{program} not found on a trusted absolute PATH");
+}
+
+/// Unix: whether `path` is a regular file the daemon's EFFECTIVE credentials can
+/// execute, via `access(2)`/`X_OK`. Unlike a mode-bit test this is euid/egid
+/// aware, so it answers "can THIS process exec it" exactly as `execvp` will —
+/// skipping a file whose execute bit is set for some other user (e.g. a
+/// daemon-owned `0601` file a non-root daemon cannot run) instead of returning
+/// it and breaking the spawn. Follows symlinks (they point within the trusted
+/// absolute dirs). Any `access` error (ENOENT, EACCES, …) is "not executable".
+#[cfg(unix)]
+fn executable_by_daemon(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !md.is_file() {
+        return false;
+    }
+    let bytes = path.as_os_str().as_bytes();
+    let mut c = Vec::with_capacity(bytes.len() + 1);
+    c.extend_from_slice(bytes);
+    c.push(0);
+    // SAFETY: `c` is a writable, NUL-terminated buffer that outlives the call.
+    unsafe { libc::access(c.as_ptr() as *const libc::c_char, libc::X_OK) == 0 }
 }
 
 /// Non-Unix fallback: the out-of-band credential path is unsupported off Unix
@@ -4267,10 +4317,23 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Opt
     let guard = GhConfigGuard::create()?;
     cmd.env("GH_CONFIG_DIR", guard.path());
     if let Some(t) = token.filter(|t| !t.is_empty()) {
-        if host.eq_ignore_ascii_case("github.com") {
+        if gh_uses_standard_token(host) {
+            // github.com AND GitHub's managed Enterprise cloud (`*.ghe.com`,
+            // e.g. `https://tenant.ghe.com/org/repo.git`) both authenticate via
+            // GH_TOKEN/GITHUB_TOKEN — gh's tenancy model treats a `*.ghe.com`
+            // host as github.com and reads GH_TOKEN for it, NOT
+            // GH_ENTERPRISE_TOKEN (which is for self-hosted GHES). Selecting
+            // GH_ENTERPRISE_TOKEN for `*.ghe.com` would leave the lookup
+            // unauthenticated (GH_TOKEN/GITHUB_TOKEN and stored credentials are
+            // scrubbed above) and return `found:false`. GH_HOST is still pinned
+            // to the trusted host below so the lookup targets the configured
+            // `repo.url` host, not gh's default.
             cmd.env("GH_TOKEN", t);
+            if !host.eq_ignore_ascii_case("github.com") {
+                cmd.env("GH_HOST", host);
+            }
         } else {
-            // `gh` authenticates to a custom (GitHub Enterprise) host via
+            // A self-hosted GitHub Enterprise Server host: `gh` authenticates via
             // GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN — GH_TOKEN is ignored
             // there — and GH_HOST pins the default host so the lookup targets
             // the trusted host from the configured `repo.url`.
@@ -4279,6 +4342,17 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Opt
         }
     }
     Ok(Some(guard))
+}
+
+/// Whether `gh` reads the STANDARD `GH_TOKEN`/`GITHUB_TOKEN` (not
+/// `GH_ENTERPRISE_TOKEN`) for `host`. True for github.com and for GitHub's
+/// managed Enterprise cloud tenancy hosts `*.ghe.com`, which gh treats as
+/// github.com for auth; false for a self-hosted GitHub Enterprise Server host.
+/// Case-insensitive; a bare `ghe.com` (no tenant subdomain) is NOT a valid
+/// tenancy host and is treated as self-hosted.
+fn gh_uses_standard_token(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "github.com" || h.ends_with(".ghe.com")
 }
 
 /// Guards the supervisor-owned `0700` `GH_CONFIG_DIR` created for one `gh`
@@ -4656,6 +4730,35 @@ mod tests {
             "no absolute dir → fail closed"
         );
 
+        // EFFECTIVE-EXECUTE (the F3 finding): an EARLIER dir holds a same-named
+        // file whose execute bit is set only for OTHER (mode 0601) — a file a
+        // non-root daemon cannot actually exec. A mode-bit check would return it
+        // and pre-empt the fallback; the effective `access(X_OK)` check must SKIP
+        // it and resolve the usable binary in the LATER dir, exactly as a real
+        // `PATH` search falls through on EACCES. (As root `access(X_OK)` succeeds
+        // whenever any execute bit is set, so the skip is only observable for a
+        // non-root daemon — guard the skip assertion accordingly.)
+        let dir_a = tmp.join("a");
+        let dir_b = tmp.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let a_bin = dir_a.join("fakebin");
+        std::fs::write(&a_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&a_bin, std::fs::Permissions::from_mode(0o601)).unwrap();
+        let b_bin = dir_b.join("fakebin");
+        std::fs::write(&b_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&b_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let two = std::env::join_paths([dir_a.clone(), dir_b.clone()]).unwrap();
+        let (resolved, _) = trusted_cli_from("fakebin", &two).expect("a usable binary exists");
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(resolved, a_bin, "root can exec any execute-bit file");
+        } else {
+            assert_eq!(
+                resolved, b_bin,
+                "a non-root daemon must skip the other-exec-only file and fall through"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4845,6 +4948,32 @@ mod tests {
             "GH_TOKEN must not be set for a GHE host: {env:?}"
         );
 
+        // Token path, GitHub MANAGED Enterprise cloud (`*.ghe.com`): gh treats a
+        // tenancy host as github.com for auth, so the token lands on GH_TOKEN
+        // (NOT GH_ENTERPRISE_TOKEN), with GH_HOST still pinned to the trusted
+        // host so the lookup targets the configured repo.url host.
+        let mut ghe_cloud = Command::new("gh");
+        for (k, v) in ambient {
+            ghe_cloud.env(k, v);
+        }
+        let _ghe_cloud_guard = gh_auth_env(&mut ghe_cloud, Some("job-token"), "tenant.ghe.com")
+            .expect("ghe-cloud token env");
+        let env = env_of(ghe_cloud.as_std());
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("job-token"),
+            "*.ghe.com must use GH_TOKEN: {env:?}"
+        );
+        assert_eq!(
+            env.get("GH_HOST").map(String::as_str),
+            Some("tenant.ghe.com"),
+            "GH_HOST must stay pinned to the trusted host: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_ENTERPRISE_TOKEN"),
+            "GH_ENTERPRISE_TOKEN must not be set for *.ghe.com: {env:?}"
+        );
+
         // Anonymous path: NO token var survives; GH_CONFIG_DIR is still set.
         let mut anon_cmd = Command::new("gh");
         for (k, v) in ambient {
@@ -4968,6 +5097,31 @@ mod tests {
             pr["error"],
             "PR reconcile unsupported for provider \"gitlab\""
         );
+    }
+
+    #[test]
+    fn reconcile_token_falls_back_to_username_for_token_as_username_urls() {
+        // The token handed to `gh` is the userinfo PASSWORD for `user:pass@`,
+        // but the USERNAME for the token-as-username `https://<pat>@host` form
+        // (where `split_url_credential` leaves the password empty). Reading only
+        // the password would hand `gh` an empty token and clear every auth
+        // source. Mirror the production selection and assert BOTH forms.
+        let select = |c: &GitCredential| -> String {
+            if c.password.is_empty() {
+                c.username.clone()
+            } else {
+                c.password.clone()
+            }
+        };
+        // `user:pass@` → the password.
+        let (_u, cred) = trusted_fetch_source("https://oauth2:secretpat@github.com/o/r.git");
+        let cred = cred.expect("user:pass credential");
+        assert_eq!(select(&cred), "secretpat");
+        // `<pat>@` (token-as-username) → the username, password empty.
+        let (_u, cred) = trusted_fetch_source("https://secretpat@github.com/o/r.git");
+        let cred = cred.expect("token-as-username credential");
+        assert!(cred.password.is_empty(), "password must be empty");
+        assert_eq!(select(&cred), "secretpat");
     }
 
     #[tokio::test]
