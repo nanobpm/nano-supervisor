@@ -383,8 +383,13 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // (via `request_shutdown`) keeps that escalation, so re-read the SETTLED
     // reason after draining rather than trusting the snapshot — otherwise the
     // daemon would exit zero and mask the fatal fencing failure.
+    // Drain the slots, but KEEP the `JoinHandle`s: on a timeout they are needed
+    // to abort the still-running slots below. Consuming them here would only
+    // DETACH a stuck slot (dropping a `JoinHandle` never aborts its task),
+    // leaving it free to enqueue hub frames after the hub has deregistered.
+    let mut handles = handles;
     let drain = async {
-        for h in handles {
+        for h in &mut handles {
             let _ = h.await;
         }
     };
@@ -434,6 +439,22 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     let fatal = settled == slot::Shutdown::Fatal;
     if fatal && reason != slot::Shutdown::Fatal {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); the fatal escalation arrived during the drain — exiting non-zero");
+    }
+
+    // Reap any slot that outlived the drain BEFORE the hub deregisters. When the
+    // drain timed out, `drain_within_deadline` dropped the drain future — which
+    // only DETACHES the not-yet-completed slots (dropping a `JoinHandle` never
+    // aborts its task). A detached slot still holds its hub session and can keep
+    // enqueueing CLAIM/transcript/RELEASE frames, so shutting the hub down first
+    // would emit DEREGISTER (false offline presence) while those slots run on and
+    // push frames into a buffer nothing drains. Abort every unfinished handle and
+    // join it (`abort()` is a no-op on an already-finished task), so no slot
+    // outlives the hub deregistration below.
+    for h in &handles {
+        h.abort();
+    }
+    for h in &mut handles {
+        let _ = h.await;
     }
 
     // Stop the agentic hub (issue #10): deregister the worker and let its

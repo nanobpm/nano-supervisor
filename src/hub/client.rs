@@ -67,6 +67,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// re-buffered and the connection is torn down so reconnect — or shutdown — can
 /// proceed instead of blocking on the wedged socket.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A single deadline around the COMPLETE terminal shutdown drain. `WRITE_TIMEOUT`
+/// bounds each individual socket write, but a peer that accepts every frame just
+/// under that bound — across many control frames plus a closing session's bulk
+/// tail — could otherwise keep [`HubClient::shutdown`] (and so daemon exit)
+/// blocked for many multiples of 30s. This caps the WHOLE deregister drain
+/// (control snapshot + every armed RELEASE's tail flush) + the final Close at one
+/// fixed upper bound, so shutdown always completes within a bounded time no matter
+/// how much is buffered or how slowly the peer reads. Generous enough that a
+/// healthy hub finishes well inside it; it only bites on a genuinely stalled peer.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Count ceiling on the ACP-update → transcript bridge channel. It sits in
 /// front of the already-byte-bounded outbound [`LaneBuffer`]; the EFFECTIVE
 /// bound used per session is the smaller of this and a byte-derived bound (see
@@ -560,6 +571,60 @@ impl LaneBuffer {
             }
         }
         self.store_back(BufferedFrame { bytes, frame });
+    }
+
+    /// Append an ARMED `RELEASE` to the back of the control lane, making room by
+    /// shedding lower-priority traffic — but NEVER a lower-lane frame whose
+    /// [`frame_stream`] equals `keep_stream`. That stream is the CLOSING session
+    /// this `RELEASE` orders against: `HubSession::close` flushed its transcript
+    /// tail into the buffer and armed a drain barrier keyed on this `RELEASE`, so
+    /// evicting that tail here would leave the barrier to find no matching frames
+    /// and send the `RELEASE` alone — silently losing the promised
+    /// tail-before-`RELEASE` ordering on the wire precisely under buffer pressure.
+    /// Eviction therefore skips the closing stream's tail (evicting OTHER streams'
+    /// bulk/interactive frames first), and the `RELEASE` itself is still admitted
+    /// exempt (never dropped). The kept tail is bounded by the session's own
+    /// transcript channel, so this cannot grow the buffer without limit.
+    fn push_back_release_preserving_stream(&mut self, frame: Frame, keep_stream: &str) {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        debug_assert_eq!(frame.family, Family::Release);
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            if !self.evict_lower_except(keep_stream) {
+                break; // only control frames and the kept stream's tail remain
+            }
+        }
+        self.store_back(BufferedFrame { bytes, frame });
+    }
+
+    /// Evict the oldest lower-lane (bulk, then interactive) frame that does NOT
+    /// belong to `keep_stream`, returning `false` when none exists. Used by
+    /// [`LaneBuffer::push_back_release_preserving_stream`] to free room for an
+    /// armed `RELEASE` without shedding the closing session's own transcript
+    /// tail. Never touches a control frame.
+    fn evict_lower_except(&mut self, keep_stream: &str) -> bool {
+        let evicted = Self::take_stream_mismatch(&mut self.bulk, keep_stream)
+            .or_else(|| Self::take_stream_mismatch(&mut self.interactive, keep_stream));
+        match evicted {
+            Some(bf) => {
+                self.account_removed(&bf);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove and return the oldest frame in `dq` whose [`frame_stream`] is NOT
+    /// `keep_stream` (or has no stream), preserving the order of the rest. Helper
+    /// for [`LaneBuffer::evict_lower_except`].
+    fn take_stream_mismatch(
+        dq: &mut VecDeque<BufferedFrame>,
+        keep_stream: &str,
+    ) -> Option<BufferedFrame> {
+        let pos = dq
+            .iter()
+            .position(|bf| frame_stream(&bf.frame) != Some(keep_stream))?;
+        dq.remove(pos)
     }
     /// supersedes presence for live instances + in-flight jobs, so leaving those
     /// stale frames in place would duplicate presence/ownership and let a
@@ -1219,8 +1284,17 @@ impl HubClient {
             // Live connection: enqueue EXEMPT and ordered — `drain`'s per-session
             // barrier writes the transcript tail before this RELEASE, and the
             // RELEASE itself is never dropped. Nothing is collapsed on the live
-            // path.
-            buf.push_back_control_bounded(frame);
+            // path. An ARMED RELEASE is admitted with its closing stream's tail
+            // PRESERVED: making room by evicting that very tail would leave the
+            // armed barrier nothing to flush and send the RELEASE ahead of a
+            // tail that never reaches the socket (the round-26 finding), so
+            // eviction skips this stream's lower-lane frames.
+            let stream = compose_stream_id(instance, job_key);
+            if armed {
+                buf.push_back_release_preserving_stream(frame, &stream);
+            } else {
+                buf.push_back_control_bounded(frame);
+            }
             None
         } else {
             // OUTAGE: nothing is draining, so an unbounded RELEASE+barrier set
@@ -2189,8 +2263,28 @@ async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::R
                     // not owed to a closing job is discarded with the socket, so
                     // draining it would only delay deregistration by up to
                     // WRITE_TIMEOUT per buffered frame.
-                    let _ = drain_control(client, &mut write).await;
-                    let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
+                    //
+                    // ONE DEADLINE AROUND THE WHOLE TERMINAL DRAIN: each socket
+                    // write inside `drain_control` is individually bounded by
+                    // `WRITE_TIMEOUT`, but a peer that accepts every frame just
+                    // under that bound — across many control frames plus a closing
+                    // session's bulk tail — could otherwise keep `shutdown()` (and
+                    // so daemon exit) blocked for many multiples of 30s. Wrap the
+                    // complete drain + the final Close in a single
+                    // `SHUTDOWN_DRAIN_TIMEOUT` deadline so shutdown has a fixed
+                    // upper bound. On expiry the remaining backlog is discarded
+                    // with the socket (best-effort deregistration); ownership is
+                    // re-derived by reconnect resync (nano-workforce#893).
+                    let terminal = async {
+                        let _ = drain_control(client, &mut write).await;
+                        let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
+                    };
+                    if timeout(SHUTDOWN_DRAIN_TIMEOUT, terminal).await.is_err() {
+                        log(&format!(
+                            "agentic hub: shutdown drain exceeded {}s; closing the socket with the remaining backlog unsent",
+                            SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+                        ));
+                    }
                     break;
                 }
             }
@@ -3222,11 +3316,14 @@ mod tests {
 
     // --- In-process live WebSocket acceptance (#10) ----------------------
 
-    /// A full end-to-end pass against a real in-process hub server: the upgrade
-    /// handshake carries the auth query params, the exact REGISTER/CLAIM/produce
-    /// frames arrive on the wire, a targeted inbound relay steers this session,
-    /// and shutdown emits a DEREGISTER. This closes the issue-#5 live-worker
-    /// acceptance seam that the contract-test corpus only panics on.
+    /// An IN-PROCESS SMOKE TEST against a real (in-process) hub server: the
+    /// upgrade handshake carries the auth query params, the exact
+    /// REGISTER/CLAIM/produce frames arrive on the wire, a targeted inbound relay
+    /// steers this session, and shutdown emits a DEREGISTER. It asserts selected
+    /// decoded fields only — it does NOT replay or byte-compare the golden corpus,
+    /// so it does NOT close issue #5's live-worker acceptance seam. That corpus
+    /// acceptance gap stays open and is tracked separately (follow-up #15); this
+    /// test only proves the client drives a real WebSocket end to end.
     #[tokio::test]
     // The `accept_hdr_async` callback must return `Result<Response, ErrorResponse>`;
     // `ErrorResponse` is large but the type is imposed by tokio-tungstenite, so
@@ -5006,6 +5103,123 @@ mod tests {
             .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(releases, vec!["j1".to_string(), "j2".to_string()]);
+    }
+
+    // Round-26 finding: admitting an ARMED RELEASE under buffer pressure must NOT
+    // evict the CLOSING stream's own transcript tail — that tail is what the armed
+    // drain barrier flushes before the RELEASE, so shedding it would send the
+    // RELEASE ahead of a tail that never reaches the socket. Eviction must skip
+    // the closing stream and shed OTHER streams' lower-lane frames first.
+    #[test]
+    fn push_back_release_preserving_stream_keeps_the_closing_tail() {
+        // capacity 3: fill with [closing tail, other tail, unrelated control].
+        let mut buf = LaneBuffer::with_limits(3, 0);
+        let closing = compose_stream_id("w", "job-close");
+        let other = compose_stream_id("w", "job-other");
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": closing, "chunk": "tail" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": other, "chunk": "other" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Heartbeat,
+            0,
+            json!({ "instance": "w" }),
+        ));
+        assert_eq!(buf.len(), 3, "precondition: buffer is full");
+
+        // Admit the ARMED RELEASE for the closing stream: it must make room by
+        // evicting the OTHER stream's tail, never the closing stream's tail.
+        buf.push_back_release_preserving_stream(
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": "job-close" }),
+            ),
+            &closing,
+        );
+
+        let bulk_chunks: Vec<String> = buf
+            .bulk
+            .iter()
+            .map(|bf| bf.frame.payload["chunk"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            bulk_chunks,
+            vec!["tail".to_string()],
+            "the closing stream's tail is preserved; the other stream's tail was evicted"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the RELEASE itself is admitted (exempt, never dropped)"
+        );
+        // The preserved tail is still drained ahead of the RELEASE by the barrier.
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&closing)
+                .map(|f| f.payload["chunk"].as_str().unwrap().to_string()),
+            Some("tail".to_string()),
+            "the barrier can still find and flush the closing tail first"
+        );
+    }
+
+    // Round-26 finding (sibling): when ONLY the closing stream's tail and control
+    // frames remain, the armed RELEASE is still admitted (exempt) without shedding
+    // that tail — it never drops the RELEASE and never eats the kept stream.
+    #[test]
+    fn push_back_release_preserving_stream_never_drops_release_or_own_tail() {
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        let closing = compose_stream_id("w", "job-close");
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": closing, "chunk": "tail" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Heartbeat,
+            0,
+            json!({ "instance": "w" }),
+        ));
+        assert_eq!(
+            buf.len(),
+            2,
+            "precondition: full with only own tail + control"
+        );
+
+        buf.push_back_release_preserving_stream(
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": "job-close" }),
+            ),
+            &closing,
+        );
+
+        assert!(
+            buf.bulk
+                .iter()
+                .any(|bf| bf.frame.payload["chunk"] == "tail"),
+            "the closing tail survives even when nothing else is evictable"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the RELEASE is admitted exempt even past the count cap"
+        );
     }
 
     // #6 (end-to-end on the client): completing more jobs than the cap while
