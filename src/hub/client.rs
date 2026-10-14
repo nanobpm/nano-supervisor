@@ -1510,8 +1510,18 @@ impl HubClient {
         // the matching session semantics (prompt injection / cancellation /
         // permission outcome). The channel is bounded (`STEER_CHANNEL_BOUND`):
         // on overflow drop the control rather than block the socket read loop
-        // or grow memory — a stalled turn must not wedge inbound routing.
-        let _ = sink.try_send(decoded.frame);
+        // or grow memory — a stalled turn must not wedge inbound routing. Log
+        // the drop so a discarded control (a denied/granted permission outcome
+        // the agent is still awaiting, a cancel) is observable rather than
+        // vanishing silently; report only the control KIND and channel depth,
+        // never the hub-controlled payload text.
+        let kind = decoded.frame.kind();
+        if sink.try_send(decoded.frame).is_err() {
+            log(&format!(
+                "agentic hub: dropped inbound {kind} control; steer channel full (depth {})",
+                sink.max_capacity()
+            ));
+        }
     }
 }
 

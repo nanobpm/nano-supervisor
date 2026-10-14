@@ -20,6 +20,19 @@ pub enum ControlFrame {
     Permission { request_id: String, outcome: String },
 }
 
+impl ControlFrame {
+    /// The stable, lowercase control-kind name (`prompt` / `cancel` /
+    /// `permission`) for logging. Used where a frame must be reported without
+    /// interpolating its hub-controlled payload text into the log stream.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ControlFrame::Prompt { .. } => "prompt",
+            ControlFrame::Cancel { .. } => "cancel",
+            ControlFrame::Permission { .. } => "permission",
+        }
+    }
+}
+
 /// The result of decoding an inbound steer chunk. `structured` distinguishes a
 /// recognised control envelope from the legacy bare-string-as-prompt fall-back.
 #[derive(Debug, Clone, PartialEq)]
