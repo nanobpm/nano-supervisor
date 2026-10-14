@@ -3725,7 +3725,11 @@ fn gh_repo_slug(url: &str) -> Option<String> {
     // GitHub Enterprise custom port (`ghe.example:8443`) or a bracketed IPv6
     // literal (`[2001:db8::1]:8443`). Splitting on the first `:` would drop the
     // port and truncate an IPv6 host, reconciling against the wrong `GH_HOST`.
-    let host = authority;
+    // The ONE normalization: strip a default `:443` from a managed-cloud
+    // `*.ghe.com` host (see `strip_managed_cloud_default_port`), so the slug,
+    // the derived `GH_HOST`, and the token selection all stay on gh's tenancy
+    // path instead of being misrouted to a self-hosted endpoint.
+    let host = strip_managed_cloud_default_port(authority);
     if host.is_empty() {
         return None;
     }
@@ -3794,6 +3798,37 @@ fn decode_repo_segment(seg: &str) -> Option<String> {
         return None;
     }
     Some(decoded)
+}
+
+/// Strip a default `:443` from a managed-cloud `*.ghe.com` GitHub host,
+/// returning the authority otherwise unchanged.
+///
+/// gh's tenancy model treats a bare `tenant.ghe.com` as GitHub's managed
+/// Enterprise cloud and routes its API to `https://api.tenant.ghe.com/graphql`.
+/// But gh's tenancy check does NOT strip a default `:443`, so the equivalent
+/// `tenant.ghe.com:443` fails that check and is misrouted to a self-hosted
+/// `https://tenant.ghe.com:443/api/graphql` endpoint — missing the PR — AND
+/// trips `gh_uses_standard_token` (the `:443` suffix breaks its `.ghe.com`
+/// match, selecting `GH_ENTERPRISE_TOKEN` instead of `GH_TOKEN`). Normalizing
+/// the port here, before the slug and `GH_HOST`/token host are derived from it,
+/// keeps the managed-cloud form on the tenancy path.
+///
+/// Only the default HTTPS port on a `*.ghe.com` host is stripped: a NON-default
+/// port is a distinct endpoint and is preserved, and a bracketed IPv6 literal
+/// (never a `.ghe.com` host) and every non-managed host (github.com aliases,
+/// handled by [`is_github_com_authority`], and self-hosted GHES) are returned
+/// verbatim.
+fn strip_managed_cloud_default_port(authority: &str) -> &str {
+    // A bracketed IPv6 literal is never a `.ghe.com` host; never split its `::`.
+    if authority.starts_with('[') {
+        return authority;
+    }
+    if let Some((host, "443")) = authority.rsplit_once(':') {
+        if !host.is_empty() && host.to_ascii_lowercase().ends_with(".ghe.com") {
+            return host;
+        }
+    }
+    authority
 }
 
 /// Whether `authority` (credential-free `host[:port]`) is a GitHub.com alias
@@ -4729,6 +4764,91 @@ mod tests {
             gh_repo_slug("https://evilgithub.com/org/repo.git").as_deref(),
             Some("evilgithub.com/org/repo")
         );
+    }
+
+    #[test]
+    fn gh_repo_slug_strips_default_port_from_managed_cloud_hosts() {
+        // GitHub's managed Enterprise cloud (`*.ghe.com`) is a tenancy host gh
+        // routes to `api.tenant.ghe.com`, but gh does NOT strip a default `:443`
+        // — so `tenant.ghe.com:443` would be misrouted to a self-hosted
+        // `tenant.ghe.com:443/api/graphql` endpoint AND select
+        // `GH_ENTERPRISE_TOKEN`. The default port MUST be dropped so both forms
+        // resolve to the same tenancy slug.
+        assert_eq!(
+            gh_repo_slug("https://tenant.ghe.com/org/repo.git").as_deref(),
+            Some("tenant.ghe.com/org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://tenant.ghe.com:443/org/repo.git").as_deref(),
+            Some("tenant.ghe.com/org/repo")
+        );
+        // Case-insensitive on the host.
+        assert_eq!(
+            gh_repo_slug("https://Tenant.GHE.com:443/org/repo.git").as_deref(),
+            Some("Tenant.GHE.com/org/repo")
+        );
+        // A NON-default port is a distinct endpoint — keep it verbatim.
+        assert_eq!(
+            gh_repo_slug("https://tenant.ghe.com:8443/org/repo.git").as_deref(),
+            Some("tenant.ghe.com:8443/org/repo")
+        );
+        // The derived GH_HOST + token host must land on the tenancy path, i.e.
+        // the standard `GH_TOKEN` (not `GH_ENTERPRISE_TOKEN`).
+        let host = gh_host_of_slug(
+            gh_repo_slug("https://tenant.ghe.com:443/org/repo.git")
+                .as_deref()
+                .unwrap(),
+        );
+        assert_eq!(host, "tenant.ghe.com");
+        assert!(
+            gh_uses_standard_token(&host),
+            "managed-cloud host must use the standard GH_TOKEN"
+        );
+        // A self-hosted GHES host that merely ends with `.ghe.com`-adjacent text
+        // is NOT managed cloud: a default `:443` on a plain Enterprise host is
+        // left verbatim (only `*.ghe.com` tenancy is normalized).
+        assert_eq!(
+            gh_repo_slug("https://ghe.example.com:443/org/repo.git").as_deref(),
+            Some("ghe.example.com:443/org/repo")
+        );
+        // A bare `ghe.com` (no tenant subdomain) is NOT a tenancy host — its
+        // `:443` is left verbatim too, matching `gh_uses_standard_token`.
+        assert_eq!(
+            gh_repo_slug("https://ghe.com:443/org/repo.git").as_deref(),
+            Some("ghe.com:443/org/repo")
+        );
+    }
+
+    #[test]
+    fn strip_managed_cloud_default_port_only_touches_ghe_tenancy_443() {
+        // Default `:443` dropped only for `*.ghe.com` (case-insensitive).
+        assert_eq!(
+            strip_managed_cloud_default_port("tenant.ghe.com:443"),
+            "tenant.ghe.com"
+        );
+        assert_eq!(
+            strip_managed_cloud_default_port("Tenant.GHE.COM:443"),
+            "Tenant.GHE.COM"
+        );
+        // Preserved verbatim: non-default port, bare tenancy host, non-tenancy
+        // hosts, a bare `ghe.com`, and a bracketed IPv6 literal (its `:443`
+        // suffix is part of the authority, and `::` must never be split).
+        for a in [
+            "tenant.ghe.com:8443",
+            "tenant.ghe.com",
+            "github.com:443",
+            "ghe.example.com:443",
+            "ghe.com:443",
+            "notghe.com:443",
+            "[2001:db8::1]:443",
+            "[2001:db8::1]",
+        ] {
+            assert_eq!(
+                strip_managed_cloud_default_port(a),
+                a,
+                "must be left verbatim: {a}"
+            );
+        }
     }
 
     #[test]
