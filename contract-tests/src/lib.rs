@@ -3213,7 +3213,8 @@ mod parity_tests {
 
     #[test]
     fn the_ledger_names_real_repos_and_open_gaps() {
-        assert!(!PARITY_GAPS.is_empty());
+        // No non-empty assertion: an empty PARITY_GAPS is the desired zero-gap
+        // end state (see tests/parity.rs), so this loop is a no-op then.
         for gap in PARITY_GAPS {
             let (repo, number) = gap
                 .issue

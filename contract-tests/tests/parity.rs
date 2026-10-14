@@ -56,12 +56,11 @@ fn resolve(repo: &str, number: &str) -> Resolution {
 
 #[test]
 fn parity_gaps_are_tracked_by_open_issues() {
-    assert!(
-        !PARITY_GAPS.is_empty(),
-        "PARITY_GAPS is empty — if every parity gap is closed, delete this guard's \
-         expectations accordingly and drop the expect_parity markers"
-    );
-
+    // An empty ledger is the desired zero-gap/cutover state, not a failure: the
+    // loops below are no-ops on an empty slice, so the guard passes cleanly once
+    // every marker and row is removed. Do NOT re-add a non-empty assertion here —
+    // that would fail CI exactly when the last gap closes and force a code change
+    // to disable the guard at the moment it has nothing left to enforce.
     let mut closed = Vec::new();
     let mut unresolved = Vec::new();
     let mut malformed = Vec::new();

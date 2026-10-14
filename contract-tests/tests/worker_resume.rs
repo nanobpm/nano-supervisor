@@ -296,16 +296,18 @@ fn agent_instance_stays_active_while_the_process_stays_open() {
             // Require a KNOWN active status, not merely "not COMPLETED": a
             // missing or unrecognised status must fail here too, or a producer
             // that never sets one (or sets garbage) would pass vacuously.
-            // `AgentInstanceUpdateStatusEnum` accepts only active statuses; the
-            // list below is the union of the active values the engine and the
-            // reference produce, so a new conforming value only needs adding.
+            // `AgentInstanceUpdateStatusEnum` — the statuses `updateAgentInstance`
+            // accepts — is exactly { IDLE, THINKING, TOOL_CALLING, TOOL_DISCOVERY }
+            // on both engines (jwulf/c8ctl-plugin-nano#274, verified against
+            // Camunda 8.10's agent-instances.yaml and nanobpmn's
+            // `agent_update_status`). `INITIALIZING` is not updateable but is the
+            // engine's own pre-first-update read-model state (#274 observed a live
+            // instance stuck in it), so a conforming instance can read it too.
             const ACTIVE_STATUSES: &[&str] = &[
-                "ACTIVE",
-                "CREATED",
-                "RUNNING",
-                "STARTED",
-                "UPDATED",
-                "IN_PROGRESS",
+                "IDLE",
+                "THINKING",
+                "TOOL_CALLING",
+                "TOOL_DISCOVERY",
                 "INITIALIZING",
             ];
             let known_active = ACTIVE_STATUSES.contains(&status);
