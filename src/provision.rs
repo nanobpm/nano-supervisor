@@ -4051,15 +4051,19 @@ async fn gh_pr_list(
 /// reconcile degrades to `{ found: false, error }` rather than running `gh`
 /// with the ambient config exposed.
 ///
-/// `gh` is not handed the swappable temp-root *name*: because `gh` resolves
-/// `GH_CONFIG_DIR` by path on every config read, a same-UID agent could
-/// otherwise `rename` the `nano-gh-config-*` entry aside and swap a symlink
-/// into its place before `gh` opens `hosts.yml` (mode `0700` and the sticky
-/// bit do not bar a directory from its same-UID owner). The guard pins the
-/// directory's inode no-follow and [`GhConfigGuard::config_path`] returns a
-/// path that re-resolves to that pinned inode (`/proc/self/fd/<fd>` on Linux,
-/// the `F_GETPATH` canonical path on macOS), so the swap cannot redirect the
-/// scrub.
+/// `gh` is handed the `mkdtemp` directory *name* directly. A same-UID process
+/// could in principle `rename` the `nano-gh-config-*` entry aside after
+/// `mkdtemp` and swap a symlink into its place before `gh` opens `hosts.yml`
+/// (mode `0700` and the sticky bit do not bar a directory from its same-UID
+/// owner), redirecting the read at the stale name. That same-UID
+/// rename/symlink swap is OUT OF SCOPE here, consistent with [`CredFile`]
+/// (which explicitly declares same-UID exposure out of scope) and with #49's
+/// sanctioned same-UID `/proc/<pid>/environ` token exposure on the token path
+/// below: a same-UID attacker can already read the operator's `~/.config/gh`
+/// credentials — or the job token out of `environ` — directly, so hardening
+/// only this one path against it buys nothing. This scrub defends against the
+/// agent-controlled checkout and ambient operator/daemon credentials, not a
+/// same-UID process.
 ///
 /// Token delivery via an env var re-creates, for `gh`, the
 /// `/proc/<pid>/environ` token exposure that #24 removed for `git` (which now
@@ -4106,13 +4110,11 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Opt
     }
     // BOTH paths: point `gh` at a private, supervisor-owned, empty config dir
     // OUTSIDE the agent-controlled checkout so a stored `hosts.yml` or OS
-    // keychain can never authenticate the lookup as the operator. The value is
-    // the guard's swap-proof FD-backed path (see [`GhConfigGuard::config_path`]),
-    // so a same-UID rename/symlink swap of the temp-root entry cannot redirect
-    // `gh`'s config reads. Fail closed when it cannot be created or resolved.
+    // keychain can never authenticate the lookup as the operator. Fail closed
+    // when it cannot be created. (A same-UID rename/symlink swap of the
+    // `mkdtemp` name is OUT OF SCOPE — see the function doc above.)
     let guard = GhConfigGuard::create()?;
-    let cfg = guard.config_path()?;
-    cmd.env("GH_CONFIG_DIR", cfg);
+    cmd.env("GH_CONFIG_DIR", guard.path());
     if let Some(t) = token.filter(|t| !t.is_empty()) {
         if host.eq_ignore_ascii_case("github.com") {
             cmd.env("GH_TOKEN", t);
@@ -4132,27 +4134,8 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Opt
 /// invocation. Its `Drop` removes the directory, so the anonymous-auth scrub's
 /// empty config never outlives the `gh` run — on every exit path, including
 /// error, timeout, and cancellation. Mirrors [`CredFile`]'s RAII contract.
-///
-/// The guard retains the directory's **pinned, no-follow file descriptor** (not
-/// just its name): `gh` resolves `GH_CONFIG_DIR` by path on every config read,
-/// and the directory sits under the world-writable system temp root, so a
-/// same-UID agent could otherwise `rename` the `nano-gh-config-*` entry aside
-/// after `mkdtemp` and swap a symlink into its place before `gh` opens
-/// `hosts.yml` — mode `0700` and the sticky bit do not bar a directory from its
-/// same-UID owner. [`GhConfigGuard::config_path`] therefore hands `gh` a path
-/// that re-resolves to the *pinned inode* rather than to the swappable name, so
-/// the swap cannot redirect the scrub.
 struct GhConfigGuard {
-    /// The directory's name under the system temp root, retained only so
-    /// [`Drop`] can unlink the entry. Never handed to `gh`.
-    #[cfg(unix)]
     dir: std::path::PathBuf,
-    /// The pinned, no-follow handle for that directory's inode. Held for the
-    /// guard's whole life so the inode cannot be recycled while `gh` still has
-    /// the FD-path open, and used by [`Drop`] to empty the *real* directory
-    /// (never a swapped-in replacement) before unlinking its name.
-    #[cfg(unix)]
-    handle: crate::saferoot::DirHandle,
 }
 
 impl GhConfigGuard {
@@ -4183,18 +4166,12 @@ impl GhConfigGuard {
         }
         template.pop();
         let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(template));
-        // Pin the just-created directory's inode no-follow. `mkdtemp` already
-        // returned a real, owner-only directory, so this open cannot follow a
-        // pre-planted symlink; pinning it by descriptor is what lets
-        // `config_path` below hand `gh` a swap-proof reference.
-        let handle = crate::saferoot::DirHandle::open_root_nofollow(&dir, false)
-            .map_err(|e| anyhow::anyhow!("pinning the private gh config directory: {e:?}"))?;
-        Ok(GhConfigGuard { dir, handle })
+        Ok(GhConfigGuard { dir })
     }
 
-    /// Non-Unix hosts have no `mkdtemp`/no-follow pinning here; fail closed
-    /// rather than fall back to a guessable or checkout-local directory (these
-    /// are not supported daemon hosts).
+    /// Non-Unix hosts have no `mkdtemp` here; fail closed rather than fall
+    /// back to a guessable or checkout-local directory (these are not
+    /// supported daemon hosts).
     #[cfg(not(unix))]
     fn create() -> Result<GhConfigGuard> {
         Err(anyhow::anyhow!(
@@ -4203,88 +4180,19 @@ impl GhConfigGuard {
         ))
     }
 
-    /// The `GH_CONFIG_DIR` value handed to `gh`: a path that resolves to the
-    /// **pinned directory inode**, immune to a same-UID rename/symlink swap of
-    /// the `nano-gh-config-*` name. On Linux this is `/proc/self/fd/<fd>` — a
-    /// per-process magic symlink to the pinned inode that stays valid for the
-    /// whole `gh` run because the guard holds the pinned descriptor until after
-    /// `gh` exits. On macOS (no procfs) it is the pinned inode's *current*
-    /// canonical path via `fcntl(F_GETPATH)`, which tracks the rename rather
-    /// than resolving a swapped-in replacement at the stale name. Fails closed
-    /// when neither non-mutating recovery is available, so `gh` never runs with
-    /// a redirectable config path.
-    #[cfg(all(unix, target_os = "linux"))]
-    fn config_path(&self) -> Result<std::path::PathBuf> {
-        Ok(std::path::PathBuf::from(format!(
-            "/proc/self/fd/{}",
-            self.handle.as_raw_fd()
-        )))
-    }
-
-    #[cfg(all(unix, target_os = "macos"))]
-    fn config_path(&self) -> Result<std::path::PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
-        let mut buf = vec![0u8; libc::PATH_MAX as usize];
-        // SAFETY: `buf` is writable for its (PATH_MAX) length; `F_GETPATH`
-        // writes a NUL-terminated absolute path into it and changes no cwd.
-        let rc = unsafe {
-            libc::fcntl(
-                self.handle.as_raw_fd(),
-                libc::F_GETPATH,
-                buf.as_mut_ptr().cast::<libc::c_char>(),
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("recovering the pinned gh config directory path (F_GETPATH)");
-        }
-        let len = buf
-            .iter()
-            .position(|&b| b == 0)
-            .context("F_GETPATH returned an unterminated gh config path")?;
-        Ok(std::path::PathBuf::from(
-            std::ffi::OsStr::from_bytes(&buf[..len]).to_os_string(),
-        ))
-    }
-
-    #[cfg(not(unix))]
-    fn config_path(&self) -> Result<std::path::PathBuf> {
-        Err(anyhow::anyhow!(
-            "the private gh config directory is not supported on this (non-Unix) platform"
-        ))
+    fn path(&self) -> &std::path::Path {
+        &self.dir
     }
 }
 
 impl Drop for GhConfigGuard {
-    #[cfg(unix)]
     fn drop(&mut self) {
-        // Best-effort: remove the private 0700 directory. The temp-root NAME is
-        // untrusted by now — a same-UID actor may have renamed the real dir
-        // aside and swapped a symlink/replacement into its place — so empty the
-        // directory's contents through the PINNED handle (anchored on the real
-        // inode, never a swapped-in replacement), then unlink the now-empty
-        // name with `AT_REMOVEDIR`, which refuses a non-empty replacement or a
-        // non-directory (the planted symlink) instead of following it. A
-        // failure cannot be meaningfully handled at drop time; the directory is
-        // owner-only regardless.
-        if let Ok(names) = self.handle.entry_names() {
-            for name in names {
-                let _ = self.handle.remove_tree(&name);
-            }
-        }
-        if let Some(name) = self.dir.file_name() {
-            // The temp root is only descended *through* to reach `name`, so open
-            // it traversal-only (no read bit needed on the world-writable root).
-            if let Ok(temp) =
-                crate::saferoot::DirHandle::open_root_nofollow(std::env::temp_dir().as_path(), true)
-            {
-                let _ = temp.remove_inspected_dir(name, &self.handle);
-            }
-        }
+        // Best-effort: remove the private 0700 directory. We created and own it
+        // (mkdtemp), so this is a simple recursive remove of a directory no
+        // other UID can have written to. A failure cannot be meaningfully
+        // handled at drop time; the directory is owner-only regardless.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
-
-    #[cfg(not(unix))]
-    fn drop(&mut self) {}
 }
 
 #[cfg(test)]
@@ -4690,73 +4598,6 @@ mod tests {
             "an inherited GH_REPO must be scrubbed anonymously: {env:?}"
         );
         assert!(env.contains_key("GH_CONFIG_DIR"));
-    }
-
-    /// The `GH_CONFIG_DIR` handed to `gh` must keep resolving to the private
-    /// pinned directory even after a same-UID actor renames the
-    /// `nano-gh-config-*` entry aside and swaps a symlink into its place — the
-    /// exact redirect the anonymous-auth scrub exists to defeat (Copilot review
-    /// #72, `GH_CONFIG_DIR` same-UID symlink replacement).
-    #[cfg(all(unix, target_os = "linux"))]
-    #[test]
-    fn gh_config_dir_path_is_swap_proof() {
-        let mut cmd = Command::new("gh");
-        let guard = gh_auth_env(&mut cmd, None, "github.com").expect("anonymous env");
-        let guard = guard.expect("a GH_CONFIG_DIR guard is bound");
-        let env = env_of(cmd.as_std());
-        let cfg = env.get("GH_CONFIG_DIR").expect("GH_CONFIG_DIR must be set");
-
-        // The value is the FD-backed magic path, not the swappable temp name.
-        assert_eq!(
-            cfg.as_str(),
-            format!("/proc/self/fd/{}", guard.handle.as_raw_fd()),
-            "gh must be pointed at the pinned fd, not the temp-root name"
-        );
-        // It resolves to the pinned private directory right now.
-        let pinned = std::fs::canonicalize(cfg).expect("config path resolves");
-        assert_eq!(
-            pinned,
-            std::fs::canonicalize(&guard.dir).unwrap(),
-            "the fd path must name the private config dir"
-        );
-
-        // Simulate the attack: rename the real dir aside and plant a symlink at
-        // the original name pointing at an attacker-controlled ambient config.
-        let attacker = guard.dir.with_file_name("nano-gh-attacker-target");
-        std::fs::create_dir(&attacker).unwrap();
-        let swapped = guard.dir.with_file_name("nano-gh-swapped-aside");
-        std::fs::rename(&guard.dir, &swapped).unwrap();
-        std::os::unix::fs::symlink(&attacker, &guard.dir).unwrap();
-
-        // The path handed to `gh` still resolves to the PINNED directory (now
-        // at its renamed location), NOT to the swapped-in symlink's target.
-        let after = std::fs::canonicalize(cfg).expect("config path still resolves");
-        assert_eq!(
-            after,
-            std::fs::canonicalize(&swapped).unwrap(),
-            "the fd path tracks the pinned inode across the rename"
-        );
-        assert_ne!(
-            after,
-            std::fs::canonicalize(&attacker).unwrap(),
-            "the fd path must NOT resolve to the swapped-in symlink target"
-        );
-        // The planted symlink at the original name is what a naive path-based
-        // `gh` would have followed; the guard's Drop removes only the real dir.
-        assert!(std::fs::symlink_metadata(&guard.dir).unwrap().is_symlink());
-
-        // Clean up the attack fixtures, then restore the real dir at its
-        // original name so the guard's Drop unlinks it (it removes the entry at
-        // the stored name only when it is the pinned, now-empty inode).
-        std::fs::remove_file(&guard.dir).unwrap(); // the planted symlink
-        std::fs::remove_dir(&attacker).unwrap();
-        std::fs::rename(&swapped, &guard.dir).unwrap();
-        let gone = guard.dir.clone();
-        drop(guard);
-        assert!(
-            !gone.exists(),
-            "the guard must remove the private config dir on drop"
-        );
     }
 
     #[test]

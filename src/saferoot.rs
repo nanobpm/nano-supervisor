@@ -842,14 +842,6 @@ impl DirHandle {
         self.fd
     }
 
-    /// Borrow the pinned descriptor without consuming the handle. Callers that
-    /// only need the raw fd value (e.g. to build a `/proc/self/fd/<fd>` path)
-    /// use this so the handle stays alive for later handle-relative operations
-    /// and for its own `Drop`-time use.
-    pub(crate) fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-
     /// Wrap an already-pinned, no-follow directory fd as a `DirHandle`, without
     /// re-resolving any path. The inverse of [`into_fd`]: lets a consumer that
     /// retained the exact validated run-dir inode (as a [`crate::safecwd::CwdHandle`])
