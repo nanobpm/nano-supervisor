@@ -3064,9 +3064,12 @@ fn build_agent_env(
     // (`<run dir>/c8ctl/plugins` → `<default data dir>/plugins`), so the agent's
     // `c8` resolves plugins from the operator's install while its
     // `session.json`/`profiles.json` writes stay quarantined in the run dir.
-    // The link is created by US (never the agent) through the same pinned
-    // no-follow handle as the seed files, and only when the operator actually
-    // has a plugins dir to share.
+    // The link is created by US (never the agent), and only when the operator
+    // actually has a plugins dir to share. On Linux it goes through the same
+    // pinned no-follow handle as the seed files; the non-Linux branch
+    // (create_agent_c8ctl_dir_path_based) creates it with
+    // `std::os::unix::fs::symlink` after its own symlink checks, so the
+    // pinned-handle guarantee is Linux-only.
     let dir = seed_agent_c8ctl_dir(cfg, result_file, run_dir_handle)?;
     // RESIDUAL RISK (#46, accepted): the seed WRITE is pinned to the run-dir
     // inode (via `run_dir_handle`, no-follow), but `C8CTL_DATA_DIR` is still

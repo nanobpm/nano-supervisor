@@ -74,10 +74,12 @@ session **without** hiding plugins, the seeder links the operator's real plugins
 dir back into the per-run root as `<run dir>/c8ctl/plugins` → `<default data
 dir>/plugins`, so the agent's `c8` resolves plugins from the operator's install
 while its `session.json`/`profiles.json` writes stay quarantined in the run dir.
-The link is created by the worker (never the agent) through the same pinned
-no-follow handle as the seed files, and only when the operator actually has a
-plugins dir to share; the seed files themselves stay **real files** (never
-links), so `c8 use profile` can never escape the run dir
+The link is created by the worker (never the agent), and only when the operator
+actually has a plugins dir to share. On Linux it goes through the same pinned
+no-follow handle as the seed files; on other platforms (e.g. macOS) the seeder
+uses a path-based fallback that still fails closed on a symlinked `c8ctl` leaf,
+so the pinned-handle guarantee is Linux-only. The seed files themselves stay
+**real files** (never links), so `c8 use profile` can never escape the run dir
 ([#51](https://github.com/nanobpm/nano-supervisor/issues/51)).
 
 ## Contract tests
