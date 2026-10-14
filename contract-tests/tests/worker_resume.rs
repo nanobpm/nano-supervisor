@@ -179,6 +179,16 @@ fn job_writes_an_agent_instance_record() {
         text.contains("transcript turn"),
         "the ASSISTANT turn must carry the agent's emitted text; got {text:?}"
     );
+    // The fencing contract covers EVERY turn, not only the opening
+    // CONFIGURATION: an ASSISTANT update that drops jobKey/elementInstanceKey
+    // must fail here too, or the update path is unfenced.
+    assert!(
+        assistant["jobKey"].is_string() && assistant["elementInstanceKey"].is_string(),
+        "the ASSISTANT turn is fenced by jobKey/elementInstanceKey like every other \
+         turn; got jobKey={:?} eik={:?}",
+        assistant["jobKey"],
+        assistant["elementInstanceKey"]
+    );
 
     // The instance's own read model: a definition the reference derives from the
     // agent profile, and a metrics block (the reference's token metrics are
@@ -283,9 +293,41 @@ fn agent_instance_stays_active_while_the_process_stays_open() {
             // `status:COMPLETED` update — the pinned reference's 422 +
             // "MANUAL RECONCILIATION REQUIRED" is exactly that violation.
             let status = instance["status"].as_str().unwrap_or("");
+            // Require a KNOWN active status, not merely "not COMPLETED": a
+            // missing or unrecognised status must fail here too, or a producer
+            // that never sets one (or sets garbage) would pass vacuously.
+            // `AgentInstanceUpdateStatusEnum` accepts only active statuses; the
+            // list below is the union of the active values the engine and the
+            // reference produce, so a new conforming value only needs adding.
+            const ACTIVE_STATUSES: &[&str] = &[
+                "ACTIVE",
+                "CREATED",
+                "RUNNING",
+                "STARTED",
+                "UPDATED",
+                "IN_PROGRESS",
+                "INITIALIZING",
+            ];
+            let known_active = ACTIVE_STATUSES.contains(&status);
             let completed = status == "COMPLETED" || instance["completionDate"].is_string();
+            // The forbidden-update half: a conforming engine 422s a producer's
+            // terminal update and leaves the instance non-terminal, so the
+            // state check above cannot expose the attempt — only the worker's
+            // own diagnostics can (the engine exposes no request audit; an
+            // instrumented proxy is the eventual upgrade). The reference logs
+            // "MANUAL RECONCILIATION REQUIRED" for exactly this rejection, so
+            // its absence proves no forbidden update was sent BY A PRODUCER
+            // THAT LOGS ITS REJECTIONS — a producer that swallowed the 422
+            // silently would still pass, the residual gap the proxy would close.
             let reconciliation = outcome.stderr().contains("MANUAL RECONCILIATION REQUIRED");
-            if completed {
+            if !known_active {
+                Err(format!(
+                    "the AgentInstance must read a known ACTIVE status while the process \
+                     is open; got status={status:?} (expected one of {ACTIVE_STATUSES:?}) \
+                     completionDate={:?}",
+                    instance["completionDate"]
+                ))
+            } else if completed {
                 Err(format!(
                     "the AgentInstance must stay ACTIVE while the process is open — \
                      completion is engine-owned (#274); got status={status:?} \
@@ -444,17 +486,36 @@ fn agent_instance_creation_conflict_is_adopted_not_retried() {
             && turn_text(t).is_some_and(|text| text.contains("adopted turn"))
     });
     let adopted = instances.iter().any(|i| instance_key(i) == preassociated);
-    let check = match (adopted, adopted_turn) {
-        (true, true) => Ok(()),
-        (true, false) => Err(format!(
-            "the worker adopted instance {preassociated} but did not append the agent's \
-             turn to it (issue #289: the create is retried instead of adopted, or the \
-             append is refused); history: {history:#?}"
-        )),
-        (false, _) => Err(format!(
-            "the worker did not adopt the pre-associated instance {preassociated} \
-             (issue #289); the process instance now has: {instances:#?}"
-        )),
+    // Retry detection: the engine exposes no request audit, so the worker's own
+    // diagnostics are the only observable of its create attempts. The engine's
+    // permanent rejection names the failed precondition ("element instance … is
+    // already associated with agent instance …"), so each occurrence in the
+    // worker's stderr is one rejected `createAgentInstance` — exactly one is
+    // the initial conflict the worker must then adopt; more is a retried
+    // permanent 4xx, the behaviour #289 forbids. (Adoption-then-append alone
+    // cannot prove this: a worker that retries the create several times before
+    // adopting satisfies both arms above while violating #289.)
+    let create_attempts = outcome.stderr().matches("already associated").count();
+    let check = if create_attempts > 1 {
+        Err(format!(
+            "the worker retried the permanent 409 create {create_attempts} times before \
+             giving up or adopting — #289 requires exactly the initial conflicting \
+             createAgentInstance, then adoption; worker stderr:\n{}",
+            outcome.stderr()
+        ))
+    } else {
+        match (adopted, adopted_turn) {
+            (true, true) => Ok(()),
+            (true, false) => Err(format!(
+                "the worker adopted instance {preassociated} but did not append the agent's \
+                 turn to it (issue #289: the create is retried instead of adopted, or the \
+                 append is refused); history: {history:#?}"
+            )),
+            (false, _) => Err(format!(
+                "the worker did not adopt the pre-associated instance {preassociated} \
+                 (issue #289); the process instance now has: {instances:#?}"
+            )),
+        }
     };
     assert_parity(expect_parity(target, gap, check), || {
         format!(
