@@ -1858,6 +1858,14 @@ async fn finalize_git_with_deadline(
                         out.commits.clear();
                         out.retain = true;
                         out.work_found = true;
+                        // This run deliberately REFUSED to publish the prepared
+                        // branch (a stranded/incomplete scan), so it is not
+                        // confirmed on the remote this run. Set the dedicated
+                        // `push_failed` state — exactly as the other retain-skip
+                        // refusal does — so the PR reconcile gate (`!push_failed`,
+                        // mirroring Node) does not claim a PR for a branch this
+                        // run never published.
+                        out.push_failed = true;
                         return out;
                     }
                 }
@@ -2609,8 +2617,14 @@ async fn git_raw_status(
     timeout: Duration,
 ) -> Option<i32> {
     use std::process::Stdio;
-    let mut cmd = Command::new("git");
+    // Trusted absolute `git` on a sanitized PATH (see `trusted_cli`): the child
+    // `fchdir`s into the cwd, so a bare name could resolve an agent-planted
+    // binary via a relative PATH entry. Fail closed (`None`) if git is not on an
+    // absolute PATH — callers already treat that as a scan failure → retain.
+    let (git_exe, safe_path) = trusted_cli("git").ok()?;
+    let mut cmd = Command::new(git_exe);
     cmd.args(args);
+    cmd.env("PATH", &safe_path);
     cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
         dir.apply(&mut cmd).ok()?;
@@ -3350,7 +3364,15 @@ async fn git_with_env_capture(
     extra_env: &[(&str, &str)],
 ) -> Result<(String, bool)> {
     use std::process::Stdio;
-    let mut cmd = Command::new("git");
+    // Resolve `git` to a trusted absolute path on a sanitized PATH BEFORE the
+    // cwd is applied: the child `fchdir`s into the (agent-controlled) checkout
+    // in `pre_exec`, so a bare `git` would let a relative PATH entry resolve an
+    // agent-planted binary — which would then run with this run's credential
+    // helper. The sanitized PATH also protects git's own transport/credential
+    // helper subprocesses.
+    let (git_exe, safe_path) = trusted_cli("git")?;
+    let mut cmd = Command::new(git_exe);
+    cmd.env("PATH", &safe_path);
     // A credential is delivered out of band via git's credential-helper
     // protocol so the secret never reaches argv (world-readable
     // `/proc/<pid>/cmdline`) NOR the stable `/proc/<pid>/environ` (readable by
@@ -3978,6 +4000,77 @@ fn gh_pr_list_args(slug: Option<&str>, branch: &str) -> Vec<String> {
     args
 }
 
+/// Resolve `program` to a trusted absolute executable plus a sanitized `PATH`,
+/// searching a copy of the daemon's `PATH` with every empty or relative entry
+/// removed.
+///
+/// Our `git`/`gh` children `fchdir` into the (often AGENT-controlled) workspace
+/// in a `pre_exec` hook BEFORE `execvp` runs, so a bare program name would have
+/// its `PATH` search performed from inside that workspace. An empty, `.`, or any
+/// other relative `PATH` entry then resolves against agent-planted files —
+/// letting an agent shadow `gh`/`git` with a forgery that runs with the job
+/// token and could fake the provider PR result (#49). Resolving to an ABSOLUTE
+/// path here, in the daemon's own cwd, bypasses `execvp`'s `PATH` search
+/// entirely, and the returned sanitized `PATH` lets the caller hand the child a
+/// `PATH` with no relative entry so any HELPER the CLI itself spawns (after the
+/// same `fchdir`) resolves only against trusted absolute directories too. Fails
+/// closed: a program not found on an absolute `PATH` is an error, never a
+/// fallback to the vulnerable bare-name search.
+fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+    let raw = std::env::var_os("PATH").unwrap_or_default();
+    trusted_cli_from(program, &raw)
+}
+
+/// Pure core of [`trusted_cli`], taking the raw `PATH` explicitly so the
+/// sanitization/resolution can be unit-tested without mutating the shared
+/// process environment (which parallel tests spawning real `git`/`gh` rely on).
+#[cfg(unix)]
+fn trusted_cli_from(
+    program: &str,
+    raw_path: &std::ffi::OsStr,
+) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    // Drop empty ("" — a leading/trailing/`::` gap, which `execvp` treats as the
+    // cwd) and every relative entry (".", "bin", "../x"): only an absolute
+    // directory is immune to the child's post-`fchdir` cwd.
+    let dirs: Vec<PathBuf> = std::env::split_paths(raw_path)
+        .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
+        .collect();
+    let sanitized = std::env::join_paths(&dirs).context("rebuilding a sanitized PATH")?;
+    // An already-absolute program is trusted as given — no `PATH` search runs.
+    if Path::new(program).is_absolute() {
+        return Ok((PathBuf::from(program), sanitized));
+    }
+    // A program carrying a slash but not absolute (e.g. `./gh`) resolves against
+    // the child cwd — exactly the attack — so refuse it rather than search.
+    if program.contains('/') {
+        bail!("refusing to resolve relative program path {program:?}");
+    }
+    for dir in &dirs {
+        let candidate = dir.join(program);
+        // A regular, executable file (follows symlinks, which only point within
+        // these trusted absolute dirs). Non-files / non-executables are skipped.
+        if let Ok(md) = std::fs::metadata(&candidate) {
+            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+                return Ok((candidate, sanitized));
+            }
+        }
+    }
+    bail!("{program} not found on a trusted absolute PATH");
+}
+
+/// Non-Unix fallback: the out-of-band credential path is unsupported off Unix
+/// (see [`git_with_env_capture`]), and there is no `fchdir`/`pre_exec` cwd race
+/// to defend against, so resolve the program name as given.
+#[cfg(not(unix))]
+fn trusted_cli_from(
+    program: &str,
+    raw_path: &std::ffi::OsStr,
+) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+    Ok((std::path::PathBuf::from(program), raw_path.to_os_string()))
+}
+
 /// Spawn `gh pr list` for `branch` in `workspace`, returning its captured
 /// outcome. Best-effort and bounded by `timeout`; the credential and ambient-gh
 /// scrubbing live in [`gh_auth_env`]. `host` is the TRUSTED GitHub host derived
@@ -3992,8 +4085,14 @@ async fn gh_pr_list(
     timeout: Duration,
 ) -> Result<GhRun> {
     use std::process::Stdio;
-    let mut cmd = Command::new("gh");
+    // Resolve `gh` to a trusted absolute path on a sanitized PATH BEFORE the
+    // workspace cwd is applied, so an agent-planted `gh` in the checkout cannot
+    // shadow the real CLI (which runs with the job token and could otherwise
+    // forge the provider PR result).
+    let (gh_exe, safe_path) = trusted_cli("gh")?;
+    let mut cmd = Command::new(gh_exe);
     cmd.args(gh_pr_list_args(slug, branch));
+    cmd.env("PATH", &safe_path);
     // Run with the job workspace as cwd, exactly as Node's `spawnSync(..., { cwd
     // }); `gh` reads the checkout's git remotes for host/auth resolution.
     workspace
@@ -4506,6 +4605,58 @@ mod tests {
         ] {
             assert!(!is_github_com_authority(a), "should NOT be github.com: {a}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_cli_resolves_absolute_and_rejects_relative_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        // A sandbox PATH: a trusted absolute dir holding a fake executable, plus
+        // the exact entries `execvp` would resolve against the child cwd — an
+        // empty entry, `.`, and a relative dir — which MUST be dropped. The pure
+        // `trusted_cli_from` takes the PATH explicitly, so this never mutates the
+        // shared process env that parallel tests spawning real git/gh rely on.
+        let tmp = std::env::temp_dir().join(format!(
+            "trusted-cli-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let exe = tmp.join("fakebin");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let crafted = std::env::join_paths([
+            std::path::PathBuf::from(""),  // empty → cwd
+            std::path::PathBuf::from("."), // cwd
+            std::path::PathBuf::from("rel-cli-dir"), // relative
+            tmp.clone(),                   // trusted absolute
+        ])
+        .unwrap();
+
+        let (resolved, sanitized) =
+            trusted_cli_from("fakebin", &crafted).expect("resolves on absolute dir");
+        assert_eq!(resolved, exe, "must resolve the trusted absolute binary");
+        // The sanitized PATH keeps ONLY the absolute entry.
+        let kept: Vec<_> = std::env::split_paths(&sanitized).collect();
+        assert_eq!(kept, vec![tmp.clone()], "relative/empty entries must be stripped");
+
+        // A relative program path is refused outright (would resolve to cwd).
+        assert!(trusted_cli_from("./fakebin", &crafted).is_err());
+        // An absolute program is trusted verbatim.
+        let (abs, _) = trusted_cli_from(exe.to_str().unwrap(), &crafted).unwrap();
+        assert_eq!(abs, exe);
+        // A binary reachable ONLY via stripped relative entries is not found
+        // (fail closed) once no absolute dir provides it.
+        let rel_only =
+            std::env::join_paths([std::path::PathBuf::from(""), std::path::PathBuf::from(".")])
+                .unwrap();
+        assert!(
+            trusted_cli_from("fakebin", &rel_only).is_err(),
+            "no absolute dir → fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -7648,6 +7799,12 @@ mod tests {
             !res.pushed,
             "retain (incomplete/stranded scan) must REFUSE the push — never publish a partial \
              account as pushed"
+        );
+        assert!(
+            res.push_failed,
+            "a retain-skipped (refused) publication must set push_failed so the PR reconcile gate \
+             (!push_failed, mirroring Node) does not claim a PR for a branch this run never \
+             published — the gate test alone can't catch a regression of this assignment"
         );
         assert!(
             res.work_found,
