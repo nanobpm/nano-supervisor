@@ -311,6 +311,23 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
         Err(_) => return out,
     };
     for entry in entries.flatten() {
+        // Check the overall deadline at the TOP of every iteration, before the
+        // socket-name filter. The filter `continue`s past every non-socket entry,
+        // so a deadline check placed after it would never run while a large temp
+        // directory of unrelated entries is drained — the sweep would then exceed
+        // its advertised bound precisely on the littered host it exists to bound.
+        if remaining(deadline).is_zero() {
+            // Deadline exhausted. We cannot distinguish a live supervisor from a
+            // stale leftover socket (or even a same-named regular file) without a
+            // probe, and the budget forbids probing — so reporting these as
+            // running "unresponsive" supervisors would fabricate results that
+            // contradict the stale-socket filtering below. Stop the sweep instead:
+            // a best-effort hygiene overlay under-reports rather than invents a
+            // phantom. Remaining candidates share the exhausted deadline, so
+            // `break` (not `continue`) is correct.
+            break;
+        }
+
         let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
@@ -322,14 +339,9 @@ pub fn discover_other_supervisors(current_home: &Path) -> Vec<DiscoveredSupervis
 
         let budget = remaining(deadline);
         if budget.is_zero() {
-            // Deadline exhausted. We cannot distinguish a live supervisor from a
-            // stale leftover socket (or even a same-named regular file) without a
-            // probe, and the budget forbids probing — so reporting these as
-            // running "unresponsive" supervisors would fabricate results that
-            // contradict the stale-socket filtering below. Stop the sweep instead:
-            // a best-effort hygiene overlay under-reports rather than invents a
-            // phantom. Remaining candidates share the exhausted deadline, so
-            // `break` (not `continue`) is correct.
+            // Unreachable: the top-of-loop check above already broke out on an
+            // exhausted deadline. Kept as a defensive guard so the probe below
+            // can never be handed a zero (or negative-saturated) budget.
             break;
         }
 
