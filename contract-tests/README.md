@@ -57,27 +57,13 @@ fake-agent and redaction tests run with no engine, so CI stays green.
 
 ## Issue-numbered worker fixes covered
 
-Every issue-numbered fix in the plugin's worker code that changes behavior gets a
-test. Keep this list current as tests are added. The full parity ledger — one row
-per behaviour-changing plugin change, with a `contract-test` / `rust-issue` /
-`n/a` disposition — lives in [`PARITY.md`](PARITY.md) (issue #57), which this
-table will fold into.
-
-| Fix | Behavior | Test |
-| --- | --- | --- |
-| jwulf/c8ctl-plugin-nano#275 | Empty agent result → **fail**, never complete | `worker_result::empty_result_fails_never_completes`, `worker_result::empty_agent_turn_is_observably_empty` |
-| jwulf/c8ctl-plugin-nano#285 | A successful producerless job completes with its vars; an empty result **fails** the job (one retry consumed), never completes. The JS `preGuardDrainTimedOut` scope bug is n/a in Rust (see [`PARITY.md`](PARITY.md)). **Not covered:** no test injects a settlement-path exception, so the "settlement throw fails the job" claim is asserted only by `src/slot.rs` reconciliation, not by a test | `worker_result::non_empty_result_completes_the_job`, `worker_result::empty_result_fails_never_completes` (result behavior only; settlement reconciliation in `src/slot.rs` is untested) |
-| nanobpm/nano-bpm#1283 | Lease token name mismatch (`leaseToken` vs `jobLeaseToken`): the worker takes a lease on every activation (engine 0.0.24 issues `jobLeaseToken`) | `worker_lease::*` |
-| Settlement fencing | Complete/fail are fenced by the lease token and land exactly once | `worker_lease::settling_commands_are_fenced_by_the_lease_token` |
-| Refresh cadence | Refresh the activation every third of `--recovery-window` | `worker_lease::leased_worker_refreshes_every_third_of_the_window` |
-| Nudge | Nudge an agent that stops without a result | `worker_result::stop_without_result_is_nudged` |
-| Finalize / PR vs fallback | An agent-reported PR is forwarded; an **unprovisioned** run creates no fallback branch | `worker_finalize::agent_reported_pr_is_forwarded`, `worker_finalize::unprovisioned_run_creates_no_fallback_branch` |
-| Reclaim / reap sweeps | Startup and periodic sweeps reap stale runs (`--reap-age`, `--reap-interval`, `--keep-runs`) | `worker_sweeps::startup_sweep_reaps_stale_runs` |
-| Disk-space check | `--min-free-mb` is the container disk floor; it does **not** gate host-sandbox runs (Node behaviour) | `worker_sweeps::min_free_mb_does_not_gate_host_runs` |
-| Checkpoint / resume | A job resumes after its worker is killed mid-run | `worker_resume::killed_worker_job_resumes_not_restarts` |
-| AgentInstance producer (issue #59) | A worker records an engine **AgentInstance** for its job (transcript = the durable artifact), not just a local run dir | `worker_resume::job_writes_an_agent_instance_record` |
-| AgentInstance on conflict (jwulf/c8ctl-plugin-nano#289) | When the element instance is **already associated**, the worker adopts the existing AgentInstance and appends its turn instead of retrying a create it cannot win | `worker_resume::agent_instance_creation_conflict_is_adopted_not_retried` |
-| Engine-owned AgentInstance completion (jwulf/c8ctl-plugin-nano#274) | While the process **stays open**, the AgentInstance stays ACTIVE and the worker does **not** send/retry the unsupported `status:COMPLETED` update (completion is the engine's, when the process ends) | `worker_resume::agent_instance_stays_active_while_the_process_stays_open` |
+The per-fix coverage table now lives in the **parity ledger**,
+[`PARITY.md`](PARITY.md): one row per behaviour-changing plugin issue or PR, each
+with a disposition (`contract-test: <path>` | `rust-issue: #N` | `n/a: <reason>`).
+It is backfilled from the fork point and CI-checked by
+[`scripts/parity-ledger`](../scripts/parity-ledger), which fails when a plugin
+issue labelled `behaviour-change` has no ledger row — so a new JS behaviour
+change cannot land un-dispositioned.
 
 Where the Node plugin's observed behavior looks like a bug, the test captures it
 anyway, marks it `// NODE-QUIRK: <issue link>`, and it is raised on issue #1

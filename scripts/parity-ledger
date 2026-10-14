@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# parity-ledger — the parity-ledger coverage gate (issue #57).
+#
+# Every *behaviour-changing* plugin issue must have a row in the ledger
+# (`contract-tests/PARITY.md`) giving it a disposition. This script finds the
+# issues that must be dispositioned and fails when one has no row, so a new JS
+# behaviour change cannot land un-dispositioned.
+#
+# Two sources of candidates:
+#
+#   1. STRICT — plugin issues AND pull requests labelled `behaviour-change`
+#      (open OR closed). A labelled item with no ledger row FAILS the gate. This
+#      is the authoritative signal: the JS side flags a behaviour change by
+#      applying the label — to the issue, or to the PR itself (the plugin's PR
+#      template, added by plugin PR #298, carries that checkbox).
+#
+#   2. INFORMATIONAL — plugin issues closed since the pinned plugin version
+#      (`.github/reference-versions.env`). One with no ledger row and no label is
+#      reported as a WARNING (a backfill nudge), never a failure: historical
+#      issues predate the label, so failing on them would wedge CI.
+#
+# Resolution needs `gh` (authenticated) and `jq`. Without a token the gate
+# SKIPS — exactly like `contract-tests/tests/parity.rs` — so a local run without
+# `gh auth` is not a hard failure; CI sets GH_TOKEN so the gate is live there.
+#
+# Flags:
+#   --warn          Downgrade STRICT misses to warnings (bootstrap mode); exit 0.
+#   --repo <r>      Plugin repo (default jwulf/c8ctl-plugin-nano).
+#   --ledger <f>    Ledger file (default contract-tests/PARITY.md).
+#   --label <l>     Behaviour-change label (default behaviour-change).
+#
+# Exit: 0 pass/skip/warn-mode; 1 a strict candidate has no ledger row; 2 usage/env.
+set -euo pipefail
+
+repo="jwulf/c8ctl-plugin-nano"
+label="behaviour-change"
+warn_only=0
+
+# Resolve paths relative to the repo root (this script lives in scripts/).
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd "$script_dir/.." && pwd)"
+ledger="$root_dir/contract-tests/PARITY.md"
+versions_env="$root_dir/.github/reference-versions.env"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --warn) warn_only=1 ;;
+    --repo) repo="${2:?--repo needs a value}"; shift ;;
+    --ledger) ledger="${2:?--ledger needs a value}"; shift ;;
+    --label) label="${2:?--label needs a value}"; shift ;;
+    -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "parity-ledger: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+note() { printf '%s\n' "$*" >&2; }
+
+if ! command -v jq >/dev/null 2>&1; then
+  note "SKIP parity-ledger: jq not found"
+  exit 0
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  note "SKIP parity-ledger: gh not found"
+  exit 0
+fi
+if [ ! -f "$ledger" ]; then
+  note "parity-ledger: ledger file not found: $ledger"
+  exit 2
+fi
+
+# No token → cannot resolve the plugin repo. Skip, as parity.rs does. Where a
+# token IS configured the gate is live and a failed lookup is a hard error, so
+# the advertised gate never silently turns itself off where it is meant to run.
+have_token=0
+if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+  have_token=1
+fi
+if ! gh auth status >/dev/null 2>&1 && [ "$have_token" -eq 0 ]; then
+  note "SKIP parity-ledger: gh is unauthenticated and no GH_TOKEN/GITHUB_TOKEN is set"
+  exit 0
+fi
+
+# A plugin issue/PR is "dispositioned" only when a LEDGER ROW cites it: the
+# reference must appear in the Plugin-change column of a table row whose
+# Disposition cell is recognised and non-empty. Scanning the whole document
+# would let the heading's `#57`, the Rust-gap table's `nano-supervisor#59`,
+# prose mentions, or a row with an EMPTY disposition silently satisfy the gate
+# — exactly the un-dispositioned change the gate exists to catch.
+#
+# Rows look like:
+#   | [jwulf/c8ctl-plugin-nano#274](https://github.com/...) | … | `contract-test: …` |
+# so strip Markdown LINK TARGETS — `](https://github.com/...)` — whose URL tail
+# `/N` would otherwise count as a `#N` reference, but keep every other
+# parenthesized note: `(closes #293)` / `(PR [#291](...))` cite real plugin
+# numbers whose rows must satisfy the gate. Then count only `#N` refs left of
+# the SECOND `|` (the Plugin change column) on lines whose disposition cell
+# carries a recognised disposition with a non-empty value.
+ledger_nums="$(
+  sed -E 's#\]\(https?://[^()]*\)#]#g' "$ledger" \
+    | awk -F'|' '
+        NF >= 4 {
+          disp = $(NF-1)
+          # The disposition must sit at the START of the cell and carry a
+          # non-empty VALUE after the colon — a bare `contract-test:`,
+          # `rust-issue:   `, or `n/a:` names no test path, tracking issue, or
+          # exemption reason, so it must not satisfy the gate. (Backticks are
+          # stripped first: `` `n/a:` `` would otherwise read as non-empty
+          # punctuation.)
+          d = disp
+          gsub(/`/, "", d)
+          if (d ~ /^[[:space:]]*(contract-test|rust-issue|n\/a)[[:space:]]*:[[:space:]]*[^[:space:]]/) {
+            n = split($2, cells, /#/)
+            for (i = 2; i <= n; i++) {
+              if (match(cells[i], /^[0-9]+/)) {
+                print substr(cells[i], RSTART, RLENGTH)
+              }
+            }
+          }
+        }
+      ' | sort -u
+)"
+has_row() { printf '%s\n' "$ledger_nums" | grep -qx "$1"; }
+
+# --- STRICT: labelled behaviour-change issues AND pull requests ---------------
+# `gh issue list` excludes pull requests, but the plugin's PR template (added by
+# plugin PR #298) tells authors to apply the `behaviour-change` label to the PR
+# itself — a labelled PR with no separately labelled issue must NOT pass this
+# gate un-dispositioned. The paginated repository *issues* endpoint returns both
+# issues and PRs (PRs carry a `pull_request` key), so use it and keep lookup
+# failures fatal wherever a token is configured.
+if ! strict_json="$(gh api "repos/$repo/issues?labels=$label&state=all&per_page=100" \
+      --paginate 2>/dev/null)"; then
+  if [ "$have_token" -eq 1 ]; then
+    note "parity-ledger: could not list '$label' issues/PRs on $repo (token configured — failing rather than waiving the gate)"
+    exit 1
+  fi
+  note "SKIP parity-ledger: could not reach $repo (no token)"
+  exit 0
+fi
+
+missing=()
+while IFS=$'\t' read -r num kind state title; do
+  [ -n "$num" ] || continue
+  if ! has_row "$num"; then
+    missing+=("$repo#$num ($kind, $state) — $title")
+  fi
+done < <(printf '%s' "$strict_json" | jq -r '.[] | "\(.number)\t\(if .pull_request then "PR" else "issue" end)\t\(.state)\t\(.title)"')
+
+# --- INFORMATIONAL: issues closed since the pinned plugin version -------------
+warn_closed=()
+pin_ver=""
+if [ -f "$versions_env" ]; then
+  pin_ver="$(grep -E '^PLUGIN_VERSION=' "$versions_env" | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+fi
+pin_date=""
+if [ -n "$pin_ver" ] && command -v npm >/dev/null 2>&1; then
+  pin_date="$(npm view "c8ctl-plugin-nano@${pin_ver}" time --json 2>/dev/null \
+    | jq -r --arg v "$pin_ver" '.[$v] // empty' 2>/dev/null || true)"
+fi
+since=""
+if [ -n "$pin_date" ]; then
+  since="${pin_date%%T*}"
+  # The issues endpoint returns PRs too; a row citing either satisfies both
+  # (they share the issue-number space).
+  if closed_json="$(gh api "repos/$repo/issues?state=closed&since=${since}T00:00:00Z&per_page=100" \
+        --paginate 2>/dev/null)"; then
+    # `since` filters by updated_at, not closed_at: an issue closed BEFORE the
+    # pin but commented on / relabelled AFTER it is returned here and would
+    # produce a false "closed since" backfill warning. Keep only items actually
+    # closed at/after the pin.
+    while IFS=$'\t' read -r num title labels; do
+      [ -n "$num" ] || continue
+      has_row "$num" && continue
+      printf '%s' "$labels" | grep -q "$label" && continue  # counted by STRICT
+      warn_closed+=("$repo#$num — $title")
+    done < <(printf '%s' "$closed_json" \
+      | jq -r --arg since "${since}T00:00:00Z" \
+          '.[] | select(.closed_at != null and .closed_at >= $since) | "\(.number)\t\(.title)\t\(.labels | map(.name) | join(","))"')
+  fi
+fi
+
+# --- Report -------------------------------------------------------------------
+if [ "${#warn_closed[@]}" -gt 0 ]; then
+  note "parity-ledger: WARN — ${#warn_closed[@]} issue(s) closed since c8ctl-plugin-nano@${pin_ver} (${since}) have no '$label' label and no ledger row (backfill candidates):"
+  for m in "${warn_closed[@]}"; do note "  - $m"; done
+fi
+
+if [ "${#missing[@]}" -eq 0 ]; then
+  note "parity-ledger: OK — every '$label' issue on $repo has a ledger row."
+  exit 0
+fi
+
+note ""
+note "parity-ledger: ${#missing[@]} '$label' issue(s) on $repo have NO row in ${ledger#$root_dir/}:"
+for m in "${missing[@]}"; do note "  - $m"; done
+note ""
+note "Add a row with a disposition (contract-test / rust-issue / n/a) — see the"
+note "ledger header for the vocabulary."
+
+if [ "$warn_only" -eq 1 ]; then
+  note "(--warn: not failing the build)"
+  exit 0
+fi
+exit 1

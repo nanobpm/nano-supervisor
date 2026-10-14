@@ -113,6 +113,20 @@ installed, its cases skip with a message. See
 `contract-tests/fixtures/socket-protocol.md` for the recorded control-socket
 protocol.
 
+### Parity ledger (issue #57)
+
+Every behaviour-changing fix in the JS supervisor
+([`jwulf/c8ctl-plugin-nano`](https://github.com/jwulf/c8ctl-plugin-nano)) gets an
+explicit disposition in the **parity ledger**,
+[`contract-tests/PARITY.md`](contract-tests/PARITY.md) — one row per plugin issue
+or PR: `contract-test: <path>` (pinned as an executable spec), `rust-issue: #N`
+(a tracked gap, also a `PARITY_GAPS` row), or `n/a: <reason>`. The ledger is
+CI-checked by [`scripts/parity-ledger`](scripts/parity-ledger): a plugin issue
+labelled `behaviour-change` with no ledger row **fails** the build, so a JS
+behaviour change cannot land un-dispositioned. The plugin repo carries the
+`behaviour-change`/`rust-parity` labels and a PR-template parity checkbox so new
+changes are flagged at the source.
+
 ### Reference versions and JS-drift detection (issue #58)
 
 The Node reference the suite pins against — the `c8ctl-plugin-nano` release and
