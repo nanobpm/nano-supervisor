@@ -982,6 +982,34 @@ impl Engine {
         v["items"].as_array().cloned().unwrap_or_default()
     }
 
+    /// Whether the process instance is still ACTIVE — i.e. has **not** reached
+    /// its end event (`POST /v2/process-instances/search`). A gated process
+    /// (`bpmn::single_task_with_gate`) stays ACTIVE after the agent job settles;
+    /// the engine only completes the instance — and force-completes the
+    /// AgentInstances inside it — once the gate's user task is completed too.
+    ///
+    /// Returns `None` when the engine does not report the instance (an engine
+    /// predating process-instance search), so a caller can distinguish "not
+    /// completed" from "cannot tell".
+    pub fn process_active(&self, process_instance_key: &str) -> Option<bool> {
+        let v: serde_json::Value = self
+            .http
+            .post(format!("{}/v2/process-instances/search", self.url))
+            .json(&serde_json::json!({
+                "filter": { "processInstanceKey": process_instance_key },
+                "page": { "limit": 10 },
+            }))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json())
+            .ok()?;
+        let item = v["items"].as_array()?.first()?.clone();
+        let state = item["state"].as_str().unwrap_or_default();
+        // Older engines omit the instance once it finishes; a present instance
+        // that has not reached the end event is ACTIVE.
+        Some(matches!(state, "ACTIVE" | "RUNNING"))
+    }
+
     /// The job's activation deadline as the engine reports it
     /// (`POST /v2/jobs/search`), epoch millis. A worker that refreshes its
     /// lease pushes this out while the agent runs.
@@ -1043,6 +1071,137 @@ impl Engine {
 impl Default for Engine {
     fn default() -> Self {
         Engine::from_env()
+    }
+}
+
+/// One row of the **parity ledger** (issue #57): a behaviour a target does not
+/// implement yet, tracked by an issue that must close before the gap is gone.
+///
+/// The ledger is data, not prose: [`PARITY_GAPS`] is asserted in CI by
+/// `contract-tests/tests/parity.rs`, which fails when a row's issue is closed or
+/// unresolvable, so a gap cannot be parked here past its fix — and each row's
+/// issue is quoted in an `expect_parity` marker at the assertions that depend on
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParityGap {
+    /// The target that does not implement the behaviour yet.
+    pub target: Target,
+    /// The issue tracking the gap: `repo#N`, e.g. `"nanobpm/nano-supervisor#59"`
+    /// or `"jwulf/c8ctl-plugin-nano#274"`.
+    pub issue: &'static str,
+}
+
+impl ParityGap {
+    pub const fn new(target: Target, issue: &'static str) -> Self {
+        ParityGap { target, issue }
+    }
+}
+
+/// Every tracked parity gap, in one place. Each row must cite an **open** issue
+/// in a repository `tests/parity.rs` can reach. Add a row only alongside an
+/// `expect_parity` marker that names the same issue, and delete both when the
+/// issue closes.
+pub const PARITY_GAPS: &[ParityGap] = &[
+    // The Rust worker has no AgentInstance/AgentHistory producer: it never calls
+    // createAgentInstance/updateAgentInstance, so no engine-observable transcript
+    // exists for it.
+    ParityGap::new(Target::Rust, "nanobpm/nano-supervisor#59"),
+    // The reference's own producer gap: the pinned plugin (1.70.2) sends the
+    // terminal status update the engine owns (#274: UPDATE accepts only active
+    // statuses, so it 422s and strands the instance non-terminal), and retries
+    // a permanent 409 "already associated" instead of adopting the instance.
+    ParityGap::new(Target::Node, "jwulf/c8ctl-plugin-nano#274"),
+    ParityGap::new(Target::Node, "jwulf/c8ctl-plugin-nano#289"),
+];
+
+/// The outcome of a parity-gated assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parity {
+    /// The target implements the behaviour.
+    Pass,
+    /// The target does not implement it yet, and an open issue tracks the gap.
+    Xfail,
+    /// The target passes despite a marker expecting failure: the gap is fixed, so
+    /// the marker is stale and must be dropped. Distinct from [`Parity::Xfail`]
+    /// so [`assert_parity`] can FAIL loudly — an XPASS returned as `Xfail` passes
+    /// the assertion, and its only signal (a stderr line) is hidden by Cargo's
+    /// test-output capture on passing tests, letting a stale marker silently
+    /// survive to waive a later regression.
+    Xpass,
+    /// A target the marker does not name disagrees with the assertion.
+    Fail,
+}
+
+/// The parity verdict for `target` against an assertion's `check` result, under
+/// the marker `gap` — the `repo#N` issue for which THIS assertion is expected to
+/// fail on `target`, or `None` when the assertion must hold on every target.
+///
+/// This is the typed replacement (issue #60) for ad-hoc `if target != … {
+/// skip!(…) }` branches: the gap is declared with the issue that tracks it, and
+/// the test's own failure carries it — no silent skip.
+///
+/// The marker's `(target, issue)` pair must exist in [`PARITY_GAPS`]: a marker
+/// without a ledger row (a typo, or a row never added) is a `Fail`, not an
+/// XFAIL — otherwise it would waive the assertion with no open-issue guard ever
+/// tracking it. Membership is by exact pair, so a marker that names a real
+/// issue but on the wrong target still fails.
+///
+/// - `check` returns `Ok(())` with a `gap`: `Xpass` — an XPASS. The
+///   implementation caught up, so the marker is stale and must be dropped.
+/// - `check` returns `Err(..)` with a `gap`: `Xfail` — the expected failure.
+/// - `check` returns `Ok(())` with no `gap`: `Pass`.
+/// - `check` returns `Err(..)` with no `gap`: `Fail` — a real regression.
+pub fn expect_parity(target: Target, gap: Option<&str>, check: Result<(), String>) -> Parity {
+    if let Some(issue) = gap {
+        if !PARITY_GAPS
+            .iter()
+            .any(|row| row.target == target && row.issue == issue)
+        {
+            eprintln!(
+                "parity marker ({target:?}, {issue}) has no PARITY_GAPS row — \
+                 add the row (with an open issue) or drop the marker"
+            );
+            return Parity::Fail;
+        }
+    }
+    match (gap, check) {
+        (None, Ok(())) => Parity::Pass,
+        (None, Err(_)) => Parity::Fail,
+        (Some(issue), Err(_)) => {
+            eprintln!(
+                "XFAIL {target:?}: {issue} (expected failure — the gap is tracked, \
+                 so this is not a regression)"
+            );
+            Parity::Xfail
+        }
+        (Some(issue), Ok(())) => {
+            eprintln!("XPASS {target:?}: {issue} is fixed — drop this parity marker");
+            Parity::Xpass
+        }
+    }
+}
+
+/// Assert parity: panic with `why` unless `verdict` is [`Parity::Pass`] or
+/// [`Parity::Xfail`]. An [`Parity::Xpass`] also panics: the gap it names is
+/// fixed, so the marker is stale and must be dropped — failing loudly (rather
+/// than passing on a hidden stderr line) is what stops a stale marker from
+/// silently waiving a later regression. Composability note — callers that need
+/// to *read* the verdict (e.g. to skip a follow-on assertion) should match on it
+/// directly.
+pub fn assert_parity(verdict: Parity, why: impl FnOnce() -> String) {
+    if verdict == Parity::Fail {
+        panic!("{}", why());
+    }
+    if verdict == Parity::Xpass {
+        panic!(
+            "XPASS: the parity gap is fixed, so this marker is stale — remove \
+             THIS `expect_parity` marker now. Several markers may cite one \
+             PARITY_GAPS row (e.g. the Rust #59 row is shared), so delete the \
+             row only once its LAST marker is gone; removing it while other \
+             markers still cite it turns their expected failures into \
+             unregistered `Fail`s ({})",
+            why()
+        );
     }
 }
 
@@ -1476,6 +1635,94 @@ pub fn run_worker_job_with(
     )
 }
 
+/// [`run_worker_job`] against a process definition the caller supplies, instead
+/// of the default `bpmn::single_task`. Use when the SHAPE of the process matters
+/// to the assertion — e.g. `bpmn::single_task_with_gate`, which keeps the
+/// process instance ACTIVE after the agent job settles so a producer-driven
+/// terminal status update is observable at the engine rather than masked by the
+/// engine's own process-completion bookkeeping.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_job_with_bpmn(
+    engine: &Engine,
+    target: &Target,
+    test: &str,
+    bpmn_xml: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+) -> JobOutcome {
+    let home = TempHome::new();
+    let mut outcome = run_worker_job_inner(
+        engine,
+        target,
+        &home,
+        None,
+        test,
+        bpmn_xml,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+        "junior",
+    );
+    outcome._home = Some(home);
+    outcome
+}
+
+/// Pre-associate `element_instance_key` with an AgentInstance owned by the
+/// harness, so a worker under test that later creates one for the same element
+/// instance hits the engine's `409 "element instance … is already associated
+/// with agent instance …"` conflict (the reference's issue #289 precondition).
+///
+/// The engine's agent-instance lease is **engine-managed**: job activation does
+/// not expose a lease token to the client, so the harness cannot mint with the
+/// worker's own lease. It does not need to — the association conflict is a
+/// property of the element instance, and `409` fires regardless of the lease on
+/// the second, competing create.
+///
+/// Creates with the CONFIGURATION turn this engine's validation accepts: an
+/// empty `content` is valid only when the turn still carries configuration
+/// fields — a non-empty `systemPrompt` and explicit `model`/`provider` (the
+/// engine rejects an all-null/empty turn with "CONFIGURATION must change
+/// supported configuration fields"). Returns the harness instance's key.
+pub fn preassociate_agent_instance(
+    engine: &Engine,
+    element_instance_key: &str,
+    job_key: &str,
+    job_lease: &str,
+    system_prompt: &str,
+) -> String {
+    let body = serde_json::json!({
+        "elementInstanceKey": element_instance_key,
+        "jobKey": job_key,
+        "jobLease": job_lease,
+        "history": [{
+            "historyItemId": format!("configuration:{element_instance_key}"),
+            "loopIteration": 1,
+            "role": "CONFIGURATION",
+            "content": [],
+            "producedAt": "2000-01-01T00:00:00.000Z",
+            "model": "unknown",
+            "provider": "unknown",
+            "systemPrompt": [{ "contentType": "TEXT", "text": system_prompt }],
+        }],
+    });
+    let v: serde_json::Value = engine
+        .http()
+        .post(format!("{}/v2/agent-instances", engine.url()))
+        .json(&body)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .unwrap_or_else(|e| panic!("pre-associate create failed: {e}"));
+    v["agentInstanceKey"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| v["agentInstanceKey"].as_i64().map(|k| k.to_string()))
+        .expect("pre-associate: engine returned no agentInstanceKey")
+}
+
 /// The worker half of a [`with_worker_running`] run: everything the scoped
 /// closure needs to observe or steer the live job.
 pub struct WorkerRun {
@@ -1816,11 +2063,42 @@ fn run_worker_job_with_home(
 ) -> JobOutcome {
     let job_type = engine.unique_type(test);
     let process_id = format!("p-{job_type}");
+    let bpmn_xml = bpmn::single_task_with_headers(&process_id, &job_type, custom_headers);
+    run_worker_job_inner(
+        engine,
+        target,
+        home,
+        owned_home,
+        &job_type,
+        &bpmn_xml,
+        script,
+        vars,
+        worker_flags,
+        extra_env,
+        rank,
+    )
+}
+
+/// Deploy `bpmn_xml` (whose agent service task must carry `job_type`) and run
+/// the worker-under-test against it. Shared by [`run_worker_job_with_home`] and
+/// [`run_worker_job_with_bpmn`]; the latter passes the process XML directly.
+#[allow(clippy::too_many_arguments)]
+fn run_worker_job_inner(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    owned_home: Option<TempHome>,
+    job_type: &str,
+    bpmn_xml: &str,
+    script: &[serde_json::Value],
+    vars: serde_json::Value,
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    rank: &str,
+) -> JobOutcome {
+    let process_id = format!("p-{job_type}");
     engine
-        .deploy_bpmn(
-            &process_id,
-            &bpmn::single_task_with_headers(&process_id, &job_type, custom_headers),
-        )
+        .deploy_bpmn(&process_id, bpmn_xml)
         .expect("deploy bpmn");
     let instance = engine
         .create_instance(&process_id, vars)
@@ -1835,6 +2113,39 @@ fn run_worker_job_with_home(
         })
         .expect("create instance: no processInstanceKey");
 
+    run_worker_against_instance(
+        engine,
+        target,
+        home,
+        owned_home,
+        job_type,
+        &process_instance_key,
+        script,
+        worker_flags,
+        extra_env,
+        rank,
+    )
+}
+
+/// Run the worker-under-test against an **already deployed, already created**
+/// process instance — no deploy, no second `createProcessInstance`. Use when
+/// the test has set the existing instance up itself (e.g. pre-associated its
+/// element instance for the #289 conflict path): deploying and creating again
+/// would enqueue a SECOND job of the same type, and the worker could settle the
+/// fresh job while the assertions inspect the first instance.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_against_instance(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    owned_home: Option<TempHome>,
+    job_type: &str,
+    process_instance_key: &str,
+    script: &[serde_json::Value],
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    rank: &str,
+) -> JobOutcome {
     let work = tempfile::Builder::new()
         .prefix("ns-run-")
         .tempdir()
@@ -1849,7 +2160,7 @@ fn run_worker_job_with_home(
     // takes `--max-jobs 1` so it exits once the job is handled.
     let profile = format!("ctfake{}", rand_suffix());
     hire_profile_with_rank(*target, home, &profile, rank);
-    let mut cmd = work_command(*target, &profile, &job_type, worker_flags);
+    let mut cmd = work_command(*target, &profile, job_type, worker_flags);
     home.apply(&mut cmd);
     // NB: `AGENT_RESULT_FILE` is intentionally NOT set here — the worker itself
     // allocates it inside the per-job run dir and hands it to the agent. The
@@ -1873,13 +2184,13 @@ fn run_worker_job_with_home(
         // `run_node_worker`).
         Target::Node => run_node_worker(cmd, &record_path, || {
             engine
-                .job(&job_type)
+                .job(job_type)
                 .map_or(Settlement::Pending, |j| job_settlement(&j))
         }),
     };
     JobOutcome {
-        job_type,
-        process_instance_key,
+        job_type: job_type.to_string(),
+        process_instance_key: process_instance_key.to_string(),
         engine: engine.clone(),
         record_path,
         output,
@@ -2881,6 +3192,98 @@ mod unit {
         assert!(
             !sock.exists(),
             "the stale socket file is cleared so a later sweep is not fooled by it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    const RUST_GAP: Option<&str> = Some("nanobpm/nano-supervisor#59");
+
+    #[test]
+    fn no_gap_passes_and_fails_loudly() {
+        assert_eq!(expect_parity(Target::Node, None, Ok(())), Parity::Pass);
+        assert_eq!(
+            expect_parity(Target::Node, None, Err("boom".into())),
+            Parity::Fail
+        );
+    }
+
+    #[test]
+    fn a_gapped_failure_is_an_xfail_and_a_gapped_pass_is_an_xpass() {
+        assert_eq!(
+            expect_parity(Target::Rust, RUST_GAP, Err("not yet".into())),
+            Parity::Xfail
+        );
+        // The implementation caught up while the marker stayed: a distinct XPASS
+        // verdict (NOT Xfail) so `assert_parity` fails loudly — the stale marker
+        // must be dropped, and a hidden stderr line is not a sufficient signal.
+        assert_eq!(expect_parity(Target::Rust, RUST_GAP, Ok(())), Parity::Xpass);
+    }
+
+    #[test]
+    fn assert_parity_panics_on_fail_and_xpass() {
+        assert_parity(Parity::Pass, || "unused".to_string());
+        assert_parity(Parity::Xfail, || "unused".to_string());
+        let panicked = std::panic::catch_unwind(|| {
+            assert_parity(Parity::Fail, || "expected failure".to_string())
+        });
+        assert!(panicked.is_err(), "Parity::Fail must panic");
+        let xpass_panicked = std::panic::catch_unwind(|| {
+            assert_parity(Parity::Xpass, || "stale marker".to_string())
+        });
+        assert!(
+            xpass_panicked.is_err(),
+            "Parity::Xpass must panic (a stale marker fails loudly)"
+        );
+    }
+
+    #[test]
+    fn the_ledger_names_real_repos_and_open_gaps() {
+        // No non-empty assertion: an empty PARITY_GAPS is the desired zero-gap
+        // end state (see tests/parity.rs), so this loop is a no-op then.
+        for gap in PARITY_GAPS {
+            let (repo, number) = gap
+                .issue
+                .rsplit_once('#')
+                .unwrap_or_else(|| panic!("unparseable issue {gap:?}"));
+            assert_eq!(
+                repo.split('/').count(),
+                2,
+                "issue must be owner/repo#N: {gap:?}"
+            );
+            assert!(number.parse::<u64>().is_ok(), "issue number: {gap:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_without_a_ledger_row_fails_instead_of_waiving() {
+        // A typo'd or never-registered issue must NOT suppress the failure: the
+        // open-issue guard only tracks rows in PARITY_GAPS, so an arbitrary
+        // marker is a Fail, whether the check passed or not.
+        assert_eq!(
+            expect_parity(Target::Rust, Some("nanobpm/nano-supervisor#99999"), Ok(())),
+            Parity::Fail
+        );
+        assert_eq!(
+            expect_parity(
+                Target::Rust,
+                Some("nanobpm/nano-supervisor#99999"),
+                Err("boom".into())
+            ),
+            Parity::Fail
+        );
+    }
+
+    #[test]
+    fn a_marker_on_the_wrong_target_fails() {
+        // The ledger holds #59 for Rust; the same issue named for Node is not a
+        // tracked (target, issue) pair, so it must not waive a Node failure.
+        assert_eq!(
+            expect_parity(Target::Node, RUST_GAP, Err("boom".into())),
+            Parity::Fail
         );
     }
 }

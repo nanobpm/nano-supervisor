@@ -57,6 +57,64 @@ pub fn single_task_with_headers(
     )
 }
 
+/// [`single_task`] with a **gate**: an agent service task on one parallel branch
+/// and a `bpmn:userTask` on another, joined before the end event. The user task
+/// waits for an external completion, so the process instance (and every job in
+/// it) stays ACTIVE after the agent job settles.
+///
+/// This is what removes the engine's mask over AgentInstance completion: with
+/// an ordinary single-task process the engine completes the process instance —
+/// and with it the AgentInstance — the moment the job completes, so a producer
+/// that wrongly drives its own terminal update (issue #274: `updateAgentInstance`
+/// deliberately accepts only active statuses; completion is owned by the engine
+/// when the process ends) is invisible behind the engine's own bookkeeping.
+/// Holding the instance open removes that mask: the AgentInstance must read
+/// ACTIVE/non-terminal on the producer's restraint alone, and any invalid
+/// terminal update the producer sends shows up as what it is — a 422.
+pub fn single_task_with_gate(process_id: &str, job_type: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="defs-{process_id}"
+                  targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="{process_id}" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="fork"/>
+    <bpmn:parallelGateway id="fork">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="task"/>
+    <bpmn:serviceTask id="task" name="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="{job_type}"/>
+        <zeebe:agentDefinition agentType="external"/>
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="review"/>
+    <bpmn:userTask id="review" name="hold the process open">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="f4" sourceRef="task" targetRef="join"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="review" targetRef="join"/>
+    <bpmn:parallelGateway id="join">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:sequenceFlow id="f6" sourceRef="join" targetRef="end"/>
+    <bpmn:endEvent id="end"><bpmn:incoming>f6</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>
+"#
+    )
+}
+
 /// The five XML predefined entities, so a header value can carry JSON quotes
 /// and `&` without breaking the document.
 fn xml_escape(s: &str) -> String {
