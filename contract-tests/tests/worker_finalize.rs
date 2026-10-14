@@ -246,20 +246,34 @@ fn provisioned_completion_detects_the_provider_pr() {
     );
     git(
         &seed,
-        &["clone", "-q", "--bare", "--", ".", origin.to_str().expect("origin path")],
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--",
+            ".",
+            origin.to_str().expect("origin path"),
+        ],
     );
 
     // A fake `gh` on PATH: it records its arguments (so the test can assert
     // the provider lookup itself, not just the reconciled outcome) and emits a
     // canned `gh pr list --json …` array, so the worker's reconcile sees one
     // open PR without any network. The dir is kept alive for the whole test.
+    //
+    // Each invocation APPENDS its argv (one arg per line) followed by a `\037`
+    // (unit-separator) delimiter line, so the test can recover every gh call
+    // rather than only the last. A target may legitimately make more than one
+    // gh call after reconcile — e.g. the Node plugin posts an attribution
+    // `gh pr comment` once it has the PR number — and a last-write-wins `>`
+    // record would clobber the `pr list` argv the test needs to assert on.
     let gh_dir = tempfile::tempdir().expect("gh tempdir");
     let gh_path = gh_dir.path().join("gh");
     let gh_args = gh_dir.path().join("gh-args");
     std::fs::write(
         &gh_path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat <<'JSON'\n[{{\"number\":4242,\"url\":\"https://github.com/nanobpm/x/pull/4242\",\"state\":\"OPEN\",\"isDraft\":false,\"title\":\"agent slice\",\"author\":{{\"login\":\"nano-bot\"}}}}]\nJSON\n",
+            "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; printf '\\037\\n'; }} >> \"{}\"\ncat <<'JSON'\n[{{\"number\":4242,\"url\":\"https://github.com/nanobpm/x/pull/4242\",\"state\":\"OPEN\",\"isDraft\":false,\"title\":\"agent slice\",\"author\":{{\"login\":\"nano-bot\"}}}}]\nJSON\n",
             gh_args.display()
         ),
     )
@@ -296,7 +310,12 @@ fn provisioned_completion_detects_the_provider_pr() {
         &[],
         &[("PATH", path_env.as_str())],
     );
-    assert_eq!(outcome.job_state(), "COMPLETED", "stderr:\n{}", outcome.stderr());
+    assert_eq!(
+        outcome.job_state(),
+        "COMPLETED",
+        "stderr:\n{}",
+        outcome.stderr()
+    );
     let vars = outcome.variables();
     assert_eq!(
         vars["pushed"].as_bool(),
@@ -306,9 +325,15 @@ fn provisioned_completion_detects_the_provider_pr() {
     // The reconcile populated `pullRequest` from the fake gh's canned PR —
     // previously it was always null (issue #49).
     let pr = &vars["pullRequest"];
-    assert_eq!(pr["found"], true, "the provider PR must be detected: {vars:#?}");
+    assert_eq!(
+        pr["found"], true,
+        "the provider PR must be detected: {vars:#?}"
+    );
     assert_eq!(pr["number"], 4242, "{vars:#?}");
-    assert_eq!(pr["url"], "https://github.com/nanobpm/x/pull/4242", "{vars:#?}");
+    assert_eq!(
+        pr["url"], "https://github.com/nanobpm/x/pull/4242",
+        "{vars:#?}"
+    );
     assert_eq!(pr["state"], "OPEN", "{vars:#?}");
     assert_eq!(pr["isDraft"], false, "{vars:#?}");
     assert_eq!(pr["title"], "agent slice", "{vars:#?}");
@@ -319,11 +344,24 @@ fn provisioned_completion_detects_the_provider_pr() {
     // — otherwise a reconcile that omitted `--head` or looked up the wrong
     // branch would still pass on the canned output. The pushed branch is the
     // completion's `branch` variable (the fallback branch the worker pushed).
+    //
+    // The fake gh appends each invocation's argv followed by a `\037` delimiter
+    // line, so split the record back into one argv vector per gh call. A target
+    // may make further gh calls after reconcile (the Node plugin posts an
+    // attribution `gh pr comment`), so assert the `pr list` call is PRESENT with
+    // the exact argument list rather than that it was the only/last gh call.
     let branch = vars["branch"].as_str().expect("pushed branch variable");
-    let recorded: Vec<String> = std::fs::read_to_string(&gh_args)
-        .expect("the fake gh must have recorded its arguments")
-        .lines()
-        .map(str::to_string)
+    let raw =
+        std::fs::read_to_string(&gh_args).expect("the fake gh must have recorded its arguments");
+    let invocations: Vec<Vec<String>> = raw
+        .split('\u{1f}')
+        .map(|rec| {
+            rec.lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .filter(|argv| !argv.is_empty())
         .collect();
     let expected: Vec<String> = [
         "pr",
@@ -340,8 +378,9 @@ fn provisioned_completion_detects_the_provider_pr() {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    assert_eq!(
-        recorded, expected,
-        "the gh pr lookup must target the pushed branch with the full argument list"
+    assert!(
+        invocations.contains(&expected),
+        "the gh pr lookup must target the pushed branch with the full argument list; \
+         recorded gh invocations: {invocations:#?}"
     );
 }

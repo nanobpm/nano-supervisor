@@ -3874,9 +3874,7 @@ fn is_github_com_authority(authority: &str) -> bool {
     // Split an optional trailing `:port`. Only an all-ASCII-digit, non-empty
     // port counts; anything else means there is no port to strip.
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-            (h, Some(p))
-        }
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
         _ => (authority, None),
     };
     // Only the default HTTPS port (or none) collapses to github.com; a custom
@@ -4378,7 +4376,11 @@ async fn gh_pr_list(
 /// for the `gh` path. The daemon's own engine-connection secrets are still
 /// scrubbed below (as the `git()` launch does) since `gh` shells out to `git`
 /// inside the agent-controlled checkout.
-fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Option<GhConfigGuard>> {
+fn gh_auth_env(
+    cmd: &mut Command,
+    token: Option<&str>,
+    host: &str,
+) -> Result<Option<GhConfigGuard>> {
     // Strip the daemon's engine-connection secrets, exactly as the git launch
     // does: `gh` runs `git` against agent-controlled remotes/config, so a hostile
     // checkout must not be able to read `CAMUNDA_*`/`ZEEBE_*` client secrets out
@@ -4533,7 +4535,12 @@ mod tests {
     fn env_of(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
         cmd.get_envs()
             .filter_map(|(k, v)| {
-                v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
             })
             .collect()
     }
@@ -4922,10 +4929,10 @@ mod tests {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let crafted = std::env::join_paths([
-            std::path::PathBuf::from(""),  // empty → cwd
-            std::path::PathBuf::from("."), // cwd
+            std::path::PathBuf::from(""),            // empty → cwd
+            std::path::PathBuf::from("."),           // cwd
             std::path::PathBuf::from("rel-cli-dir"), // relative
-            tmp.clone(),                   // trusted absolute
+            tmp.clone(),                             // trusted absolute
         ])
         .unwrap();
 
@@ -4934,7 +4941,11 @@ mod tests {
         assert_eq!(resolved, exe, "must resolve the trusted absolute binary");
         // The sanitized PATH keeps ONLY the absolute entry.
         let kept: Vec<_> = std::env::split_paths(&sanitized).collect();
-        assert_eq!(kept, vec![tmp.clone()], "relative/empty entries must be stripped");
+        assert_eq!(
+            kept,
+            vec![tmp.clone()],
+            "relative/empty entries must be stripped"
+        );
 
         // A relative program path is refused outright (would resolve to cwd).
         assert!(trusted_cli_from("./fakebin", &crafted).is_err());
@@ -4988,11 +4999,20 @@ mod tests {
         // A bare owner/repo slug is github.com; a 3-segment slug names its
         // GitHub Enterprise host.
         assert_eq!(gh_host_of_slug("org/repo"), "github.com");
-        assert_eq!(gh_host_of_slug("ghe.example.com/org/repo"), "ghe.example.com");
+        assert_eq!(
+            gh_host_of_slug("ghe.example.com/org/repo"),
+            "ghe.example.com"
+        );
         // The host segment keeps a custom port / bracketed IPv6 so `GH_HOST`
         // pins the exact Enterprise authority.
-        assert_eq!(gh_host_of_slug("ghe.example:8443/org/repo"), "ghe.example:8443");
-        assert_eq!(gh_host_of_slug("[2001:db8::1]:8443/org/repo"), "[2001:db8::1]:8443");
+        assert_eq!(
+            gh_host_of_slug("ghe.example:8443/org/repo"),
+            "ghe.example:8443"
+        );
+        assert_eq!(
+            gh_host_of_slug("[2001:db8::1]:8443/org/repo"),
+            "[2001:db8::1]:8443"
+        );
     }
 
     #[test]
@@ -5006,12 +5026,25 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "pr", "list", "-R", "org/repo", "--head", "feat/x", "--state", "all", "--json",
-                "number,url,state,isDraft,title,author", "--limit", "1",
+                "pr",
+                "list",
+                "-R",
+                "org/repo",
+                "--head",
+                "feat/x",
+                "--state",
+                "all",
+                "--json",
+                "number,url,state,isDraft,title,author",
+                "--limit",
+                "1",
             ]
         );
         // The `-R owner/repo` pair is adjacent and carries the exact slug.
-        let i = args.iter().position(|a| a == "-R").expect("-R must be present for a slug");
+        let i = args
+            .iter()
+            .position(|a| a == "-R")
+            .expect("-R must be present for a slug");
         assert_eq!(args[i + 1], "org/repo");
 
         // A GitHub Enterprise slug keeps its host prefix so `-R` targets the
@@ -5023,8 +5056,14 @@ mod tests {
         // No slug → NO `-R` (cwd-based inference), but the branch is still
         // pinned with `--head`.
         let none = gh_pr_list_args(None, "feat/x");
-        assert!(!none.iter().any(|a| a == "-R"), "no -R without a slug: {none:?}");
-        let h = none.iter().position(|a| a == "--head").expect("--head present");
+        assert!(
+            !none.iter().any(|a| a == "-R"),
+            "no -R without a slug: {none:?}"
+        );
+        let h = none
+            .iter()
+            .position(|a| a == "--head")
+            .expect("--head present");
         assert_eq!(none[h + 1], "feat/x");
     }
 
@@ -5032,7 +5071,10 @@ mod tests {
     fn reconcile_gate_mirrors_node_push_failed() {
         // Mirrors Node's `workingBranch && allowPr && !pushFailed`: reconcile
         // runs for an allow-PR run whose publication did not fail.
-        assert!(reconcile_gate(true, false), "allow-PR + !push_failed → reconcile");
+        assert!(
+            reconcile_gate(true, false),
+            "allow-PR + !push_failed → reconcile"
+        );
         assert!(
             !reconcile_gate(false, false),
             "a run that was not asked to open a PR never reconciles"
@@ -5128,8 +5170,8 @@ mod tests {
         // could redirect the lookup off the trusted repo/host.
         cmd.env("GH_HOST", "evil.example.com");
         cmd.env("GH_REPO", "evil/repo");
-        let _guard = gh_auth_env(&mut cmd, Some("job-token"), "github.com")
-            .expect("github.com token env");
+        let _guard =
+            gh_auth_env(&mut cmd, Some("job-token"), "github.com").expect("github.com token env");
         let env = env_of(cmd.as_std());
         assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some("job-token"));
         assert!(
@@ -5156,14 +5198,17 @@ mod tests {
         // An ambient GH_HOST must be OVERRIDDEN to the trusted Enterprise host,
         // not left as whatever was inherited.
         ghe_cmd.env("GH_HOST", "evil.example.com");
-        let _ghe_guard = gh_auth_env(&mut ghe_cmd, Some("job-token"), "ghe.example.com")
-            .expect("ghe token env");
+        let _ghe_guard =
+            gh_auth_env(&mut ghe_cmd, Some("job-token"), "ghe.example.com").expect("ghe token env");
         let env = env_of(ghe_cmd.as_std());
         assert_eq!(
             env.get("GH_ENTERPRISE_TOKEN").map(String::as_str),
             Some("job-token")
         );
-        assert_eq!(env.get("GH_HOST").map(String::as_str), Some("ghe.example.com"));
+        assert_eq!(
+            env.get("GH_HOST").map(String::as_str),
+            Some("ghe.example.com")
+        );
         assert!(
             !env.contains_key("GH_TOKEN"),
             "GH_TOKEN must not be set for a GHE host: {env:?}"
@@ -5202,8 +5247,7 @@ mod tests {
         }
         anon_cmd.env("GH_HOST", "evil.example.com");
         anon_cmd.env("GH_REPO", "evil/repo");
-        let _anon_guard =
-            gh_auth_env(&mut anon_cmd, None, "github.com").expect("anonymous env");
+        let _anon_guard = gh_auth_env(&mut anon_cmd, None, "github.com").expect("anonymous env");
         let env = env_of(anon_cmd.as_std());
         for k in [
             "GH_TOKEN",
@@ -5211,7 +5255,10 @@ mod tests {
             "GH_ENTERPRISE_TOKEN",
             "GITHUB_ENTERPRISE_TOKEN",
         ] {
-            assert!(!env.contains_key(k), "{k} must be scrubbed anonymously: {env:?}");
+            assert!(
+                !env.contains_key(k),
+                "{k} must be scrubbed anonymously: {env:?}"
+            );
         }
         assert!(
             !env.contains_key("GH_HOST"),
@@ -5229,7 +5276,10 @@ mod tests {
         let token = "s3cr3tPAT";
         let text = format!("gh error using {token} at https://{token}@github.com/o/r");
         let red = redact_token(&text, Some(token));
-        assert!(!red.contains(token), "the literal token must be scrubbed: {red}");
+        assert!(
+            !red.contains(token),
+            "the literal token must be scrubbed: {red}"
+        );
         assert!(!red.contains('@'), "http userinfo must be scrubbed: {red}");
         assert!(red.contains("***"));
         // No token → userinfo is still scrubbed (the regex arm runs unconditionally).
@@ -5273,7 +5323,10 @@ mod tests {
         assert_eq!(bad["found"], false);
         assert_eq!(bad["openedBy"], serde_json::Value::Null);
         assert!(
-            bad["error"].as_str().unwrap_or_default().contains("malformed JSON"),
+            bad["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("malformed JSON"),
             "a parse failure must carry an error: {bad:#?}"
         );
         // A parsed-but-non-array payload (a JSON object) is likewise malformed,
@@ -5281,7 +5334,10 @@ mod tests {
         let obj = parse_pr_list(r#"{"number":1}"#);
         assert_eq!(obj["found"], false);
         assert!(
-            obj["error"].as_str().unwrap_or_default().contains("non-array"),
+            obj["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("non-array"),
             "a non-array payload must carry an error: {obj:#?}"
         );
         // The empty array and empty stdout stay error-free "no PR" results.
@@ -5293,10 +5349,16 @@ mod tests {
         // would falsely report found:true with all-null fields. Fail closed.
         for bad in [r#"[null]"#, r#"[1]"#, r#"["x"]"#, r#"[[]]"#, r#"[true]"#] {
             let r = parse_pr_list(bad);
-            assert_eq!(r["found"], false, "non-object entry must not be found: {bad}");
+            assert_eq!(
+                r["found"], false,
+                "non-object entry must not be found: {bad}"
+            );
             assert_eq!(r["openedBy"], serde_json::Value::Null);
             assert!(
-                r["error"].as_str().unwrap_or_default().contains("non-object"),
+                r["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("non-object"),
                 "a non-object array entry must carry an error: {r:#?}"
             );
         }
