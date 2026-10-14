@@ -10,7 +10,7 @@
 //! agents it is trying to quarantine (issue #41).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use camunda_orchestration_sdk::{CamundaClient, CamundaConfig, CamundaOptions, TlsConfig};
@@ -130,13 +130,45 @@ pub fn c8ctl_data_dir() -> Option<PathBuf> {
 /// plugins should resolve from too. Returns `None` when no plugins dir exists,
 /// so the seed simply omits the link (c8ctl then creates an empty one inside the
 /// isolated dir — there is nothing to share).
+///
+/// The returned path is ALWAYS absolute. `C8CTL_DATA_DIR` is honoured verbatim
+/// (see [`c8ctl_data_dir`]) and may therefore be relative, but the seed stores
+/// this path as a **symlink target** under `<run>/c8ctl/plugins` — and a
+/// relative target is resolved by the OS relative to the link's own parent, not
+/// the worker's cwd, so a relative source would seed a dangling link that still
+/// hides the operator's plugins. Absolutizing here, at the single producer of
+/// the target, closes that class for both seeders.
 pub fn c8ctl_plugins_dir() -> Option<PathBuf> {
-    let dir = c8ctl_data_dir()?.join("plugins");
+    plugins_dir_under(&c8ctl_data_dir()?)
+}
+
+/// Core of [`c8ctl_plugins_dir`], split out from the env lookup so it is unit
+/// testable without mutating process-global `C8CTL_DATA_DIR`.
+fn plugins_dir_under(data_dir: &Path) -> Option<PathBuf> {
+    let dir = data_dir.join("plugins");
     // `metadata` follows a symlink: an operator may legitimately keep their
     // plugins dir as a link. Only link it in when it resolves to a directory.
     match std::fs::metadata(&dir) {
-        Ok(m) if m.is_dir() => Some(dir),
+        Ok(m) if m.is_dir() => Some(absolutize(dir)),
         _ => None,
+    }
+}
+
+/// Make `path` absolute so it is safe to store as a symlink *target*: a relative
+/// target is resolved relative to the LINK's parent dir, not the worker's cwd.
+/// The path is known to exist (the caller checked `metadata`), so
+/// `canonicalize` yields an absolute, symlink-resolved path; if that ever fails
+/// we still never return a relative path — fall back to joining the cwd.
+fn absolutize(path: PathBuf) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(&path) {
+        return canon;
+    }
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
     }
 }
 
@@ -802,5 +834,104 @@ UN1CCiHPvqDsiGUoCf+ajydjBPrOo+S8rBIR1HlMUnLMojMp7kExWF0rXdkjvyic\n\
             err.to_string().contains("invalid client certificate/key"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Issue #51 (review round 2): a relative `C8CTL_DATA_DIR` yields a relative
+    /// plugins source, which — stored verbatim as the `<run>/c8ctl/plugins`
+    /// symlink target — would resolve relative to the link's parent and dangle.
+    /// `plugins_dir_under` must therefore ALWAYS return an absolute path, even
+    /// when the data dir handed to it is relative.
+    #[test]
+    fn plugins_dir_under_absolutizes_a_relative_data_dir() {
+        // A real plugins dir reachable via a relative path from the test's cwd.
+        let unique = format!("nano-profile-test-relplugins-{}", std::process::id());
+        let abs_data = std::env::temp_dir().join(&unique);
+        let _ = std::fs::remove_dir_all(&abs_data);
+        std::fs::create_dir_all(abs_data.join("plugins").join("nano")).unwrap();
+        std::fs::write(abs_data.join("plugins").join("nano").join("marker"), "P").unwrap();
+
+        // Build a RELATIVE data dir pointing at the same place, so the join +
+        // metadata check succeeds through a relative path.
+        let cwd = std::env::current_dir().unwrap();
+        let rel_data = pathdiff_relative(&cwd, &abs_data);
+        assert!(
+            rel_data.is_relative(),
+            "test precondition: data dir must be relative, got {}",
+            rel_data.display()
+        );
+
+        let out = plugins_dir_under(&rel_data).expect("existing plugins dir must resolve");
+        assert!(
+            out.is_absolute(),
+            "a relative data dir must still yield an absolute plugins target, got {}",
+            out.display()
+        );
+        // And it must not dangle: the absolute target resolves to the marker.
+        assert_eq!(
+            std::fs::read_to_string(out.join("nano").join("marker")).unwrap(),
+            "P",
+            "the absolutized target must resolve to the real plugins dir"
+        );
+        let _ = std::fs::remove_dir_all(&abs_data);
+    }
+
+    /// A missing plugins dir still yields `None` (seed omits the link), and an
+    /// existing absolute one is returned absolute and non-dangling.
+    #[test]
+    fn plugins_dir_under_handles_absent_and_absolute() {
+        let base = std::env::temp_dir().join(format!(
+            "nano-profile-test-absplugins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        // Absent: no plugins subdir.
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(
+            plugins_dir_under(&base).is_none(),
+            "no plugins dir means no link"
+        );
+        // Present (absolute input): returned absolute.
+        std::fs::create_dir_all(base.join("plugins")).unwrap();
+        let out = plugins_dir_under(&base).expect("plugins dir must resolve");
+        assert!(out.is_absolute(), "output must be absolute");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `absolutize` never returns a relative path, even for a path that does not
+    /// exist (so `canonicalize` fails and the cwd-join fallback runs).
+    #[test]
+    fn absolutize_never_returns_a_relative_path() {
+        let out = absolutize(PathBuf::from("does/not/exist/plugins"));
+        assert!(
+            out.is_absolute(),
+            "absolutize must always return an absolute path, got {}",
+            out.display()
+        );
+        assert!(
+            out.ends_with("does/not/exist/plugins"),
+            "the relative tail must be preserved under the cwd, got {}",
+            out.display()
+        );
+    }
+
+    /// Minimal relative-path computation (avoids a dependency): express `target`
+    /// relative to `base` by stripping the shared prefix and prepending `..` for
+    /// each remaining `base` component.
+    fn pathdiff_relative(base: &Path, target: &Path) -> PathBuf {
+        let base_c: Vec<_> = base.components().collect();
+        let tgt_c: Vec<_> = target.components().collect();
+        let common = base_c
+            .iter()
+            .zip(tgt_c.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut out = PathBuf::new();
+        for _ in common..base_c.len() {
+            out.push("..");
+        }
+        for c in &tgt_c[common..] {
+            out.push(c.as_os_str());
+        }
+        out
     }
 }
