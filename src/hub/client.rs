@@ -42,7 +42,7 @@ use tokio::time::{interval, sleep, timeout};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::hub::config::HubConfig;
+use crate::hub::config::{HubConfig, LOCAL_AGENTIC_TOKEN};
 use crate::hub::control::{parse_inbound_relay_chunk, ControlFrame};
 use crate::hub::frame::{decode_frame, encode_frame, Family, Frame, Lane, FRAME_HEADER_BYTES};
 use crate::hub::stream::{compose_stream_id, parse_stream_id};
@@ -392,13 +392,13 @@ impl LaneBuffer {
     /// historical CLAIM behind, so the "bounded" outage buffer still grew without
     /// limit. Reconnect resync is authoritative for ownership, so a collapsed
     /// CLAIM+RELEASE pair is re-derived on reconnect. Returns the collapsed
-    /// RELEASE's stream id (so the caller can disarm its now-orphaned drain
-    /// barrier), or `None` when under the cap. `cap == 0` disables collapsing
-    /// (admit without a bound).
-    fn push_back_release_bounded(&mut self, frame: Frame, cap: usize) -> Option<String> {
+    /// RELEASE frame's unique `seq` (so the caller can disarm its now-orphaned
+    /// drain barrier, which is keyed by that `seq`), or `None` when under the
+    /// cap. `cap == 0` disables collapsing (admit without a bound).
+    fn push_back_release_bounded(&mut self, frame: Frame, cap: usize) -> Option<u32> {
         debug_assert_eq!(frame.lane, Lane::Control);
         debug_assert_eq!(frame.family, Family::Release);
-        let mut collapsed = None;
+        let mut collapsed_seq = None;
         if cap > 0 {
             let release_count = self
                 .control
@@ -411,15 +411,17 @@ impl LaneBuffer {
                     .iter()
                     .position(|bf| bf.frame.family == Family::Release)
                 {
+                    let mut collapsed_stream = None;
                     if let Some(bf) = self.control.remove(pos) {
                         self.account_removed(&bf);
-                        collapsed = presence_stream_id(&bf.frame.payload);
+                        collapsed_seq = Some(bf.frame.seq);
+                        collapsed_stream = presence_stream_id(&bf.frame.payload);
                     }
                     // Compact the completed ownership record as a unit: drop the
                     // matching CLAIM too, or it stays orphaned (its RELEASE is
                     // gone) and the outage buffer grows one CLAIM per completed
                     // job without bound.
-                    if let Some(stream) = collapsed.as_deref() {
+                    if let Some(stream) = collapsed_stream.as_deref() {
                         if let Some(cpos) = self.control.iter().position(|bf| {
                             bf.frame.family == Family::Claim
                                 && presence_stream_id(&bf.frame.payload).as_deref() == Some(stream)
@@ -433,7 +435,7 @@ impl LaneBuffer {
             }
         }
         self.push_back_control_bounded(frame);
-        collapsed
+        collapsed_seq
     }
 
     /// Pop the next CONTROL frame only, leaving the lower (interactive/bulk)
@@ -670,14 +672,29 @@ pub struct HubClient {
     /// bridges, the SUM of every live bridge's pre-buffer stays within
     /// `buffer_byte_budget`.
     transcript_bridge_bound: usize,
-    /// Per-session RELEASE drain barriers, keyed by the session's composed
-    /// **stream id** (`<instance>/<jobKey>`) — the same identity a drained
-    /// RELEASE frame carries, so `drain` can look the barrier up directly.
-    /// [`HubSession::close`] arms the barrier when it enqueues the RELEASE;
-    /// `drain` then flushes the buffered lower-lane transcript tail to the
-    /// socket BEFORE writing that RELEASE. This preserves the cross-lane
-    /// ordering `LaneBuffer::pop` alone cannot (control drains before bulk).
-    release_barriers: Mutex<HashMap<String, ReleaseBarrier>>,
+    /// FIXED steer channel bound for EVERY session, precomputed at
+    /// [`spawn`](HubClient::spawn) as
+    /// `steer_channel_bound(buffer_byte_budget / slot_count)`. Partitioned by the
+    /// configured slot count for the SAME reason as `transcript_bridge_bound`: a
+    /// per-session `steer_channel_bound(buffer_byte_budget)` would let each of
+    /// the (up to `slot_count`) live sessions retain the full byte budget in its
+    /// steer queue, so a stalled/hostile hub could pin `slot_count ×
+    /// buffer_byte_budget` across them. A fixed `budget / slot_count` share with
+    /// at most `slot_count` concurrent sessions keeps the aggregate steer memory
+    /// within `buffer_byte_budget`.
+    steer_bridge_bound: usize,
+    /// Armed RELEASE drain barriers, keyed by the unique **`seq` of the RELEASE
+    /// frame** the arming [`HubSession::close`] enqueued — NOT the composed
+    /// stream id. A stream id is reused by every retry of the same job on the
+    /// same slot, so a stream-keyed barrier let a redelivered job's
+    /// `register_session` overwrite a predecessor's still-armed barrier whose
+    /// RELEASE was buffered during an outage, letting that RELEASE overtake its
+    /// queued transcript tail. Keying on the RELEASE frame's own `seq` (unique
+    /// per frame) lets multiple generations of the same stream coexist until
+    /// each RELEASE drains. `drain` looks the barrier up by the popped RELEASE
+    /// frame's `seq`; a matching (armed) seq defers the RELEASE until that
+    /// session's transcript tail has been written, then consumes it.
+    release_barriers: Mutex<HashSet<u32>>,
     /// Per-client PRNG state for reconnect jitter (seeded once at spawn from a
     /// real entropy mix), so a fleet of daemons does not reconnect in lockstep.
     rng: AtomicU64,
@@ -737,6 +754,13 @@ impl HubClient {
             (byte_capacity / slot_count.max(1)).max(1)
         };
         let transcript_bridge_bound = transcript_channel_bound(per_bridge_budget);
+        // The steer channel gets the SAME fixed per-slot share as the transcript
+        // bridge: a per-session `steer_channel_bound(buffer_byte_budget)` would
+        // let each of the up-to-`slot_count` live sessions retain the whole byte
+        // budget in its steer queue (aggregate `slot_count × budget`), defeating
+        // the daemon-wide bound. Partitioning by the fixed slot count keeps the
+        // summed steer memory within `buffer_byte_budget`.
+        let steer_bridge_bound = steer_channel_bound(per_bridge_budget);
         let client = Arc::new(HubClient {
             config,
             outbound: Mutex::new(LaneBuffer::with_limits(capacity, byte_capacity)),
@@ -754,7 +778,8 @@ impl HubClient {
             active_bridges: AtomicU64::new(0),
             slot_count,
             transcript_bridge_bound,
-            release_barriers: Mutex::new(HashMap::new()),
+            steer_bridge_bound,
+            release_barriers: Mutex::new(HashSet::new()),
             rng: AtomicU64::new(seed_rng()),
         });
         // Fold the config-level advertisement into each pre-seeded capability.
@@ -800,8 +825,14 @@ impl HubClient {
         // of `STEER_CHANNEL_BOUND` and a byte-derived bound (see
         // `steer_channel_bound`), so a hub delivering steer faster than the turn
         // consumes it can neither queue unbounded controls nor grow memory past
-        // the configured `buffer_byte_budget`.
-        let steer_bound = steer_channel_bound(self.config.buffer_byte_budget);
+        // the configured `buffer_byte_budget`. The byte share is the FIXED
+        // per-slot `buffer_byte_budget / slot_count` (`steer_bridge_bound`,
+        // precomputed at `spawn`), NOT the whole budget: with up to `slot_count`
+        // concurrent sessions each holding a full-budget steer queue, the
+        // aggregate would otherwise reach `slot_count × buffer_byte_budget`. The
+        // fixed share keeps the SUM across all live steer queues within the
+        // budget, exactly as the transcript bridge partitions its own.
+        let steer_bound = self.steer_bridge_bound;
         let (steer_tx, steer_rx) = mpsc::channel::<ControlFrame>(steer_bound);
         self.sessions
             .lock()
@@ -866,14 +897,14 @@ impl HubClient {
         }
         self.outbound_notify.notify_one();
 
-        // Arm the RELEASE drain barrier for this session, keyed by its stream id
-        // (the identity a drained RELEASE carries). `close` arms it before
-        // enqueueing the RELEASE; `drain` then flushes the transcript tail to
-        // the socket before writing that RELEASE.
-        self.release_barriers
-            .lock()
-            .unwrap()
-            .insert(stream.clone(), ReleaseBarrier::default());
+        // No RELEASE barrier is pre-registered here. A barrier exists only once
+        // `close` arms it, keyed by the unique `seq` of the RELEASE frame it
+        // enqueues (see `HubClient::release_job`/`release_barriers`). Keying on
+        // the per-frame `seq` rather than this session's (reusable) stream id is
+        // what lets a retry of the same job on the same slot coexist with a
+        // predecessor whose armed RELEASE is still buffered during an outage —
+        // the predecessor's barrier is no longer overwritten by this
+        // registration.
 
         HubSession {
             client: self.clone(),
@@ -1101,7 +1132,15 @@ impl HubClient {
     /// nano-workforce#893 — a RELEASE collapsed during an outage can leave a job
     /// looking owned until the worker deregisters; ownership is advisory
     /// visibility only, so this is accepted.)
-    fn release_job(&self, instance: &str, job_key: &str) {
+    /// Enqueue a job's RELEASE. `armed` is `true` from the preferred
+    /// [`HubSession::close`] path (the transcript tail was flushed and the
+    /// RELEASE must be deferred at the socket until that tail is written) and
+    /// `false` from the `Drop` fallback (no tail was awaited, so the RELEASE may
+    /// be sent immediately). An armed RELEASE records a drain barrier keyed by
+    /// the RELEASE frame's unique `seq`, so `drain`/`drain_control` can match it
+    /// exactly — even when a retry of the SAME job on the SAME slot has another
+    /// RELEASE (a different `seq`) for the identical stream still buffered.
+    fn release_job(&self, instance: &str, job_key: &str, armed: bool) {
         let payload = json!({ "instance": instance, "jobKey": job_key });
         // Hold the SINGLE outbound lock across BOTH the `in_flight` removal and
         // the RELEASE admission, so the pair is atomic with respect to
@@ -1120,67 +1159,83 @@ impl HubClient {
         if let Some(jobs) = self.in_flight.lock().unwrap().get_mut(instance) {
             jobs.remove(job_key);
         }
-        if self.connected.load(Ordering::Relaxed) {
+        let frame = self.make_frame(Lane::Control, Family::Release, payload);
+        // The unique identity the drain barrier is keyed on (see
+        // `release_barriers`). Captured BEFORE the frame is moved into the
+        // buffer.
+        let release_seq = frame.seq;
+        // Arm THIS RELEASE's barrier (if requested) while STILL holding the
+        // outbound lock and BEFORE the frame is enqueued, so a concurrent
+        // `drain` cannot pop the RELEASE and see it un-armed in the window
+        // between enqueue and arm — which would send it ahead of its transcript
+        // tail. `drain` always takes the outbound lock to pop, then the
+        // `release_barriers` lock in `release_gate`; arming here under the
+        // outbound lock keeps that outbound → release_barriers order (no
+        // deadlock) and makes "frame buffered" imply "barrier armed".
+        if armed {
+            self.release_barriers.lock().unwrap().insert(release_seq);
+        }
+        let collapsed = if self.connected.load(Ordering::Relaxed) {
             // Live connection: enqueue EXEMPT and ordered — `drain`'s per-session
             // barrier writes the transcript tail before this RELEASE, and the
-            // RELEASE itself is never dropped.
-            let frame = self.make_frame(Lane::Control, Family::Release, payload);
+            // RELEASE itself is never dropped. Nothing is collapsed on the live
+            // path.
             buf.push_back_control_bounded(frame);
-            drop(buf);
-            self.outbound_notify.notify_one();
-            return;
-        }
-        // OUTAGE: nothing is draining, so an unbounded RELEASE+barrier set would
-        // otherwise grow with every completed job for the whole outage. Reconnect
-        // resync is AUTHORITATIVE for ownership (it re-derives every live claim),
-        // so the buffered RELEASE set is bounded under a fixed cap: a new RELEASE
-        // collapses the OLDEST completed-ownership one past the cap (see
-        // `RELEASE_OUTAGE_CAP`). The newest RELEASE is still admitted exempt. The
-        // collapsed stream's orphaned drain barrier is disarmed so armed barriers
-        // stay bounded too.
-        let frame = self.make_frame(Lane::Control, Family::Release, payload);
-        let collapsed = buf.push_back_release_bounded(frame, RELEASE_OUTAGE_CAP);
+            None
+        } else {
+            // OUTAGE: nothing is draining, so an unbounded RELEASE+barrier set
+            // would otherwise grow with every completed job for the whole outage.
+            // Reconnect resync is AUTHORITATIVE for ownership (it re-derives every
+            // live claim), so the buffered RELEASE set is bounded under a fixed
+            // cap: a new RELEASE collapses the OLDEST completed-ownership one past
+            // the cap (see `RELEASE_OUTAGE_CAP`). The newest RELEASE is still
+            // admitted exempt. The collapsed RELEASE's orphaned drain barrier is
+            // disarmed below so armed barriers stay bounded too.
+            buf.push_back_release_bounded(frame, RELEASE_OUTAGE_CAP)
+        };
         drop(buf);
-        if let Some(stream) = collapsed {
-            self.disarm_release_barrier(&stream);
+        // Disarm the barrier of any RELEASE the outage cap collapsed (keyed by
+        // that frame's own `seq`). It is distinct from `release_seq` — the newest
+        // RELEASE is always admitted, never collapsed — so this never undoes the
+        // arm above.
+        if let Some(collapsed_seq) = collapsed {
+            self.disarm_release_barrier(collapsed_seq);
         }
         self.outbound_notify.notify_one();
     }
 
-    /// Arm a session's RELEASE drain barrier: the RELEASE `close` is about to
-    /// enqueue must be deferred at the socket until the transcript tail already
-    /// buffered ahead of it has been written. Called by [`HubSession::close`]
-    /// AFTER the bridge flush and BEFORE the RELEASE is enqueued.
-    fn arm_release_barrier(&self, stream: &str) {
-        if let Some(barrier) = self.release_barriers.lock().unwrap().get_mut(stream) {
-            barrier.armed = true;
-        }
-    }
-
     /// Decide what `drain` should do with a just-popped RELEASE. Looks the
-    /// barrier up by the RELEASE's own `(instance, jobKey)` (composed to its
-    /// stream id). A RELEASE with an ARMED barrier is deferred (`Defer`) so the
-    /// transcript tail drains first; any other RELEASE (a `Drop` fallback, or an
-    /// already-consumed barrier) is sent immediately (`SendNow`).
-    fn release_gate(&self, payload: &Value) -> ReleaseGate {
+    /// barrier up by the RELEASE frame's unique `seq`. A RELEASE whose `seq` is
+    /// armed is deferred (`Defer`) so the transcript tail drains first; any
+    /// other RELEASE (a `Drop` fallback, or an already-consumed barrier) is sent
+    /// immediately (`SendNow`). `Defer` carries both the `seq` to consume and the
+    /// composed stream id whose tail must be flushed first.
+    fn release_gate(&self, frame: &Frame) -> ReleaseGate {
+        if !self.release_barriers.lock().unwrap().contains(&frame.seq) {
+            return ReleaseGate::SendNow;
+        }
+        // The barrier is armed. Derive the stream whose transcript tail must be
+        // flushed ahead of this RELEASE. An armed RELEASE always carries a valid
+        // `(instance, jobKey)` (built by `release_job`); if it somehow does not,
+        // consume the barrier and send now rather than leak it.
         let (Some(instance), Some(job_key)) = (
-            payload.get("instance").and_then(Value::as_str),
-            payload.get("jobKey").and_then(Value::as_str),
+            frame.payload.get("instance").and_then(Value::as_str),
+            frame.payload.get("jobKey").and_then(Value::as_str),
         ) else {
+            self.disarm_release_barrier(frame.seq);
             return ReleaseGate::SendNow;
         };
-        let stream = compose_stream_id(instance, job_key);
-        let barriers = self.release_barriers.lock().unwrap();
-        match barriers.get(&stream) {
-            Some(ReleaseBarrier { armed: true }) => ReleaseGate::Defer { stream },
-            _ => ReleaseGate::SendNow,
+        ReleaseGate::Defer {
+            stream: compose_stream_id(instance, job_key),
+            seq: frame.seq,
         }
     }
 
-    /// Consume a session's RELEASE barrier once `drain` has finally written the
-    /// RELEASE (so a late duplicate or a reconnect resync does not re-defer).
-    fn disarm_release_barrier(&self, stream: &str) {
-        self.release_barriers.lock().unwrap().remove(stream);
+    /// Consume a RELEASE barrier (by the RELEASE frame's `seq`) once `drain` has
+    /// finally written the RELEASE (so a late duplicate or a reconnect resync
+    /// does not re-defer), or when the outage cap collapses that RELEASE.
+    fn disarm_release_barrier(&self, seq: u32) {
+        self.release_barriers.lock().unwrap().remove(&seq);
     }
 
     /// Remove the bridge flush handle for `id` and decrement the live-bridge
@@ -1427,26 +1482,21 @@ struct BridgeFlush {
     handle: JoinHandle<()>,
 }
 
-/// A per-session RELEASE drain barrier (finding: a job's RELEASE must not
-/// overtake its transcript tail ON THE WIRE). `LaneBuffer::pop` always drains
-/// the control lane (RELEASE) before the bulk lane (transcript), so enqueue
-/// order alone does not order them on the socket. While a barrier is armed for
-/// a stream, `drain` flushes that stream's buffered lower-lane transcript tail
-/// to the socket ([`drain_lower_lanes`]) BEFORE writing the RELEASE — so the
-/// tail is on the wire first, without giving up control-over-bulk priority for
-/// any other frame.
-///
-/// The barrier is armed by [`HubSession::close`] (which flushes the bridge tail
-/// into the buffer first) and consumed by `drain` when it finally sends the
-/// RELEASE. A `Drop` fallback RELEASE (a session dropped without `close`) arms
-/// no barrier, so it is sent immediately — best-effort, as documented.
-#[derive(Default)]
-struct ReleaseBarrier {
-    /// True once `close` has armed the barrier (the RELEASE is expected and the
-    /// tail must be flushed first). Distinguishes an armed barrier from a
-    /// `Drop`-fallback RELEASE that should be sent immediately.
-    armed: bool,
-}
+// RELEASE drain barriers (finding: a job's RELEASE must not overtake its
+// transcript tail ON THE WIRE) are tracked as a `HashSet<u32>` of ARMED RELEASE
+// frame `seq`s on `HubClient`, keyed by each RELEASE frame's unique `seq`
+// rather than by stream id. `LaneBuffer::pop` always drains the control lane
+// (RELEASE) before the bulk lane (transcript), so enqueue order alone does not
+// order them on the socket. While a RELEASE's `seq` is in the armed set,
+// `drain` flushes that stream's buffered lower-lane transcript tail to the
+// socket (`drain_lower_lanes`) BEFORE writing the RELEASE — so the tail is on
+// the wire first, without giving up control-over-bulk priority for any other
+// frame. Keying on the frame `seq` (unique per RELEASE) instead of the reusable
+// stream id lets a RETRIED job on the same slot carry its own barrier without
+// clobbering a predecessor RELEASE for the identical stream that is still
+// buffered during an outage. A barrier is armed by `HubSession::close` and
+// consumed by `drain` when it finally sends the RELEASE; a `Drop` fallback
+// RELEASE arms none, so it is sent immediately — best-effort, as documented.
 
 /// What `drain` should do with a just-popped RELEASE frame (see
 /// [`HubClient::release_gate`]).
@@ -1454,8 +1504,9 @@ enum ReleaseGate {
     /// No barrier applies — write the RELEASE to the socket immediately.
     SendNow,
     /// Flush this stream's buffered lower-lane tail to the socket first, then
-    /// write the RELEASE. `stream` identifies the barrier to consume.
-    Defer { stream: String },
+    /// write the RELEASE. `stream` identifies the lower-lane tail to flush and
+    /// `seq` the armed barrier to consume (the RELEASE frame's unique `seq`).
+    Defer { stream: String, seq: u32 },
 }
 
 /// A per-job hub session: worker presence is live for its instance, the job is
@@ -1584,7 +1635,7 @@ impl HubSession {
             }
             let _ = handle.await;
         }
-        // NOTE: no `arm_release_barrier` and no `release_job` here — the job
+        // NOTE: no armed RELEASE barrier and no `release_job` here — the job
         // stays CLAIMed; the tail is buffered for the NEXT turn's bridge (or
         // the final `close`) to flush ahead of the single job-level RELEASE.
     }
@@ -1592,16 +1643,17 @@ impl HubSession {
     /// Asynchronously flush this session's transcript tail all the way toward
     /// the socket, then enqueue the job's RELEASE behind a drain barrier so it
     /// cannot overtake that tail on the wire. Steps: (1) close the bridge input
-    /// and await its accepted updates reaching the outbound buffer; (2) arm this
-    /// session's drain barrier; (3) enqueue the RELEASE. When `drain` pops that
+    /// and await its accepted updates reaching the outbound buffer; (2) enqueue
+    /// the RELEASE with `armed = true`, which records this RELEASE's drain
+    /// barrier (keyed by its frame `seq`). When `drain` pops that
     /// RELEASE it first flushes the buffered lower-lane tail to the socket
     /// ([`drain_lower_lanes`]) and only then writes the RELEASE — so the
     /// transcript tail is on the wire first even though the control lane
     /// (RELEASE) drains before the bulk lane. This is the PREFERRED close path:
     /// it awaits on the runtime, so (unlike `Drop`) it never parks a Tokio worker
     /// thread. Bounded by `TRANSCRIPT_FLUSH_TIMEOUT` so a wedged bridge can never
-    /// hang the caller. Idempotent: after it runs, `released` is set and `Drop`
-    /// finds the barrier already armed, so neither re-enqueues the RELEASE.
+    /// hang the caller. Idempotent: after it runs, `released` is set, so neither
+    /// it nor `Drop` re-enqueues the RELEASE.
     pub async fn close(&mut self) {
         // Idempotent against a SECOND `close()` (or a `close` after a `Drop`
         // fallback already released): once the RELEASE is enqueued, `released`
@@ -1654,23 +1706,18 @@ impl HubSession {
             // can produce nothing more before we enqueue the RELEASE.
             let _ = handle.await;
         }
-        // Arm the drain barrier BEFORE enqueueing the RELEASE: the RELEASE must
-        // be deferred at the socket until the transcript tail already buffered
-        // ahead of it has been written.
-        self.client.arm_release_barrier(&self.stream);
         // Mark released ONLY now — after every await — so a `close` cancelled
         // mid-flush leaves `released == false` and lets `Drop` fall back to a
         // best-effort `release_job` (no job is ever stranded in `in_flight`).
         // Past this point there are no more awaits, so `Drop` cannot interleave
-        // and double-RELEASE: it sees `released == true` and the barrier already
-        // armed, and bails.
+        // and double-RELEASE: it sees `released == true` and bails.
         self.released = true;
-        // RELEASE the job now that its transcript tail is queued behind the
-        // barrier. Worker REGISTER persists until shutdown/deregister. The
-        // barrier entry stays in the map; `drain` consumes it when it sends the
-        // RELEASE (and `Drop` below finds it already armed, so it does not
-        // re-RELEASE).
-        self.client.release_job(&self.instance, &self.job_key);
+        // RELEASE the job now that its transcript tail is queued. Pass
+        // `armed = true`: `release_job` records a drain barrier keyed by the
+        // RELEASE frame's unique `seq`, so `drain` flushes that transcript tail
+        // ahead of the RELEASE on the wire. Worker REGISTER persists until
+        // shutdown/deregister.
+        self.client.release_job(&self.instance, &self.job_key, true);
     }
 
     /// Nonblocking transcript-flush fallback for drop paths that did not call
@@ -1714,14 +1761,10 @@ impl Drop for HubSession {
             return;
         }
         self.released = true;
-        // Disarm the (unarmed) barrier so a later stale lookup cannot fire, then
-        // release. `drain`/`close` treat an armed-or-gone barrier as handled.
+        // RELEASE best-effort with no drain barrier (`armed = false`): the
+        // bridge tail was not awaited on this fallback path.
         self.client
-            .release_barriers
-            .lock()
-            .unwrap()
-            .remove(&self.stream);
-        self.client.release_job(&self.instance, &self.job_key);
+            .release_job(&self.instance, &self.job_key, false);
     }
 }
 
@@ -1890,7 +1933,94 @@ fn percent_encode_query(value: &str) -> String {
     out
 }
 
+/// Whether connecting with `config` would transmit a real identity credential
+/// over an UNENCRYPTED, non-local WebSocket. `tokio-tungstenite` carries the
+/// identity as a `?token=` query param on the upgrade URL (see
+/// [`authenticated_url`]); over a plaintext `ws://` scheme that whole URL —
+/// credential included — crosses the network in the clear, so a real secret or
+/// token sent to a remote host is exposed to anyone on-path. Returns `true`
+/// (meaning "refuse") only when ALL of these hold:
+///   * a real identity is configured — `identity_token` resolves to something
+///     that is NOT the sentinel [`LOCAL_AGENTIC_TOKEN`] (the local, no-auth dev
+///     token carries no secret worth protecting, so local-mode is exempt), AND
+///   * the URL scheme is plaintext `ws://` (a `wss://` URL is encrypted — the
+///     `rustls-tls-native-roots` feature gives tungstenite a TLS backend so it
+///     can actually complete that handshake), AND
+///   * the host is NOT loopback/localhost (sending a credential to a process on
+///     the same machine never leaves it, so local plaintext is fine and keeps
+///     the default dev experience working).
+fn insecure_credential_exposure(config: &HubConfig) -> bool {
+    let Some(identity) = identity_token(config) else {
+        return false; // no credential to expose
+    };
+    if identity == LOCAL_AGENTIC_TOKEN {
+        return false; // local no-auth dev token — nothing secret to protect
+    }
+    let url = config.url.trim();
+    // `wss://` is TLS-encrypted; only bare `ws://` is in the clear. Any other
+    // scheme is not a WebSocket URL we would connect over plaintext.
+    let Some(rest) = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("WS://"))
+    else {
+        return false;
+    };
+    !is_local_host(host_of(rest))
+}
+
+/// Extract the host from the post-`ws://` remainder of a URL: drop any
+/// `userinfo@`, stop at the first `/`, `?`, or `#`, and strip a trailing
+/// `:port` (handling a bracketed `[ipv6]:port`). Best-effort — a value this
+/// cannot parse is treated as a (non-local) host by the caller, i.e. refused.
+fn host_of(rest: &str) -> &str {
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Drop userinfo (`user:pass@host`); the host is after the LAST `@`.
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(after_bracket) = hostport.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port` — the host is inside the brackets.
+        return after_bracket.split(']').next().unwrap_or(after_bracket);
+    }
+    // `host` or `host:port` — a bare IPv6 has multiple colons and no brackets,
+    // but such a URL is malformed; splitting on the first `:` is fine for the
+    // host:port case and still yields a non-local token for anything odd.
+    hostport.split(':').next().unwrap_or(hostport)
+}
+
+/// Whether `host` names the local machine (loopback), so a plaintext credential
+/// sent to it never leaves the host. Covers the `localhost` name (and any
+/// `*.localhost` per RFC 6761) plus every loopback IP literal — `127.0.0.0/8`
+/// and `::1` — via `IpAddr::is_loopback`, not just the `127.0.0.1`/`::1` spelling.
+fn is_local_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") || {
+        let lower = host.to_ascii_lowercase();
+        lower.ends_with(".localhost")
+    } {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 async fn connect(config: &HubConfig) -> anyhow::Result<WsStream> {
+    // Fail CLOSED before the handshake if connecting would leak a real
+    // credential over plaintext to a remote host (see
+    // `insecure_credential_exposure`). The identity rides the upgrade URL's
+    // `?token=` query param, so an unencrypted `ws://` to a non-local host would
+    // put the secret on the wire in the clear. Bailing here just fails this
+    // connect attempt; `connection_loop` logs it and retries with backoff,
+    // never exposing the credential. Use `wss://` (TLS) or a loopback host.
+    if insecure_credential_exposure(config) {
+        anyhow::bail!(
+            "agentic hub: refusing to send credential over plaintext ws:// to a non-local host; \
+             use wss:// (TLS) or point the URL at localhost"
+        );
+    }
     let url = authenticated_url(config);
     // The identity is carried on the `?token=` query param (see
     // `authenticated_url`/`identity_token`), exactly as the reference client
@@ -2054,7 +2184,7 @@ async fn drain(
         // without yielding control-over-bulk priority for any OTHER frame (a
         // different session's control frame already drained ahead).
         if frame.family == Family::Release {
-            if let ReleaseGate::Defer { stream } = client.release_gate(&frame.payload) {
+            if let ReleaseGate::Defer { stream, seq } = client.release_gate(&frame) {
                 // Write this session's own buffered bulk/interactive tail first,
                 // but in BOUNDED batches: an armed RELEASE must not let its tail
                 // flush bypass `batch_limit` and keep `read.next()` /
@@ -2089,7 +2219,7 @@ async fn drain(
                 }
                 // The tail is now fully on the socket: consume the barrier and
                 // let the RELEASE be written.
-                client.disarm_release_barrier(&stream);
+                client.disarm_release_barrier(seq);
             }
         }
         match encode_frame(&frame) {
@@ -2248,15 +2378,15 @@ async fn drain_control(
         // it ahead of a tail that will never be written, and end the terminal
         // drain (ownership is re-derived by reconnect resync).
         if frame.family == Family::Release {
-            if let ReleaseGate::Defer { stream } = client.release_gate(&frame.payload) {
+            if let ReleaseGate::Defer { stream, seq } = client.release_gate(&frame) {
                 // Terminal path: flush the whole tail (budget `0` = unbounded).
                 // There are no reads to keep serviceable here — the socket is
                 // about to close — so bounding would only add round-trips.
                 if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream, 0).await {
-                    client.disarm_release_barrier(&stream);
+                    client.disarm_release_barrier(seq);
                     return Err(e);
                 }
-                client.disarm_release_barrier(&stream);
+                client.disarm_release_barrier(seq);
             }
         }
         match encode_frame(&frame) {
@@ -4637,19 +4767,23 @@ mod tests {
             0,
             json!({ "op": "produce", "stream": s0, "chunk": "t" }),
         ));
-        let rel = |j: &str| {
+        let rel = |j: &str, seq: u32| {
             Frame::new(
                 Lane::Control,
                 Family::Release,
-                0,
+                seq,
                 json!({ "instance": "w", "jobKey": j }),
             )
         };
-        assert!(buf.push_back_release_bounded(rel("j0"), 2).is_none());
-        assert!(buf.push_back_release_bounded(rel("j1"), 2).is_none());
-        // Third RELEASE at cap=2 collapses the OLDEST (j0) and names its stream.
-        let collapsed = buf.push_back_release_bounded(rel("j2"), 2);
-        assert_eq!(collapsed.as_deref(), Some(s0.as_str()));
+        assert!(buf.push_back_release_bounded(rel("j0", 10), 2).is_none());
+        assert!(buf.push_back_release_bounded(rel("j1", 11), 2).is_none());
+        // Third RELEASE at cap=2 collapses the OLDEST (j0) and names its seq.
+        let collapsed = buf.push_back_release_bounded(rel("j2", 12), 2);
+        assert_eq!(
+            collapsed,
+            Some(10),
+            "collapsed RELEASE's own frame seq is returned"
+        );
         let releases: Vec<String> = buf
             .control
             .iter()
@@ -4728,15 +4862,17 @@ mod tests {
             !client.connected.load(Ordering::Relaxed),
             "precondition: the client is disconnected (outage)"
         );
-        let first = compose_stream_id("w", "job-0");
-        // Arm a barrier for the oldest job, exactly as `close()` would.
-        client
-            .release_barriers
-            .lock()
-            .unwrap()
-            .insert(first.clone(), ReleaseBarrier { armed: true });
-        for i in 0..RELEASE_OUTAGE_CAP + 5 {
-            client.release_job("w", &format!("job-{i}"));
+        // Arm a barrier for the oldest job exactly as `close()` would — by
+        // enqueueing its RELEASE with `armed = true`, which records the drain
+        // barrier keyed by that RELEASE frame's own seq. Capture that seq.
+        client.release_job("w", "job-0", true);
+        let first_seq = {
+            let set = client.release_barriers.lock().unwrap();
+            assert_eq!(set.len(), 1, "exactly the oldest job's barrier is armed");
+            *set.iter().next().unwrap()
+        };
+        for i in 1..RELEASE_OUTAGE_CAP + 5 {
+            client.release_job("w", &format!("job-{i}"), false);
         }
         let releases = client
             .outbound
@@ -4751,7 +4887,7 @@ mod tests {
             "the buffered RELEASE set stays bounded during an outage"
         );
         assert!(
-            !client.release_barriers.lock().unwrap().contains_key(&first),
+            !client.release_barriers.lock().unwrap().contains(&first_seq),
             "a collapsed RELEASE's orphaned drain barrier is disarmed"
         );
         client.shutdown().await;
@@ -4765,7 +4901,7 @@ mod tests {
         let client = HubClient::spawn(test_config(), &[]); // never truly connects
         client.connected.store(true, Ordering::Relaxed); // but drive the live path
         for i in 0..RELEASE_OUTAGE_CAP + 5 {
-            client.release_job("w", &format!("job-{i}"));
+            client.release_job("w", &format!("job-{i}"), false);
         }
         let releases = client
             .outbound
@@ -4811,7 +4947,7 @@ mod tests {
         // Complete the job. Under the fix this is one atomic outbound-locked
         // step; a concurrent resync cannot interleave between the in_flight
         // removal and the RELEASE enqueue.
-        client.release_job("w", "job-1");
+        client.release_job("w", "job-1", false);
         {
             let buf = client.outbound.lock().unwrap();
             let has_claim = buf
@@ -4929,11 +5065,8 @@ mod tests {
         let stream = compose_stream_id(instance, job);
         // Reproduce the shutdown state `close()` leaves: this job's transcript
         // tail buffered (bulk) behind an ARMED RELEASE (control) still queued.
-        client
-            .release_barriers
-            .lock()
-            .unwrap()
-            .insert(stream.clone(), ReleaseBarrier { armed: true });
+        // The barrier is keyed by the RELEASE frame's seq (2, below).
+        client.release_barriers.lock().unwrap().insert(2);
         {
             let mut buf = client.outbound.lock().unwrap();
             buf.push(Frame::new(
@@ -4977,11 +5110,7 @@ mod tests {
             "shutdown must write the transcript tail BEFORE the RELEASE, got {order:?}"
         );
         assert!(
-            !client
-                .release_barriers
-                .lock()
-                .unwrap()
-                .contains_key(&stream),
+            !client.release_barriers.lock().unwrap().contains(&2),
             "the barrier is consumed once its RELEASE is written"
         );
         client.shutdown().await;
@@ -5029,12 +5158,9 @@ mod tests {
         let job = "job-bnd";
         let stream = compose_stream_id(instance, job);
         // The shutdown state `close()` leaves, but with a MULTI-frame tail (3
-        // produce chunks) buffered behind an armed RELEASE.
-        client
-            .release_barriers
-            .lock()
-            .unwrap()
-            .insert(stream.clone(), ReleaseBarrier { armed: true });
+        // produce chunks) buffered behind an armed RELEASE. The barrier is keyed
+        // by the RELEASE frame's seq (9, below).
+        client.release_barriers.lock().unwrap().insert(9);
         {
             let mut buf = client.outbound.lock().unwrap();
             for i in 0..3 {
@@ -5071,12 +5197,7 @@ mod tests {
             "a bounded pass writes exactly batch_limit tail frames and no RELEASE, got {first:?}"
         );
         assert!(
-            client
-                .release_barriers
-                .lock()
-                .unwrap()
-                .get(&stream)
-                .is_some_and(|b| b.armed),
+            client.release_barriers.lock().unwrap().contains(&9),
             "the barrier stays armed while the tail is only partially flushed"
         );
 
@@ -5098,15 +5219,159 @@ mod tests {
             "the final pass flushes the remaining tail, then the RELEASE, got {rest:?}"
         );
         assert!(
-            !client
-                .release_barriers
-                .lock()
-                .unwrap()
-                .contains_key(&stream),
+            !client.release_barriers.lock().unwrap().contains(&9),
             "the barrier is consumed once the whole tail and the RELEASE are written"
         );
 
         client.shutdown().await;
         server.abort();
+    }
+
+    // Finding (round 21): the inbound-steer byte budget, like the transcript
+    // budget, must be partitioned by a FIXED per-slot share — NOT handed to each
+    // session in full. An mpsc channel's capacity is fixed at creation, so with
+    // up to `slot_count` concurrent sessions each holding a full-budget steer
+    // queue the aggregate retained memory would reach `slot_count ×
+    // buffer_byte_budget`. A fixed `budget / slot_count` share bounds the sum.
+    #[tokio::test]
+    async fn steer_budget_is_partitioned_by_fixed_slot_share() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB
+        let slots = vec![
+            ("w-s1".to_string(), capability()),
+            ("w-s2".to_string(), capability()),
+        ];
+        // Each of the 2 slots gets a FIXED 8 MiB / 2 = 4 MiB steer share.
+        let per_slot = steer_channel_bound(8 * 1024 * 1024 / 2);
+        assert!(
+            per_slot < steer_channel_bound(8 * 1024 * 1024),
+            "precondition: the per-slot share is strictly smaller than the whole budget"
+        );
+        let client = HubClient::spawn(cfg, &slots);
+        assert_eq!(
+            client.steer_bridge_bound, per_slot,
+            "the precomputed steer bound is the fixed per-slot share, not the whole budget"
+        );
+
+        // Each registered session's steer channel is created at exactly that
+        // fixed share — the first session does NOT get the whole budget.
+        let s1 = client.register_session("w-s1", capability(), "job-s1");
+        let s2 = client.register_session("w-s2", capability(), "job-s2");
+        let cap_of = |instance: &str, job: &str| {
+            let stream = compose_stream_id(instance, job);
+            client
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&stream)
+                .expect("steer channel registered")
+                .max_capacity()
+        };
+        assert_eq!(cap_of("w-s1", "job-s1"), per_slot);
+        assert_eq!(
+            cap_of("w-s2", "job-s2"),
+            per_slot,
+            "both live: each steer queue holds the same fixed share, so the sum stays in budget"
+        );
+        drop(s1);
+        drop(s2);
+        client.shutdown().await;
+    }
+
+    // Finding (round 21): a RELEASE drain barrier is keyed by the RELEASE frame's
+    // unique `seq`, NOT by the reusable stream id. A retried job on the SAME slot
+    // (identical instance+jobKey ⇒ identical stream) must get its OWN barrier
+    // without clobbering a predecessor RELEASE for that stream still buffered
+    // during an outage — otherwise the older barrier is lost and its transcript
+    // tail could be overtaken by its RELEASE on the wire. Each generation's
+    // barrier must coexist.
+    #[tokio::test]
+    async fn retried_job_on_the_same_slot_keeps_each_generations_barrier() {
+        let client = HubClient::spawn(test_config(), &[]); // port 1: never connects
+        assert!(
+            !client.connected.load(Ordering::Relaxed),
+            "precondition: disconnected, so RELEASEs buffer instead of draining"
+        );
+
+        // First generation of the job on this slot: close() arms its barrier.
+        let mut first = client.register_session("w-retry", capability(), "job-retry");
+        first.close().await;
+        assert_eq!(
+            client.release_barriers.lock().unwrap().len(),
+            1,
+            "the first generation's RELEASE barrier is armed"
+        );
+
+        // A RETRY of the SAME job on the SAME slot (identical stream). Arming its
+        // barrier must NOT drop the predecessor's — the core of the seq-keyed fix.
+        let mut second = client.register_session("w-retry", capability(), "job-retry");
+        assert_eq!(
+            client.release_barriers.lock().unwrap().len(),
+            1,
+            "registering the retry must not disturb the predecessor's armed barrier"
+        );
+        second.close().await;
+        assert_eq!(
+            client.release_barriers.lock().unwrap().len(),
+            2,
+            "both generations' barriers coexist, keyed by each RELEASE's unique seq"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 21): never send a real credential over plaintext ws:// to a
+    // remote host — the identity rides the upgrade URL's `?token=` query param,
+    // so an unencrypted remote ws:// puts it on the wire in the clear. `connect`
+    // fails closed for exactly that case and ONLY that case.
+    #[test]
+    fn insecure_credential_exposure_only_fires_for_remote_plaintext_with_a_real_secret() {
+        let with = |url: &str, secret: Option<&str>, token: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.url = url.into();
+            cfg.secret = secret.map(Into::into);
+            cfg.token = token.map(Into::into);
+            insecure_credential_exposure(&cfg)
+        };
+
+        // The one case that must be refused: a real secret over remote ws://.
+        assert!(with("ws://hub.example.com/na", Some("s3cr3t"), None));
+        assert!(
+            with("ws://hub.example.com:9000/na?x=1", None, Some("tok")),
+            "the deprecated token alias is a real credential too"
+        );
+
+        // Encrypted transport is always fine, remote or not.
+        assert!(!with("wss://hub.example.com/na", Some("s3cr3t"), None));
+
+        // Loopback / localhost never leaves the machine, so plaintext is fine.
+        assert!(!with("ws://127.0.0.1:8080/na", Some("s3cr3t"), None));
+        assert!(!with("ws://localhost/na", Some("s3cr3t"), None));
+        assert!(!with("ws://[::1]:8080/na", Some("s3cr3t"), None));
+        assert!(!with("ws://sub.localhost/na", Some("s3cr3t"), None));
+        assert!(
+            !with("ws://user:pass@127.0.0.1/na", Some("s3cr3t"), None),
+            "userinfo is stripped before the loopback host check"
+        );
+
+        // No real credential ⇒ nothing to protect, even remote plaintext.
+        assert!(!with("ws://hub.example.com/na", None, None));
+        assert!(
+            !with("ws://hub.example.com/na", Some(LOCAL_AGENTIC_TOKEN), None),
+            "the local no-auth dev token carries no secret worth protecting"
+        );
+    }
+
+    #[test]
+    fn is_local_host_recognises_every_loopback_spelling() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("LOCALHOST"));
+        assert!(is_local_host("app.localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("127.5.6.7")); // all of 127.0.0.0/8 is loopback
+        assert!(is_local_host("::1"));
+        assert!(!is_local_host("hub.example.com"));
+        assert!(!is_local_host("10.0.0.1"));
+        assert!(!is_local_host("localhost.example.com"));
+        assert!(!is_local_host(""));
     }
 }

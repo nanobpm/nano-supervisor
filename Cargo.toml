@@ -58,10 +58,13 @@ ryu = "1"
 fs2 = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs", "net"] }
 # Worker-side agentic-hub client (issue #10): one WebSocket per daemon,
-# multiplexed across all slots. Pinned to the SDK's already-locked versions so
-# `--locked` stays satisfied without pulling a new TLS stack (default features,
-# `ws://`); a `wss://` endpoint needs the crate's TLS feature, a follow-up.
-tokio-tungstenite = "0.24"
+# multiplexed across all slots. `rustls-tls-native-roots` reuses the SDK's
+# already-locked rustls stack (same rustls/tokio-rustls/rustls-native-certs the
+# `camunda-orchestration-sdk`/`reqwest` `rustls` features pull), so `wss://`
+# connects over TLS without a second TLS backend and `--locked` stays satisfied.
+# Plaintext `ws://` to a non-local host is refused when a real secret/token is
+# configured (see `connect`), so a credential is never sent in cleartext.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).
