@@ -835,18 +835,22 @@ pub struct GitResult {
     /// that is not being pushed. The caller must RETAIN the run dir: the only
     /// copy of that work may live in it, so reaping would destroy it.
     pub retain: bool,
-    /// Set ONLY when PUBLICATION of the prepared work branch failed or could
-    /// not be confirmed this run — the push admin context could not be built,
-    /// or the push errored and the trusted remote tip could not be verified to
-    /// contain its commits. This is the Rust analogue of the Node plugin's
+    /// Set when PUBLICATION of the prepared work branch failed, could not be
+    /// confirmed, or was deliberately refused this run — the push admin context
+    /// could not be built, the push errored and the trusted remote tip could not
+    /// be verified to contain its commits, OR an earlier incomplete/stranded
+    /// scan set `retain` so the push path REFUSED to publish (a retain-skipped,
+    /// uncertain publication). In every case this run's prepared branch is NOT
+    /// confirmed on the remote. This is the Rust analogue of the Node plugin's
     /// `pushFailed`, and it is DELIBERATELY distinct from [`retain`]: `retain`
     /// is also set by many unrelated incomplete/stranded-scan guards that leave
     /// publication itself intact (and even by a run whose push then succeeds),
     /// so gating PR reconciliation on `retain` would skip reconcile for a run
     /// whose branch IS published — falsely reporting `pullRequest: null` and
     /// diverging from Node's `!pushFailed` parity. Reconciliation is gated on
-    /// `!push_failed` so a confirmed (or un-attempted) publication still looks
-    /// its PR up, while a genuinely failed/uncertain push does not claim one.
+    /// `!push_failed` so a confirmed OR un-attempted/no-new-commit publication
+    /// still looks its PR up, while a failed/uncertain/retain-skipped push does
+    /// not claim one.
     pub push_failed: bool,
     /// Set when finalize found real agent work, independent of whether it was
     /// pushed or even enumerated onto the work branch. Distinct from `retain`
@@ -2286,6 +2290,15 @@ async fn finalize_git_with_deadline(
                      stranded work (retain set), so the push would publish only a partial account \
                      of the agent's commits; leaving the run dir retained"
                 ));
+                // This is a retain-skipped / uncertain publication: the prepared
+                // branch was deliberately NOT published, so it is not confirmed
+                // on the remote. Mark it with the DEDICATED failure state so the
+                // reconcile gate (keyed on `!push_failed`, mirroring Node's
+                // `!pushFailed`) does not report a PR for a branch this run never
+                // published — WITHOUT the gate having to globally require that a
+                // push occurred, which would wrongly drop valid lookups for an
+                // un-attempted or no-new-commit branch that already has a PR.
+                out.push_failed = true;
             } else if !out.commits.is_empty() {
                 // This push runs AFTER arbitrary agent code controlled the
                 // checkout, so it must not trust agent-mutable state:
@@ -2421,21 +2434,23 @@ async fn finalize_git_with_deadline(
     mark_unborn_no_ref(&mut out, prep, workspace, remaining!()).await;
 
     // PR reconciliation (the Node plugin's `reconcileAgentPr`, c8ctl-plugin.js
-    // ~L6627): with a prepared work branch AND `task.allowPr`, look the pushed
+    // ~L6627): with a prepared work branch AND `task.allowPr`, look the
     // branch's provider PR up so the completion's `pullRequest` variable is
     // populated (issue #49 — it was previously always null). Gate on
-    // `!push_failed && out.pushed`: reconcile runs only when this run actually
-    // PUBLISHED the branch. `push_failed` (the Rust analogue of Node's
-    // `!out.pushFailed`) is set when publication errored or could not be
-    // confirmed; `out.pushed` is additionally false whenever publication was
-    // deliberately SKIPPED — an earlier incomplete/stranded scan set `retain`
-    // (fail-closed), so the push path refused to publish and this run's
-    // prepared branch is NOT on the remote. Reporting a PR for such a branch
-    // would attach a PR that does not carry this run's commits, so a
-    // retain-skipped push is treated as failed/uncertain (not published) and
-    // reconcile is skipped. Best-effort: it never fails the job — any
-    // `gh`/parse error becomes `{ found: false, error }`, exactly as Node does.
-    if reconcile_gate(allow_pr, out.push_failed, out.pushed) {
+    // `!push_failed`, exactly mirroring Node's `workingBranch && allowPr &&
+    // !pushFailed`: reconcile runs whenever publication did not fail or come up
+    // uncertain. `push_failed` is set when publication errored and could not be
+    // confirmed, when the push admin context could not be built, OR when the
+    // push was deliberately refused because an earlier incomplete/stranded scan
+    // set `retain` (fail-closed) — all cases where this run's prepared branch is
+    // NOT confirmed on the remote, so reporting a PR for it could attach one that
+    // does not carry this run's commits. Crucially the gate does NOT require a
+    // push to have OCCURRED: an un-attempted publication (push disabled) or a
+    // prepared branch with no new commits leaves `push_failed` false and still
+    // looks up an existing provider PR, matching Node. Best-effort: it never
+    // fails the job — any `gh`/parse error becomes `{ found: false, error }`,
+    // exactly as Node does.
+    if reconcile_gate(allow_pr, out.push_failed) {
         if let Some(branch) = &prep.working_branch {
             out.pr = Some(
                 reconcile_agent_pr(workspace, &repo.provider, &repo.url, branch, remaining!()).await,
@@ -3710,17 +3725,20 @@ fn gh_host_of_slug(slug: &str) -> String {
     }
 }
 
-/// Whether finalize should run PR reconciliation this round. Reconcile runs
-/// only when the job was asked to open a PR (`allow_pr`) AND this run actually
-/// PUBLISHED the work branch: publication did not fail (`!push_failed`) AND was
-/// not deliberately skipped (`pushed`). `pushed` is false both when publication
-/// failed and when an earlier incomplete/stranded scan set `retain` (fail-closed)
-/// so the push path refused to publish — in both cases this run's prepared branch
-/// is not confirmed on the remote, so reporting a PR for it would attach a PR
-/// that may not carry this run's commits. Keeping this a pure predicate makes
-/// the gate's semantics unit-testable in isolation.
-fn reconcile_gate(allow_pr: bool, push_failed: bool, pushed: bool) -> bool {
-    allow_pr && !push_failed && pushed
+/// Whether finalize should run PR reconciliation this round. Mirrors the Node
+/// plugin's gate `workingBranch && allowPr && !pushFailed`: reconcile runs when
+/// the job was asked to open a PR (`allow_pr`) AND publication did not fail or
+/// come up uncertain (`!push_failed`). `push_failed` is set whenever this run's
+/// prepared branch is NOT confirmed on the remote — publication errored and
+/// could not be verified, the push admin context could not be built, or the
+/// push was deliberately refused because an earlier incomplete/stranded scan set
+/// `retain` (fail-closed). The gate deliberately does NOT require a push to have
+/// OCCURRED: an un-attempted publication (push disabled) or a prepared branch
+/// with no new commits leaves `push_failed` false and still looks up an existing
+/// provider PR, so a valid existing-branch lookup is never dropped. Keeping this
+/// a pure predicate makes the gate's semantics unit-testable in isolation.
+fn reconcile_gate(allow_pr: bool, push_failed: bool) -> bool {
+    allow_pr && !push_failed
 }
 
 /// Look the provider PR up for a pushed branch, mirroring the Node plugin's
@@ -4398,26 +4416,25 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_gate_requires_a_published_branch() {
-        // Reconcile runs only for an allow-PR run that actually PUBLISHED the
-        // branch this run prepared.
+    fn reconcile_gate_mirrors_node_push_failed() {
+        // Mirrors Node's `workingBranch && allowPr && !pushFailed`: reconcile
+        // runs for an allow-PR run whose publication did not fail.
+        assert!(reconcile_gate(true, false), "allow-PR + !push_failed → reconcile");
         assert!(
-            reconcile_gate(true, false, true),
-            "allow-PR + published → reconcile"
-        );
-        assert!(
-            !reconcile_gate(false, false, true),
+            !reconcile_gate(false, false),
             "a run that was not asked to open a PR never reconciles"
         );
         assert!(
-            !reconcile_gate(true, true, true),
+            !reconcile_gate(true, true),
             "a failed/uncertain publication must NOT claim a PR"
         );
-        // A run whose UNRELATED scan set `retain` but whose push SUCCEEDED
-        // (push_failed stays false, pushed true) still reconciles — gating on
-        // `retain` would have suppressed it and reported `pullRequest: null`
-        // for a branch that is actually published.
-        let mut out = GitResult {
+        // The crux of this finding: the gate must NOT require a push to have
+        // OCCURRED. A prepared branch with no new commits (or a push-disabled
+        // run) was never published this round yet leaves `push_failed` false,
+        // and an existing provider PR for it must still be looked up. A run with
+        // an UNRELATED `retain` whose push nonetheless succeeded is the same
+        // shape from the gate's view (`push_failed` false).
+        let published = GitResult {
             branch: Some("feat/x".into()),
             commits: vec!["deadbeef".into()],
             pushed: true,
@@ -4429,31 +4446,43 @@ mod tests {
             scan_incomplete: false,
         };
         assert!(
-            reconcile_gate(true, out.push_failed, out.pushed),
-            "retain set by an unrelated scan must not suppress reconcile for a published branch"
+            reconcile_gate(true, published.push_failed),
+            "a published branch (push_failed false) is reconciled even with retain set"
         );
-        // Flip to a genuine publication failure and the gate closes.
-        out.push_failed = true;
-        assert!(!reconcile_gate(true, out.push_failed, out.pushed));
-        // The regression this guards (the retain-SKIPPED push): a run whose
-        // earlier scan set `retain` so the push path REFUSED to publish —
-        // `pushed` is false even though `push_failed` was never set. Reporting
-        // a PR for that branch would attach a PR that does not carry this
-        // run's commits, so reconcile must be skipped.
-        let skipped = GitResult {
+        let no_new_commits = GitResult {
             branch: Some("feat/x".into()),
-            commits: vec!["deadbeef".into()],
+            commits: vec![],
             pushed: false,
             pr: None,
-            retain: true,
+            retain: false,
             push_failed: false,
             work_found: false,
             unborn_no_ref: false,
             scan_incomplete: false,
         };
         assert!(
-            !reconcile_gate(true, skipped.push_failed, skipped.pushed),
-            "a retain-skipped (unpublished) push must NOT report a PR"
+            reconcile_gate(true, no_new_commits.push_failed),
+            "an un-attempted / no-new-commit branch must still look up its existing PR"
+        );
+        // The retain-SKIPPED push: the finalize push path REFUSES to publish
+        // when an earlier incomplete/stranded scan set `retain`, and marks that
+        // uncertain publication with the dedicated `push_failed` state. Reporting
+        // a PR for that unpublished branch would attach one that may not carry
+        // this run's commits, so the gate must close.
+        let skipped = GitResult {
+            branch: Some("feat/x".into()),
+            commits: vec!["deadbeef".into()],
+            pushed: false,
+            pr: None,
+            retain: true,
+            push_failed: true,
+            work_found: false,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        assert!(
+            !reconcile_gate(true, skipped.push_failed),
+            "a retain-skipped (unpublished) push sets push_failed, so it must NOT report a PR"
         );
     }
 
