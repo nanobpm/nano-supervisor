@@ -208,7 +208,7 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 }
 
 /// True while at least one **non-zombie** process remains in the group led by
-/// `pid`. This is the distinction [`group_alive`] cannot draw: a reaped-and-held
+/// `pid`. This is the distinction [`group_alive`] cannot draw: an exited-but-held
 /// leader zombie (the identity anchor [`terminate_group_and_reap`] keeps unreaped
 /// through its grace loop) still answers `kill(-pid, 0)`, so `group_alive` reads
 /// the group as live even after every real member has exited — which forced the
@@ -1185,7 +1185,21 @@ pub(crate) async fn terminate_group_and_reap(
                 // held zombie anchor remains, SIGKILL to a zombie is a no-op and
                 // adds no grace wait; when the scan under-reported, it still reaps
                 // the missed member on the fast path instead of leaking it.
-                if !group_has_live_member(pgid) {
+                //
+                // Run the scan on the blocking pool: it is a synchronous,
+                // potentially system-wide traversal (Linux reads one
+                // `/proc/<pid>/stat` per PID) and this loop repeats it every
+                // 50 ms, so running it inline on a Tokio worker can starve
+                // unrelated async work on a high-PID host — the same reason
+                // `slot::prepare_run_dir_blocking` offloads its traversal. A join
+                // failure (the scan task panicked) is treated as "still a live
+                // member", so the grace loop keeps waiting rather than breaking
+                // early — the fail-safe direction.
+                let has_live_member =
+                    tokio::task::spawn_blocking(move || group_has_live_member(pgid))
+                        .await
+                        .unwrap_or(true);
+                if !has_live_member {
                     if guard.still_ours() {
                         sigkill_group(pgid);
                     }
@@ -2447,9 +2461,8 @@ mod tests {
         // Reap the member so the test leaves no zombie, regardless of outcome.
         let _ = member.kill();
         let _ = member.wait();
-        let status = status.expect(
-            "a TERM-resistant group member must be SIGKILLed by teardown, not leaked",
-        );
+        let status = status
+            .expect("a TERM-resistant group member must be SIGKILLed by teardown, not leaked");
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             status.signal(),
