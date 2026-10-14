@@ -39,8 +39,10 @@ impl PhantomReason {
     /// A short operator-facing phrase for the status rendering.
     pub fn describe(&self) -> String {
         match self {
-            PhantomReason::DeletedCwd(p) => format!("cwd is a deleted dir ({})", p.display()),
-            PhantomReason::HomeUnderTmp(p) => format!("home under temp dir ({})", p.display()),
+            PhantomReason::DeletedCwd(p) => format!("cwd is a deleted dir ({})", escape_display(p)),
+            PhantomReason::HomeUnderTmp(p) => {
+                format!("home under temp dir ({})", escape_display(p))
+            }
         }
     }
 }
@@ -109,26 +111,60 @@ pub fn classify(
     reasons
 }
 
-/// Normalized absolute forms of `path` used for identity-based containment.
+/// The normalized absolute identity of `path` used for containment.
 /// `Path::starts_with` is purely lexical, so an unnormalized `/tmp/../home/x`
 /// would spuriously match `/tmp` and a symlinked alias into the temp tree would
-/// evade it. We therefore compare *resolved* identities: the canonical path when
-/// it still exists on disk (resolving `..` and symlinks), plus a lexical
-/// normalization (resolving `.`/`..` without touching the filesystem) as an
-/// explicit fallback for a home that has since disappeared. A non-absolute or
-/// empty result is dropped so a misread can never match a root.
-fn normalized_forms(path: &Path) -> Vec<PathBuf> {
-    let mut forms = Vec::new();
-    let mut push = |p: PathBuf| {
-        if p.is_absolute() && !forms.contains(&p) {
-            forms.push(p);
-        }
-    };
+/// evade it. We therefore compare the *resolved* identity: the canonical path
+/// when it exists on disk (resolving `..` and every symlink). The lexical
+/// normalization (resolving `.`/`..` without touching the filesystem) is only a
+/// *fallback* for a path that has since disappeared — and then it is anchored at
+/// the canonical form of the longest ancestor that still exists, so a vanished
+/// descendant of a symlinked directory still resolves to its real location.
+///
+/// Crucially the lexical form is NOT retained alongside the canonical one: an
+/// existing `/tmp/state-link` that points at `/srv/state` has the canonical
+/// identity `/srv/state`, and keeping its lexical `/tmp/...` spelling as a
+/// second identity would falsely flag it as a temp-backed phantom. One path has
+/// one identity. A non-absolute or empty result yields `None` so a misread can
+/// never match a root.
+fn normalized_identity(path: &Path) -> Option<PathBuf> {
     if let Ok(canon) = std::fs::canonicalize(path) {
-        push(canon);
+        return Some(canon);
     }
-    push(lexical_normalize(path));
-    forms
+    // The path itself is gone (or unstatable). Canonicalize the longest ancestor
+    // that still exists so any symlinked prefix is resolved to its real target,
+    // then re-attach the lexically-normalized missing tail.
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                missing.push(cursor.file_name().unwrap_or_default().to_os_string());
+                cursor = parent;
+                if let Ok(canon) = std::fs::canonicalize(cursor) {
+                    let mut out = canon;
+                    for comp in missing.iter().rev() {
+                        out.push(comp);
+                    }
+                    let out = lexical_normalize(&out);
+                    return if out.is_absolute() && !out.as_os_str().is_empty() {
+                        Some(out)
+                    } else {
+                        None
+                    };
+                }
+            }
+            _ => {
+                // No statable ancestor: fall back to a purely lexical resolution.
+                let out = lexical_normalize(path);
+                return if out.is_absolute() && !out.as_os_str().is_empty() {
+                    Some(out)
+                } else {
+                    None
+                };
+            }
+        }
+    }
 }
 
 /// Resolve `.` and `..` components purely lexically, without consulting the
@@ -150,19 +186,16 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 /// Whether `path` resolves to the same as, or nested under, any of `roots`,
-/// comparing normalized filesystem identities ([`normalized_forms`]) rather than
-/// raw lexical prefixes. A relative or empty root (or candidate) matches nothing,
-/// so a misread never flags a legitimate home.
+/// comparing normalized filesystem identities ([`normalized_identity`]) rather
+/// than raw lexical prefixes. A relative or empty root (or candidate) matches
+/// nothing, so a misread never flags a legitimate home.
 fn path_under_any(path: &Path, roots: &[PathBuf]) -> bool {
-    let path_forms = normalized_forms(path);
-    if path_forms.is_empty() {
+    let Some(path) = normalized_identity(path) else {
         return false;
-    }
-    roots.iter().any(|root| {
-        normalized_forms(root)
-            .iter()
-            .any(|r| path_forms.iter().any(|p| p.starts_with(r)))
-    })
+    };
+    roots
+        .iter()
+        .any(|root| normalized_identity(root).is_some_and(|r| path.starts_with(r)))
 }
 
 /// The throwaway temp roots a daemon's state home is matched against. The socket
@@ -405,17 +438,18 @@ fn process_cwd(pid: u32) -> Option<Cwd> {
     let target = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     // Check the FULL kernel-reported path first. If it exists verbatim it is a
     // live directory — even one whose real name literally ends in " (deleted)".
-    // Only when that exact path is absent AND carries the kernel's " (deleted)"
-    // marker is the cwd genuinely unlinked; then strip the marker to recover the
-    // real (now-gone) directory name. Checking the stripped sibling instead would
-    // misread a live `foo (deleted)` dir (whose sibling `foo` usually does not
-    // exist) as a deleted cwd.
     if target.exists() {
         return Some(Cwd {
             path: target,
             exists: true,
         });
     }
+    // The verbatim target is absent. Only the kernel's literal " (deleted)"
+    // marker proves the cwd was unlinked; strip it to recover the real (now-gone)
+    // directory name and flag it. An UNMARKED target that fails `exists()` is NOT
+    // proof of deletion: `exists()` is also false on a permission error, and the
+    // target may live outside this process's mount namespace. Treat that case as
+    // unknown (None) rather than fabricating a deleted-cwd phantom flag.
     let s = target.to_string_lossy();
     if let Some(stripped) = s.strip_suffix(" (deleted)") {
         return Some(Cwd {
@@ -423,10 +457,7 @@ fn process_cwd(pid: u32) -> Option<Cwd> {
             exists: false,
         });
     }
-    Some(Cwd {
-        path: target,
-        exists: false,
-    })
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -472,6 +503,30 @@ fn process_cwd(_pid: u32) -> Option<Cwd> {
     None
 }
 
+/// Escape a peer-derived path for terminal display. The home, socket, cwd, and
+/// reason paths rendered by [`render`] ultimately come from whatever peer bound
+/// a hash-shaped socket in the shared temp directory, and `Path::display()`
+/// preserves control characters and newlines verbatim. A hostile local process
+/// could therefore answer `status` with a crafted `logFile` that injects ANSI
+/// escapes or spoofs extra status lines on the operator's terminal. Render every
+/// control character (and DEL) as a visible `\u{XX}` escape so a peer-derived
+/// path can never emit a terminal control sequence or a line break.
+fn escape_display(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                format!("\\u{{{:02x}}}", c as u32)
+                    .chars()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
 /// Render the "other supervisors on this host" section of `supervisor status`.
 /// Returns the lines to print (empty when none were found) so the caller owns
 /// the I/O and the formatting is testable.
@@ -500,8 +555,8 @@ pub fn render(supervisors: &[DiscoveredSupervisor]) -> Vec<String> {
         let home = s
             .home
             .as_ref()
-            .map(|h| h.display().to_string())
-            .unwrap_or_else(|| s.socket.display().to_string());
+            .map(|h| escape_display(h))
+            .unwrap_or_else(|| escape_display(&s.socket));
         if s.is_phantom() {
             let why = s
                 .reasons
@@ -516,7 +571,10 @@ pub fn render(supervisors: &[DiscoveredSupervisor]) -> Vec<String> {
             // A healthy supervisor: show its cwd when we could read it, so an
             // operator can see at a glance where it is running from.
             match &s.cwd {
-                Some(cwd) => lines.push(format!("  {home} ({pid}) cwd {}", cwd.path.display())),
+                Some(cwd) => lines.push(format!(
+                    "  {home} ({pid}) cwd {}",
+                    escape_display(&cwd.path)
+                )),
                 None => lines.push(format!("  {home} ({pid})")),
             }
         }
@@ -796,6 +854,46 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn classify_does_not_flag_a_symlink_that_escapes_tmp() {
+        // Regression for the retained-lexical-form false positive: an EXISTING
+        // symlink that lives under a temp root but points OUTSIDE it must not be
+        // flagged. Its canonical identity is the target (`/srv/state`-like), so
+        // keeping the lexical `/tmp/...` spelling as a second identity would
+        // falsely match the temp root. One path has one identity.
+        let _guard = crate::cwd_test_guard();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // A real target OUTSIDE every temp root, under a unique non-temp dir.
+        let real = std::env::current_dir().expect("cwd").join(format!(
+            "c8ctl-nano-escape-real-{}-{nanos}",
+            std::process::id()
+        ));
+        // A symlink to it parked under the system temp dir.
+        let link = std::env::temp_dir().join(format!(
+            "c8ctl-nano-escape-link-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&real).expect("create real dir outside temp");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("create escaping symlink");
+        // Classify against the temp roots: the link's lexical spelling is under
+        // temp, but its canonical identity (the real dir) is not.
+        let roots = temp_roots();
+        let reasons = classify(Some(&link), &roots, None);
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| matches!(r, PhantomReason::HomeUnderTmp(_))),
+            "a symlink whose canonical target escapes temp must NOT flag: {reasons:?}"
+        );
+    }
+
     #[test]
     fn classify_flags_literal_tmp_home_regardless_of_socket_dir() {
         // Finding: on macOS the socket dir is `/var/folders/...`, so classifying
@@ -867,6 +965,41 @@ mod tests {
     #[test]
     fn render_empty_when_no_others() {
         assert!(render(&[]).is_empty());
+    }
+
+    #[test]
+    fn render_escapes_control_characters_in_peer_paths() {
+        // Peer-derived paths (home, cwd, and the reason paths they feed) must
+        // never reach the terminal bearing control characters or newlines: a
+        // hostile local process could otherwise spoof status lines or emit ANSI
+        // escapes. Every control char is rendered as a visible \u{XX} escape.
+        let evil_home = PathBuf::from("/tmp/nshome-\u{1b}[31m\nspoofed");
+        let evil_cwd = PathBuf::from("/home/u/work\u{1b}[2j");
+        let supers = vec![DiscoveredSupervisor {
+            socket: PathBuf::from("/tmp/c8ctl-nano-sup-aaaaaaaa.sock"),
+            pid: Some(7),
+            home: Some(evil_home.clone()),
+            cwd: Some(Cwd {
+                path: evil_cwd.clone(),
+                exists: true,
+            }),
+            reasons: vec![PhantomReason::HomeUnderTmp(evil_home.clone())],
+            responsive: true,
+        }];
+        let out = render(&supers).join("\n");
+        assert!(
+            !out.contains('\u{1b}'),
+            "no raw ESC may reach the terminal: {out:?}"
+        );
+        // The only newline is the one we joined with; the peer's `\n` is escaped.
+        assert!(
+            !out.contains("spoofed\n") && out.contains("\\u{0a}"),
+            "the embedded newline is escaped: {out:?}"
+        );
+        assert!(
+            out.contains("\\u{1b}"),
+            "the escape char itself is rendered visibly: {out:?}"
+        );
     }
 
     /// A genuinely deleted cwd IS flagged: chdir into a dir, remove it, and
