@@ -3849,6 +3849,17 @@ fn parse_pr_list(stdout: &str) -> serde_json::Value {
             "error": "gh pr list returned a non-array JSON payload",
         });
     };
+    // Fail closed on a non-object entry (`[null]`, `[1]`, `["x"]`): `gh pr list`
+    // yields an array of PR objects, so a non-object first element is corrupt
+    // output, not a PR. Mapping it would report `found: true` with all-null
+    // fields — a false "PR found" from malformed CLI output.
+    if !first.is_object() {
+        return json!({
+            "openedBy": null,
+            "found": false,
+            "error": "gh pr list returned a non-object array entry",
+        });
+    }
     let pr = first;
     let opened_by = pr
         .get("author")
@@ -4664,6 +4675,18 @@ mod tests {
         assert!(parse_pr_list("[]").get("error").is_none());
         assert!(parse_pr_list("").get("error").is_none());
         assert!(parse_pr_list("   \n").get("error").is_none());
+        // A parsed array whose first element is a non-object (null, number,
+        // string, nested array) is corrupt output, not a found PR: mapping it
+        // would falsely report found:true with all-null fields. Fail closed.
+        for bad in [r#"[null]"#, r#"[1]"#, r#"["x"]"#, r#"[[]]"#, r#"[true]"#] {
+            let r = parse_pr_list(bad);
+            assert_eq!(r["found"], false, "non-object entry must not be found: {bad}");
+            assert_eq!(r["openedBy"], serde_json::Value::Null);
+            assert!(
+                r["error"].as_str().unwrap_or_default().contains("non-object"),
+                "a non-object array entry must carry an error: {r:#?}"
+            );
+        }
     }
 
     #[tokio::test]
