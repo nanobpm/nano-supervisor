@@ -182,33 +182,46 @@ fn job_writes_an_agent_instance_record() {
         "the instance definition carries the agent's system prompt; got {:#?}",
         instance["definition"]
     );
+    // Require the metrics OBJECT and the key's presence: serde_json indexing
+    // yields `Null` for an absent `metrics` or `modelCalls`, so a bare
+    // `is_number() || is_null()` would pass vacuously on a missing block.
+    let metrics = instance["metrics"].as_object().unwrap_or_else(|| {
+        panic!(
+            "the instance carries a metrics object; got {:#?}",
+            instance["metrics"]
+        )
+    });
+    let model_calls = metrics
+        .get("modelCalls")
+        .unwrap_or_else(|| panic!("the metrics block carries a modelCalls key; got {metrics:#?}"));
     assert!(
-        instance["metrics"]["modelCalls"].is_number()
-            || instance["metrics"]["modelCalls"].is_null(),
-        "the instance carries a metrics block; got {:#?}",
-        instance["metrics"]
+        model_calls.is_number() || model_calls.is_null(),
+        "metrics.modelCalls is a number or explicit null; got {model_calls:#?}"
     );
 }
 
-/// The reference is expected to leave the AgentInstance `COMPLETED` and the
-/// process instance non-`COMPLETED` — and this is the parity test that will go
-/// **green → red → green** for the Rust port, so it is the issue-#59 gate.
+/// While the process stays open, a conforming AgentInstance stays in an
+/// **active** status: completion is owned by the engine, which completes the
+/// instance only when the owning process instance ends
+/// (jwulf/c8ctl-plugin-nano#274 — `updateAgentInstance` deliberately accepts
+/// only active statuses and 422s a producer's `status:COMPLETED`). This is the
+/// issue-#59 gate, the parity test that goes **green → red → green** for the
+/// Rust port.
 ///
 /// The process is gated (`bpmn::single_task_with_gate`: a parallel `userTask`
-/// holds the instance ACTIVE after the agent job settles). Without that gate the
-/// engine force-completes the process instance — and with it the AgentInstance —
-/// the moment the job completes, masking the producer's own terminal update.
-/// With it, the AgentInstance can only read `COMPLETED` if the producer's
-/// `status:COMPLETED` update actually landed, which is exactly the behaviour
-/// jwulf/c8ctl-plugin-nano#274 says is broken: UPDATE rejects `COMPLETED`, so
-/// every instance strands non-terminal.
+/// holds the instance ACTIVE after the agent job settles), so an engine
+/// force-completion cannot mask what the producer did. The contract under test
+/// is the producer's restraint: it must NOT send or retry the unsupported
+/// terminal update (the pinned reference does — it 422s and logs "MANUAL
+/// RECONCILIATION REQUIRED", observed live — that is its recorded #274 gap),
+/// and the instance must read ACTIVE/non-terminal with no `completionDate`
+/// while the process is open.
 ///
-/// Markers: Rust = #59 (no producer at all). Node = the reference's own #274 —
-/// the pinned reference 422s the update and logs "MANUAL RECONCILIATION
-/// REQUIRED", observed live; the marker drops when the pin moves to a plugin
-/// release carrying the #274 fix (issue #58) and the Node target passes.
+/// Markers: Rust = #59 (no producer at all). Node = the reference's own #274;
+/// the marker drops when the pin moves to a plugin release carrying the #274
+/// fix (issue #58) and the Node target passes.
 #[test]
-fn agent_instance_status_is_durable_when_the_process_stays_open() {
+fn agent_instance_stays_active_while_the_process_stays_open() {
     let (engine, target) = match require_engine_and_target() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
@@ -235,13 +248,14 @@ fn agent_instance_status_is_durable_when_the_process_stays_open() {
         outcome.stderr()
     );
     // The gate held: the process instance is still open, so the engine did NOT
-    // force-complete the AgentInstance. (If this is false the test below would
-    // be vacuous — the engine's bookkeeping would produce the COMPLETED.)
+    // complete the AgentInstance itself — whatever status the instance reads is
+    // the producer's own doing. (If this is false the assertions below would be
+    // vacuous — the engine's bookkeeping would own the status.)
     assert_eq!(
         engine.process_active(&outcome.process_instance_key),
         Some(true),
         "the gated process instance must stay ACTIVE after the agent job settles \
-         (processInstanceKey {}); the gate did not hold, so the status assertion \
+         (processInstanceKey {}); the gate did not hold, so the status assertions \
          below would be masked by process completion",
         outcome.process_instance_key
     );
@@ -251,31 +265,42 @@ fn agent_instance_status_is_durable_when_the_process_stays_open() {
         Target::Node => Some("jwulf/c8ctl-plugin-nano#274"),
     };
     let instances = engine.agent_instances(&outcome.process_instance_key);
-    let terminal = match instances.first() {
+    let restraint = match instances.first() {
         None => Err(format!(
             "no AgentInstance for process instance {} — the producer never created one",
             outcome.process_instance_key
         )),
         Some(instance) => {
+            // Engine-owned completion (#274): while the process is open the
+            // instance must read ACTIVE (non-terminal, no completionDate), and
+            // the worker must not have sent/retried the unsupported
+            // `status:COMPLETED` update — the pinned reference's 422 +
+            // "MANUAL RECONCILIATION REQUIRED" is exactly that violation.
             let status = instance["status"].as_str().unwrap_or("");
-            if status == "COMPLETED" {
-                Ok(())
-            } else {
+            let completed = status == "COMPLETED" || instance["completionDate"].is_string();
+            let reconciliation = outcome.stderr().contains("MANUAL RECONCILIATION REQUIRED");
+            if completed {
                 Err(format!(
-                    "the AgentInstance must be COMPLETED once the agent job has settled and \
-                     the process is still open, so no engine bookkeeping can strand it; \
-                     got status={status:?} completionDate={:?}.\n\
-                     worker stderr:\n{}",
-                    instance["completionDate"],
+                    "the AgentInstance must stay ACTIVE while the process is open — \
+                     completion is engine-owned (#274); got status={status:?} \
+                     completionDate={:?}",
+                    instance["completionDate"]
+                ))
+            } else if reconciliation {
+                Err(format!(
+                    "the worker sent/retried the unsupported terminal AgentInstance update \
+                     (#274: UPDATE rejects COMPLETED on a conforming engine); worker stderr:\n{}",
                     outcome.stderr()
                 ))
+            } else {
+                Ok(())
             }
         }
     };
-    assert_parity(expect_parity(target, gap, terminal), || {
+    assert_parity(expect_parity(target, gap, restraint), || {
         format!(
-            "AgentInstance terminal status is not durable on {target:?}; \
-             worker stderr:\n{}",
+            "AgentInstance completion is engine-owned (#274): the producer must not \
+             drive a terminal status on {target:?}; worker stderr:\n{}",
             outcome.stderr()
         )
     });
@@ -302,9 +327,6 @@ fn agent_instance_creation_conflict_is_adopted_not_retried() {
         Ok(v) => v,
         Err(Skip(why)) => skip!(why),
     };
-    if target == Target::Rust {
-        skip!("the Rust worker has no AgentInstance producer yet (nanobpm/nano-supervisor#59)");
-    }
 
     // A gated process keeps the element instance ACTIVE while the harness
     // associates it, so the later, competing create really does conflict.
@@ -395,7 +417,12 @@ fn agent_instance_creation_conflict_is_adopted_not_retried() {
     // turn was appended to IT (the worker resumed the existing instance rather
     // than retrying a create it could never win). Marked with the reference's
     // own #289 for the Node target — the pinned reference retries the permanent
-    // conflict and records nothing, observed live above.
+    // conflict and records nothing, observed live above — and with #59 for the
+    // Rust target, which has no producer at all.
+    let gap = match target {
+        Target::Rust => Some("nanobpm/nano-supervisor#59"),
+        Target::Node => Some("jwulf/c8ctl-plugin-nano#289"),
+    };
     let instances = engine.agent_instances(&pik);
     let history = engine.agent_instance_history(&preassociated);
     let adopted_turn = history.iter().any(|t| {
@@ -415,16 +442,13 @@ fn agent_instance_creation_conflict_is_adopted_not_retried() {
              (issue #289); the process instance now has: {instances:#?}"
         )),
     };
-    assert_parity(
-        expect_parity(target, Some("jwulf/c8ctl-plugin-nano#289"), check),
-        || {
-            format!(
-                "AgentInstance creation conflicts must be adopted, not retried \
-                 (jwulf/c8ctl-plugin-nano#289).\nworker stderr:\n{}",
-                outcome.stderr()
-            )
-        },
-    );
+    assert_parity(expect_parity(target, gap, check), || {
+        format!(
+            "AgentInstance creation conflicts must be adopted, not retried \
+             (jwulf/c8ctl-plugin-nano#289).\nworker stderr:\n{}",
+            outcome.stderr()
+        )
+    });
 }
 
 /// A job whose first worker is KILLED mid-run is picked up by a fresh worker

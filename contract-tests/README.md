@@ -73,7 +73,7 @@ test. Keep this list current as tests are added:
 | Checkpoint / resume | A job resumes after its worker is killed mid-run | `worker_resume::killed_worker_job_resumes_not_restarts` |
 | AgentInstance producer (issue #59) | A worker records an engine **AgentInstance** for its job (transcript = the durable artifact), not just a local run dir | `worker_resume::job_writes_an_agent_instance_record` |
 | AgentInstance on conflict (jwulf/c8ctl-plugin-nano#289) | When the element instance is **already associated**, the worker adopts the existing AgentInstance and appends its turn instead of retrying a create it cannot win | `worker_resume::agent_instance_creation_conflict_is_adopted_not_retried` |
-| Durable AgentInstance status (jwulf/c8ctl-plugin-nano#274) | The AgentInstance reaches a terminal status even when the process **stays open** (trivially-completing process masks the bug) | `worker_resume::agent_instance_status_is_durable_when_the_process_stays_open` |
+| Engine-owned AgentInstance completion (jwulf/c8ctl-plugin-nano#274) | While the process **stays open**, the AgentInstance stays ACTIVE and the worker does **not** send/retry the unsupported `status:COMPLETED` update (completion is the engine's, when the process ends) | `worker_resume::agent_instance_stays_active_while_the_process_stays_open` |
 
 Where the Node plugin's observed behavior looks like a bug, the test captures it
 anyway, marks it `// NODE-QUIRK: <issue link>`, and it is raised on issue #1
@@ -100,7 +100,7 @@ output.
 | --- | --- | --- |
 | No AgentInstance producer yet (job transcript only local) | rust | nanobpm/nano-supervisor#59 |
 | Create conflict (409) is retried, not adopted | node | jwulf/c8ctl-plugin-nano#289 (fixed in 1.70.3) |
-| AgentInstance never reaches a terminal status | node | jwulf/c8ctl-plugin-nano#274 |
+| Producer drives the terminal AgentInstance update the engine owns (422s, instance stranded) | node | jwulf/c8ctl-plugin-nano#274 |
 
 #250 (reactivating a terminal AgentInstance re-runs the agent) has **no
 reproducible scenario yet**, so it is deliberately not asserted here; it is a

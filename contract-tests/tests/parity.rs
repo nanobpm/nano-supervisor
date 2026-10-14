@@ -84,14 +84,9 @@ fn parity_gaps_are_tracked_by_open_issues() {
         "PARITY_GAPS rows must cite `owner/repo#N`; malformed: {malformed:#?}"
     );
 
-    if !unresolved.is_empty() {
-        eprintln!(
-            "SKIP parity_gaps_are_tracked_by_open_issues: could not resolve {unresolved:?} \
-             (gh missing/unauthenticated/offline); the guard is enforced where gh is available"
-        );
-        return;
-    }
-
+    // A closed row is a stale marker — report it even when other rows could not
+    // be resolved: one transient lookup failure must not mask a gap whose issue
+    // is already known to be closed.
     assert!(
         closed.is_empty(),
         "these parity gaps cite a CLOSED issue, so their `expect_parity` markers are \
@@ -99,6 +94,25 @@ fn parity_gaps_are_tracked_by_open_issues() {
          (or re-point it at the issue that actually still tracks the gap):\n{}",
         closed.join("\n")
     );
+
+    if !unresolved.is_empty() {
+        // Where a token is configured (CI sets GH_TOKEN) a lookup is supposed to
+        // succeed: a nonexistent issue, a permission error, or a transient
+        // failure must FAIL the guard — otherwise the advertised open-issue gate
+        // silently turns itself off exactly where it is meant to enforce. With
+        // no token (a local run without `gh auth`) the guard genuinely cannot
+        // resolve, so it skips like the other network-dependent tests.
+        assert!(
+            std::env::var_os("GH_TOKEN").is_none() && std::env::var_os("GITHUB_TOKEN").is_none(),
+            "a GitHub token is configured, so every PARITY_GAPS issue must resolve; \
+             unresolvable: {unresolved:?} (nonexistent issue, permission error, or outage — \
+             the guard fails rather than waiving the gate)"
+        );
+        eprintln!(
+            "SKIP parity_gaps_are_tracked_by_open_issues: could not resolve {unresolved:?} \
+             (gh missing/unauthenticated/offline); the guard is enforced where gh is available"
+        );
+    }
 }
 
 /// The ledger must not merely be well-formed: every row has to name a target that

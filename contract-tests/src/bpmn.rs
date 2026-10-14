@@ -62,12 +62,15 @@ pub fn single_task_with_headers(
 /// waits for an external completion, so the process instance (and every job in
 /// it) stays ACTIVE after the agent job settles.
 ///
-/// This is what makes a producer-driven `status:COMPLETED` update *observable*:
-/// with an ordinary single-task process the engine force-completes the process
-/// instance — and with it the AgentInstance — the moment the job completes, so a
-/// broken terminal update (issue #274) is masked by the engine's own
-/// bookkeeping. Holding the instance open removes that mask: the AgentInstance
-/// can only read `COMPLETED` if the producer's own update landed.
+/// This is what removes the engine's mask over AgentInstance completion: with
+/// an ordinary single-task process the engine completes the process instance —
+/// and with it the AgentInstance — the moment the job completes, so a producer
+/// that wrongly drives its own terminal update (issue #274: `updateAgentInstance`
+/// deliberately accepts only active statuses; completion is owned by the engine
+/// when the process ends) is invisible behind the engine's own bookkeeping.
+/// Holding the instance open removes that mask: the AgentInstance must read
+/// ACTIVE/non-terminal on the producer's restraint alone, and any invalid
+/// terminal update the producer sends shows up as what it is — a 422.
 pub fn single_task_with_gate(process_id: &str, job_type: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

@@ -1106,9 +1106,10 @@ pub const PARITY_GAPS: &[ParityGap] = &[
     // createAgentInstance/updateAgentInstance, so no engine-observable transcript
     // exists for it.
     ParityGap::new(Target::Rust, "nanobpm/nano-supervisor#59"),
-    // The reference's own producer gap: the pinned plugin (1.70.2) 422s on the
-    // terminal status update, stranding instances non-terminal, and retries a
-    // permanent 409 "already associated" instead of adopting the instance.
+    // The reference's own producer gap: the pinned plugin (1.70.2) sends the
+    // terminal status update the engine owns (#274: UPDATE accepts only active
+    // statuses, so it 422s and strands the instance non-terminal), and retries
+    // a permanent 409 "already associated" instead of adopting the instance.
     ParityGap::new(Target::Node, "jwulf/c8ctl-plugin-nano#274"),
     ParityGap::new(Target::Node, "jwulf/c8ctl-plugin-nano#289"),
 ];
@@ -1132,12 +1133,30 @@ pub enum Parity {
 /// skip!(…) }` branches: the gap is declared with the issue that tracks it, and
 /// the test's own failure carries it — no silent skip.
 ///
+/// The marker's `(target, issue)` pair must exist in [`PARITY_GAPS`]: a marker
+/// without a ledger row (a typo, or a row never added) is a `Fail`, not an
+/// XFAIL — otherwise it would waive the assertion with no open-issue guard ever
+/// tracking it. Membership is by exact pair, so a marker that names a real
+/// issue but on the wrong target still fails.
+///
 /// - `check` returns `Ok(())` with a `gap`: `Xfail` — an XPASS. The
 ///   implementation caught up, so the marker is stale and must be dropped.
 /// - `check` returns `Err(..)` with a `gap`: `Xfail` — the expected failure.
 /// - `check` returns `Ok(())` with no `gap`: `Pass`.
 /// - `check` returns `Err(..)` with no `gap`: `Fail` — a real regression.
 pub fn expect_parity(target: Target, gap: Option<&str>, check: Result<(), String>) -> Parity {
+    if let Some(issue) = gap {
+        if !PARITY_GAPS
+            .iter()
+            .any(|row| row.target == target && row.issue == issue)
+        {
+            eprintln!(
+                "parity marker ({target:?}, {issue}) has no PARITY_GAPS row — \
+                 add the row (with an open issue) or drop the marker"
+            );
+            return Parity::Fail;
+        }
+    }
     match (gap, check) {
         (None, Ok(())) => Parity::Pass,
         (None, Err(_)) => Parity::Fail,
@@ -3174,5 +3193,34 @@ mod parity_tests {
             );
             assert!(number.parse::<u64>().is_ok(), "issue number: {gap:?}");
         }
+    }
+
+    #[test]
+    fn a_marker_without_a_ledger_row_fails_instead_of_waiving() {
+        // A typo'd or never-registered issue must NOT suppress the failure: the
+        // open-issue guard only tracks rows in PARITY_GAPS, so an arbitrary
+        // marker is a Fail, whether the check passed or not.
+        assert_eq!(
+            expect_parity(Target::Rust, Some("nanobpm/nano-supervisor#99999"), Ok(())),
+            Parity::Fail
+        );
+        assert_eq!(
+            expect_parity(
+                Target::Rust,
+                Some("nanobpm/nano-supervisor#99999"),
+                Err("boom".into())
+            ),
+            Parity::Fail
+        );
+    }
+
+    #[test]
+    fn a_marker_on_the_wrong_target_fails() {
+        // The ledger holds #59 for Rust; the same issue named for Node is not a
+        // tracked (target, issue) pair, so it must not waive a Node failure.
+        assert_eq!(
+            expect_parity(Target::Node, RUST_GAP, Err("boom".into())),
+            Parity::Fail
+        );
     }
 }
