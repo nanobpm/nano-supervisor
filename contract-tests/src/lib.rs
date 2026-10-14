@@ -390,28 +390,21 @@ impl Drop for TempHome {
         if !sock.exists() {
             return;
         }
-        let _ = control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }));
-        // Issue #54: don't fire-and-forget. After the force-stop, give the daemon
-        // a bounded window to release its control socket (the daemon removes it as
-        // it exits), so a still-live daemon is given the chance to stop cleanly
-        // before this home's `TempDir` is deleted. A daemon that ignores the stop
-        // is still reaped: it watches its `C8CTL_NANO_TEST_OWNER_PID` and this
-        // home, and the owner watchdog SIGKILLs the daemon process (by pid — the
-        // daemon is not its own process-group leader, so its shared test group
-        // must never be signalled) once the owner is gone or — once the `TempDir`
-        // below deletes this home — the home disappears. So no daemon outlives
-        // its test even when `Drop` is the only cleanup that ran.
-        let deadline = Instant::now() + DROP_STOP_GRACE;
-        while Instant::now() < deadline {
-            // The socket is removed by the daemon as it exits; once it no longer
-            // answers a connect the daemon is gone (or never was).
-            if std::os::unix::net::UnixStream::connect(&sock).is_err() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // Issue #54: don't fire-and-forget. Issue #64: `Drop` and the startup
+        // sweep share ONE confirmed-stop helper (`force_stop_daemon`), so both
+        // paths force-stop, wait the same bounded grace for the socket to stop
+        // answering, and apply the same retention rule — there is no second,
+        // divergent cleanup loop to reintroduce the unlink-vs-live-daemon race.
+        // A daemon that ignores the stop is still reaped: it watches its
+        // `C8CTL_NANO_TEST_OWNER_PID` and this home, and the owner watchdog
+        // SIGKILLs the daemon process (by pid — the daemon is not its own
+        // process-group leader, so its shared test group must never be
+        // signalled) once the owner is gone or — once the `TempDir` below
+        // deletes this home — the home disappears. So no daemon outlives its
+        // test even when `Drop` is the only cleanup that ran.
+        let _ = force_stop_daemon(&sock);
         // Remove the socket file only once the daemon stopped answering it (the
-        // loop above broke on a failed connect, so the daemon is gone and the
+        // helper returned with a failed connect, so the daemon is gone and the
         // file is stale): a later test's startup sweep must not mistake it for a
         // live daemon. If the daemon is STILL accepting after the grace (a live
         // listener), leave the pathname in place — unlinking a live Unix socket
@@ -421,23 +414,33 @@ impl Drop for TempHome {
         // that still converges that daemon (it fires on owner death or on this
         // home's `TempDir` removal below); retaining the socket lets a later
         // sweep retry the stop in the meantime.
-        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+        if UnixStream::connect(&sock).is_err() {
             let _ = std::fs::remove_file(&sock);
         }
     }
 }
 
-/// How long `Drop for TempHome` waits for a force-stopped daemon to release its
-/// control socket. If the daemon stops answering within the grace, its socket
-/// file is stale and `Drop` removes it. If the daemon is STILL accepting
-/// connections after the grace (a live listener we could not stop in time),
-/// `Drop` intentionally RETAINS the socket file: unlinking a live Unix socket
-/// does not terminate its process, it only strips the name a later startup
-/// sweep needs to reach and stop it, stranding an unreachable orphan. Keep that
-/// retention when changing this cleanup so the unreachable-orphan bug is not
-/// reintroduced (issue #54 review); the Rust target's owner watchdog converges
-/// such a daemon in the meantime.
-const DROP_STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long a force-stopped daemon is given to release its control socket before
+/// the cleanup path gives up waiting. Shared by `Drop for TempHome` and the
+/// startup sweep (issue #64: one constant, not two divergent graces). If the
+/// daemon stops answering within the grace, its socket file is stale and the
+/// caller removes it. If the daemon is STILL accepting connections after the
+/// grace (a live listener we could not stop in time), the caller intentionally
+/// RETAINS the socket file: unlinking a live Unix socket does not terminate its
+/// process, it only strips the name a later startup sweep needs to reach and
+/// stop it, stranding an unreachable orphan. Keep that retention when changing
+/// this cleanup so the unreachable-orphan bug is not reintroduced (issue #54
+/// review); the Rust target's owner watchdog converges such a daemon in the
+/// meantime.
+///
+/// Residual race (issue #64, accepted): a daemon that is merely SLOW to answer —
+/// still live but not accepting within the grace — reads as "stopped" to the
+/// connect probe, so its socket pathname is removed while it runs. That daemon
+/// is then unreachable via the socket, but the Rust owner watchdog still
+/// converges it (owner death / home removal), and the window is bounded by this
+/// grace. Widening the grace only narrows the window; it cannot close it without
+/// a positive liveness handshake, which the control protocol does not provide.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Derive the plugin's control-socket path for a given home directory. Mirrors
 /// the Node plugin exactly: `join(tmpdir(), "c8ctl-nano-sup-<sha1(home)[:8]>.sock")`.
@@ -454,13 +457,25 @@ pub fn supervisor_socket_path(home: &Path) -> PathBuf {
 /// [`TempHome`] so leftovers from a crashed/killed `cargo test` are reclaimed
 /// before this test starts, rather than accumulating on a fleet machine.
 ///
-/// A leftover is recognised by its `ct-home-*` state home in the system temp
-/// dir. To avoid disturbing a *concurrently-running* test's live daemon (every
-/// test in one `cargo test` process shares the same owner pid), a home is only
-/// treated as orphaned when its recorded owner pid (`ct-owner.pid`, written by
-/// the daemon when it armed its owner watchdog) is **gone** — or when there is
-/// no owner marker at all (an older binary that never wrote one). For each
-/// orphaned home whose daemon still answers its control socket we force-stop it.
+/// Issue #64 narrowed this surface. A leftover is recognised by its `ct-home-*`
+/// state home in the system temp dir, and reclaimed **only** on positive proof
+/// it is ours — never on the name prefix alone:
+///
+/// - a home whose `ct-owner.pid` marker positively names a **dead or recycled**
+///   owner ([`HomeOwnership::Orphaned`]) — the harness wrote that marker, so the
+///   home is provably a test home; or
+/// - a home whose supervisor endpoint we **positively identified**: its derived
+///   control socket answered the `stop` op with the protocol's terminal
+///   `{type:"stopped", final:true}` frame and then stopped accepting
+///   ([`force_stop_daemon`]). This is the only path that reclaims a *markerless*
+///   home (a leftover from a binary that predates the owner marker).
+///
+/// A home with a live, matching owner marker ([`HomeOwnership::Live`]) belongs
+/// to a concurrently-running test and is left entirely alone. A markerless home
+/// with no reachable supervisor endpoint ([`HomeOwnership::Unknown`], nothing
+/// answered) is also left alone: the `ct-home-*` prefix is not proof of
+/// ownership, and the endpoint heuristic can be stale under PID reuse or a slow
+/// shutdown, so we never delete a directory we did not positively identify.
 /// The daemon's own owner watchdog is the primary reaper; this sweep is the
 /// backstop for a daemon started by an older binary or one that never bound its
 /// owner. Best-effort and cheap: it never touches a home that is not a
@@ -478,68 +493,40 @@ fn sweep_orphaned_daemons() {
             continue;
         }
         let home = entry.path();
-        // Classify ownership: only a home whose marker positively names a
-        // dead/recycled owner (Orphaned) or one with no readable marker whose
-        // supervisor endpoint we can positively confirm (Unknown) may be
-        // reclaimed. A home with a live, matching owner marker belongs to a
-        // concurrently-running test and must be left entirely alone.
+        // Classify ownership from the marker. A home with a live, matching owner
+        // marker belongs to a concurrently-running test: leave it entirely alone.
         let ownership = classify_home(&home);
         if matches!(ownership, HomeOwnership::Live) {
             continue;
         }
+        // Try to reach and confirm this home's supervisor endpoint. This runs
+        // the SAME confirmed-stop helper `Drop` uses (issue #64): force-stop,
+        // bounded grace, retention on a still-accepting socket. `confirmed` is
+        // true only when a genuine supervisor answered the `stop` op with the
+        // terminal `stopped` frame AND then stopped accepting — positive
+        // identification, not a heuristic.
         let sock = supervisor_socket_path(&home);
         let mut endpoint_confirmed = false;
         if sock.exists() {
-            // Ask whatever is at this socket to stop. A *genuine* supervisor
-            // answers the `stop` op with a terminal `{type:"stopped", final:true}`
-            // frame (see `contract-tests/fixtures/socket-protocol.md`); only that
-            // positive protocol response proves a supervisor daemon lived at this
-            // home. A stale leftover socket file (no listener), or an unrelated
-            // program that happens to hold a socket at this derived path, yields
-            // no such response and must NOT be treated as identification — for an
-            // `Unknown`/markerless home that would let a stale socket authorise
-            // deleting a directory we never proved is ours (issue #54 review
-            // r4240279294).
-            let answered_stop =
-                control_request(&sock, &serde_json::json!({ "op": "stop", "force": true }))
-                    .ok()
-                    .is_some_and(|frames| {
-                        frames.iter().any(|f| {
-                            f.get("final").and_then(|v| v.as_bool()).unwrap_or(false)
-                                && f.get("type").and_then(|v| v.as_str()) == Some("stopped")
-                        })
-                    });
-            if answered_stop {
-                // A real supervisor acknowledged the force-stop: give it a bounded
-                // moment to exit before removing the (soon-stale) socket file. Its
-                // owner watchdog will SIGKILL it regardless once it notices the
-                // dead owner; this just hurries a clean stop along.
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < deadline
-                    && std::os::unix::net::UnixStream::connect(&sock).is_ok()
-                {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
+            endpoint_confirmed = force_stop_daemon(&sock);
             // If something is STILL accepting on the socket — the stop was never
-            // acknowledged (stale/unrelated listener) or the deadline expired —
-            // leave both the pathname and the home in place: unlinking a live Unix
-            // socket does not kill its process, it only strips the one name a
-            // later sweep (or this daemon's own owner watchdog, which needs no
+            // acknowledged (stale/unrelated listener) or the grace expired —
+            // leave both the pathname and the home in place: unlinking a live
+            // Unix socket does not kill its process, it only strips the one name
+            // a later sweep (or this daemon's own owner watchdog, which needs no
             // socket) could use to reach and stop it, stranding an unreachable
             // orphan (issue #54 review).
-            if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            if UnixStream::connect(&sock).is_ok() {
                 continue;
             }
             // Nothing answers the socket now. Remove the (stale) socket file so a
             // later sweep is not fooled by it — but ONLY treat this as positive
-            // supervisor identification when we actually received the terminal
-            // `stopped` response above. A socket file with no valid protocol
-            // response is a stale/unrelated leftover: clear the pathname, but do
-            // not let it authorise deleting a markerless home (issue #54 review
-            // r4240279294).
+            // supervisor identification when the helper actually received the
+            // terminal `stopped` response above. A socket file with no valid
+            // protocol response is a stale/unrelated leftover: clear the
+            // pathname, but do not let it authorise deleting a markerless home
+            // (issue #54 review r4240279294).
             let _ = std::fs::remove_file(&sock);
-            endpoint_confirmed = answered_stop;
         }
         // Recursive deletion is gated on POSITIVE ownership, not the `ct-home-`
         // prefix alone (issue #54 review): a same-user directory under TMPDIR
@@ -568,6 +555,45 @@ fn sweep_orphaned_daemons() {
         // left for the next sweep).
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+/// Force-stop the supervisor daemon answering a control socket, and report
+/// whether it was **positively identified** as a supervisor. Shared by
+/// `Drop for TempHome` and the startup sweep so both cleanup paths apply one
+/// identical stop-and-confirm sequence (issue #64).
+///
+/// Sends the `stop` op with `force:true`, then waits a bounded [`STOP_GRACE`]
+/// for the daemon to release its socket (the daemon removes the pathname as it
+/// exits). Returns `true` only when the daemon answered with the protocol's
+/// terminal `{type:"stopped", final:true}` frame (see
+/// `contract-tests/fixtures/socket-protocol.md`) — the positive identification
+/// that proves a supervisor daemon lived at this socket. A stale leftover
+/// socket file (no listener), or an unrelated program that happens to hold a
+/// socket at this path, yields no such frame and returns `false`.
+///
+/// This function does **not** unlink the socket: the caller decides, after
+/// checking whether anything still accepts (a live listener retains its
+/// pathname — see [`STOP_GRACE`]).
+fn force_stop_daemon(sock: &Path) -> bool {
+    let answered_stop = control_request(sock, &serde_json::json!({ "op": "stop", "force": true }))
+        .ok()
+        .is_some_and(|frames| {
+            frames.iter().any(|f| {
+                f.get("final").and_then(|v| v.as_bool()).unwrap_or(false)
+                    && f.get("type").and_then(|v| v.as_str()) == Some("stopped")
+            })
+        });
+    if answered_stop {
+        // A real supervisor acknowledged the force-stop: give it a bounded
+        // moment to exit before the caller removes the (soon-stale) socket file.
+        // Its owner watchdog will SIGKILL it regardless once it notices the dead
+        // owner; this just hurries a clean stop along.
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline && UnixStream::connect(sock).is_ok() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    answered_stop
 }
 
 /// A process's start-time incarnation token, in the SAME units the Rust daemon's
@@ -3193,6 +3219,71 @@ mod unit {
             !sock.exists(),
             "the stale socket file is cleared so a later sweep is not fooled by it"
         );
+    }
+
+    // Issue #64: `Drop for TempHome` and the startup sweep share ONE
+    // confirmed-stop helper (`force_stop_daemon`) and ONE grace constant
+    // (`STOP_GRACE`), so there is no divergent second cleanup loop to
+    // reintroduce the unlink-vs-live-daemon race. Pin the helper's contract
+    // directly: it returns `true` only on a terminal `stopped` frame, and it
+    // never unlinks the socket (the caller decides after re-probing).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn force_stop_daemon_reports_identification_and_keeps_the_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("sup.sock");
+
+        // No listener at all: nothing answers, so no positive identification.
+        assert!(
+            !force_stop_daemon(&sock),
+            "no listener => not identified as a supervisor"
+        );
+
+        // A listener that speaks the control protocol: answers `stop` with the
+        // terminal `stopped` frame, then drops the listener (stops accepting).
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let answerer = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"{\"type\":\"stopped\",\"final\":true}\n");
+                let _ = stream.flush();
+            }
+        });
+        assert!(
+            force_stop_daemon(&sock),
+            "a terminal stopped frame positively identifies the supervisor"
+        );
+        let _ = answerer.join();
+        // The helper must NOT unlink the socket itself: the caller removes it
+        // only after confirming nothing still accepts (retention rule).
+        assert!(
+            sock.exists(),
+            "force_stop_daemon never unlinks the socket; the caller decides"
+        );
+
+        // A listener that accepts but answers with a NON-terminal frame (not a
+        // supervisor stop response) is not a positive identification. It keeps
+        // accepting, so the helper must not wait the grace.
+        let sock2 = dir.path().join("sup2.sock");
+        let listener2 = UnixListener::bind(&sock2).expect("bind2");
+        let answerer2 = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener2.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"{\"type\":\"status\",\"final\":false}\n");
+                let _ = stream.flush();
+            }
+            // listener2 dropped here
+        });
+        assert!(
+            !force_stop_daemon(&sock2),
+            "a non-terminal frame is not a positive supervisor identification"
+        );
+        let _ = answerer2.join();
     }
 }
 
