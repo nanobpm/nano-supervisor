@@ -835,6 +835,19 @@ pub struct GitResult {
     /// that is not being pushed. The caller must RETAIN the run dir: the only
     /// copy of that work may live in it, so reaping would destroy it.
     pub retain: bool,
+    /// Set ONLY when PUBLICATION of the prepared work branch failed or could
+    /// not be confirmed this run — the push admin context could not be built,
+    /// or the push errored and the trusted remote tip could not be verified to
+    /// contain its commits. This is the Rust analogue of the Node plugin's
+    /// `pushFailed`, and it is DELIBERATELY distinct from [`retain`]: `retain`
+    /// is also set by many unrelated incomplete/stranded-scan guards that leave
+    /// publication itself intact (and even by a run whose push then succeeds),
+    /// so gating PR reconciliation on `retain` would skip reconcile for a run
+    /// whose branch IS published — falsely reporting `pullRequest: null` and
+    /// diverging from Node's `!pushFailed` parity. Reconciliation is gated on
+    /// `!push_failed` so a confirmed (or un-attempted) publication still looks
+    /// its PR up, while a genuinely failed/uncertain push does not claim one.
+    pub push_failed: bool,
     /// Set when finalize found real agent work, independent of whether it was
     /// pushed or even enumerated onto the work branch. Distinct from `retain`
     /// (which only marks an incomplete/stranded scan) and from `commits` (which
@@ -1360,6 +1373,7 @@ async fn finalize_git_with_deadline(
         pushed: false,
         pr: None,
         retain: false,
+        push_failed: false,
         work_found: false,
         unborn_no_ref: false,
         scan_incomplete: false,
@@ -2310,6 +2324,7 @@ async fn finalize_git_with_deadline(
                                  pushed to a possibly rewritten/MITM'd destination"
                             ));
                             out.retain = true;
+                            out.push_failed = true;
                             None
                         }
                     };
@@ -2384,6 +2399,7 @@ async fn finalize_git_with_deadline(
                                          retaining the run dir so the work is not lost"
                                     ));
                                     out.retain = true;
+                                    out.push_failed = true;
                                 }
                             }
                         }
@@ -2396,15 +2412,19 @@ async fn finalize_git_with_deadline(
     // PR reconciliation (the Node plugin's `reconcileAgentPr`, c8ctl-plugin.js
     // ~L6627): with a prepared work branch AND `task.allowPr`, look the pushed
     // branch's provider PR up so the completion's `pullRequest` variable is
-    // populated (issue #49 — it was previously always null). Gate on `!retain`,
-    // the Rust analogue of Node's `!out.pushFailed`: `retain` is set whenever a
-    // scan was incomplete or the push could not be confirmed, so reporting a PR
-    // against a branch whose publication is uncertain would falsely claim this
-    // run's commits are in it. Node runs reconcile even with no new commits (a
-    // PR-head branch may carry a PR from an earlier run), so this does NOT gate
-    // on `pushed`. Best-effort: it never fails the job — any `gh`/parse error
-    // becomes `{ found: false, error }`, exactly as Node does.
-    if allow_pr && !out.retain {
+    // populated (issue #49 — it was previously always null). Gate on
+    // `!push_failed`, the true Rust analogue of Node's `!out.pushFailed`: only a
+    // run whose PUBLICATION of the branch failed or could not be confirmed is
+    // skipped, so reporting a PR against a branch that may not carry this run's
+    // commits is avoided WITHOUT suppressing reconcile for the common case where
+    // an UNRELATED incomplete/stranded scan set `retain` but the push itself
+    // succeeded (or was never attempted) — gating on `retain` there would
+    // falsely report `pullRequest: null` for a branch that IS published. Node
+    // runs reconcile even with no new commits (a PR-head branch may carry a PR
+    // from an earlier run), so this does NOT gate on `pushed`. Best-effort: it
+    // never fails the job — any `gh`/parse error becomes `{ found: false, error }`,
+    // exactly as Node does.
+    if reconcile_gate(allow_pr, out.push_failed) {
         if let Some(branch) = &prep.working_branch {
             out.pr = Some(
                 reconcile_agent_pr(workspace, &repo.provider, &repo.url, branch, remaining!()).await,
@@ -3680,6 +3700,16 @@ fn gh_host_of_slug(slug: &str) -> String {
     }
 }
 
+/// Whether finalize should run PR reconciliation this round. Reconcile runs
+/// when the job was asked to open a PR (`allow_pr`) AND publication of the work
+/// branch did NOT fail (`!push_failed`). Keeping this a pure predicate makes the
+/// gate's semantics — keyed on the dedicated `push_failed` state, never on the
+/// broad `retain` flag (which an unrelated incomplete/stranded scan sets while
+/// the push itself succeeds) — unit-testable in isolation.
+fn reconcile_gate(allow_pr: bool, push_failed: bool) -> bool {
+    allow_pr && !push_failed
+}
+
 /// Look the provider PR up for a pushed branch, mirroring the Node plugin's
 /// `reconcileAgentPr` (c8ctl-plugin.js ~L5636): `gh pr list --head <branch>
 /// --state all --json number,url,state,isDraft,title,author --limit 1`, run with
@@ -3833,6 +3863,38 @@ fn exit_desc(status: &std::process::ExitStatus) -> String {
         .unwrap_or_else(|| "null".into())
 }
 
+/// Build the `gh pr list` argument vector for `branch`, pinning the repository
+/// with `-R <slug>` when a trusted GitHub slug resolved from the configured
+/// `repo.url` is available. Keeping this a pure builder makes the `-R` pin —
+/// the control that forces the token-bearing lookup onto a SUPERVISOR-chosen
+/// repository rather than the agent-mutable `origin` remote — independently
+/// testable: a regression that dropped `-R` for a resolved slug would otherwise
+/// pass every spawn-based test (the finalize contract test uses a `file://`
+/// origin with no slug, so it never exercises `-R`).
+fn gh_pr_list_args(slug: Option<&str>, branch: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["pr".into(), "list".into()];
+    // Pin the repository when we could resolve a trusted GitHub slug; otherwise
+    // let `gh` infer it from the checkout's remotes (cwd-based, as Node does).
+    if let Some(slug) = slug {
+        args.push("-R".into());
+        args.push(slug.into());
+    }
+    args.extend(
+        [
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,url,state,isDraft,title,author",
+            "--limit",
+            "1",
+        ]
+        .map(String::from),
+    );
+    args
+}
+
 /// Spawn `gh pr list` for `branch` in `workspace`, returning its captured
 /// outcome. Best-effort and bounded by `timeout`; the credential and ambient-gh
 /// scrubbing live in [`gh_auth_env`]. `host` is the TRUSTED GitHub host derived
@@ -3848,22 +3910,7 @@ async fn gh_pr_list(
 ) -> Result<GhRun> {
     use std::process::Stdio;
     let mut cmd = Command::new("gh");
-    cmd.args(["pr", "list"]);
-    // Pin the repository when we could resolve a trusted GitHub slug; otherwise
-    // let `gh` infer it from the checkout's remotes (cwd-based, as Node does).
-    if let Some(slug) = slug {
-        cmd.args(["-R", slug]);
-    }
-    cmd.args([
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--json",
-        "number,url,state,isDraft,title,author",
-        "--limit",
-        "1",
-    ]);
+    cmd.args(gh_pr_list_args(slug, branch));
     // Run with the job workspace as cwd, exactly as Node's `spawnSync(..., { cwd
     // }); `gh` reads the checkout's git remotes for host/auth resolution.
     workspace
@@ -3950,7 +3997,11 @@ async fn gh_pr_list(
 ///     credential source — all four token env vars AND any stored
 ///     `hosts.yml`/keychain (via a private empty `GH_CONFIG_DIR`) — so no path
 ///     can silently authenticate as the daemon/operator with an inherited
-///     credential.
+///     credential. An inherited `GH_HOST`/`GH_REPO` is scrubbed too: for the
+///     bare `owner/repo` (github.com) form `GH_HOST` would otherwise redirect
+///     the lookup to an attacker-chosen default host, and `GH_REPO` would
+///     override the repository target on the cwd-inference path; `GH_HOST` is
+///     restored only in the Enterprise branch, pinned to the trusted host.
 ///   * With a token: deliver it as `GH_TOKEN` for github.com, or as
 ///     `GH_ENTERPRISE_TOKEN` + `GH_HOST` for a GitHub Enterprise host (`gh`
 ///     ignores `GH_TOKEN` for a custom host). `host` comes from the TRUSTED
@@ -3999,6 +4050,17 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Opt
         "GH_ENTERPRISE_TOKEN",
         "GITHUB_ENTERPRISE_TOKEN",
     ] {
+        cmd.env_remove(k);
+    }
+    // BOTH paths: scrub any inherited `GH_HOST`/`GH_REPO`. For the bare
+    // `owner/repo` form used for github.com, `gh` resolves the omitted host
+    // through its DEFAULT host, so an ambient `GH_HOST` could silently redirect
+    // the lookup away from the trusted host; an ambient `GH_REPO` likewise
+    // overrides the repository target on the cwd-inference (no-`-R`) path. Both
+    // are cleared here; `GH_HOST` is set back below only in the GitHub
+    // Enterprise branch, pinned to the host derived from the configured
+    // `repo.url`.
+    for k in ["GH_HOST", "GH_REPO"] {
         cmd.env_remove(k);
     }
     // BOTH paths: point `gh` at a private, supervisor-owned, empty config dir
@@ -4112,6 +4174,8 @@ mod tests {
         ] {
             cmd.env_remove(k);
         }
+        cmd.env_remove("GH_HOST");
+        cmd.env_remove("GH_REPO");
         let guard = GhConfigGuard::create()?;
         cmd.env("GH_CONFIG_DIR", guard.path());
         if let Some(t) = token.filter(|t| !t.is_empty()) {
@@ -4291,6 +4355,76 @@ mod tests {
     }
 
     #[test]
+    fn gh_pr_list_args_pins_the_trusted_slug_with_dash_r() {
+        // A resolved slug MUST be pinned with `-R owner/repo` so the
+        // token-bearing lookup targets the supervisor-chosen repository, never
+        // the agent-mutable `origin`. The finalize contract test uses a
+        // `file://` origin (no slug), so without this unit assertion a
+        // regression that stopped adding `-R` would go uncaught.
+        let args = gh_pr_list_args(Some("org/repo"), "feat/x");
+        assert_eq!(
+            args,
+            vec![
+                "pr", "list", "-R", "org/repo", "--head", "feat/x", "--state", "all", "--json",
+                "number,url,state,isDraft,title,author", "--limit", "1",
+            ]
+        );
+        // The `-R owner/repo` pair is adjacent and carries the exact slug.
+        let i = args.iter().position(|a| a == "-R").expect("-R must be present for a slug");
+        assert_eq!(args[i + 1], "org/repo");
+
+        // A GitHub Enterprise slug keeps its host prefix so `-R` targets the
+        // right host.
+        let ghe = gh_pr_list_args(Some("ghe.example.com/org/repo"), "feat/x");
+        let i = ghe.iter().position(|a| a == "-R").expect("-R for GHE slug");
+        assert_eq!(ghe[i + 1], "ghe.example.com/org/repo");
+
+        // No slug → NO `-R` (cwd-based inference), but the branch is still
+        // pinned with `--head`.
+        let none = gh_pr_list_args(None, "feat/x");
+        assert!(!none.iter().any(|a| a == "-R"), "no -R without a slug: {none:?}");
+        let h = none.iter().position(|a| a == "--head").expect("--head present");
+        assert_eq!(none[h + 1], "feat/x");
+    }
+
+    #[test]
+    fn reconcile_gate_keys_on_push_failed_not_retain() {
+        // Reconcile runs only for an allow-PR run whose publication did not
+        // fail.
+        assert!(reconcile_gate(true, false), "allow-PR + published → reconcile");
+        assert!(
+            !reconcile_gate(false, false),
+            "a run that was not asked to open a PR never reconciles"
+        );
+        assert!(
+            !reconcile_gate(true, true),
+            "a failed/uncertain publication must NOT claim a PR"
+        );
+        // The regression this guards: a run whose UNRELATED scan set `retain`
+        // but whose push SUCCEEDED (push_failed stays false) must still
+        // reconcile — gating on `retain` would have suppressed it and reported
+        // `pullRequest: null` for a branch that is actually published.
+        let mut out = GitResult {
+            branch: Some("feat/x".into()),
+            commits: vec!["deadbeef".into()],
+            pushed: true,
+            pr: None,
+            retain: true,
+            push_failed: false,
+            work_found: false,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        assert!(
+            reconcile_gate(true, out.push_failed),
+            "retain set by an unrelated scan must not suppress reconcile for a published branch"
+        );
+        // Flip to a genuine publication failure and the gate closes.
+        out.push_failed = true;
+        assert!(!reconcile_gate(true, out.push_failed));
+    }
+
+    #[test]
     fn gh_auth_env_scrubs_ambient_credentials_on_both_paths() {
         // Pre-seed a command with ambient operator credentials; gh_auth_env
         // must scrub them ALL on both the token and anonymous paths, and always
@@ -4318,6 +4452,12 @@ mod tests {
         for (k, v) in ambient {
             cmd.env(k, v);
         }
+        // Seed an ambient GH_HOST/GH_REPO too: a bare owner/repo (github.com)
+        // lookup resolves the omitted host through gh's default and GH_REPO
+        // overrides the repository target, so both must be scrubbed or they
+        // could redirect the lookup off the trusted repo/host.
+        cmd.env("GH_HOST", "evil.example.com");
+        cmd.env("GH_REPO", "evil/repo");
         let _guard = gh_auth_env_std(&mut cmd, Some("job-token"), "github.com")
             .expect("github.com token env");
         let env = env_of(&cmd);
@@ -4330,6 +4470,10 @@ mod tests {
             !env.contains_key("GH_HOST"),
             "GH_HOST must not be set for github.com: {env:?}"
         );
+        assert!(
+            !env.contains_key("GH_REPO"),
+            "an inherited GH_REPO must be scrubbed for github.com: {env:?}"
+        );
         let cfg = env.get("GH_CONFIG_DIR").expect("GH_CONFIG_DIR must be set");
         assert!(std::path::Path::new(cfg).is_absolute());
 
@@ -4339,6 +4483,9 @@ mod tests {
         for (k, v) in ambient {
             ghe_cmd.env(k, v);
         }
+        // An ambient GH_HOST must be OVERRIDDEN to the trusted Enterprise host,
+        // not left as whatever was inherited.
+        ghe_cmd.env("GH_HOST", "evil.example.com");
         let _ghe_guard = gh_auth_env_std(&mut ghe_cmd, Some("job-token"), "ghe.example.com")
             .expect("ghe token env");
         let env = env_of(&ghe_cmd);
@@ -4357,6 +4504,8 @@ mod tests {
         for (k, v) in ambient {
             anon_cmd.env(k, v);
         }
+        anon_cmd.env("GH_HOST", "evil.example.com");
+        anon_cmd.env("GH_REPO", "evil/repo");
         let _anon_guard =
             gh_auth_env_std(&mut anon_cmd, None, "github.com").expect("anonymous env");
         let env = env_of(&anon_cmd);
@@ -4368,6 +4517,14 @@ mod tests {
         ] {
             assert!(!env.contains_key(k), "{k} must be scrubbed anonymously: {env:?}");
         }
+        assert!(
+            !env.contains_key("GH_HOST"),
+            "an inherited GH_HOST must be scrubbed anonymously: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_REPO"),
+            "an inherited GH_REPO must be scrubbed anonymously: {env:?}"
+        );
         assert!(env.contains_key("GH_CONFIG_DIR"));
     }
 

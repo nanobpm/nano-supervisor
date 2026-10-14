@@ -4425,6 +4425,7 @@ mod tests {
             pushed: true,
             pr: None,
             retain: false,
+            push_failed: false,
             work_found: true,
             unborn_no_ref: false,
             scan_incomplete: false,
