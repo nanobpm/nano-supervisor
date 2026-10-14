@@ -1455,10 +1455,28 @@ pub fn supervisor(op: SupervisorOp) -> Result<()> {
 
 /// `supervisor status`: print "not running" when no daemon is bound, else query
 /// the control socket and render the live daemon descriptor and worker roster.
+///
+/// The fleet-hygiene overlay (nanobpm/nano-supervisor#42) must render on EVERY
+/// path — including the error paths — so operators see the other/phantom
+/// supervisors on the host exactly when the current fleet is unhealthy and the
+/// hygiene view matters most. Rather than sprinkle `print_other_supervisors`
+/// before each return (and risk a future early-return skipping it, as the
+/// protocol-error and live-but-unhealthy transport paths once did), this thin
+/// wrapper runs the current-supervisor probe and then ALWAYS renders the overlay
+/// before propagating the probe's result (preserving the primary error).
 fn supervisor_status(home: &std::path::Path) -> Result<()> {
+    let current = supervisor_status_current(home);
+    print_other_supervisors(home);
+    current
+}
+
+/// Probe and render the *current* supervisor's state. Returns the result the
+/// command should exit with; the fleet-hygiene overlay is rendered by the
+/// `supervisor_status` wrapper on every path, so this function must never call
+/// `print_other_supervisors` itself.
+fn supervisor_status_current(home: &std::path::Path) -> Result<()> {
     if !supervisor_running(home) {
         println!("Supervisor not running");
-        print_other_supervisors(home);
         return Ok(());
     }
     let sock = control::socket_path(home);
@@ -1495,7 +1513,6 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
                 }
                 None => println!("Supervisor running"),
             }
-            print_other_supervisors(home);
             Ok(())
         }
         // The socket vanished between the probe and the request (a genuine race
@@ -1506,7 +1523,6 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
         // (nanobpm/nano-supervisor#8).
         Err(e) if is_daemon_absent(&e) => {
             println!("Supervisor not running");
-            print_other_supervisors(home);
             Ok(())
         }
         Err(e) => Err(e).context("querying the supervisor control socket"),
