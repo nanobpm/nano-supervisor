@@ -217,17 +217,23 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// has drained to just that anchor, so a clean exit finishes immediately instead
 /// of waiting out `grace`.
 ///
-/// The enumeration must never *under*-report a live member — the grace loop
-/// skips its SIGKILL when this returns `false`, so a false negative would leak a
-/// `TERM`-resistant descendant. Linux reads one snapshot of each `/proc/<pid>/stat`;
-/// a live member always has a `/proc` entry naming the group, so a member alive at
-/// scan time is always seen. macOS enumerates the group with
-/// `proc_listpids(PROC_PGRP_ONLY)` and rejects each member whose `proc_pidinfo`
-/// status is `SZOMB`. On both, a member that exits *during* the scan is already
-/// leaving, so missing it is harmless. If the platform enumeration cannot run
-/// (an unreadable `/proc`, a failed `proc_listpids`) the function degrades to
-/// [`group_alive`] — the pre-#50 behaviour (never break early) — rather than
-/// risking a wrongful early break.
+/// This enumeration is best-effort and non-atomic, and it fails *open*: a member
+/// that forks+exits mid-scan, or one whose per-member read fails, can read as
+/// absent. Linux reads one snapshot of each `/proc/<pid>/stat` (a live member
+/// always has a `/proc` entry naming the group, so a member alive *and readable*
+/// at scan time is seen); macOS enumerates with `proc_listpids(PROC_PGRP_ONLY)`
+/// and rejects each member whose `proc_pidinfo` status is `SZOMB`. A member that
+/// exits *during* the scan is already leaving, so missing it is harmless. If the
+/// platform enumeration cannot run at all (an unreadable `/proc`, a failed
+/// `proc_listpids`) the function degrades to [`group_alive`] — the pre-#50
+/// behaviour (never break early).
+///
+/// Because the scan can still under-report (a racing fork, an unreadable
+/// `/proc`/`proc_pidinfo` entry), callers must **not** treat a `false` as proof
+/// that the group holds nothing worth SIGKILLing. [`terminate_group_and_reap`]'s
+/// fast path guards against that by sending an identity-gated group SIGKILL
+/// *before* it breaks on a `false` (a no-op when only the held zombie anchor
+/// remains), so a false negative cannot leak a `TERM`-resistant descendant.
 #[cfg(target_os = "linux")]
 pub(crate) fn group_has_live_member(pgid: u32) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -1168,7 +1174,21 @@ pub(crate) async fn terminate_group_and_reap(
                 // nothing left to SIGKILL — break immediately. The zombie anchor is
                 // still held until the final `child.wait()` below, so the identity
                 // stays verifiable for the gating above right up to this break.
+                //
+                // That enumeration is best-effort and non-atomic, and it fails
+                // *open*: a member that forks+exits mid-scan, or one whose
+                // `/proc` stat / `proc_pidinfo` read fails, reads as absent. A
+                // bare break would then skip the SIGKILL and leak that
+                // `TERM`-resistant member. So make a false negative harmless:
+                // SIGKILL the group (identity-gated, exactly like the deadline
+                // branch) *before* breaking. When the scan was right and only the
+                // held zombie anchor remains, SIGKILL to a zombie is a no-op and
+                // adds no grace wait; when the scan under-reported, it still reaps
+                // the missed member on the fast path instead of leaking it.
                 if !group_has_live_member(pgid) {
+                    if guard.still_ours() {
+                        sigkill_group(pgid);
+                    }
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -2366,6 +2386,75 @@ mod tests {
             elapsed < std::time::Duration::from_secs(10),
             "a clean SIGTERM exit must break the grace loop early rather than wait \
              out the {grace:?} grace (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_reaps_a_term_resistant_member() {
+        // The class the fast-path SIGKILL guards (review r4266146398): a
+        // `TERM`-resistant descendant must NEVER survive teardown, whichever path
+        // the grace loop takes. `group_has_live_member` is best-effort and fails
+        // open, so a missed live member would break the fast path early; the
+        // identity-gated group SIGKILL (fast path *and* deadline) is what keeps a
+        // false negative harmless. Here the member ignores SIGTERM, so the group
+        // SIGKILL — not SIGTERM — is the only thing that can reap it. After
+        // `terminate_group_and_reap` returns, nothing in the group may be alive.
+        let mut leader_cmd = tokio::process::Command::new("sh");
+        leader_cmd
+            .arg("-c")
+            // Leader exits on SIGTERM; it is held unreaped as the identity anchor.
+            .arg("exec sleep 30")
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = leader_cmd.spawn().expect("spawn leader");
+        let pgid = child.id().expect("leader pid");
+
+        // A descendant in the leader's group that blocks SIGTERM: only SIGKILL
+        // can reap it.
+        use std::os::unix::process::CommandExt;
+        let mut member_cmd = std::process::Command::new("sh");
+        member_cmd
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .process_group(pgid as i32)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut member = member_cmd.spawn().expect("spawn TERM-resistant member");
+        // Let the member install its SIGTERM trap before teardown.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let guard = PgidGuard::capture(pgid);
+        let grace = std::time::Duration::from_secs(2);
+        terminate_group_and_reap(&mut child, Some(guard), grace).await;
+
+        // The group SIGKILL must have reaped the resistant member. It ignores
+        // SIGTERM and sleeps 30s, so the only way it can have exited inside this
+        // window is the teardown's SIGKILL. `try_wait` reports its real exit
+        // (a bare `kill(pid,0)` can't: a SIGKILLed-but-unreaped member lingers as
+        // a zombie that still answers the liveness probe).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            match member.try_wait() {
+                Ok(Some(s)) => {
+                    status = Some(s);
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        // Reap the member so the test leaves no zombie, regardless of outcome.
+        let _ = member.kill();
+        let _ = member.wait();
+        let status = status.expect(
+            "a TERM-resistant group member must be SIGKILLed by teardown, not leaked",
+        );
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the resistant member must be reaped by the group SIGKILL, got {status:?}"
         );
     }
 
