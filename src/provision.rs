@@ -3705,12 +3705,53 @@ fn gh_repo_slug(url: &str) -> Option<String> {
     let repo = segs.next().filter(|s| !s.is_empty())?;
     // `gh`'s `-R` accepts a bare `owner/repo` for github.com and
     // `host/owner/repo` elsewhere (GitHub Enterprise). Keep the host prefix only
-    // when it is not the canonical github.com so the common case is unchanged.
-    if host.eq_ignore_ascii_case("github.com") {
+    // when it is not a github.com alias so the common case is unchanged. A bare
+    // exact match would misclassify the alias/default-port forms `gh` itself
+    // normalizes to github.com (`www.github.com`, `github.com:443`) as an
+    // Enterprise slug, routing the lookup to `GH_ENTERPRISE_TOKEN` + a GHES
+    // `/api/v3` endpoint and leaving it unauthenticated.
+    if is_github_com_authority(host) {
         Some(format!("{owner}/{repo}"))
     } else {
         Some(format!("{host}/{owner}/{repo}"))
     }
+}
+
+/// Whether `authority` (credential-free `host[:port]`) is a GitHub.com alias
+/// `gh` collapses to the single host `github.com`, where it reads `GH_TOKEN`
+/// (not `GH_ENTERPRISE_TOKEN`) and the default endpoint (no `/api/v3`).
+///
+/// `gh` normalizes any `*.github.com` subdomain — including `www.github.com`
+/// and `api.github.com` — to `github.com`, so the exact string `github.com` is
+/// NOT the only form that authenticates there. It also ignores the default
+/// HTTPS port, so `github.com:443` is still github.com. Classifying any of
+/// these as an Enterprise slug sets the wrong token env var and/or pins a bogus
+/// `GH_HOST`, so the PR lookup runs unauthenticated or against a GHES endpoint.
+///
+/// A genuine Enterprise host, a bracketed IPv6 literal, and a NON-default port
+/// (even on a github.com alias — a distinct endpoint) are all rejected so their
+/// host/port is retained verbatim by the caller.
+fn is_github_com_authority(authority: &str) -> bool {
+    // A bracketed IPv6 literal is never a github.com alias; reject it before any
+    // `:port` split so an inner `::` is not mistaken for a port separator.
+    if authority.starts_with('[') {
+        return false;
+    }
+    // Split an optional trailing `:port`. Only an all-ASCII-digit, non-empty
+    // port counts; anything else means there is no port to strip.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            (h, Some(p))
+        }
+        _ => (authority, None),
+    };
+    // Only the default HTTPS port (or none) collapses to github.com; a custom
+    // port is a distinct endpoint that must keep its port.
+    if !matches!(port, None | Some("443")) {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    host == "github.com" || host.ends_with(".github.com")
 }
 
 /// The trusted GitHub host a resolved [`gh_repo_slug`] targets: the bare
@@ -4394,6 +4435,77 @@ mod tests {
         assert!(gh_repo_slug("/tmp/local/repo").is_none());
         // A URL with no repo path segment yields nothing to act on.
         assert!(gh_repo_slug("https://github.com/org").is_none());
+    }
+
+    #[test]
+    fn gh_repo_slug_normalizes_github_com_aliases() {
+        // `gh` normalizes every github.com alias/default-port form to the single
+        // host `github.com` (where it reads `GH_TOKEN`). Each MUST therefore emit
+        // the bare `owner/repo` slug — NOT a 3-segment Enterprise slug that would
+        // route the lookup to `GH_ENTERPRISE_TOKEN` + a GHES endpoint and run
+        // unauthenticated.
+        for url in [
+            "https://www.github.com/org/repo.git",
+            "https://WWW.GitHub.COM/org/repo.git",
+            "https://api.github.com/org/repo",
+            "https://github.com:443/org/repo.git",
+            "https://www.github.com:443/org/repo.git",
+            "http://github.com:443/org/repo",
+        ] {
+            assert_eq!(
+                gh_repo_slug(url).as_deref(),
+                Some("org/repo"),
+                "github.com alias must collapse to a bare slug: {url}"
+            );
+        }
+        // A NON-default port is a distinct endpoint even on a github.com alias:
+        // keep the full authority so `GH_HOST` pins it (never silently drop the
+        // port and authenticate against the wrong endpoint).
+        assert_eq!(
+            gh_repo_slug("https://github.com:8443/org/repo.git").as_deref(),
+            Some("github.com:8443/org/repo")
+        );
+        // A host that merely ENDS WITH `github.com` but is a different domain
+        // (no dot boundary) is NOT an alias — it stays an Enterprise slug.
+        assert_eq!(
+            gh_repo_slug("https://notgithub.com/org/repo.git").as_deref(),
+            Some("notgithub.com/org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://evilgithub.com/org/repo.git").as_deref(),
+            Some("evilgithub.com/org/repo")
+        );
+    }
+
+    #[test]
+    fn is_github_com_authority_classifies_aliases_and_rejects_enterprise() {
+        // github.com + its aliases, with no port or the default HTTPS port.
+        for a in [
+            "github.com",
+            "GitHub.com",
+            "github.com:443",
+            "www.github.com",
+            "www.github.com:443",
+            "api.github.com",
+            "foo.github.com",
+        ] {
+            assert!(is_github_com_authority(a), "should be github.com: {a}");
+        }
+        // Non-default port, Enterprise hosts, look-alike domains, and IPv6
+        // literals are all rejected so their authority is retained verbatim.
+        for a in [
+            "github.com:8443",
+            "www.github.com:8443",
+            "ghe.example.com",
+            "ghe.example:8443",
+            "notgithub.com",
+            "evilgithub.com",
+            "[2001:db8::1]",
+            "[2001:db8::1]:443",
+            "[2001:db8::1]:8443",
+        ] {
+            assert!(!is_github_com_authority(a), "should NOT be github.com: {a}");
+        }
     }
 
     #[test]
