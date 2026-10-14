@@ -9886,34 +9886,12 @@ mod tests {
         );
     }
 
-    /// Serializes tests that mutate the process-wide `TMPDIR` env var and the
-    /// process cwd (both global side effects), restoring the prior values on
-    /// drop. A plain `std::sync::Mutex` because the guarded constructors are
-    /// synchronous.
+    /// Env var set on the re-exec'd child (never on the parent harness) so the
+    /// relative-`TMPDIR` regression below runs in its own process. Mutating the
+    /// process-wide `TMPDIR`/cwd in-process would race any sibling test that
+    /// reads `std::env::temp_dir()`, so we isolate it in a subprocess instead.
     #[cfg(unix)]
-    static TMPDIR_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Restores `TMPDIR` and the process cwd to their pre-test values on drop,
-    /// so a relative-`TMPDIR` regression test never leaks that global state
-    /// into another test even on an early `?`/panic.
-    #[cfg(unix)]
-    struct TmpdirCwdGuard {
-        tmpdir: Option<std::ffi::OsString>,
-        cwd: std::path::PathBuf,
-    }
-    #[cfg(unix)]
-    impl Drop for TmpdirCwdGuard {
-        fn drop(&mut self) {
-            // Restore cwd FIRST: the saved absolute `TMPDIR` restore below is
-            // unaffected by cwd, but leaving a bogus cwd set would break any
-            // later test that reads it.
-            let _ = std::env::set_current_dir(&self.cwd);
-            match &self.tmpdir {
-                Some(v) => std::env::set_var("TMPDIR", v),
-                None => std::env::remove_var("TMPDIR"),
-            }
-        }
-    }
+    const RELTMP_CHILD_ENV: &str = "NANO_RELTMP_CHILD";
 
     /// Regression: a RELATIVE `TMPDIR` (e.g. `reltmp`) must not yield a relative
     /// private directory. `std::env::temp_dir()` honours a relative `TMPDIR`
@@ -9924,13 +9902,83 @@ mod tests {
     /// and the credential-secret file must produce ABSOLUTE paths, and those
     /// paths must still resolve to the real private directory from a child whose
     /// cwd differs from the daemon's.
+    ///
+    /// The relative `TMPDIR` and sandbox cwd are process-wide globals, so the
+    /// checks run in a re-exec'd subprocess (set via `Command`, not on this
+    /// harness process). That keeps the parent's `TMPDIR`/cwd untouched, so no
+    /// parallel test observing `temp_dir()` can flake on our mutation.
     #[cfg(unix)]
     #[test]
     fn relative_tmpdir_yields_absolute_child_resolvable_paths() {
-        let _lock = TMPDIR_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Child role: the parent re-exec'd us with cwd=<base> and a RELATIVE
+        // `TMPDIR=reltmp` set on THIS process only. Run the assertions, drop a
+        // sentinel proving the body actually ran (so a zero-match test filter
+        // can't masquerade as success), and exit 0; any failed assertion panics
+        // and the harness exits non-zero for the parent to catch.
+        if std::env::var_os(RELTMP_CHILD_ENV).is_some() {
+            // cwd is the absolute sandbox `base`; TMPDIR is the relative name.
+            let base = std::env::current_dir().expect("child cwd (sandbox base)");
+            let other = base.join("other-cwd");
+            std::fs::create_dir_all(&other).expect("create alternate child cwd");
 
-        // An absolute sandbox we control, and a DIFFERENT absolute dir to run a
-        // child from, so "resolves from a child with a different cwd" is real.
+            // The helper itself must absolutize a relative TMPDIR.
+            let resolved =
+                absolute_temp_root().expect("absolute_temp_root resolves relative TMPDIR");
+            assert!(
+                resolved.is_absolute(),
+                "absolute_temp_root must return an absolute path, got {resolved:?}"
+            );
+
+            // gh config guard: path must be absolute, not resolved against a child cwd.
+            let gh = GhConfigGuard::create().expect("create gh config dir under relative TMPDIR");
+            let gh_path = gh.path().to_path_buf();
+            assert!(
+                gh_path.is_absolute(),
+                "GH_CONFIG_DIR must be absolute even under a relative TMPDIR, got {gh_path:?}"
+            );
+            assert!(
+                gh_path.exists(),
+                "the private gh config dir must actually exist at its absolute path"
+            );
+
+            // Credential secret file: path must be absolute and child-resolvable.
+            let (cred, cred_file) =
+                cred_secret_file(b"reltmp-secret").expect("create cred file under relative TMPDIR");
+            assert!(
+                cred_file.is_absolute(),
+                "NANO_GIT_CRED_FILE must be absolute even under a relative TMPDIR, got {cred_file:?}"
+            );
+
+            // Resolve both paths from a grandchild whose cwd is `other` (NOT the
+            // daemon cwd `base`). An absolute path resolves identically
+            // regardless of cwd; the pre-fix relative path would have been looked
+            // up under `other` and missed the real private directory.
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(r#"test -d "$GH_CONFIG_DIR" && test "reltmp-secret" = "$(cat "$NANO_GIT_CRED_FILE")""#)
+                .current_dir(&other)
+                .env("GH_CONFIG_DIR", &gh_path)
+                .env("NANO_GIT_CRED_FILE", &cred_file)
+                .status()
+                .expect("spawn child to resolve paths from a different cwd");
+            assert!(
+                ok.success(),
+                "absolute GH_CONFIG_DIR and NANO_GIT_CRED_FILE must resolve from a child with a \
+                 different cwd than the daemon"
+            );
+
+            drop(cred);
+            drop(gh);
+            // Sentinel: prove this body ran (guards against a filter matching
+            // zero tests, which would otherwise exit 0 and fake a pass).
+            std::fs::write(base.join(".reltmp-ran"), b"1").expect("write ran sentinel");
+            return;
+        }
+
+        // Parent role: build an absolute sandbox, then run the body in a child
+        // process whose cwd is `base` and whose `TMPDIR` is the RELATIVE name
+        // `reltmp`. Setting those globals only on the child keeps this harness
+        // process's `TMPDIR`/cwd untouched, so no parallel test can race them.
         let uniq = format!(
             "{}-{}",
             std::process::id(),
@@ -9942,67 +9990,32 @@ mod tests {
         let base = std::path::absolute(std::env::temp_dir())
             .expect("absolute temp root for test base")
             .join(format!("nano-reltmp-base-{uniq}"));
-        let other = base.join("other-cwd");
         let reltmp = base.join("reltmp");
         std::fs::create_dir_all(&reltmp).expect("create relative TMPDIR target");
-        std::fs::create_dir_all(&other).expect("create alternate child cwd");
 
-        let guard = TmpdirCwdGuard {
-            tmpdir: std::env::var_os("TMPDIR"),
-            cwd: std::env::current_dir().expect("save cwd"),
-        };
-        // Daemon-side cwd is `base`; `TMPDIR` is the RELATIVE name `reltmp`.
-        std::env::set_current_dir(&base).expect("enter sandbox cwd");
-        std::env::set_var("TMPDIR", "reltmp");
-
-        // The helper itself must absolutize a relative TMPDIR.
-        let resolved = absolute_temp_root().expect("absolute_temp_root resolves relative TMPDIR");
-        assert!(
-            resolved.is_absolute(),
-            "absolute_temp_root must return an absolute path, got {resolved:?}"
-        );
-
-        // gh config guard: path must be absolute, not resolved against a child cwd.
-        let gh = GhConfigGuard::create().expect("create gh config dir under relative TMPDIR");
-        let gh_path = gh.path().to_path_buf();
-        assert!(
-            gh_path.is_absolute(),
-            "GH_CONFIG_DIR must be absolute even under a relative TMPDIR, got {gh_path:?}"
-        );
-        assert!(
-            gh_path.exists(),
-            "the private gh config dir must actually exist at its absolute path"
-        );
-
-        // Credential secret file: path must be absolute and child-resolvable.
-        let (cred, cred_file) =
-            cred_secret_file(b"reltmp-secret").expect("create cred file under relative TMPDIR");
-        assert!(
-            cred_file.is_absolute(),
-            "NANO_GIT_CRED_FILE must be absolute even under a relative TMPDIR, got {cred_file:?}"
-        );
-
-        // Resolve both paths from a child whose cwd is `other` (NOT the daemon
-        // cwd `base`). An absolute path resolves identically regardless of cwd;
-        // the pre-fix relative path would have been looked up under `other` and
-        // missed the real private directory.
-        let ok = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(r#"test -d "$GH_CONFIG_DIR" && test "reltmp-secret" = "$(cat "$NANO_GIT_CRED_FILE")""#)
-            .current_dir(&other)
-            .env("GH_CONFIG_DIR", &gh_path)
-            .env("NANO_GIT_CRED_FILE", &cred_file)
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "provision::tests::relative_tmpdir_yields_absolute_child_resolvable_paths",
+            ])
+            .env(RELTMP_CHILD_ENV, "1")
+            // RELATIVE TMPDIR + sandbox cwd, applied to the child ONLY.
+            .env("TMPDIR", "reltmp")
+            .current_dir(&base)
             .status()
-            .expect("spawn child to resolve paths from a different cwd");
+            .expect("spawn relative-TMPDIR regression child");
         assert!(
-            ok.success(),
-            "absolute GH_CONFIG_DIR and NANO_GIT_CRED_FILE must resolve from a child with a \
-             different cwd than the daemon"
+            status.success(),
+            "relative-TMPDIR regression failed in child (exit {:?}): temp-derived paths must be \
+             absolutized before being handed to children with a different cwd",
+            status.code()
         );
-
-        drop(cred);
-        drop(gh);
-        drop(guard);
+        assert!(
+            base.join(".reltmp-ran").exists(),
+            "regression child did not run its body (test filter matched zero tests?)"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
