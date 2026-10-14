@@ -557,6 +557,40 @@ impl DirHandle {
         f.flush()
     }
 
+    /// Create a direct child **symbolic link** (`name` → `target`) relative to
+    /// this handle. `name` must be a single path component (never containing
+    /// `/`, `.`, or `..`), so `symlinkat` anchored on this pinned fd cannot
+    /// place the link outside this directory; `target` is stored verbatim as
+    /// the link's contents (it is NOT resolved here) and may be an absolute
+    /// path escaping the directory — which is the point: the agent's isolated
+    /// c8ctl dir links `plugins` out to the operator's real plugins dir so
+    /// plugins still resolve while `session.json`/`profiles.json` stay isolated
+    /// (issue #51).
+    ///
+    /// `symlinkat` fails closed with `EEXIST` if `name` already exists as
+    /// anything (a planted symlink, a pre-existing file or directory), so a
+    /// same-UID sibling cannot pre-plant `name` and have this call silently
+    /// accept it. The link entry itself is created in this directory's inode,
+    /// never by following a component.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn symlink_child(&self, name: &OsStr, target: &Path) -> io::Result<()> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "refusing non-single-component child name",
+            ));
+        }
+        let c_name = cstr(name)?;
+        let c_target = CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "symlink target contains NUL"))?;
+        let r = unsafe { libc::symlinkat(c_target.as_ptr(), self.fd.as_raw_fd(), c_name.as_ptr()) };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// `lstat` a direct child (relative, never following the entry).
     pub(crate) fn symlink_metadata(&self, name: &OsStr) -> io::Result<EntryMeta> {
         let c = cstr(name)?;

@@ -3056,15 +3056,20 @@ fn build_agent_env(
     // on the operator's global session — the exact write this prevents — so a
     // best-effort skip here would silently reopen the incident.
     //
-    // DELIBERATE TRADEOFF (#46): `C8CTL_DATA_DIR` is c8ctl's *entire* user-data
-    // root, so redirecting it also hides the operator's installed `c8` plugins
+    // ISSUE #51: `C8CTL_DATA_DIR` is c8ctl's *entire* user-data root, so
+    // redirecting it would also hide the operator's installed `c8` plugins
     // (e.g. `c8 nano`) from the agent — c8ctl has no finer lever (it ignores
-    // `C8CTL_CONFIG_DIR`; see `profile.rs`). For this MVP that is accepted: the
-    // agent runs with `NANO_AGENTIC=off` and `guard_nested_supervisor` already
-    // blocks it from acting as a supervisor/worker, so it does not need the
-    // nano plugin, and we deliberately do NOT symlink the operator's plugins
-    // dir into this fail-closed no-follow root. Isolating session/profiles
-    // without relocating the plugins dir is tracked in #51.
+    // `C8CTL_CONFIG_DIR`; see `profile.rs`). Rather than drop the plugins, the
+    // seeder links the operator's real plugins dir back into this isolated root
+    // (`<run dir>/c8ctl/plugins` → `<default data dir>/plugins`), so the agent's
+    // `c8` resolves plugins from the operator's install while its
+    // `session.json`/`profiles.json` writes stay quarantined in the run dir.
+    // The link is created by US (never the agent), and only when the operator
+    // actually has a plugins dir to share. On Linux it goes through the same
+    // pinned no-follow handle as the seed files; the non-Linux branch
+    // (create_agent_c8ctl_dir_path_based) creates it with
+    // `std::os::unix::fs::symlink` after its own symlink checks, so the
+    // pinned-handle guarantee is Linux-only.
     let dir = seed_agent_c8ctl_dir(cfg, result_file, run_dir_handle)?;
     // RESIDUAL RISK (#46, accepted): the seed WRITE is pinned to the run-dir
     // inode (via `run_dir_handle`, no-follow), but `C8CTL_DATA_DIR` is still
@@ -3080,7 +3085,9 @@ fn build_agent_env(
     // is warranted under this PR's same-UID threat model: an actor who can swap
     // `run_dir` already shares the UID and can edit the `0600` seed files — or
     // the operator's global config — directly, so the export adds no new
-    // boundary here. This mirrors the accepted plugins-dir tradeoff in #51.
+    // boundary here. The plugins link seeded alongside (issue #51) shares the
+    // same read-side property: an actor who can swap `run_dir` already shares
+    // the UID.
     env.push(("C8CTL_DATA_DIR".into(), dir.to_string_lossy().into_owned()));
     Ok(env)
 }
@@ -3184,13 +3191,28 @@ fn seed_agent_c8ctl_dir(
                     ..Default::default()
                 })
         });
-    create_agent_c8ctl_dir(&run_dir, profile.as_ref(), run_dir_handle)
+    // Issue #51: resolve the operator's plugins dir ONCE here (not inside the
+    // pinned seeder, which must stay pure path I/O) and thread it down so both
+    // the pinned and path-based seeders link it into the isolated dir. `None`
+    // when the operator has no plugins to share — the seed then omits the link.
+    let plugins_src = crate::profile::c8ctl_plugins_dir();
+    create_agent_c8ctl_dir(
+        &run_dir,
+        profile.as_ref(),
+        plugins_src.as_deref(),
+        run_dir_handle,
+    )
 }
 
 /// Create `<run dir>/c8ctl` (wiping any stale/planted entry), restrict it to
 /// `0700`, and write the seed files — dispatching to the pinned no-follow
 /// implementation on Linux and the path-based fallback elsewhere. Returns the
 /// created dir.
+///
+/// `plugins_src`, when set, is the operator's real plugins dir: the seeder
+/// links it in as `<c8ctl>/plugins` so the agent's `c8` still resolves plugins
+/// from the operator's install even though its data root is relocated for
+/// session/profile isolation (issue #51).
 ///
 /// `run_dir_handle` is the EXACT pinned run-directory capability `execute`
 /// retained (`PreparedRun`) — when present (production), the Linux path seeds
@@ -3202,6 +3224,7 @@ fn seed_agent_c8ctl_dir(
 fn create_agent_c8ctl_dir(
     run_dir: &Path,
     profile: Option<&crate::profile::Profile>,
+    plugins_src: Option<&Path>,
     run_dir_handle: Option<&crate::safecwd::CwdHandle>,
 ) -> Result<PathBuf> {
     let dir = run_dir.join("c8ctl");
@@ -3217,12 +3240,12 @@ fn create_agent_c8ctl_dir(
                     .try_clone_fd()
                     .map_err(PinError::Io)
                     .map_err(|e| anyhow_from_pin(e, &dir))?;
-                seed_agent_c8ctl_pinned(&DirHandle::from_fd(fd), profile)
+                seed_agent_c8ctl_pinned(&DirHandle::from_fd(fd), profile, plugins_src)
             }
             None => {
                 let root = DirHandle::open_root_nofollow(run_dir, false)
                     .map_err(|e| anyhow_from_pin(e, &dir))?;
-                seed_agent_c8ctl_pinned(&root, profile)
+                seed_agent_c8ctl_pinned(&root, profile, plugins_src)
             }
         };
         // A refused symlinked component (ELOOP) or any other I/O error is a
@@ -3237,7 +3260,7 @@ fn create_agent_c8ctl_dir(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = run_dir_handle;
-        create_agent_c8ctl_dir_path_based(run_dir, &dir, profile)?;
+        create_agent_c8ctl_dir_path_based(run_dir, &dir, profile, plugins_src)?;
         Ok(dir)
     }
 }
@@ -3264,6 +3287,7 @@ fn anyhow_from_pin(e: crate::saferoot::PinError, dir: &Path) -> anyhow::Error {
 fn seed_agent_c8ctl_pinned(
     root: &crate::saferoot::DirHandle,
     profile: Option<&crate::profile::Profile>,
+    plugins_src: Option<&Path>,
 ) -> std::result::Result<(), crate::saferoot::PinError> {
     use crate::saferoot::PinError;
     use std::ffi::OsStr;
@@ -3285,6 +3309,18 @@ fn seed_agent_c8ctl_pinned(
             c8.write_new_child_file(OsStr::new(name), bytes.as_bytes(), 0o600)
                 .map_err(PinError::Io)?;
         }
+    }
+    // Issue #51: link the operator's plugins dir in as `<c8ctl>/plugins` so the
+    // agent's `c8` resolves plugins from the operator's install while its
+    // session/profile writes stay isolated. Created through the retained,
+    // freshly-prepared handle: `symlinkat` is anchored on the pinned 0700 inode
+    // and fails closed (`EEXIST`) on anything already at `plugins`, so a planted
+    // entry cannot be followed. We do NOT write files THROUGH the link — only
+    // the agent's own `c8` traverses it — so it deliberately escapes the
+    // no-follow root; that is the whole point of #51.
+    if let Some(src) = plugins_src {
+        c8.symlink_child(OsStr::new("plugins"), src)
+            .map_err(PinError::Io)?;
     }
     Ok(())
 }
@@ -3312,6 +3348,7 @@ fn create_agent_c8ctl_dir_path_based(
     run_dir: &Path,
     dir: &Path,
     profile: Option<&crate::profile::Profile>,
+    plugins_src: Option<&Path>,
 ) -> Result<()> {
     // The runs root (run_dir's parent) and above are trusted; validate the tail
     // beneath it so a swapped run-dir ancestor cannot redirect the wipe/create.
@@ -3358,6 +3395,22 @@ fn create_agent_c8ctl_dir_path_based(
     if let Some(profile) = profile {
         seed_c8ctl_dir(dir, profile)?;
     }
+    // Issue #51: link the operator's plugins dir in as `<c8ctl>/plugins` so the
+    // agent's `c8` still resolves plugins while its session/profiles stay
+    // isolated. `dir` was just reject-symlinked and freshly created/0700 above,
+    // so creating the `plugins` entry here lands inside the real run-dir inode;
+    // `symlink` fails closed if anything already occupies that name. The link
+    // target deliberately escapes the run dir — only the agent's own `c8`
+    // traverses it; we never write files through it.
+    #[cfg(unix)]
+    if let Some(src) = plugins_src {
+        let link = dir.join("plugins");
+        std::os::unix::fs::symlink(src, &link).with_context(|| {
+            format!("linking the operator's plugins dir into {}", link.display())
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = plugins_src;
     Ok(())
 }
 
@@ -3829,12 +3882,86 @@ mod tests {
         // A stale/planted child from a previous (or hostile) occupant.
         std::fs::write(dir.join("session.json"), "{\"activeProfile\":\"operator\"}").unwrap();
         // No profile: the fallback must still clear the directory.
-        create_agent_c8ctl_dir_path_based(&run, &dir, None).unwrap();
+        create_agent_c8ctl_dir_path_based(&run, &dir, None, None).unwrap();
         assert!(
             !dir.join("session.json").exists(),
             "the path-based fallback must wipe a planted session.json even with no profile"
         );
         assert!(dir.is_dir(), "the c8ctl dir must be recreated");
+        let _ = std::fs::remove_dir_all(&run);
+    }
+
+    /// Issue #51: the path-based fallback links the operator's plugins dir into
+    /// the isolated `c8ctl` dir as `plugins`, so the agent's `c8` still resolves
+    /// plugins from the operator's install even though the data root is
+    /// relocated for session/profile isolation. The link must point at the
+    /// source and resolve to it, while the seeded `session.json`/`profiles.json`
+    /// stay REAL files inside the run dir (never links), so `c8 use profile`
+    /// writes remain quarantined.
+    #[cfg(unix)]
+    #[test]
+    fn path_based_seed_links_the_operator_plugins_dir() {
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-plugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // The operator's real plugins dir, with a sentinel plugin inside.
+        let plugins_src = base.join("default-c8ctl").join("plugins");
+        std::fs::create_dir_all(plugins_src.join("nano")).unwrap();
+        std::fs::write(plugins_src.join("nano").join("marker"), "PLUGIN").unwrap();
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let dir = run.join("c8ctl");
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+        create_agent_c8ctl_dir_path_based(&run, &dir, Some(&profile), Some(&plugins_src)).unwrap();
+
+        // `plugins` is a symlink resolving to the operator's plugins dir.
+        let link = dir.join("plugins");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "plugins must be a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("nano").join("marker")).unwrap(),
+            "PLUGIN",
+            "the plugins link must resolve to the operator's install"
+        );
+        // Session/profile files stay REAL files, not links — writes to them
+        // must never escape the run dir.
+        for name in ["session.json", "profiles.json"] {
+            assert!(
+                std::fs::symlink_metadata(dir.join(name))
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "{name} must be a real file, never a link"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #51: with no plugins source (the operator has none to share), the
+    /// seed must simply omit the link — never create a dangling `plugins`
+    /// entry.
+    #[cfg(unix)]
+    #[test]
+    fn path_based_seed_omits_plugins_link_when_source_absent() {
+        let run =
+            std::env::temp_dir().join(format!("nano-slot-test-noplugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        let dir = run.join("c8ctl");
+        create_agent_c8ctl_dir_path_based(&run, &dir, None, None).unwrap();
+        assert!(
+            !dir.join("plugins").exists()
+                && std::fs::symlink_metadata(dir.join("plugins")).is_err(),
+            "no plugins entry must be created when there is no source to share"
+        );
         let _ = std::fs::remove_dir_all(&run);
     }
 
@@ -3866,7 +3993,7 @@ mod tests {
         let run_dir = runs_root.join("job-1");
         std::os::unix::fs::symlink(&operator, &run_dir).unwrap();
         let dir = run_dir.join("c8ctl");
-        let err = create_agent_c8ctl_dir_path_based(&run_dir, &dir, None)
+        let err = create_agent_c8ctl_dir_path_based(&run_dir, &dir, None, None)
             .expect_err("a symlinked run-dir ancestor must be refused, not followed");
         assert!(
             err.to_string().contains("symlink"),
@@ -3977,7 +4104,7 @@ mod tests {
             base_url: Some("http://engine:8080".into()),
             ..Default::default()
         };
-        let dir = create_agent_c8ctl_dir(&swapped, Some(&profile), Some(&handle))
+        let dir = create_agent_c8ctl_dir(&swapped, Some(&profile), None, Some(&handle))
             .expect("seed through the pinned handle");
         // The seed landed in the PINNED inode, not the swapped path.
         assert!(
@@ -3989,6 +4116,50 @@ mod tests {
             "seed must NOT be written to the swapped run-dir path"
         );
         assert_eq!(dir, swapped.join("c8ctl"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #51 (Linux pinned path): the pinned seeder links the operator's
+    /// plugins dir in as `<c8ctl>/plugins` through the retained no-follow
+    /// handle, so the agent's `c8` resolves plugins from the operator's install
+    /// while its session/profiles stay isolated.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_seed_links_the_operator_plugins_dir() {
+        use crate::saferoot::DirHandle;
+        let base =
+            std::env::temp_dir().join(format!("nano-slot-test-pinplug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let plugins_src = base.join("default-c8ctl").join("plugins");
+        std::fs::create_dir_all(plugins_src.join("nano")).unwrap();
+        std::fs::write(plugins_src.join("nano").join("marker"), "PLUGIN").unwrap();
+        let run_dir = base.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let root = DirHandle::open_root_nofollow(&run_dir, false).expect("pin the run dir");
+        let profile = crate::profile::Profile {
+            name: "merlin".into(),
+            base_url: Some("http://engine:8080".into()),
+            ..Default::default()
+        };
+        seed_agent_c8ctl_pinned(&root, Some(&profile), Some(&plugins_src))
+            .expect("seed with a plugins link");
+        let link = run_dir.join("c8ctl").join("plugins");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "plugins must be a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("nano").join("marker")).unwrap(),
+            "PLUGIN",
+            "the plugins link must resolve to the operator's install"
+        );
+        // A second seed over the same pinned dir re-prepares (wipes) it, so the
+        // link is recreated cleanly rather than failing closed on a stale entry.
+        seed_agent_c8ctl_pinned(&root, Some(&profile), Some(&plugins_src))
+            .expect("re-seeding wipes and recreates the plugins link");
         let _ = std::fs::remove_dir_all(&base);
     }
     /// EXCLUSIVELY (`O_CREAT | O_EXCL`), so a same-UID sibling who plants a
