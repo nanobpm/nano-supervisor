@@ -249,14 +249,19 @@ fn provisioned_completion_detects_the_provider_pr() {
         &["clone", "-q", "--bare", "--", ".", origin.to_str().expect("origin path")],
     );
 
-    // A fake `gh` on PATH: it ignores its arguments and emits a canned
-    // `gh pr list --json …` array, so the worker's reconcile sees one open PR
-    // without any network. The dir is kept alive for the whole test.
+    // A fake `gh` on PATH: it records its arguments (so the test can assert
+    // the provider lookup itself, not just the reconciled outcome) and emits a
+    // canned `gh pr list --json …` array, so the worker's reconcile sees one
+    // open PR without any network. The dir is kept alive for the whole test.
     let gh_dir = tempfile::tempdir().expect("gh tempdir");
     let gh_path = gh_dir.path().join("gh");
+    let gh_args = gh_dir.path().join("gh-args");
     std::fs::write(
         &gh_path,
-        "#!/bin/sh\ncat <<'JSON'\n[{\"number\":4242,\"url\":\"https://github.com/nanobpm/x/pull/4242\",\"state\":\"OPEN\",\"isDraft\":false,\"title\":\"agent slice\",\"author\":{\"login\":\"nano-bot\"}}]\nJSON\n",
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat <<'JSON'\n[{{\"number\":4242,\"url\":\"https://github.com/nanobpm/x/pull/4242\",\"state\":\"OPEN\",\"isDraft\":false,\"title\":\"agent slice\",\"author\":{{\"login\":\"nano-bot\"}}}}]\nJSON\n",
+            gh_args.display()
+        ),
     )
     .expect("write fake gh");
     #[cfg(unix)]
@@ -308,4 +313,35 @@ fn provisioned_completion_detects_the_provider_pr() {
     assert_eq!(pr["isDraft"], false, "{vars:#?}");
     assert_eq!(pr["title"], "agent slice", "{vars:#?}");
     assert_eq!(pr["openedBy"], "nano-bot", "{vars:#?}");
+
+    // The provider lookup itself is covered: the fake gh must have been invoked
+    // as `gh pr list --head <pushed-branch> --state all --json <fields> --limit 1`
+    // — otherwise a reconcile that omitted `--head` or looked up the wrong
+    // branch would still pass on the canned output. The pushed branch is the
+    // completion's `branch` variable (the fallback branch the worker pushed).
+    let branch = vars["branch"].as_str().expect("pushed branch variable");
+    let recorded: Vec<String> = std::fs::read_to_string(&gh_args)
+        .expect("the fake gh must have recorded its arguments")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let expected: Vec<String> = [
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,url,state,isDraft,title,author",
+        "--limit",
+        "1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        recorded, expected,
+        "the gh pr lookup must target the pushed branch with the full argument list"
+    );
 }

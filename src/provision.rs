@@ -3632,8 +3632,10 @@ fn redact_token(text: &str, token: Option<&str>) -> String {
 /// repository it targets must be chosen from supervisor-controlled state, never
 /// a value an agent could rewrite to point the token at a repo of its choosing.
 /// `None` for any URL that is not an http(s) GitHub-style `host/owner/repo`
-/// (e.g. the `file://` origins the finalize tests push to), so `gh` is never
-/// invoked for a source it cannot resolve.
+/// (e.g. the `file://` origins the finalize tests push to) — the caller then
+/// lets `gh` infer the repository from the checkout's remotes (the cwd-based
+/// fallback; see [`reconcile_agent_pr`]), exactly as the Node plugin always
+/// does. It does NOT skip the lookup: `gh` is still invoked.
 fn gh_repo_slug(url: &str) -> Option<String> {
     let sanitized = scrub_url_credentials(url);
     let after_scheme = sanitized
@@ -3666,6 +3668,18 @@ fn gh_repo_slug(url: &str) -> Option<String> {
     }
 }
 
+/// The trusted GitHub host a resolved [`gh_repo_slug`] targets: the bare
+/// `owner/repo` form is github.com; the 3-segment `host/owner/repo` form is
+/// that GitHub Enterprise host. Used to pick the token env var `gh` actually
+/// honours for the host (`GH_TOKEN` vs `GH_ENTERPRISE_TOKEN` + `GH_HOST`).
+fn gh_host_of_slug(slug: &str) -> String {
+    let mut segs = slug.splitn(3, '/');
+    match (segs.next(), segs.next(), segs.next()) {
+        (Some(host), Some(_owner), Some(_repo)) => host.to_string(),
+        _ => "github.com".to_string(),
+    }
+}
+
 /// Look the provider PR up for a pushed branch, mirroring the Node plugin's
 /// `reconcileAgentPr` (c8ctl-plugin.js ~L5636): `gh pr list --head <branch>
 /// --state all --json number,url,state,isDraft,title,author --limit 1`, run with
@@ -3694,8 +3708,9 @@ async fn reconcile_agent_pr(
         });
     }
     // The token the worker uses for clone/push: the userinfo lifted out of the
-    // trusted `repo.url`. `gh` is handed it via `GH_TOKEN` (see `gh_auth_env`);
-    // absent one, the anonymous path scrubs every ambient gh credential.
+    // trusted `repo.url`. `gh` is handed it via `GH_TOKEN`/`GH_ENTERPRISE_TOKEN`
+    // (see `gh_auth_env`); absent one, the anonymous path scrubs every ambient
+    // gh credential.
     let (_fetch_url, cred) = trusted_fetch_source(repo_url);
     let token = cred.as_ref().map(|c| c.password.as_str());
     // When the configured `repo.url` resolves to a GitHub `[host/]owner/repo`,
@@ -3705,7 +3720,16 @@ async fn reconcile_agent_pr(
     // tests push to) there is no slug to pin, so fall back to `gh`'s cwd-based
     // remote inference — matching the Node plugin, which always runs cwd-based.
     let slug = gh_repo_slug(repo_url);
-    match gh_pr_list(workspace, slug.as_deref(), branch, token, timeout).await {
+    // The trusted host is derived the same way — from the configured `repo.url`
+    // (github.com when there is no slug/host to derive) — and decides whether
+    // the token travels as `GH_TOKEN` (github.com) or `GH_ENTERPRISE_TOKEN` +
+    // `GH_HOST` (a GitHub Enterprise host), since `gh` ignores `GH_TOKEN` for a
+    // custom host.
+    let host = slug
+        .as_deref()
+        .map(gh_host_of_slug)
+        .unwrap_or_else(|| "github.com".to_string());
+    match gh_pr_list(workspace, slug.as_deref(), branch, token, &host, timeout).await {
         Ok(GhRun { status, stdout, .. }) if status_is_success(&status) => parse_pr_list(&stdout),
         Ok(GhRun { status, stderr, .. }) => {
             let detail = redact_token(stderr.trim(), token);
@@ -3728,20 +3752,43 @@ async fn reconcile_agent_pr(
     }
 }
 
-/// Parse `gh pr list`'s JSON array into the reconcile result object. A non-array
-/// or empty result is `{ openedBy: null, found: false }` (no error — simply no
-/// PR); the first element maps `author.login → openedBy` and carries
+/// Parse `gh pr list`'s JSON array into the reconcile result object. An empty
+/// stdout or an empty array is `{ openedBy: null, found: false }` (no error —
+/// simply no PR); the first element maps `author.login → openedBy` and carries
 /// `number/url/state/isDraft/title`, exactly as Node's `reconcileAgentPr` does.
+/// A NON-EMPTY stdout that fails to parse (or parses to a non-array) is NOT
+/// "no PR": it is truncated/corrupt `gh` output, so it surfaces as
+/// `{ found: false, error }` — the PR's stated best-effort contract — instead
+/// of being silently indistinguishable from "this branch has no PR".
 fn parse_pr_list(stdout: &str) -> serde_json::Value {
     use serde_json::json;
     let trimmed = stdout.trim();
-    let parsed: serde_json::Value =
-        serde_json::from_str(if trimmed.is_empty() { "[]" } else { trimmed })
-            .unwrap_or(serde_json::Value::Array(Vec::new()));
-    let first = parsed.as_array().and_then(|a| a.first());
-    let Some(pr) = first else {
+    if trimmed.is_empty() {
         return json!({ "openedBy": null, "found": false });
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({
+                "openedBy": null,
+                "found": false,
+                "error": format!("gh pr list returned malformed JSON: {e}"),
+            });
+        }
     };
+    let Some(first) = parsed.as_array().and_then(|a| a.first()) else {
+        // A parsed-but-non-array payload (or an empty array) is not a PR list:
+        // the empty array is "no PR"; any other shape is malformed output.
+        if parsed.as_array().is_some() {
+            return json!({ "openedBy": null, "found": false });
+        }
+        return json!({
+            "openedBy": null,
+            "found": false,
+            "error": "gh pr list returned a non-array JSON payload",
+        });
+    };
+    let pr = first;
     let opened_by = pr
         .get("author")
         .and_then(|a| a.get("login"))
@@ -3788,12 +3835,15 @@ fn exit_desc(status: &std::process::ExitStatus) -> String {
 
 /// Spawn `gh pr list` for `branch` in `workspace`, returning its captured
 /// outcome. Best-effort and bounded by `timeout`; the credential and ambient-gh
-/// scrubbing live in [`gh_auth_env`].
+/// scrubbing live in [`gh_auth_env`]. `host` is the TRUSTED GitHub host derived
+/// from the configured `repo.url` (github.com when no slug resolved), and
+/// decides which token env var `gh` honours.
 async fn gh_pr_list(
     workspace: &CwdHandle,
     slug: Option<&str>,
     branch: &str,
     token: Option<&str>,
+    host: &str,
     timeout: Duration,
 ) -> Result<GhRun> {
     use std::process::Stdio;
@@ -3819,7 +3869,11 @@ async fn gh_pr_list(
     workspace
         .apply(&mut cmd)
         .context("binding gh working directory")?;
-    gh_auth_env(&mut cmd, token, workspace);
+    // The anonymous path's private GH_CONFIG_DIR guard: bound BEFORE the spawn
+    // and kept alive until after `gh` has exited (the wait/timeout joins below),
+    // so the directory exists for the whole run and is removed on every exit
+    // path — error, timeout, and cancellation included.
+    let _gh_cfg_guard = gh_auth_env(&mut cmd, token, host)?;
     cmd.kill_on_drop(true);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3892,25 +3946,40 @@ async fn gh_pr_list(
 ///
 ///   * Every path: disable `gh`'s interactive auth/update prompts
 ///     (`GH_PROMPT_DISABLED`/`GH_NO_UPDATE_NOTIFIER`) so a non-interactive
-///     worker fails fast instead of blocking.
-///   * With a token: inject it as `GH_TOKEN`.
-///   * Anonymous (no token): scrub EVERY ambient gh credential — the token env
-///     vars AND point `gh` at a private, empty `GH_CONFIG_DIR` inside the
-///     (harness-reaped) workspace, with interactive prompts off — so a token-less
-///     job cannot authenticate as the operator through a stored `hosts.yml` or OS
-///     keychain. This scrub is a security property, not a nicety.
+///     worker fails fast instead of blocking, and scrub EVERY ambient gh
+///     credential source — all four token env vars AND any stored
+///     `hosts.yml`/keychain (via a private empty `GH_CONFIG_DIR`) — so no path
+///     can silently authenticate as the daemon/operator with an inherited
+///     credential.
+///   * With a token: deliver it as `GH_TOKEN` for github.com, or as
+///     `GH_ENTERPRISE_TOKEN` + `GH_HOST` for a GitHub Enterprise host (`gh`
+///     ignores `GH_TOKEN` for a custom host). `host` comes from the TRUSTED
+///     configured `repo.url`, never the agent-mutable checkout.
+///   * Anonymous (no token): the scrub above IS the whole defence — a
+///     token-less job cannot authenticate as the operator through an inherited
+///     env var, a stored `hosts.yml`, or the OS keychain. This scrub is a
+///     security property, not a nicety.
 ///
-/// Token delivery via `GH_TOKEN` re-creates, for `gh`, the `/proc/<pid>/environ`
-/// token exposure that #24 removed for `git` (which now delivers the password
-/// through a per-command 0600 file read by a credential helper). `gh` has no
-/// comparable file/FD secret-input channel short of writing the token into a
-/// `hosts.yml` under `GH_CONFIG_DIR`, so this port matches the Node plugin's
-/// `GH_TOKEN` delivery EXPLICITLY (not silently) — see #24 and #49's decision
-/// note, which sanctions accepting the env exposure for the `gh` path. The
-/// daemon's own engine-connection secrets are still scrubbed below (as the
-/// `git()` launch does) since `gh` shells out to `git` inside the
-/// agent-controlled checkout.
-fn gh_auth_env(cmd: &mut Command, token: Option<&str>, workspace: &CwdHandle) {
+/// The `GH_CONFIG_DIR` is a supervisor-owned `0700` directory created with
+/// `mkdtemp` under the system temp root — OUTSIDE the agent-controlled
+/// checkout, so an agent cannot pre-create it as a symlink to an ambient gh
+/// config (the `create_dir_all`-follows-symlinks defeat documented in
+/// src/slot.rs) — and the returned [`GhConfigGuard`] removes it on drop, once
+/// `gh` has exited. Any failure to create it FAILS CLOSED (an `Err`): the
+/// reconcile degrades to `{ found: false, error }` rather than running `gh`
+/// with the ambient config exposed.
+///
+/// Token delivery via an env var re-creates, for `gh`, the
+/// `/proc/<pid>/environ` token exposure that #24 removed for `git` (which now
+/// delivers the password through a per-command 0600 file read by a credential
+/// helper). `gh` has no comparable file/FD secret-input channel short of
+/// writing the token into a `hosts.yml` under `GH_CONFIG_DIR`, so this port
+/// matches the Node plugin's `GH_TOKEN` delivery EXPLICITLY (not silently) —
+/// see #24 and #49's decision note, which sanctions accepting the env exposure
+/// for the `gh` path. The daemon's own engine-connection secrets are still
+/// scrubbed below (as the `git()` launch does) since `gh` shells out to `git`
+/// inside the agent-controlled checkout.
+fn gh_auth_env(cmd: &mut Command, token: Option<&str>, host: &str) -> Result<Option<GhConfigGuard>> {
     // Strip the daemon's engine-connection secrets, exactly as the git launch
     // does: `gh` runs `git` against agent-controlled remotes/config, so a hostile
     // checkout must not be able to read `CAMUNDA_*`/`ZEEBE_*` client secrets out
@@ -3920,12 +3989,10 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, workspace: &CwdHandle) {
     }
     cmd.env("GH_PROMPT_DISABLED", "1");
     cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
-    if let Some(t) = token.filter(|t| !t.is_empty()) {
-        cmd.env("GH_TOKEN", t);
-        return;
-    }
-    // Anonymous path: remove every ambient gh token env var so an inherited
-    // operator credential cannot be used.
+    // BOTH paths: remove every ambient gh token env var so an inherited
+    // operator/daemon credential is never picked up — on the token path the
+    // job token is then set on the exact var `gh` honours for the host, and on
+    // the anonymous path the scrub below leaves no credential source at all.
     for k in [
         "GH_TOKEN",
         "GITHUB_TOKEN",
@@ -3934,20 +4001,129 @@ fn gh_auth_env(cmd: &mut Command, token: Option<&str>, workspace: &CwdHandle) {
     ] {
         cmd.env_remove(k);
     }
-    // Fail closed: always point gh at a private, empty config dir so it can never
-    // fall back to the operator's on-disk config/keychain — even if the mkdir
-    // fails, gh reading a missing/empty dir errors out rather than silently
-    // authenticating as the operator.
-    if let Ok(dir) = workspace.path() {
-        let cfg_dir = dir.join(".nano-gh-anon");
-        let _ = std::fs::create_dir_all(&cfg_dir);
-        cmd.env("GH_CONFIG_DIR", cfg_dir);
+    // BOTH paths: point `gh` at a private, supervisor-owned, empty config dir
+    // OUTSIDE the agent-controlled checkout so a stored `hosts.yml` or OS
+    // keychain can never authenticate the lookup as the operator. Fail closed
+    // when it cannot be created.
+    let guard = GhConfigGuard::create()?;
+    cmd.env("GH_CONFIG_DIR", guard.path());
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        if host.eq_ignore_ascii_case("github.com") {
+            cmd.env("GH_TOKEN", t);
+        } else {
+            // `gh` authenticates to a custom (GitHub Enterprise) host via
+            // GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN — GH_TOKEN is ignored
+            // there — and GH_HOST pins the default host so the lookup targets
+            // the trusted host from the configured `repo.url`.
+            cmd.env("GH_ENTERPRISE_TOKEN", t);
+            cmd.env("GH_HOST", host);
+        }
+    }
+    Ok(Some(guard))
+}
+
+/// Guards the supervisor-owned `0700` `GH_CONFIG_DIR` created for one `gh`
+/// invocation. Its `Drop` removes the directory, so the anonymous-auth scrub's
+/// empty config never outlives the `gh` run — on every exit path, including
+/// error, timeout, and cancellation. Mirrors [`CredFile`]'s RAII contract.
+struct GhConfigGuard {
+    dir: std::path::PathBuf,
+}
+
+impl GhConfigGuard {
+    /// Create a fresh private `0700` directory under the system temp root —
+    /// outside any agent-controlled checkout — via `mkdtemp` (which creates
+    /// with mode `0700` regardless of umask and picks a unique name, so an
+    /// agent cannot pre-create or symlink the path). Fails closed with an
+    /// `Err` when the directory cannot be created, so `gh` is never run with
+    /// the ambient config exposed.
+    #[cfg(unix)]
+    fn create() -> Result<GhConfigGuard> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut template = {
+            let mut dir = std::env::temp_dir();
+            dir.push("nano-gh-config-XXXXXX");
+            let mut bytes = dir.into_os_string().into_vec();
+            bytes.push(0);
+            bytes
+        };
+        // SAFETY: `template` is a writable, NUL-terminated buffer whose final
+        // component is `XXXXXX`; mkdtemp replaces those in place and returns
+        // the same pointer (or NULL on failure). We never move the buffer
+        // during the call.
+        let res = unsafe { libc::mkdtemp(template.as_mut_ptr() as *mut libc::c_char) };
+        if res.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("creating the private gh config directory");
+        }
+        template.pop();
+        let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(template));
+        Ok(GhConfigGuard { dir })
+    }
+
+    /// Non-Unix hosts have no `mkdtemp` here; fail closed rather than fall
+    /// back to a guessable or checkout-local directory (these are not
+    /// supported daemon hosts).
+    #[cfg(not(unix))]
+    fn create() -> Result<GhConfigGuard> {
+        Err(anyhow::anyhow!(
+            "the private gh config directory is not supported on this (non-Unix) \
+             platform; cannot run gh with a guaranteed-anonymous auth scrub"
+        ))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.dir
+    }
+}
+
+impl Drop for GhConfigGuard {
+    fn drop(&mut self) {
+        // Best-effort: remove the private 0700 directory. We created and own it
+        // (mkdtemp), so this is a simple recursive remove of a directory no
+        // other UID can have written to. A failure cannot be meaningfully
+        // handled at drop time; the directory is owner-only regardless.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Configure a sync `std::process::Command` with the same gh auth env as
+    /// the async tokio path, so tests can inspect the resulting env via
+    /// `get_envs` (which `tokio::process::Command` does not expose).
+    fn gh_auth_env_std(
+        cmd: &mut std::process::Command,
+        token: Option<&str>,
+        host: &str,
+    ) -> Result<Option<GhConfigGuard>> {
+        for k in crate::slot::SENSITIVE_DAEMON_ENV {
+            cmd.env_remove(k);
+        }
+        cmd.env("GH_PROMPT_DISABLED", "1");
+        cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+        for k in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            cmd.env_remove(k);
+        }
+        let guard = GhConfigGuard::create()?;
+        cmd.env("GH_CONFIG_DIR", guard.path());
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            if host.eq_ignore_ascii_case("github.com") {
+                cmd.env("GH_TOKEN", t);
+            } else {
+                cmd.env("GH_ENTERPRISE_TOKEN", t);
+                cmd.env("GH_HOST", host);
+            }
+        }
+        Ok(Some(guard))
+    }
 
     #[test]
     fn hex_sha_validation() {
@@ -4107,6 +4283,95 @@ mod tests {
     }
 
     #[test]
+    fn gh_host_of_slug_derives_the_trusted_host() {
+        // A bare owner/repo slug is github.com; a 3-segment slug names its
+        // GitHub Enterprise host.
+        assert_eq!(gh_host_of_slug("org/repo"), "github.com");
+        assert_eq!(gh_host_of_slug("ghe.example.com/org/repo"), "ghe.example.com");
+    }
+
+    #[test]
+    fn gh_auth_env_scrubs_ambient_credentials_on_both_paths() {
+        // Pre-seed a command with ambient operator credentials; gh_auth_env
+        // must scrub them ALL on both the token and anonymous paths, and always
+        // pin a supervisor-owned GH_CONFIG_DIR outside any checkout.
+        // `get_envs` reports an explicitly-removed var as a `None` value —
+        // treat those as absent so a scrubbed var reads as "not set".
+        fn env_of(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
+            cmd.get_envs()
+                .filter_map(|(k, v)| {
+                    v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+                })
+                .collect()
+        }
+        let ambient = [
+            ("GH_TOKEN", "ambient-gh"),
+            ("GITHUB_TOKEN", "ambient-github"),
+            ("GH_ENTERPRISE_TOKEN", "ambient-ghe"),
+            ("GITHUB_ENTERPRISE_TOKEN", "ambient-ghe2"),
+        ];
+
+        // Token path, github.com: the job token lands on GH_TOKEN; every other
+        // credential source is scrubbed; GH_CONFIG_DIR is a private dir
+        // OUTSIDE the checkout.
+        let mut cmd = std::process::Command::new("gh");
+        for (k, v) in ambient {
+            cmd.env(k, v);
+        }
+        let _guard = gh_auth_env_std(&mut cmd, Some("job-token"), "github.com")
+            .expect("github.com token env");
+        let env = env_of(&cmd);
+        assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some("job-token"));
+        assert!(
+            !env.contains_key("GH_ENTERPRISE_TOKEN"),
+            "enterprise token must not be set for github.com: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_HOST"),
+            "GH_HOST must not be set for github.com: {env:?}"
+        );
+        let cfg = env.get("GH_CONFIG_DIR").expect("GH_CONFIG_DIR must be set");
+        assert!(std::path::Path::new(cfg).is_absolute());
+
+        // Token path, GitHub Enterprise: the job token lands on
+        // GH_ENTERPRISE_TOKEN with GH_HOST pinned; GH_TOKEN is NOT set.
+        let mut ghe_cmd = std::process::Command::new("gh");
+        for (k, v) in ambient {
+            ghe_cmd.env(k, v);
+        }
+        let _ghe_guard = gh_auth_env_std(&mut ghe_cmd, Some("job-token"), "ghe.example.com")
+            .expect("ghe token env");
+        let env = env_of(&ghe_cmd);
+        assert_eq!(
+            env.get("GH_ENTERPRISE_TOKEN").map(String::as_str),
+            Some("job-token")
+        );
+        assert_eq!(env.get("GH_HOST").map(String::as_str), Some("ghe.example.com"));
+        assert!(
+            !env.contains_key("GH_TOKEN"),
+            "GH_TOKEN must not be set for a GHE host: {env:?}"
+        );
+
+        // Anonymous path: NO token var survives; GH_CONFIG_DIR is still set.
+        let mut anon_cmd = std::process::Command::new("gh");
+        for (k, v) in ambient {
+            anon_cmd.env(k, v);
+        }
+        let _anon_guard =
+            gh_auth_env_std(&mut anon_cmd, None, "github.com").expect("anonymous env");
+        let env = env_of(&anon_cmd);
+        for k in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            assert!(!env.contains_key(k), "{k} must be scrubbed anonymously: {env:?}");
+        }
+        assert!(env.contains_key("GH_CONFIG_DIR"));
+    }
+
+    #[test]
     fn redact_token_scrubs_the_literal_token_and_userinfo() {
         let token = "s3cr3tPAT";
         let text = format!("gh error using {token} at https://{token}@github.com/o/r");
@@ -4145,6 +4410,33 @@ mod tests {
         assert_eq!(no_author["isDraft"], false);
     }
 
+    #[test]
+    fn parse_pr_list_reports_malformed_output_as_an_error() {
+        // Non-empty stdout that fails to parse is NOT "no PR" — it is
+        // truncated/corrupt gh output and must surface as {found:false,error}
+        // (the PR's stated best-effort contract), not be silently
+        // indistinguishable from "this branch has no PR".
+        let bad = parse_pr_list("[{\"number\":1");
+        assert_eq!(bad["found"], false);
+        assert_eq!(bad["openedBy"], serde_json::Value::Null);
+        assert!(
+            bad["error"].as_str().unwrap_or_default().contains("malformed JSON"),
+            "a parse failure must carry an error: {bad:#?}"
+        );
+        // A parsed-but-non-array payload (a JSON object) is likewise malformed,
+        // not "no PR".
+        let obj = parse_pr_list(r#"{"number":1}"#);
+        assert_eq!(obj["found"], false);
+        assert!(
+            obj["error"].as_str().unwrap_or_default().contains("non-array"),
+            "a non-array payload must carry an error: {obj:#?}"
+        );
+        // The empty array and empty stdout stay error-free "no PR" results.
+        assert!(parse_pr_list("[]").get("error").is_none());
+        assert!(parse_pr_list("").get("error").is_none());
+        assert!(parse_pr_list("   \n").get("error").is_none());
+    }
+
     #[tokio::test]
     async fn reconcile_agent_pr_rejects_non_github_provider() {
         let dir = git_workspace("reconcile-provider").await;
@@ -4166,9 +4458,11 @@ mod tests {
     #[tokio::test]
     async fn reconcile_agent_pr_never_fails_without_gh_slug() {
         // A github provider but a non-GitHub-http URL (a file:// origin) has no
-        // trusted slug to pin, so reconcile falls back to cwd-based `gh` — which,
-        // in a checkout with no GitHub remote (and no `gh` auth), returns
-        // found:false rather than ever failing the job.
+        // trusted slug to pin with `-R`. Reconciliation does NOT skip `gh` —
+        // it still invokes `gh pr list` with cwd-based repository inference
+        // (the checkout's own remotes), which in a checkout with no GitHub
+        // remote (and no `gh` auth) returns found:false rather than ever
+        // failing the job.
         let dir = git_workspace("reconcile-skip").await;
         let pr = reconcile_agent_pr(
             &dir,
