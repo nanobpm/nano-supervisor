@@ -128,6 +128,15 @@ pub fn classify(
 /// one identity. A non-absolute or empty result yields `None` so a misread can
 /// never match a root.
 fn normalized_identity(path: &Path) -> Option<PathBuf> {
+    // Reject non-absolute (or empty) input *before* touching the filesystem.
+    // `canonicalize` (and the ancestor walk below) resolve a relative path
+    // against the *status command's* own cwd, not the peer's — so a relative
+    // home left unresolved (e.g. the peer cwd was unreadable) could be
+    // canonicalized against our cwd and spuriously match a temp root. A path
+    // we cannot anchor to the peer has no absolute identity: yield `None`.
+    if !path.is_absolute() {
+        return None;
+    }
     if let Ok(canon) = std::fs::canonicalize(path) {
         return Some(canon);
     }
@@ -139,7 +148,17 @@ fn normalized_identity(path: &Path) -> Option<PathBuf> {
     loop {
         match cursor.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
-                missing.push(cursor.file_name().unwrap_or_default().to_os_string());
+                // Capture the *real* final component of `cursor`. `file_name()`
+                // returns `None` when `cursor` ends in `..` (or `.`), so using
+                // it would push an empty component and silently drop that
+                // traversal — e.g. `/tmp/missing/../../srv/state` would lose the
+                // `..`s and reconstruct `/tmp/missing/srv/state`, falsely
+                // temp-flagging a home that actually resolves to `/srv/state`.
+                // Pushing the raw component lets `lexical_normalize` below apply
+                // the `..` pop correctly.
+                if let Some(last) = cursor.components().next_back() {
+                    missing.push(last.as_os_str().to_os_string());
+                }
                 cursor = parent;
                 if let Ok(canon) = std::fs::canonicalize(cursor) {
                     let mut out = canon;
@@ -809,6 +828,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn relative_home_resolved_against_tmp_cwd_is_flagged() {
         // The classification half of the relative-home fix: once `resolve_home`
@@ -853,6 +873,40 @@ mod tests {
         ));
         // ...while a genuinely nested (but `.`/`..`-laden) path still matches.
         assert!(path_under_any(Path::new("/tmp/./a/../b"), &tmp_roots()));
+    }
+
+    #[test]
+    fn normalized_identity_rejects_relative_input_before_touching_disk() {
+        // A relative candidate must yield `None` rather than being canonicalized
+        // against the *status command's* cwd: `.` and `..` both exist relative to
+        // our cwd and would otherwise resolve to real absolute paths that could
+        // spuriously match a temp root.
+        assert_eq!(normalized_identity(Path::new(".")), None);
+        assert_eq!(normalized_identity(Path::new("..")), None);
+        assert_eq!(normalized_identity(Path::new("nshome")), None);
+        assert_eq!(normalized_identity(Path::new("")), None);
+    }
+
+    #[test]
+    fn normalized_identity_preserves_trailing_parent_traversal_in_missing_tail() {
+        // A vanished descendant whose missing tail contains `..` must keep that
+        // traversal: the longest existing ancestor is canonicalized and the tail
+        // re-applied lexically, so `<tmp>/missing/../sibling` resolves to
+        // `<tmp>/sibling`, NOT `<tmp>/missing/sibling`. Dropping the `..` (the old
+        // `file_name()` bug) would falsely place it under the missing subtree.
+        let base = std::env::temp_dir().join(format!("c8ctl-nano-normid-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("create base");
+        let real = std::fs::canonicalize(&base).expect("canonicalize base");
+        // `missing` does not exist, so the tail `missing/../sibling` is resolved
+        // lexically against the canonical base.
+        let candidate = base.join("missing").join("..").join("sibling");
+        let got = normalized_identity(&candidate);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            got,
+            Some(real.join("sibling")),
+            "the `..` in the missing tail must collapse `missing`"
+        );
     }
 
     #[cfg(unix)]
@@ -1002,6 +1056,7 @@ mod tests {
         assert!(render(&[]).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn status_frame_shape_requires_the_positive_documented_form() {
         // A genuine status answer is accepted.
@@ -1027,6 +1082,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn status_frame_pid_rejects_an_out_of_range_value() {
         // An in-range pid is recovered.
