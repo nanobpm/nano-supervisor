@@ -111,6 +111,35 @@ pub fn c8ctl_data_dir() -> Option<PathBuf> {
     Some(base.join("c8ctl"))
 }
 
+/// The operator's c8ctl **plugins** directory — `<data dir>/plugins`, the exact
+/// path c8ctl's own `getPluginsDir()` derives — returned only when it already
+/// exists (as a directory, after following any operator-placed symlink).
+///
+/// Issue #51: the worker relocates the agent's `C8CTL_DATA_DIR` to isolate its
+/// `session.json`/`profiles.json`, but c8ctl has no finer lever — relocating the
+/// whole data root also hides the operator's installed `c8` plugins (`c8 nano`,
+/// etc.), which live under `<data dir>/plugins`. The worker links this directory
+/// back into the isolated dir so plugins still resolve from the operator's real
+/// install while session/profile writes stay quarantined.
+///
+/// Resolution honours the SAME `C8CTL_DATA_DIR` the rest of c8ctl does (via
+/// [`c8ctl_data_dir`]): the worker itself runs un-isolated (it never exports the
+/// per-run override onto its own process), so this reads the operator's default
+/// data dir — unless the operator deliberately set `C8CTL_DATA_DIR` host-wide,
+/// in which case their plugins live there and that is exactly where the agent's
+/// plugins should resolve from too. Returns `None` when no plugins dir exists,
+/// so the seed simply omits the link (c8ctl then creates an empty one inside the
+/// isolated dir — there is nothing to share).
+pub fn c8ctl_plugins_dir() -> Option<PathBuf> {
+    let dir = c8ctl_data_dir()?.join("plugins");
+    // `metadata` follows a symlink: an operator may legitimately keep their
+    // plugins dir as a link. Only link it in when it resolves to a directory.
+    match std::fs::metadata(&dir) {
+        Ok(m) if m.is_dir() => Some(dir),
+        _ => None,
+    }
+}
+
 /// The name of c8ctl's currently active profile, if a session names one.
 /// Compared against the pinned connection to detect drift (issue #41): an
 /// agent's `c8 use profile` rewrites exactly this, so a mismatch after the
