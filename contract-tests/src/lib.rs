@@ -2091,6 +2091,39 @@ fn run_worker_job_inner(
         })
         .expect("create instance: no processInstanceKey");
 
+    run_worker_against_instance(
+        engine,
+        target,
+        home,
+        owned_home,
+        job_type,
+        &process_instance_key,
+        script,
+        worker_flags,
+        extra_env,
+        rank,
+    )
+}
+
+/// Run the worker-under-test against an **already deployed, already created**
+/// process instance — no deploy, no second `createProcessInstance`. Use when
+/// the test has set the existing instance up itself (e.g. pre-associated its
+/// element instance for the #289 conflict path): deploying and creating again
+/// would enqueue a SECOND job of the same type, and the worker could settle the
+/// fresh job while the assertions inspect the first instance.
+#[allow(clippy::too_many_arguments)]
+pub fn run_worker_against_instance(
+    engine: &Engine,
+    target: &Target,
+    home: &TempHome,
+    owned_home: Option<TempHome>,
+    job_type: &str,
+    process_instance_key: &str,
+    script: &[serde_json::Value],
+    worker_flags: &[&str],
+    extra_env: &[(&str, &str)],
+    rank: &str,
+) -> JobOutcome {
     let work = tempfile::Builder::new()
         .prefix("ns-run-")
         .tempdir()
@@ -2135,7 +2168,7 @@ fn run_worker_job_inner(
     };
     JobOutcome {
         job_type: job_type.to_string(),
-        process_instance_key,
+        process_instance_key: process_instance_key.to_string(),
         engine: engine.clone(),
         record_path,
         output,

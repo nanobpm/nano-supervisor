@@ -14,7 +14,8 @@
 
 use contract_tests::{
     assert_parity, bpmn, expect_parity, preassociate_agent_instance, require_engine_and_target,
-    run_worker_job, run_worker_job_with_bpmn, skip, Skip, Target,
+    run_worker_against_instance, run_worker_job, run_worker_job_with_bpmn, skip, Skip, Target,
+    TempHome,
 };
 use serde_json::{json, Value};
 
@@ -116,7 +117,12 @@ fn job_writes_an_agent_instance_record() {
             )
         },
     );
-    if target == Target::Rust {
+    // Return only when the instance is actually ABSENT (today's missing Rust
+    // producer still XFAILs above). Never key this off the target: a partial
+    // Rust producer that creates an empty or malformed instance must fall
+    // through to the full contract below and fail there, not be reported as a
+    // pass because the target-based return skipped validation.
+    if !has_instance {
         return; // #59: no record to inspect yet — the marker above already said so.
     }
 
@@ -393,18 +399,26 @@ fn agent_instance_creation_conflict_is_adopted_not_retried() {
         .and_then(|r| r.error_for_status())
         .expect("release the pre-association activation");
 
-    let outcome = run_worker_job_with_bpmn(
+    // Run the worker against the SAME instance the harness just pre-associated —
+    // never `run_worker_job_with_bpmn` here: that helper deploys the XML and
+    // creates a SECOND process instance, enqueuing a duplicate job of the same
+    // type the worker could settle instead, bypassing the 409 precondition this
+    // test exists to pin while the assertions inspect the first instance.
+    let home = TempHome::new();
+    let outcome = run_worker_against_instance(
         &engine,
         &target,
+        &home,
+        None,
         &job_type,
-        &xml,
+        &pik,
         &[
             json!({ "emit": "adopted turn" }),
             json!({ "write_result": { "ok": true } }),
         ],
-        json!({ "prompt": "adopt me" }),
         &[],
         &[],
+        "junior",
     );
     assert_eq!(
         outcome.job_state(),
