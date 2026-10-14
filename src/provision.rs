@@ -2409,22 +2409,33 @@ async fn finalize_git_with_deadline(
         }
     }
 
+    // UNBORN/NO-REF verdict (see the helper): a proven-still-unborn run's
+    // `retain` is only the fail-closed guard of a repo with no anchor, not
+    // evidence a commit exists — mark it so the caller's empty-result check
+    // does not read that retain as `has_commits`. This SAFETY-CRITICAL probe
+    // runs BEFORE the best-effort PR reconciliation below: a hung `gh` could
+    // otherwise consume the remaining finalize deadline, leaving this
+    // `git_raw_status` probe a ~1 ns budget and an actually-empty unborn run
+    // with `unborn_no_ref = false` — its `retain` then misread as evidence of
+    // commits, bypassing empty-result detection.
+    mark_unborn_no_ref(&mut out, prep, workspace, remaining!()).await;
+
     // PR reconciliation (the Node plugin's `reconcileAgentPr`, c8ctl-plugin.js
     // ~L6627): with a prepared work branch AND `task.allowPr`, look the pushed
     // branch's provider PR up so the completion's `pullRequest` variable is
     // populated (issue #49 — it was previously always null). Gate on
-    // `!push_failed`, the true Rust analogue of Node's `!out.pushFailed`: only a
-    // run whose PUBLICATION of the branch failed or could not be confirmed is
-    // skipped, so reporting a PR against a branch that may not carry this run's
-    // commits is avoided WITHOUT suppressing reconcile for the common case where
-    // an UNRELATED incomplete/stranded scan set `retain` but the push itself
-    // succeeded (or was never attempted) — gating on `retain` there would
-    // falsely report `pullRequest: null` for a branch that IS published. Node
-    // runs reconcile even with no new commits (a PR-head branch may carry a PR
-    // from an earlier run), so this does NOT gate on `pushed`. Best-effort: it
-    // never fails the job — any `gh`/parse error becomes `{ found: false, error }`,
-    // exactly as Node does.
-    if reconcile_gate(allow_pr, out.push_failed) {
+    // `!push_failed && out.pushed`: reconcile runs only when this run actually
+    // PUBLISHED the branch. `push_failed` (the Rust analogue of Node's
+    // `!out.pushFailed`) is set when publication errored or could not be
+    // confirmed; `out.pushed` is additionally false whenever publication was
+    // deliberately SKIPPED — an earlier incomplete/stranded scan set `retain`
+    // (fail-closed), so the push path refused to publish and this run's
+    // prepared branch is NOT on the remote. Reporting a PR for such a branch
+    // would attach a PR that does not carry this run's commits, so a
+    // retain-skipped push is treated as failed/uncertain (not published) and
+    // reconcile is skipped. Best-effort: it never fails the job — any
+    // `gh`/parse error becomes `{ found: false, error }`, exactly as Node does.
+    if reconcile_gate(allow_pr, out.push_failed, out.pushed) {
         if let Some(branch) = &prep.working_branch {
             out.pr = Some(
                 reconcile_agent_pr(workspace, &repo.provider, &repo.url, branch, remaining!()).await,
@@ -2432,11 +2443,6 @@ async fn finalize_git_with_deadline(
         }
     }
 
-    // UNBORN/NO-REF verdict (see the helper): a proven-still-unborn run's
-    // `retain` is only the fail-closed guard of a repo with no anchor, not
-    // evidence a commit exists — mark it so the caller's empty-result check
-    // does not read that retain as `has_commits`.
-    mark_unborn_no_ref(&mut out, prep, workspace, remaining!()).await;
     out
 }
 
@@ -3668,7 +3674,11 @@ fn gh_repo_slug(url: &str) -> Option<String> {
     // `rest` is `[userinfo@]host[:port]/owner/repo[.git][/…]`; the scrub already
     // dropped http(s) userinfo, so split host from path on the first slash.
     let (authority, path) = after_scheme.split_once('/')?;
-    let host = authority.split(':').next().unwrap_or(authority);
+    // Keep the COMPLETE credential-free authority as the host — including a
+    // GitHub Enterprise custom port (`ghe.example:8443`) or a bracketed IPv6
+    // literal (`[2001:db8::1]:8443`). Splitting on the first `:` would drop the
+    // port and truncate an IPv6 host, reconciling against the wrong `GH_HOST`.
+    let host = authority;
     if host.is_empty() {
         return None;
     }
@@ -3701,13 +3711,16 @@ fn gh_host_of_slug(slug: &str) -> String {
 }
 
 /// Whether finalize should run PR reconciliation this round. Reconcile runs
-/// when the job was asked to open a PR (`allow_pr`) AND publication of the work
-/// branch did NOT fail (`!push_failed`). Keeping this a pure predicate makes the
-/// gate's semantics — keyed on the dedicated `push_failed` state, never on the
-/// broad `retain` flag (which an unrelated incomplete/stranded scan sets while
-/// the push itself succeeds) — unit-testable in isolation.
-fn reconcile_gate(allow_pr: bool, push_failed: bool) -> bool {
-    allow_pr && !push_failed
+/// only when the job was asked to open a PR (`allow_pr`) AND this run actually
+/// PUBLISHED the work branch: publication did not fail (`!push_failed`) AND was
+/// not deliberately skipped (`pushed`). `pushed` is false both when publication
+/// failed and when an earlier incomplete/stranded scan set `retain` (fail-closed)
+/// so the push path refused to publish — in both cases this run's prepared branch
+/// is not confirmed on the remote, so reporting a PR for it would attach a PR
+/// that may not carry this run's commits. Keeping this a pure predicate makes
+/// the gate's semantics unit-testable in isolation.
+fn reconcile_gate(allow_pr: bool, push_failed: bool, pushed: bool) -> bool {
+    allow_pr && !push_failed && pushed
 }
 
 /// Look the provider PR up for a pushed branch, mirroring the Node plugin's
@@ -4153,40 +4166,16 @@ impl Drop for GhConfigGuard {
 mod tests {
     use super::*;
 
-    /// Configure a sync `std::process::Command` with the same gh auth env as
-    /// the async tokio path, so tests can inspect the resulting env via
-    /// `get_envs` (which `tokio::process::Command` does not expose).
-    fn gh_auth_env_std(
-        cmd: &mut std::process::Command,
-        token: Option<&str>,
-        host: &str,
-    ) -> Result<Option<GhConfigGuard>> {
-        for k in crate::slot::SENSITIVE_DAEMON_ENV {
-            cmd.env_remove(k);
-        }
-        cmd.env("GH_PROMPT_DISABLED", "1");
-        cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
-        for k in [
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "GH_ENTERPRISE_TOKEN",
-            "GITHUB_ENTERPRISE_TOKEN",
-        ] {
-            cmd.env_remove(k);
-        }
-        cmd.env_remove("GH_HOST");
-        cmd.env_remove("GH_REPO");
-        let guard = GhConfigGuard::create()?;
-        cmd.env("GH_CONFIG_DIR", guard.path());
-        if let Some(t) = token.filter(|t| !t.is_empty()) {
-            if host.eq_ignore_ascii_case("github.com") {
-                cmd.env("GH_TOKEN", t);
-            } else {
-                cmd.env("GH_ENTERPRISE_TOKEN", t);
-                cmd.env("GH_HOST", host);
-            }
-        }
-        Ok(Some(guard))
+    /// Read the environment a production [`gh_auth_env`]-configured Tokio
+    /// command will run with, via its underlying `std::process::Command`
+    /// (`as_std`). `get_envs` reports an explicitly-removed var as a `None`
+    /// value — treat those as absent so a scrubbed var reads as "not set".
+    fn env_of(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            })
+            .collect()
     }
 
     #[test]
@@ -4337,6 +4326,23 @@ mod tests {
             gh_repo_slug("https://ghe.example.com/org/repo.git").as_deref(),
             Some("ghe.example.com/org/repo")
         );
+        // A GitHub Enterprise CUSTOM PORT is preserved in the host (splitting
+        // the authority on the first `:` would drop it and reconcile against
+        // the wrong `GH_HOST`).
+        assert_eq!(
+            gh_repo_slug("https://ghe.example:8443/org/repo.git").as_deref(),
+            Some("ghe.example:8443/org/repo")
+        );
+        // A bracketed IPv6 literal (optionally with a port) is preserved whole —
+        // a naive `:` split would truncate it at the first colon.
+        assert_eq!(
+            gh_repo_slug("https://[2001:db8::1]:8443/org/repo.git").as_deref(),
+            Some("[2001:db8::1]:8443/org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://[2001:db8::1]/org/repo.git").as_deref(),
+            Some("[2001:db8::1]/org/repo")
+        );
         // A non-http(s) remote (the finalize tests' file:// origins, ssh, local
         // paths) is NOT a GitHub http remote → None, so gh is never spawned for it.
         assert!(gh_repo_slug("file:///tmp/origin.git").is_none());
@@ -4352,6 +4358,10 @@ mod tests {
         // GitHub Enterprise host.
         assert_eq!(gh_host_of_slug("org/repo"), "github.com");
         assert_eq!(gh_host_of_slug("ghe.example.com/org/repo"), "ghe.example.com");
+        // The host segment keeps a custom port / bracketed IPv6 so `GH_HOST`
+        // pins the exact Enterprise authority.
+        assert_eq!(gh_host_of_slug("ghe.example:8443/org/repo"), "ghe.example:8443");
+        assert_eq!(gh_host_of_slug("[2001:db8::1]:8443/org/repo"), "[2001:db8::1]:8443");
     }
 
     #[test]
@@ -4388,22 +4398,25 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_gate_keys_on_push_failed_not_retain() {
-        // Reconcile runs only for an allow-PR run whose publication did not
-        // fail.
-        assert!(reconcile_gate(true, false), "allow-PR + published → reconcile");
+    fn reconcile_gate_requires_a_published_branch() {
+        // Reconcile runs only for an allow-PR run that actually PUBLISHED the
+        // branch this run prepared.
         assert!(
-            !reconcile_gate(false, false),
+            reconcile_gate(true, false, true),
+            "allow-PR + published → reconcile"
+        );
+        assert!(
+            !reconcile_gate(false, false, true),
             "a run that was not asked to open a PR never reconciles"
         );
         assert!(
-            !reconcile_gate(true, true),
+            !reconcile_gate(true, true, true),
             "a failed/uncertain publication must NOT claim a PR"
         );
-        // The regression this guards: a run whose UNRELATED scan set `retain`
-        // but whose push SUCCEEDED (push_failed stays false) must still
-        // reconcile — gating on `retain` would have suppressed it and reported
-        // `pullRequest: null` for a branch that is actually published.
+        // A run whose UNRELATED scan set `retain` but whose push SUCCEEDED
+        // (push_failed stays false, pushed true) still reconciles — gating on
+        // `retain` would have suppressed it and reported `pullRequest: null`
+        // for a branch that is actually published.
         let mut out = GitResult {
             branch: Some("feat/x".into()),
             commits: vec!["deadbeef".into()],
@@ -4416,28 +4429,43 @@ mod tests {
             scan_incomplete: false,
         };
         assert!(
-            reconcile_gate(true, out.push_failed),
+            reconcile_gate(true, out.push_failed, out.pushed),
             "retain set by an unrelated scan must not suppress reconcile for a published branch"
         );
         // Flip to a genuine publication failure and the gate closes.
         out.push_failed = true;
-        assert!(!reconcile_gate(true, out.push_failed));
+        assert!(!reconcile_gate(true, out.push_failed, out.pushed));
+        // The regression this guards (the retain-SKIPPED push): a run whose
+        // earlier scan set `retain` so the push path REFUSED to publish —
+        // `pushed` is false even though `push_failed` was never set. Reporting
+        // a PR for that branch would attach a PR that does not carry this
+        // run's commits, so reconcile must be skipped.
+        let skipped = GitResult {
+            branch: Some("feat/x".into()),
+            commits: vec!["deadbeef".into()],
+            pushed: false,
+            pr: None,
+            retain: true,
+            push_failed: false,
+            work_found: false,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        assert!(
+            !reconcile_gate(true, skipped.push_failed, skipped.pushed),
+            "a retain-skipped (unpublished) push must NOT report a PR"
+        );
     }
 
     #[test]
     fn gh_auth_env_scrubs_ambient_credentials_on_both_paths() {
-        // Pre-seed a command with ambient operator credentials; gh_auth_env
-        // must scrub them ALL on both the token and anonymous paths, and always
-        // pin a supervisor-owned GH_CONFIG_DIR outside any checkout.
-        // `get_envs` reports an explicitly-removed var as a `None` value —
-        // treat those as absent so a scrubbed var reads as "not set".
-        fn env_of(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
-            cmd.get_envs()
-                .filter_map(|(k, v)| {
-                    v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
-                })
-                .collect()
-        }
+        // Pre-seed a command with ambient operator credentials; the PRODUCTION
+        // `gh_auth_env` must scrub them ALL on both the token and anonymous
+        // paths, and always pin a supervisor-owned GH_CONFIG_DIR outside any
+        // checkout. The test drives the real Tokio command helper and inspects
+        // the resulting env through its underlying `std::process::Command`
+        // (`as_std`), so a regression that diverges from — or removes — the
+        // production scrub turns this test red.
         let ambient = [
             ("GH_TOKEN", "ambient-gh"),
             ("GITHUB_TOKEN", "ambient-github"),
@@ -4448,7 +4476,7 @@ mod tests {
         // Token path, github.com: the job token lands on GH_TOKEN; every other
         // credential source is scrubbed; GH_CONFIG_DIR is a private dir
         // OUTSIDE the checkout.
-        let mut cmd = std::process::Command::new("gh");
+        let mut cmd = Command::new("gh");
         for (k, v) in ambient {
             cmd.env(k, v);
         }
@@ -4458,9 +4486,9 @@ mod tests {
         // could redirect the lookup off the trusted repo/host.
         cmd.env("GH_HOST", "evil.example.com");
         cmd.env("GH_REPO", "evil/repo");
-        let _guard = gh_auth_env_std(&mut cmd, Some("job-token"), "github.com")
+        let _guard = gh_auth_env(&mut cmd, Some("job-token"), "github.com")
             .expect("github.com token env");
-        let env = env_of(&cmd);
+        let env = env_of(cmd.as_std());
         assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some("job-token"));
         assert!(
             !env.contains_key("GH_ENTERPRISE_TOKEN"),
@@ -4479,16 +4507,16 @@ mod tests {
 
         // Token path, GitHub Enterprise: the job token lands on
         // GH_ENTERPRISE_TOKEN with GH_HOST pinned; GH_TOKEN is NOT set.
-        let mut ghe_cmd = std::process::Command::new("gh");
+        let mut ghe_cmd = Command::new("gh");
         for (k, v) in ambient {
             ghe_cmd.env(k, v);
         }
         // An ambient GH_HOST must be OVERRIDDEN to the trusted Enterprise host,
         // not left as whatever was inherited.
         ghe_cmd.env("GH_HOST", "evil.example.com");
-        let _ghe_guard = gh_auth_env_std(&mut ghe_cmd, Some("job-token"), "ghe.example.com")
+        let _ghe_guard = gh_auth_env(&mut ghe_cmd, Some("job-token"), "ghe.example.com")
             .expect("ghe token env");
-        let env = env_of(&ghe_cmd);
+        let env = env_of(ghe_cmd.as_std());
         assert_eq!(
             env.get("GH_ENTERPRISE_TOKEN").map(String::as_str),
             Some("job-token")
@@ -4500,15 +4528,15 @@ mod tests {
         );
 
         // Anonymous path: NO token var survives; GH_CONFIG_DIR is still set.
-        let mut anon_cmd = std::process::Command::new("gh");
+        let mut anon_cmd = Command::new("gh");
         for (k, v) in ambient {
             anon_cmd.env(k, v);
         }
         anon_cmd.env("GH_HOST", "evil.example.com");
         anon_cmd.env("GH_REPO", "evil/repo");
         let _anon_guard =
-            gh_auth_env_std(&mut anon_cmd, None, "github.com").expect("anonymous env");
-        let env = env_of(&anon_cmd);
+            gh_auth_env(&mut anon_cmd, None, "github.com").expect("anonymous env");
+        let env = env_of(anon_cmd.as_std());
         for k in [
             "GH_TOKEN",
             "GITHUB_TOKEN",
