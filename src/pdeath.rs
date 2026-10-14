@@ -217,16 +217,22 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
 /// has drained to just that anchor, so a clean exit finishes immediately instead
 /// of waiting out `grace`.
 ///
-/// This enumeration is best-effort and non-atomic, and it fails *open*: a member
-/// that forks+exits mid-scan, or one whose per-member read fails, can read as
-/// absent. Linux reads one snapshot of each `/proc/<pid>/stat` (a live member
-/// always has a `/proc` entry naming the group, so a member alive *and readable*
-/// at scan time is seen); macOS enumerates with `proc_listpids(PROC_PGRP_ONLY)`
-/// and rejects each member whose `proc_pidinfo` status is `SZOMB`. A member that
-/// exits *during* the scan is already leaving, so missing it is harmless. If the
-/// platform enumeration cannot run at all (an unreadable `/proc`, a failed
-/// `proc_listpids`) the function degrades to [`group_alive`] — the pre-#50
-/// behaviour (never break early).
+/// This enumeration is best-effort and non-atomic. It fails *open* only for the
+/// unavoidable race — a member that forks+exits mid-scan, so its
+/// `/proc`/`proc_pidinfo` entry vanishes with a *process-gone* error (`NotFound`
+/// on Linux, `ESRCH` on macOS) — because that member is already leaving, so
+/// missing it is harmless. It does **not** treat any other inspection failure as
+/// proof of absence: a per-member read that errors for any reason other than
+/// process-gone (a permission or transient I/O error), a directory read that
+/// errors partway through the enumeration, or a whole-enumeration failure (an
+/// unreadable `/proc`, a failed `proc_listpids`) all degrade to [`group_alive`]
+/// — the pre-#50 behaviour (never break early) — because the unreadable member
+/// could be a still-live one and a false `false` would bypass the grace period
+/// and SIGKILL it. Linux reads one snapshot of each `/proc/<pid>/stat` (a live
+/// member always has a `/proc` entry naming the group, so a member alive *and
+/// readable* at scan time is seen); macOS enumerates with
+/// `proc_listpids(PROC_PGRP_ONLY)` and rejects each member whose `proc_pidinfo`
+/// status is `SZOMB`.
 ///
 /// Because the scan can still under-report (a racing fork, an unreadable
 /// `/proc`/`proc_pidinfo` entry), callers must **not** treat a `false` as proof
@@ -241,7 +247,13 @@ pub(crate) fn group_has_live_member(pgid: u32) -> bool {
         // never breaks early on a group it could not inspect.
         return group_alive(pgid);
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // A readdir error mid-enumeration makes the listing unreliable: keep the
+        // grace loop open rather than conclude the group drained from a partial
+        // scan that may have skipped a still-live member.
+        let Ok(entry) = entry else {
+            return group_alive(pgid);
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -249,26 +261,65 @@ pub(crate) fn group_has_live_member(pgid: u32) -> bool {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) else {
-            // The process exited between the readdir and this read: it is gone,
-            // so it cannot be the live member we are looking for.
-            continue;
-        };
-        // `comm` (field 2) may contain spaces and parentheses, so parse from just
-        // past the final ')': field 3 (state) is the first token, field 5 (pgrp)
-        // the third.
-        let Some(rparen) = stat.rfind(')') else {
-            continue;
-        };
-        let mut fields = stat[rparen + 1..].split_whitespace();
-        let state = fields.next();
-        let _ppid = fields.next();
-        let pgrp = fields.next().and_then(|s| s.parse::<u32>().ok());
-        if pgrp == Some(pgid) && !matches!(state, Some("Z") | Some("X") | Some("x")) {
-            return true;
+        let read = std::fs::read_to_string(format!("/proc/{name}/stat"));
+        match classify_proc_stat(read.as_deref().map_err(std::io::Error::kind), pgid) {
+            MemberVerdict::LiveMember => return true,
+            MemberVerdict::Skip => continue,
+            // An inspection failure (not a clean process-gone race) means we
+            // cannot prove this member is absent: degrade to the numeric probe so
+            // a false negative cannot bypass the grace period and SIGKILL a
+            // running process early.
+            MemberVerdict::Unknown => return group_alive(pgid),
         }
     }
     false
+}
+
+/// Per-member verdict for the Linux `/proc` scan in [`group_has_live_member`].
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq, Debug)]
+enum MemberVerdict {
+    /// A readable, non-zombie member of the target pgid: the group still has live
+    /// work, so the grace loop must not break.
+    LiveMember,
+    /// Readable but not a live member of the target pgid (a different group, a
+    /// zombie), or a genuine *process-gone* race — safe to pass over.
+    Skip,
+    /// The member could not be inspected for a reason other than process-gone:
+    /// the scan is unreliable and must fall back to [`group_alive`] rather than
+    /// read the unknown as absence.
+    Unknown,
+}
+
+/// Classify one `/proc/<pid>/stat` read against `pgid`. Pure so the fail-safe
+/// contract — only a *process-gone* (`NotFound`) read error is `Skip`; any other
+/// read error is `Unknown` (never silently dropped) — is unit-tested directly.
+#[cfg(target_os = "linux")]
+fn classify_proc_stat(read: Result<&str, std::io::ErrorKind>, pgid: u32) -> MemberVerdict {
+    let stat = match read {
+        Ok(stat) => stat,
+        // The process exited between the readdir and this read: it is gone, so it
+        // cannot be the live member we are looking for.
+        Err(std::io::ErrorKind::NotFound) => return MemberVerdict::Skip,
+        // Any other read error (permission, transient I/O) is an *inspection*
+        // failure, not proof of absence.
+        Err(_) => return MemberVerdict::Unknown,
+    };
+    // `comm` (field 2) may contain spaces and parentheses, so parse from just
+    // past the final ')': field 3 (state) is the first token, field 5 (pgrp)
+    // the third.
+    let Some(rparen) = stat.rfind(')') else {
+        return MemberVerdict::Skip;
+    };
+    let mut fields = stat[rparen + 1..].split_whitespace();
+    let state = fields.next();
+    let _ppid = fields.next();
+    let pgrp = fields.next().and_then(|s| s.parse::<u32>().ok());
+    if pgrp == Some(pgid) && !matches!(state, Some("Z") | Some("X") | Some("x")) {
+        MemberVerdict::LiveMember
+    } else {
+        MemberVerdict::Skip
+    }
 }
 
 /// macOS counterpart of the Linux `/proc` scan: enumerate the process group with
@@ -307,16 +358,33 @@ pub(crate) fn group_has_live_member(pgid: u32) -> bool {
         return if got < 0 { group_alive(pgid) } else { false };
     }
     pids.truncate((got as usize) / (pid_sz as usize));
-    pids.into_iter()
-        .any(|pid| pid > 0 && pid_is_running(pid as u32))
+    for pid in pids {
+        if pid <= 0 {
+            continue;
+        }
+        match pid_liveness(pid as u32) {
+            // A readable, non-zombie member: the group still has live work.
+            Some(true) => return true,
+            // A zombie or an already-exited member: not a live member, keep going.
+            Some(false) => {}
+            // The member could not be inspected (an error other than process-gone):
+            // we cannot prove it is absent, so degrade to the numeric probe rather
+            // than read the unknown as absence and break the grace loop early.
+            None => return group_alive(pgid),
+        }
+    }
+    false
 }
 
-/// True when `pid` names a live process that is **not** a zombie, read from
-/// `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_status`. Used by the macOS
-/// [`group_has_live_member`] scan to exclude the held leader zombie (and any
-/// reaped-pending member) from the live-member count.
+/// Per-member liveness for the macOS [`group_has_live_member`] scan, read from
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_status`:
+/// - `Some(true)`  — a live, non-zombie process;
+/// - `Some(false)` — a zombie (`SZOMB`) or an already-exited pid (`ESRCH`): not a
+///   live member, safe to skip;
+/// - `None`        — the status read failed for any other reason: an *inspection*
+///   failure, not proof of absence, so the caller must not treat it as gone.
 #[cfg(target_os = "macos")]
-fn pid_is_running(pid: u32) -> bool {
+fn pid_liveness(pid: u32) -> Option<bool> {
     // SAFETY: `proc_pidinfo` fills a `proc_bsdinfo` for a live or zombie pid.
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
@@ -327,7 +395,16 @@ fn pid_is_running(pid: u32) -> bool {
             &mut info as *mut _ as *mut libc::c_void,
             std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
         );
-        n > 0 && info.pbi_status != libc::SZOMB
+        if n > 0 {
+            return Some(info.pbi_status != libc::SZOMB);
+        }
+        // A non-positive return filled no `bsdinfo`. `ESRCH` is a genuine
+        // process-gone race (treat as not-a-live-member); any other errno is an
+        // inspection failure that must not read as proof of absence.
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -2312,6 +2389,64 @@ mod tests {
         // Cleanup: kill the surviving descendant.
         let _ = member.kill();
         let _ = member.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_proc_stat_only_process_gone_counts_as_absent() {
+        use std::io::ErrorKind;
+        // A process-gone race is the *only* read error that proves absence.
+        assert_eq!(
+            classify_proc_stat(Err(ErrorKind::NotFound), 1234),
+            MemberVerdict::Skip,
+            "a vanished /proc entry is a clean exit race"
+        );
+        // Every other inspection failure must keep the grace loop open (Unknown),
+        // never be silently dropped as absence — otherwise a transiently
+        // unreadable but still-live member would bypass the grace period.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                classify_proc_stat(Err(kind), 1234),
+                MemberVerdict::Unknown,
+                "inspection failure {kind:?} must fail safe, not read as absent"
+            );
+        }
+        // A readable, non-zombie member of the group is detected.
+        assert_eq!(
+            classify_proc_stat(Ok("999 (wo rk) R 1 1234 1234 0 -1"), 1234),
+            MemberVerdict::LiveMember,
+            "a live member of the target pgid counts"
+        );
+        // A zombie of the group is not a live member.
+        assert_eq!(
+            classify_proc_stat(Ok("999 (wo rk) Z 1 1234 1234 0 -1"), 1234),
+            MemberVerdict::Skip,
+            "a zombie of the group is not a live member"
+        );
+        // A live process in a different group is skipped.
+        assert_eq!(
+            classify_proc_stat(Ok("999 (wo rk) R 1 5678 5678 0 -1"), 1234),
+            MemberVerdict::Skip,
+            "a live process in another group does not count"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pid_liveness_reports_self_live() {
+        // Our own process is a live, non-zombie member — the one deterministic
+        // anchor for the macOS per-member probe. (The zombie -> `Some(false)`
+        // path is covered by `group_has_live_member_false_for_held_zombie_anchor`.)
+        assert_eq!(
+            pid_liveness(std::process::id()),
+            Some(true),
+            "the running test process must read as a live member"
+        );
     }
 
     #[test]
