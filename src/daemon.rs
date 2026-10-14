@@ -447,14 +447,20 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // aborts its task). A detached slot still holds its hub session and can keep
     // enqueueing CLAIM/transcript/RELEASE frames, so shutting the hub down first
     // would emit DEREGISTER (false offline presence) while those slots run on and
-    // push frames into a buffer nothing drains. Abort every unfinished handle and
-    // join it (`abort()` is a no-op on an already-finished task), so no slot
-    // outlives the hub deregistration below.
+    // push frames into a buffer nothing drains. Abort every handle (`abort()` is
+    // a no-op on an already-finished task), then join ONLY the ones still
+    // running: the drain above already polled the finished handles to completion,
+    // and awaiting a completed `JoinHandle` a second time panics (`JoinHandle
+    // polled after completion`). Finished unconsumed handles are simply dropped —
+    // their tasks have already ended — so no slot outlives the hub deregistration
+    // below.
     for h in &handles {
         h.abort();
     }
     for h in &mut handles {
-        let _ = h.await;
+        if !h.is_finished() {
+            let _ = h.await;
+        }
     }
 
     // Stop the agentic hub (issue #10): deregister the worker and let its
@@ -2419,6 +2425,40 @@ mod tests {
         let drain = async {};
         let drained = drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
         assert!(drained, "an immediately-finished drain must report success");
+    }
+
+    // Regression (JoinHandle polled after completion): on a NORMAL drain the
+    // drain future has already polled every slot `JoinHandle` to completion, so
+    // the post-drain reap must NOT await them again — awaiting a completed
+    // `JoinHandle` panics. This mirrors the production sequence (drain to
+    // completion, then abort + re-join only the unfinished handles) and would
+    // panic before the fix.
+    #[tokio::test]
+    async fn reap_after_clean_drain_does_not_reawait_finished_handles() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
+        let mut rx = tx.subscribe();
+        let mut handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..3).map(|_| tokio::spawn(async {})).collect();
+
+        // The drain awaits every handle to completion (the normal-shutdown path).
+        let drain = async {
+            for h in &mut handles {
+                let _ = h.await;
+            }
+        };
+        let drained = drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
+        assert!(drained, "all slots finished, so the drain reports success");
+
+        // The reap must not panic on the already-completed handles: abort all,
+        // then await only the ones still running.
+        for h in &handles {
+            h.abort();
+        }
+        for h in &mut handles {
+            if !h.is_finished() {
+                let _ = h.await;
+            }
+        }
     }
 
     // A parsed `stop` must publish the shutdown BEFORE the reply is written, so a
