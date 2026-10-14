@@ -56,11 +56,33 @@ done
 
 note() { printf '%s\n' "$*" >&2; }
 
+# No token → cannot resolve the plugin repo. Skip, as parity.rs does. Where a
+# token IS configured the gate is live and a missing dependency or a failed
+# lookup is a hard error, so the advertised gate never silently turns itself
+# off where it is meant to run. Detect the token up front so the dependency
+# checks below can fail (rather than SKIP) in that case.
+have_token=0
+if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+  have_token=1
+fi
+
+# A missing jq/gh must FAIL the gate wherever a token is configured (CI sets
+# GH_TOKEN): a required check that SKIPs on a missing tool passes without ever
+# checking the ledger — a fail-open. Only a tokenless local run may SKIP, since
+# it cannot resolve the plugin repo anyway.
 if ! command -v jq >/dev/null 2>&1; then
+  if [ "$have_token" -eq 1 ]; then
+    note "parity-ledger: jq not found (token configured — failing rather than waiving the gate)"
+    exit 1
+  fi
   note "SKIP parity-ledger: jq not found"
   exit 0
 fi
 if ! command -v gh >/dev/null 2>&1; then
+  if [ "$have_token" -eq 1 ]; then
+    note "parity-ledger: gh not found (token configured — failing rather than waiving the gate)"
+    exit 1
+  fi
   note "SKIP parity-ledger: gh not found"
   exit 0
 fi
@@ -69,13 +91,6 @@ if [ ! -f "$ledger" ]; then
   exit 2
 fi
 
-# No token → cannot resolve the plugin repo. Skip, as parity.rs does. Where a
-# token IS configured the gate is live and a failed lookup is a hard error, so
-# the advertised gate never silently turns itself off where it is meant to run.
-have_token=0
-if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
-  have_token=1
-fi
 if ! gh auth status >/dev/null 2>&1 && [ "$have_token" -eq 0 ]; then
   note "SKIP parity-ledger: gh is unauthenticated and no GH_TOKEN/GITHUB_TOKEN is set"
   exit 0
@@ -192,7 +207,7 @@ if [ "${#missing[@]}" -eq 0 ]; then
 fi
 
 note ""
-note "parity-ledger: ${#missing[@]} '$label' issue(s) on $repo have NO row in ${ledger#$root_dir/}:"
+note "parity-ledger: ${#missing[@]} '$label' issue(s) on $repo have NO row in ${ledger#"$root_dir"/}:"
 for m in "${missing[@]}"; do note "  - $m"; done
 note ""
 note "Add a row with a disposition (contract-test / rust-issue / n/a) — see the"
