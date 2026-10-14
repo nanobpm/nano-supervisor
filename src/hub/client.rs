@@ -1,0 +1,5924 @@
+//! The worker-side agentic-hub client: ONE WebSocket per daemon, multiplexed
+//! across every slot (mirroring how `@nanobpm/agentic/emit`'s `AgenticEmitClient`
+//! does it in the Node plugin).
+//!
+//! A single background task owns the connection. It reconnects with jittered
+//! exponential backoff, and while the hub is down outbound frames accumulate in
+//! a bounded, QoS-aware ring buffer (per-lane FIFO; overflow sheds the
+//! least-important lane first so a bulk transcript flood can never evict a
+//! control frame) so the job keeps running and the transcript resumes on
+//! reconnect without unbounded memory growth.
+//!
+//! The protocol is the live twin of the Node emit client's wire:
+//!
+//!   - worker **presence** is a `register {instance, capability}` /
+//!     `heartbeat {instance}` / `deregister {instance, reason}` family;
+//!   - job **ownership** is a separate `claim {instance, jobKey}` /
+//!     `release {instance, jobKey}` family;
+//!   - a job's **transcript** rides the `relay` family as
+//!     `{op: "produce", stream, incarnation, chunk}`, where `stream` is the
+//!     per-`(instance, jobKey)` composed stream id and `incarnation` is the
+//!     producer generation (bumped on every reconnect so a resumed producer
+//!     fences its stale predecessor);
+//!   - **inbound steer** is a `relay {stream, …chunk}` delivery routed to the
+//!     one job owning that stream (foreign/invalid streams are dropped, never
+//!     broadcast), decoded to a typed control and applied to the running turn.
+//!
+//! Each running job registers a [`HubSession`]: it REGISTERs its worker
+//! instance (once), CLAIMs the job, bridges the agent's ACP `session/update`
+//! stream to transcript produce frames, and receives inbound steer routed to
+//! it. The session RELEASEs the job when dropped.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep, timeout};
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::hub::config::{HubConfig, LOCAL_AGENTIC_TOKEN};
+use crate::hub::control::{parse_inbound_relay_chunk, ControlFrame};
+use crate::hub::frame::{decode_frame, encode_frame, Family, Frame, Lane, FRAME_HEADER_BYTES};
+use crate::hub::stream::{compose_stream_id, parse_stream_id};
+use crate::hub::transcript::acp_update_to_transcript_chunk;
+use crate::runtime::log;
+
+/// First reconnect delay after a dropped/failed hub connection.
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Ceiling on the reconnect backoff.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How often the client sends a presence heartbeat while connected.
+const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Ceiling on a single connect/handshake attempt. Without it a hung TCP/TLS or
+/// WebSocket handshake would park the connection task indefinitely, wedging both
+/// reconnect backoff and a requested shutdown (which only lands between attempts).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling on any single socket write/flush. A hub that stops reading lets TCP
+/// backpressure fill the kernel send buffer; without this bound `drain` (and so
+/// the entire connection task, including the `shutdown`-watch branch that only
+/// runs between `select!` iterations) could park inside one `send` forever,
+/// wedging reconnect and shutdown alike. On timeout the in-flight frame is
+/// re-buffered and the connection is torn down so reconnect — or shutdown — can
+/// proceed instead of blocking on the wedged socket.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A single deadline around the COMPLETE terminal shutdown drain. `WRITE_TIMEOUT`
+/// bounds each individual socket write, but a peer that accepts every frame just
+/// under that bound — across many control frames plus a closing session's bulk
+/// tail — could otherwise keep [`HubClient::shutdown`] (and so daemon exit)
+/// blocked for many multiples of 30s. This caps the WHOLE deregister drain
+/// (control snapshot + every armed RELEASE's tail flush) + the final Close at one
+/// fixed upper bound, so shutdown always completes within a bounded time no matter
+/// how much is buffered or how slowly the peer reads. Generous enough that a
+/// healthy hub finishes well inside it; it only bites on a genuinely stalled peer.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Count ceiling on the ACP-update → transcript bridge channel. It sits in
+/// front of the already-byte-bounded outbound [`LaneBuffer`]; the EFFECTIVE
+/// bound used per session is the smaller of this and a byte-derived bound (see
+/// [`transcript_channel_bound`]), so this queue's own worst-case memory is held
+/// to the configured byte budget instead of `1024 × 1 MiB ≈ 1 GiB`. On overflow
+/// the producer drops the update rather than blocking the ACP read loop (see
+/// `acp.rs`).
+const TRANSCRIPT_CHANNEL_BOUND: usize = 1024;
+/// Upper bound on a single buffered `session/update` value. The ACP reader caps
+/// each JSON-RPC line (hence each update) at ~1 MiB, so this mirrors `acp.rs`'s
+/// `MAX_ACP_FRAME` and lets [`transcript_channel_bound`] translate the byte
+/// budget into a worst-case item count for the pre-buffer queue.
+const MAX_TRANSCRIPT_UPDATE_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRAME
+/// Count ceiling on each session's inbound-steer channel. A hub delivering
+/// controls faster than the ACP turn consumes them (e.g. while setup or the
+/// agent is stalled) must not grow daemon memory without limit, so the channel
+/// is bounded and `route_inbound` drops the control on overflow rather than
+/// blocking the socket read loop. Like the transcript pre-buffer, the EFFECTIVE
+/// per-session bound is the smaller of this and a byte-derived bound (see
+/// [`steer_channel_bound`]), so the queue's worst-case memory is held to the
+/// configured byte budget instead of `256 × MAX_STEER_CHUNK_BYTES`.
+const STEER_CHANNEL_BOUND: usize = 256;
+/// Upper bound on a single inbound steer chunk's bytes, mirroring
+/// [`MAX_TRANSCRIPT_UPDATE_BYTES`] / `acp::MAX_ACP_FRAME`: the ACP side already
+/// caps each JSON-RPC line (hence each steer the agent can act on) at ~1 MiB, so
+/// that same frame budget — NOT the conformance corpus's size, which is not a
+/// protocol maximum — is the right ceiling for an inbound control. It bounds the
+/// memory a single queued [`ControlFrame::Prompt`] (which owns its chunk
+/// `String`) can hold, since the WebSocket read applies no `max_message_size`;
+/// combined with the byte-derived channel depth ([`steer_channel_bound`]) the
+/// channel's worst-case memory is the configured `buffer_byte_budget`. A chunk
+/// past this cap is dropped (fail closed) rather than truncated — a partial
+/// steer is a corrupted instruction, and the legacy raw-byte path would
+/// otherwise forward a silently-cut prefix — and the drop is logged (see
+/// `route_inbound`) rather than silent, so an operator can observe a rejected
+/// over-large control. Legitimate steering prompts (a prompt body, a cancel
+/// reason, a permission outcome) sit far below 1 MiB.
+const MAX_STEER_CHUNK_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRAME
+/// Ceiling on how long the async teardown paths ([`HubSession::close`] and
+/// [`HubSession::detach_turn`]) wait for the transcript bridge to drain its
+/// accepted updates before RELEASE (finding: RELEASE must not overtake the
+/// transcript tail). Bounded so a wedged bridge can never hang the awaiting
+/// task; on timeout the RELEASE proceeds (the tail is best-effort). The
+/// synchronous `Drop` fallback does NOT use this timeout — it signals the
+/// bridge and aborts it without waiting (see [`HubSession::flush_transcript`]),
+/// so `Drop` can never park a worker thread.
+const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// The harness-protocol version this worker advertises on REGISTER
+/// (`capability.harnessProtocol`). nano-workforce (#802) treats an absent
+/// version as a stale harness and can refuse routing under its stale-harness
+/// policy, so presence must carry it. Single source of truth, mirroring the
+/// reference Node worker's `HARNESS_PROTOCOL_VERSION` (issue #272); bump it
+/// when the harness's ACP/relay contract changes.
+pub(crate) const HARNESS_PROTOCOL_VERSION: u32 = 1;
+/// Maximum frames `drain` writes to the socket before yielding back to the
+/// connection `select!` loop (finding: a sustained transcript producer must not
+/// keep the outbound buffer non-empty and so starve `read.next()` and
+/// `shutdown.changed()`, which would stop an inbound cancel from ever reaching a
+/// noisy job). After this many writes `drain` re-arms the outbound notify (if
+/// frames remain) and returns, so reads and shutdown stay serviceable while the
+/// backlog still drains promptly. A terminal shutdown drain passes `0` to drain
+/// the whole DEREGISTER snapshot in one pass.
+const DRAIN_BATCH: usize = 256;
+
+/// Fixed cap on the number of completed-job RELEASE frames buffered while the
+/// hub connection is DOWN. A RELEASE retires the hub's ownership of a finished
+/// job; while connected it is enqueued EXEMPT from the buffer bound and drained
+/// promptly, so its count stays tiny. During a long OUTAGE, however, every job
+/// that completes leaves another exempt RELEASE (and an armed drain barrier)
+/// with nothing draining it, so the set would otherwise grow without bound for
+/// the whole outage. Reconnect resync is AUTHORITATIVE for ownership — it
+/// re-derives every live claim from `in_flight` and the hub reconciles against
+/// that snapshot — so a completed job's buffered RELEASE is redundant once a
+/// reconnect happens. We therefore hold the buffered RELEASE set to this fixed
+/// cap during an outage, collapsing the OLDEST completed-ownership RELEASE (and
+/// disarming its orphaned barrier) when a new one would exceed it. The cap is
+/// generous: it only bites during an outage long enough to complete this many
+/// jobs, and a collapsed RELEASE's ownership is re-derived by resync.
+const RELEASE_OUTAGE_CAP: usize = 1024;
+
+/// A buffered frame carrying its precomputed on-wire byte size, so the buffer
+/// can enforce a memory (byte) budget without re-serialising the payload on
+/// every eviction/drain.
+struct BufferedFrame {
+    bytes: usize,
+    frame: Frame,
+}
+
+/// Approximate on-wire byte size of a frame: the fixed header plus its
+/// serialised JSON payload. Used only for the buffer's memory budget, so a
+/// serialisation failure (never expected for frames we construct) counts as the
+/// header alone.
+fn frame_bytes(frame: &Frame) -> usize {
+    FRAME_HEADER_BYTES
+        + serde_json::to_string(&frame.payload)
+            .map(|s| s.len())
+            .unwrap_or(0)
+}
+
+/// Compose the `<instance>/<jobKey>` stream id from a presence frame payload
+/// (`CLAIM`/`RELEASE` both carry `{instance, jobKey}`). `None` when either field
+/// is absent, so a malformed frame never matches a real stream.
+fn presence_stream_id(payload: &Value) -> Option<String> {
+    let instance = payload.get("instance").and_then(Value::as_str)?;
+    let job_key = payload.get("jobKey").and_then(Value::as_str)?;
+    Some(compose_stream_id(instance, job_key))
+}
+
+/// Extract the `jobKey` from a presence frame payload (`CLAIM`/`RELEASE`).
+/// `None` when the field is absent, so a malformed frame never matches a real
+/// job. Used by the resync supersession prune, which discriminates on the job
+/// key (the hub reconciles ownership by job key, not by `(instance, jobKey)`
+/// stream) so a cross-slot retry is collapsed exactly like a same-slot one.
+fn presence_job_key(payload: &Value) -> Option<String> {
+    payload
+        .get("jobKey")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The relay `stream` a buffered transcript `produce` frame (or any lower-lane
+/// frame) belongs to, if it carries one. Control/presence frames and any frame
+/// without a string `stream` return `None`, so they never match a session's
+/// per-stream drain. Used by the per-session RELEASE drain barrier to flush
+/// only the closing session's OWN transcript tail.
+fn frame_stream(frame: &Frame) -> Option<&str> {
+    frame.payload.get("stream").and_then(Value::as_str)
+}
+
+/// Effective count bound for one session's pre-buffer transcript channel,
+/// derived from the configured outbound byte budget. Each queued update is
+/// bounded to [`MAX_TRANSCRIPT_UPDATE_BYTES`] by the ACP reader, so capping the
+/// channel at `byte_budget / MAX_TRANSCRIPT_UPDATE_BYTES` holds this queue's
+/// worst-case memory to the same budget as the outbound buffer (rather than a
+/// flat `1024 × 1 MiB ≈ 1 GiB`). A disabled byte budget (`0`, meaning the
+/// outbound buffer enforces no byte cap) falls back to the flat count ceiling.
+/// The result is clamped to `1..=TRANSCRIPT_CHANNEL_BOUND` so a tiny budget
+/// still admits at least one update and a large one never exceeds the ceiling.
+fn transcript_channel_bound(byte_budget: usize) -> usize {
+    if byte_budget == 0 {
+        return TRANSCRIPT_CHANNEL_BOUND;
+    }
+    (byte_budget / MAX_TRANSCRIPT_UPDATE_BYTES).clamp(1, TRANSCRIPT_CHANNEL_BOUND)
+}
+
+/// Effective count bound for one session's inbound-steer channel, derived from
+/// the same configured byte budget as [`transcript_channel_bound`]. Each queued
+/// control is capped to [`MAX_STEER_CHUNK_BYTES`] by `route_inbound`, so capping
+/// the channel at `byte_budget / MAX_STEER_CHUNK_BYTES` holds its worst-case
+/// memory to the configured `buffer_byte_budget` instead of
+/// `STEER_CHANNEL_BOUND × MAX_STEER_CHUNK_BYTES`. A disabled byte budget (`0`)
+/// falls back to the flat count ceiling, and the result is clamped to
+/// `1..=STEER_CHANNEL_BOUND` so a tiny budget still admits one control and a
+/// large one never exceeds the ceiling.
+fn steer_channel_bound(byte_budget: usize) -> usize {
+    if byte_budget == 0 {
+        return STEER_CHANNEL_BOUND;
+    }
+    (byte_budget / MAX_STEER_CHUNK_BYTES).clamp(1, STEER_CHANNEL_BOUND)
+}
+
+/// A bounded, QoS-aware outbound buffer: one FIFO queue per lane, with a shared
+/// frame-count cap AND a shared byte budget. Draining prefers control →
+/// interactive → bulk; overflow eviction sheds the least-important non-empty
+/// lane first (bulk, then interactive, then control), so a bulk transcript
+/// flood can never displace a `register`/`claim`/`deregister` control frame and
+/// break presence. The byte budget bounds *memory*: a count cap alone cannot,
+/// because a single transcript chunk may be ~1 MiB, so `capacity` frames could
+/// otherwise retain ~1 GiB.
+#[derive(Default)]
+struct LaneBuffer {
+    control: VecDeque<BufferedFrame>,
+    interactive: VecDeque<BufferedFrame>,
+    bulk: VecDeque<BufferedFrame>,
+    capacity: usize,
+    byte_capacity: usize,
+    bytes: usize,
+}
+
+impl LaneBuffer {
+    fn with_limits(capacity: usize, byte_capacity: usize) -> LaneBuffer {
+        LaneBuffer {
+            capacity,
+            byte_capacity,
+            ..LaneBuffer::default()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.control.len() + self.interactive.len() + self.bulk.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Would admitting `incoming` more bytes still fit the byte budget? A zero
+    /// budget means "unbounded" (never used in production, but keeps tests that
+    /// only exercise the count cap simple).
+    fn bytes_fit(&self, incoming: usize) -> bool {
+        self.byte_capacity == 0 || self.bytes + incoming <= self.byte_capacity
+    }
+
+    /// Append `frame` to its lane. When either the count cap OR the byte budget
+    /// would be exceeded, evict to make room — but only ever shed a frame whose
+    /// priority is at or below the incoming frame's, least-important lane first,
+    /// and NEVER a control frame. A bulk flood can therefore displace only other
+    /// bulk frames; it can never evict an interactive or control frame to admit
+    /// itself. When nothing at or below the incoming priority remains to evict
+    /// (the buffer holds only higher-priority traffic, or the frame alone
+    /// exceeds the whole byte budget), the incoming frame is dropped instead —
+    /// presence/steer control is never sacrificed, even for another control
+    /// frame (see [`LaneBuffer::evict_for`]).
+    fn push(&mut self, frame: Frame) {
+        if self.capacity == 0 {
+            return; // no room at all: drop on the floor
+        }
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            if !self.evict_for(frame.lane) {
+                return; // only higher-priority frames remain / too large: drop
+            }
+        }
+        self.store_back(BufferedFrame { bytes, frame });
+    }
+
+    fn store_back(&mut self, bf: BufferedFrame) {
+        self.bytes += bf.bytes;
+        match bf.frame.lane {
+            Lane::Control => self.control.push_back(bf),
+            Lane::Interactive => self.interactive.push_back(bf),
+            Lane::Bulk => self.bulk.push_back(bf),
+        }
+    }
+
+    fn store_front(&mut self, bf: BufferedFrame) {
+        self.bytes += bf.bytes;
+        match bf.frame.lane {
+            Lane::Control => self.control.push_front(bf),
+            Lane::Interactive => self.interactive.push_front(bf),
+            Lane::Bulk => self.bulk.push_front(bf),
+        }
+    }
+
+    fn account_removed(&mut self, bf: &BufferedFrame) {
+        self.bytes = self.bytes.saturating_sub(bf.bytes);
+    }
+
+    /// Evict the oldest frame whose lane priority is at or below `incoming`'s,
+    /// least-important lane first. Returns `false` when no such frame exists —
+    /// i.e. every buffered frame strictly outranks `incoming` — so the caller
+    /// drops the incoming frame rather than displacing higher-priority traffic.
+    ///
+    /// CONTROL IS NEVER EVICTED, not even by another control frame: presence
+    /// frames are an ordered, interdependent set (a `CLAIM` is meaningless
+    /// without its prerequisite `REGISTER`, and `REGISTER` strictly precedes
+    /// `CLAIM`), so shedding one control frame to admit another can silently
+    /// desync ownership — e.g. under a tiny `NANO_AGENTIC_BUFFER_CAPACITY` a
+    /// `register_session`'s CLAIM would evict the REGISTER it was enqueued
+    /// after, and the hub would learn ownership of an instance it never saw
+    /// registered. Control is low-volume by design, so when only control
+    /// remains the incoming frame is dropped instead (a bounded buffer must
+    /// drop *something*; dropping the newcomer preserves the ordering of what
+    /// is already queued). The reconnect resync rebuilds the full presence set
+    /// from state via `push_front_control_bounded`, so a dropped frame is
+    /// repaired on the next reconnect.
+    fn evict_for(&mut self, incoming: Lane) -> bool {
+        let evicted = match incoming {
+            // Bulk may only evict bulk.
+            Lane::Bulk => self.bulk.pop_front(),
+            // Interactive may evict bulk, then interactive — never control.
+            Lane::Interactive => self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front()),
+            // Control may shed lower-priority traffic (bulk, then interactive)
+            // to make room, but NEVER another control frame (see above).
+            Lane::Control => self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front()),
+        };
+        match evicted {
+            Some(bf) => {
+                self.account_removed(&bf);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Pop the next frame to send, draining the highest-priority lane first.
+    fn pop(&mut self) -> Option<Frame> {
+        let bf = self
+            .control
+            .pop_front()
+            .or_else(|| self.interactive.pop_front())
+            .or_else(|| self.bulk.pop_front())?;
+        self.account_removed(&bf);
+        Some(bf.frame)
+    }
+
+    /// Pop the next lower-lane frame (interactive first, then bulk) whose
+    /// [`frame_stream`] equals `stream`, leaving every OTHER session's frames
+    /// untouched. Used by the per-session RELEASE drain barrier to flush only
+    /// the CLOSING session's own transcript tail ahead of its RELEASE — never
+    /// the global lower-lane backlog, which other live sessions keep refilling
+    /// (draining that globally would let a busy neighbour starve this barrier,
+    /// and block steer/shutdown behind an unbounded flush). Oldest-matching-first
+    /// preserves the stream's own FIFO order. Returns `None` when no buffered
+    /// lower-lane frame belongs to `stream`.
+    fn pop_lower_lane_for_stream(&mut self, stream: &str) -> Option<Frame> {
+        let bf = Self::take_stream_match(&mut self.interactive, stream)
+            .or_else(|| Self::take_stream_match(&mut self.bulk, stream))?;
+        self.account_removed(&bf);
+        Some(bf.frame)
+    }
+
+    /// Remove and return the oldest frame in `dq` whose [`frame_stream`] matches
+    /// `stream`, preserving the order of the rest. Helper for
+    /// [`LaneBuffer::pop_lower_lane_for_stream`].
+    fn take_stream_match(dq: &mut VecDeque<BufferedFrame>, stream: &str) -> Option<BufferedFrame> {
+        let pos = dq
+            .iter()
+            .position(|bf| frame_stream(&bf.frame) == Some(stream))?;
+        dq.remove(pos)
+    }
+
+    /// Append a completed-job RELEASE to the BACK of the control lane during an
+    /// OUTAGE, holding the buffered RELEASE set to `cap` frames. Like
+    /// [`push_back_control_bounded`], the RELEASE itself is EXEMPT from the
+    /// ordinary count/byte bound (it sheds lower-priority traffic, never itself)
+    /// — but to keep completed-ownership replay from growing without bound for
+    /// the whole outage (see [`RELEASE_OUTAGE_CAP`]), when `cap` RELEASE frames
+    /// are already buffered this first collapses the OLDEST one. The collapse
+    /// removes the completed ownership record as a UNIT — the RELEASE AND its
+    /// matching CLAIM — because the CLAIM alone would be orphaned: every job that
+    /// starts and completes during a prolonged outage would otherwise leave one
+    /// historical CLAIM behind, so the "bounded" outage buffer still grew without
+    /// limit. Reconnect resync is authoritative for ownership, so a collapsed
+    /// CLAIM+RELEASE pair is re-derived on reconnect. Returns the collapsed
+    /// RELEASE frame's unique `seq` (so the caller can disarm its now-orphaned
+    /// drain barrier, which is keyed by that `seq`), or `None` when under the
+    /// cap. `cap == 0` disables collapsing (admit without a bound).
+    fn push_back_release_bounded(&mut self, frame: Frame, cap: usize) -> Option<u32> {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        debug_assert_eq!(frame.family, Family::Release);
+        let mut collapsed_seq = None;
+        if cap > 0 {
+            let release_count = self
+                .control
+                .iter()
+                .filter(|bf| bf.frame.family == Family::Release)
+                .count();
+            if release_count >= cap {
+                if let Some(pos) = self
+                    .control
+                    .iter()
+                    .position(|bf| bf.frame.family == Family::Release)
+                {
+                    let mut collapsed_stream = None;
+                    if let Some(bf) = self.control.remove(pos) {
+                        self.account_removed(&bf);
+                        collapsed_seq = Some(bf.frame.seq);
+                        collapsed_stream = presence_stream_id(&bf.frame.payload);
+                    }
+                    // Compact the completed ownership record as a unit: drop the
+                    // matching CLAIM too, or it stays orphaned (its RELEASE is
+                    // gone) and the outage buffer grows one CLAIM per completed
+                    // job without bound.
+                    if let Some(stream) = collapsed_stream.as_deref() {
+                        if let Some(cpos) = self.control.iter().position(|bf| {
+                            bf.frame.family == Family::Claim
+                                && presence_stream_id(&bf.frame.payload).as_deref() == Some(stream)
+                        }) {
+                            if let Some(cf) = self.control.remove(cpos) {
+                                self.account_removed(&cf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.push_back_control_bounded(frame);
+        collapsed_seq
+    }
+
+    /// Pop the next CONTROL frame only, leaving the lower (interactive/bulk)
+    /// lanes untouched. Used by the terminal shutdown drain ([`drain_control`]),
+    /// which must flush the DEREGISTER control snapshot to the socket but
+    /// deliberately DISCARDS the lower-lane backlog (bulk transcript,
+    /// interactive steer) rather than blocking shutdown on it. Returns `None`
+    /// when the control lane is empty, even if lower lanes still hold frames.
+    fn pop_control(&mut self) -> Option<Frame> {
+        let bf = self.control.pop_front()?;
+        self.account_removed(&bf);
+        Some(bf.frame)
+    }
+
+    /// Re-admit a popped frame to the FRONT of its lane (a write failed or timed
+    /// out; retry it first on reconnect, preserving its lane priority). The
+    /// buffer is NOT guaranteed to still be at its pre-pop size: producers can
+    /// refill the freed slot while the failing write is awaited, so this re-runs
+    /// the SAME priority-aware eviction as `push` before restoring the frame —
+    /// otherwise repeated write failures could grow the buffer past its
+    /// advertised count/byte caps. When only strictly-higher-priority traffic
+    /// remains (or the frame alone exceeds the whole byte budget), the retry
+    /// frame is dropped rather than displacing more important frames. Like
+    /// `push`, a control retry never evicts another control frame (see
+    /// [`LaneBuffer::evict_for`]).
+    fn push_front(&mut self, frame: Frame) {
+        if self.capacity == 0 {
+            return; // no room at all: drop on the floor
+        }
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            if !self.evict_for(frame.lane) {
+                return; // only higher-priority frames remain / too large: drop
+            }
+        }
+        self.store_front(BufferedFrame { bytes, frame });
+    }
+
+    /// Re-admit a popped frame to the FRONT of its lane after a failed or
+    /// timed-out write, like [`push_front`] — but a MUST-DELIVER control frame
+    /// (`RELEASE` / `DEREGISTER`) is re-admitted EXEMPT from the buffer bound
+    /// (via [`push_front_control_bounded`]) so a write failure can NEVER silently
+    /// drop it. A `RELEASE` for a job already removed from `in_flight` cannot be
+    /// rebuilt by the reconnect resync, so dropping it on re-buffer would strand
+    /// the job's CLAIM on the hub (ownership desync); a `DEREGISTER` is the only
+    /// frame that retires a worker's presence. Everything else re-buffers through
+    /// the ordinary bounded [`push_front`], which may shed it under pressure
+    /// (transcript/steer is repairable, presence is not).
+    fn requeue_front(&mut self, frame: Frame) {
+        if frame.lane == Lane::Control
+            && matches!(frame.family, Family::Release | Family::Deregister)
+        {
+            self.push_front_control_bounded(frame);
+        } else {
+            self.push_front(frame);
+        }
+    }
+
+    /// Prepend a CONTROL frame to the front of its lane, shedding lower-priority
+    /// (bulk, then interactive) traffic to make room — never another control
+    /// frame, so presence/ownership ordering is preserved. Used by the reconnect
+    /// resync snapshot, which must land at the front in REGISTER-then-CLAIM
+    /// order.
+    ///
+    /// PRESENCE IS EXEMPT FROM THE BUFFER BOUND (a deliberate capacity-semantics
+    /// decision, not an oversight): when only control frames remain and the
+    /// count/byte cap is still exceeded, this stops evicting and prepends the
+    /// snapshot frame anyway, so a presence set larger than a tiny
+    /// `NANO_AGENTIC_BUFFER_CAPACITY` is NOT dropped or fragmented. Rationale:
+    /// presence is already bounded by live instances + in-flight jobs (a small,
+    /// meaningful set), and dropping or fragmenting it would hide workers from
+    /// the hub or desync ownership — a worse failure than transiently exceeding a
+    /// memory bound by a few small control frames. The count/byte budget still
+    /// bounds the *transcript/bulk* traffic that dominates memory; presence
+    /// frames are exempt because their correctness (every worker visible, every
+    /// claim owned) matters more than their negligible bytes.
+    fn push_front_control_bounded(&mut self, frame: Frame) {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            // Shed the least-important non-control frame. If only control
+            // frames remain, stop evicting (presence is EXEMPT from the bound —
+            // see the doc comment) and prepend anyway: the snapshot is bounded
+            // by live instances+jobs, never by the configured buffer limits.
+            let evicted = self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front());
+            match evicted {
+                Some(bf) => self.account_removed(&bf),
+                None => break,
+            }
+        }
+        self.store_front(BufferedFrame { bytes, frame });
+    }
+
+    /// Append a CONTROL frame to the BACK of the control lane, shedding only
+    /// lower-priority (bulk, then interactive) traffic to make room and NEVER
+    /// dropping the control frame itself — the same capacity EXEMPTION as
+    /// [`push_front_control_bounded`], but preserving enqueue order at the tail.
+    /// Used for the shutdown DEREGISTER snapshot: a clean shutdown must emit a
+    /// DEREGISTER for EVERY registered worker, so when the configured capacity is
+    /// smaller than the number of registered slots the ordinary bounded `push`
+    /// (which drops a control newcomer once the control lane fills, since control
+    /// never evicts control) would silently send only a subset. Presence is
+    /// bounded by live instances, so admitting the whole snapshot is safe.
+    fn push_back_control_bounded(&mut self, frame: Frame) {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            let evicted = self
+                .bulk
+                .pop_front()
+                .or_else(|| self.interactive.pop_front());
+            match evicted {
+                Some(bf) => self.account_removed(&bf),
+                None => break,
+            }
+        }
+        self.store_back(BufferedFrame { bytes, frame });
+    }
+
+    /// Append an ARMED `RELEASE` to the back of the control lane, making room by
+    /// shedding lower-priority traffic — but NEVER a lower-lane frame whose
+    /// [`frame_stream`] equals `keep_stream`. That stream is the CLOSING session
+    /// this `RELEASE` orders against: `HubSession::close` flushed its transcript
+    /// tail into the buffer and armed a drain barrier keyed on this `RELEASE`, so
+    /// evicting that tail here would leave the barrier to find no matching frames
+    /// and send the `RELEASE` alone — silently losing the promised
+    /// tail-before-`RELEASE` ordering on the wire precisely under buffer pressure.
+    /// Eviction therefore skips the closing stream's tail (evicting OTHER streams'
+    /// bulk/interactive frames first), and the `RELEASE` itself is still admitted
+    /// exempt (never dropped). The kept tail is bounded by the session's own
+    /// transcript channel, so this cannot grow the buffer without limit.
+    fn push_back_release_preserving_stream(&mut self, frame: Frame, keep_stream: &str) {
+        debug_assert_eq!(frame.lane, Lane::Control);
+        debug_assert_eq!(frame.family, Family::Release);
+        let bytes = frame_bytes(&frame);
+        while self.len() >= self.capacity || !self.bytes_fit(bytes) {
+            if !self.evict_lower_except(keep_stream) {
+                break; // only control frames and the kept stream's tail remain
+            }
+        }
+        self.store_back(BufferedFrame { bytes, frame });
+    }
+
+    /// Evict the oldest lower-lane (bulk, then interactive) frame that does NOT
+    /// belong to `keep_stream`, returning `false` when none exists. Used by
+    /// [`LaneBuffer::push_back_release_preserving_stream`] to free room for an
+    /// armed `RELEASE` without shedding the closing session's own transcript
+    /// tail. Never touches a control frame.
+    fn evict_lower_except(&mut self, keep_stream: &str) -> bool {
+        let evicted = Self::take_stream_mismatch(&mut self.bulk, keep_stream)
+            .or_else(|| Self::take_stream_mismatch(&mut self.interactive, keep_stream));
+        match evicted {
+            Some(bf) => {
+                self.account_removed(&bf);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove and return the oldest frame in `dq` whose [`frame_stream`] is NOT
+    /// `keep_stream` (or has no stream), preserving the order of the rest. Helper
+    /// for [`LaneBuffer::evict_lower_except`].
+    fn take_stream_mismatch(
+        dq: &mut VecDeque<BufferedFrame>,
+        keep_stream: &str,
+    ) -> Option<BufferedFrame> {
+        let pos = dq
+            .iter()
+            .position(|bf| frame_stream(&bf.frame) != Some(keep_stream))?;
+        dq.remove(pos)
+    }
+    /// supersedes presence for live instances + in-flight jobs, so leaving those
+    /// stale frames in place would duplicate presence/ownership and let a
+    /// `CLAIM` buffered while disconnected drain ahead of the snapshot's
+    /// `REGISTER`.
+    ///
+    /// A `CLAIM` WHOSE STREAM HAS A PENDING `RELEASE` IS KEPT: that is a job
+    /// which started and finished during the outage. `release_job` has already
+    /// removed it from `in_flight`, so the resync snapshot CANNOT recreate its
+    /// `CLAIM`; dropping the buffered one would send the preserved transcript
+    /// and the `RELEASE` without the prerequisite ownership frame, desyncing the
+    /// hub (a `RELEASE`/transcript for a job it never saw claimed). Preserving
+    /// the `CLAIM` keeps the whole `CLAIM → tail → RELEASE` sequence intact.
+    /// Other control families (`DEREGISTER`/`HEARTBEAT`) are preserved.
+    ///
+    /// A buffered `RELEASE` WHOSE JOB KEY IS CURRENTLY IN-FLIGHT — on ANY
+    /// instance — is a SUPERSEDED earlier generation and is DROPPED (its drain
+    /// barrier disarmed via the returned `seq`). This is the retry-during-outage
+    /// hazard: a prior generation of the job completes during the outage (its
+    /// `RELEASE` buffered, its slot removed from `in_flight`), then an
+    /// identical-keyed retry re-claims the job and is live again. The resync
+    /// snapshot prepends an authoritative `CLAIM` for that live retry, but the
+    /// stale `RELEASE` drains AFTER it and would clear the retry's ownership —
+    /// the hub then has no claim for a job that is still running. Barriers key
+    /// on the `RELEASE` `seq` and the tail flushes by stream id, so neither can
+    /// tell the two generations apart; collapsing the superseded `RELEASE`/`CLAIM`
+    /// here (the snapshot rebuilds the live `CLAIM`) is the fence.
+    ///
+    /// The supersession discriminant is the **job key**, not the composed
+    /// `(instance, jobKey)` stream id: the hub reconciles ownership by job key
+    /// (its `ClaimRegistry` moves a job's ownership on any `CLAIM` naming that
+    /// key), so a retry on a DIFFERENT slot is the same hazard as a retry on the
+    /// same slot. A stale `(A, jobKey)` `CLAIM`/`RELEASE` pair would otherwise
+    /// survive a `(B, jobKey)` live retry — the `CLAIM` moves the job's ownership
+    /// back to the finished slot A and the `RELEASE` then removes it, leaving the
+    /// running retry on B absent from ownership visibility. Keying the prune on
+    /// the job key collapses the superseded pair across instances too.
+    ///
+    /// A `RELEASE` whose job key is NOT in-flight anywhere is a genuinely
+    /// completed job with no live retry and is preserved. Returns the `seq` of
+    /// every dropped `RELEASE` so the caller can disarm its drain barrier.
+    fn drop_control_presence(&mut self, in_flight_job_keys: &HashSet<String>) -> Vec<u32> {
+        // Job keys with a buffered RELEASE whose job is NOT currently in-flight
+        // on any instance: a job that started and finished during the outage
+        // with no live retry. Its CLAIM is for a completed job the snapshot
+        // cannot rebuild, so it must survive this prune (keeping
+        // CLAIM → tail → RELEASE intact). A RELEASE whose job key IS in-flight
+        // is excluded here — that CLAIM is rebuilt by the snapshot and the stale
+        // RELEASE is dropped below.
+        let pending_release: HashSet<String> = self
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .filter_map(|bf| presence_job_key(&bf.frame.payload))
+            .filter(|jk| !in_flight_job_keys.contains(jk))
+            .collect();
+        let mut freed = 0;
+        let mut disarmed: Vec<u32> = Vec::new();
+        self.control.retain(|bf| {
+            let job_key = presence_job_key(&bf.frame.payload);
+            let drop_it = match bf.frame.family {
+                Family::Register => true,
+                Family::Claim => job_key
+                    .as_ref()
+                    .map(|jk| !pending_release.contains(jk))
+                    .unwrap_or(true),
+                // Superseded RELEASE for a re-claimed (live) job key: drop it so
+                // it cannot clear the retry's snapshot-asserted ownership.
+                Family::Release => job_key
+                    .as_ref()
+                    .map(|jk| in_flight_job_keys.contains(jk))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if drop_it {
+                freed += bf.bytes;
+                if bf.frame.family == Family::Release {
+                    disarmed.push(bf.frame.seq);
+                }
+            }
+            !drop_it
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+        disarmed
+    }
+
+    /// Test-only: iterate every buffered frame (across all lanes) so a test can
+    /// read each frame's `seq` — the enqueue order — independent of drain order.
+    #[cfg(test)]
+    fn iter_frames(&self) -> impl Iterator<Item = &Frame> {
+        self.control
+            .iter()
+            .chain(self.interactive.iter())
+            .chain(self.bulk.iter())
+            .map(|bf| &bf.frame)
+    }
+}
+
+/// The shared hub client. Construct with [`HubClient::spawn`]; share it as
+/// `Arc<HubClient>` across slots and open one [`HubSession`] per running job.
+pub struct HubClient {
+    config: HubConfig,
+    /// Bounded, QoS-aware outbound buffer, drained to the socket when connected
+    /// and retained (least-important-lane-dropped) while disconnected.
+    outbound: Mutex<LaneBuffer>,
+    /// Woken whenever a frame is enqueued so the connection task drains promptly.
+    outbound_notify: Notify,
+    /// Monotonic per-frame sequence number.
+    seq: AtomicU32,
+    /// True while the WebSocket is up (presence is live).
+    connected: AtomicBool,
+    /// The producer generation stamped as each transcript frame's `incarnation`.
+    /// Bumped on every reconnect (never on the first connect) so a resumed
+    /// producer strictly outranks its stale predecessor.
+    generation: AtomicU32,
+    /// Registered worker instances → their declared capability, for reconnect
+    /// re-`register`. Worker presence is tracked separately from job ownership.
+    instances: Mutex<HashMap<String, Value>>,
+    /// Per-instance set of in-flight (claimed, un-released) job keys, for
+    /// reconnect re-`claim`.
+    in_flight: Mutex<HashMap<String, HashSet<String>>>,
+    /// Per-session steer sinks, keyed by the session's composed **stream id**,
+    /// used to route an inbound relay delivery to the one job owning it.
+    sessions: Mutex<HashMap<String, mpsc::Sender<ControlFrame>>>,
+    /// Flipped to request the connection task to deregister and exit.
+    shutdown_tx: watch::Sender<bool>,
+    /// The spawned connection task's handle, awaited by [`HubClient::shutdown`]
+    /// so a clean shutdown blocks until the task has flushed its `DEREGISTER`
+    /// and torn the socket down — not merely signalled the watch.
+    conn_task: Mutex<Option<JoinHandle<()>>>,
+    /// Per-session transcript-bridge flush handles, keyed by a unique session
+    /// sequence (NOT the stream id, which a later session for the same job
+    /// would reuse and so could steal a predecessor's flush handle). Lets the
+    /// async teardown paths ([`HubSession::close`]/[`HubSession::detach_turn`])
+    /// close a bridge's input and synchronously wait for its accepted updates
+    /// to reach the outbound buffer BEFORE enqueuing the job's RELEASE. The
+    /// synchronous `Drop` fallback ([`HubSession::flush_transcript`]) closes the
+    /// input and aborts the bridge but does NOT wait, so `Drop` never parks.
+    bridge_tasks: Mutex<HashMap<u64, BridgeFlush>>,
+    /// Allocates the unique per-session key for `bridge_tasks`.
+    next_session_seq: AtomicU64,
+    /// Number of LIVE transcript bridges (one per active ACP turn). Each slot
+    /// runs at most one job at a time and each job-turn at most one bridge, so
+    /// this never exceeds [`slot_count`](Self::slot_count) — the invariant that
+    /// lets the FIXED per-slot transcript budget (`transcript_bridge_bound`)
+    /// bound the aggregate (`active × share ≤ slot_count × share ≤ budget`).
+    /// Incremented in [`HubClient::spawn_bridge`] and decremented wherever a
+    /// bridge is torn down (`detach_turn`, `close`, `flush_transcript`).
+    active_bridges: AtomicU64,
+    /// Number of configured worker slots (known at [`spawn`](HubClient::spawn)).
+    /// Upper bound on concurrent live bridges; the divisor for the FIXED
+    /// per-bridge transcript budget.
+    slot_count: usize,
+    /// FIXED transcript pre-buffer channel bound for EVERY bridge, precomputed
+    /// at [`spawn`](HubClient::spawn) as
+    /// `transcript_channel_bound(buffer_byte_budget / slot_count)`. A fixed
+    /// share — rather than a creation-time `budget / active_bridges` divisor —
+    /// is what actually caps aggregate memory: an mpsc channel's capacity is
+    /// fixed at creation and cannot shrink, so a dynamic divisor would leave an
+    /// early bridge oversized and let N bridges retain ≈ `budget × H(N)`. With
+    /// a fixed `budget / slot_count` share and at most `slot_count` concurrent
+    /// bridges, the SUM of every live bridge's pre-buffer stays within
+    /// `buffer_byte_budget`.
+    transcript_bridge_bound: usize,
+    /// FIXED steer channel bound for EVERY session, precomputed at
+    /// [`spawn`](HubClient::spawn) as
+    /// `steer_channel_bound(buffer_byte_budget / slot_count)`. Partitioned by the
+    /// configured slot count for the SAME reason as `transcript_bridge_bound`: a
+    /// per-session `steer_channel_bound(buffer_byte_budget)` would let each of
+    /// the (up to `slot_count`) live sessions retain the full byte budget in its
+    /// steer queue, so a stalled/hostile hub could pin `slot_count ×
+    /// buffer_byte_budget` across them. A fixed `budget / slot_count` share with
+    /// at most `slot_count` concurrent sessions keeps the aggregate steer memory
+    /// within `buffer_byte_budget`.
+    steer_bridge_bound: usize,
+    /// Armed RELEASE drain barriers, keyed by the unique **`seq` of the RELEASE
+    /// frame** the arming [`HubSession::close`] enqueued — NOT the composed
+    /// stream id. A stream id is reused by every retry of the same job on the
+    /// same slot, so a stream-keyed barrier let a redelivered job's
+    /// `register_session` overwrite a predecessor's still-armed barrier whose
+    /// RELEASE was buffered during an outage, letting that RELEASE overtake its
+    /// queued transcript tail. Keying on the RELEASE frame's own `seq` (unique
+    /// per frame) lets multiple generations of the same stream coexist until
+    /// each RELEASE drains. `drain` looks the barrier up by the popped RELEASE
+    /// frame's `seq`; a matching (armed) seq defers the RELEASE until that
+    /// session's transcript tail has been written, then consumes it.
+    release_barriers: Mutex<HashSet<u32>>,
+    /// Per-client PRNG state for reconnect jitter (seeded once at spawn from a
+    /// real entropy mix), so a fleet of daemons does not reconnect in lockstep.
+    rng: AtomicU64,
+}
+
+impl std::fmt::Debug for HubClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubClient")
+            .field("url", &self.config.url)
+            .field("connected", &self.connected.load(Ordering::Relaxed))
+            .field("buffer_capacity", &self.config.buffer_capacity)
+            .field("buffer_byte_budget", &self.config.buffer_byte_budget)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HubClient {
+    /// Start the single hub connection task and return the shared client. The
+    /// task runs until [`HubClient::shutdown`] (or the process exits).
+    ///
+    /// `slots` is the identity `(instance, capability)` of every configured
+    /// worker slot this daemon serves. Each is REGISTERed at spawn — and
+    /// re-REGISTERed on every reconnect — independently of any job, so idle
+    /// capacity is visible on the hub from the moment the daemon connects
+    /// (register-on-connect), not lazily on a slot's first job. An "instance"
+    /// is one configured slot's worker identity (e.g. `host-nanod-<hire>-<n>`);
+    /// it stays registered for the daemon's lifetime and heartbeats while
+    /// connected, whether or not it is running a job. Job ownership (CLAIM /
+    /// RELEASE) remains per-job via [`HubClient::register_session`].
+    pub fn spawn(config: HubConfig, slots: &[(String, Value)]) -> Arc<HubClient> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let capacity = config.buffer_capacity;
+        let byte_capacity = config.buffer_byte_budget;
+        // Pre-seed the presence set with every configured slot so the very first
+        // connect's resync snapshot (and each heartbeat) covers idle slots too.
+        // Fold the config-level advertisement into each capability exactly as
+        // `register_session` would, so a slot's identity is identical whether it
+        // is idle or running a job.
+        let mut instances = HashMap::new();
+        for (instance, capability) in slots {
+            instances.insert(instance.clone(), capability.clone());
+        }
+        let slot_count = instances.len();
+        // Precompute the FIXED per-bridge transcript channel bound: partition the
+        // byte budget by the number of configured slots (the upper bound on
+        // concurrent bridges). A fixed share is mandatory for aggregate bounding —
+        // an mpsc channel's capacity cannot shrink after creation, so a
+        // creation-time `budget / active_bridges` divisor would leave earlier
+        // bridges oversized (N bridges ≈ `budget × H(N)`). `slot_count.max(1)`
+        // guards an empty slot list; the per-slot share is clamped to ≥1 byte so
+        // a tiny-but-nonzero budget still yields the 1-item floor rather than
+        // tripping `transcript_channel_bound`'s disabled (`0`) path. A disabled
+        // budget (`0`) keeps the flat count ceiling, unchanged.
+        let per_bridge_budget = if byte_capacity == 0 {
+            0
+        } else {
+            (byte_capacity / slot_count.max(1)).max(1)
+        };
+        let transcript_bridge_bound = transcript_channel_bound(per_bridge_budget);
+        // The steer channel gets the SAME fixed per-slot share as the transcript
+        // bridge: a per-session `steer_channel_bound(buffer_byte_budget)` would
+        // let each of the up-to-`slot_count` live sessions retain the whole byte
+        // budget in its steer queue (aggregate `slot_count × budget`), defeating
+        // the daemon-wide bound. Partitioning by the fixed slot count keeps the
+        // summed steer memory within `buffer_byte_budget`.
+        let steer_bridge_bound = steer_channel_bound(per_bridge_budget);
+        let client = Arc::new(HubClient {
+            config,
+            outbound: Mutex::new(LaneBuffer::with_limits(capacity, byte_capacity)),
+            outbound_notify: Notify::new(),
+            seq: AtomicU32::new(0),
+            connected: AtomicBool::new(false),
+            generation: AtomicU32::new(0),
+            instances: Mutex::new(instances),
+            in_flight: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            shutdown_tx,
+            conn_task: Mutex::new(None),
+            bridge_tasks: Mutex::new(HashMap::new()),
+            next_session_seq: AtomicU64::new(0),
+            active_bridges: AtomicU64::new(0),
+            slot_count,
+            transcript_bridge_bound,
+            steer_bridge_bound,
+            release_barriers: Mutex::new(HashSet::new()),
+            rng: AtomicU64::new(seed_rng()),
+        });
+        // Fold the config-level advertisement into each pre-seeded capability.
+        // Done after the Arc is built because `capability_payload` reads config.
+        {
+            let mut insts = client.instances.lock().unwrap();
+            let seeded: Vec<(String, Value)> =
+                insts.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for (instance, cap) in seeded {
+                insts.insert(instance, client.capability_payload(cap));
+            }
+        }
+        log(&format!(
+            "agentic hub: enabled → {} (buffer {} frame(s), {} slot(s) registered{})",
+            client.config.url,
+            client.config.buffer_capacity,
+            slot_count,
+            if client.config.terminal {
+                // The mode is configured but the relay transport is not wired
+                // in this PR, so it is parsed but not advertised/relayed.
+                ", terminal relay configured (transport pending)"
+            } else {
+                ""
+            }
+        ));
+        let handle = tokio::spawn(connection_loop(client.clone(), shutdown_rx));
+        *client.conn_task.lock().unwrap() = Some(handle);
+        client
+    }
+
+    /// Register a job as a live hub session: REGISTERs its worker `instance`
+    /// (once, with `capability`), CLAIMs the job, and returns the handle the
+    /// slot wires into the ACP agent for transcript + steer. Worker presence
+    /// (register) is kept distinct from job ownership (claim).
+    pub fn register_session(
+        self: &Arc<Self>,
+        instance: &str,
+        capability: Value,
+        job_key: &str,
+    ) -> HubSession {
+        let stream = compose_stream_id(instance, job_key);
+        // Bounded by BOTH count and memory: the effective depth is the smaller
+        // of `STEER_CHANNEL_BOUND` and a byte-derived bound (see
+        // `steer_channel_bound`), so a hub delivering steer faster than the turn
+        // consumes it can neither queue unbounded controls nor grow memory past
+        // the configured `buffer_byte_budget`. The byte share is the FIXED
+        // per-slot `buffer_byte_budget / slot_count` (`steer_bridge_bound`,
+        // precomputed at `spawn`), NOT the whole budget: with up to `slot_count`
+        // concurrent sessions each holding a full-budget steer queue, the
+        // aggregate would otherwise reach `slot_count × buffer_byte_budget`. The
+        // fixed share keeps the SUM across all live steer queues within the
+        // budget, exactly as the transcript bridge partitions its own.
+        let steer_bound = self.steer_bridge_bound;
+        let (steer_tx, steer_rx) = mpsc::channel::<ControlFrame>(steer_bound);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(stream.clone(), steer_tx);
+
+        // Worker presence + job ownership. The state mutations (instances,
+        // in_flight) AND the matching REGISTER/CLAIM enqueues are performed
+        // together under the SINGLE outbound lock, so they are atomic with
+        // respect to `resync_presence` (which also takes the outbound lock while
+        // it snapshots that state and replaces the buffered presence frames).
+        // Without this, a reconnect snapshot could read the state BEFORE this
+        // insert, then `drop_control_presence` could delete the REGISTER/CLAIM
+        // this call just enqueued — leaving the live job unregistered until the
+        // next reconnect. Lock order is always outbound → instances/in_flight
+        // (the heartbeat/shutdown loops snapshot keys first to honour it), so no
+        // deadlock is possible.
+        {
+            let mut buf = self.outbound.lock().unwrap();
+            // REGISTER this instance exactly once (its lifetime is the worker's,
+            // not any single job's), folding in the config-level advertisement.
+            let register = {
+                let mut insts = self.instances.lock().unwrap();
+                if insts.contains_key(instance) {
+                    None
+                } else {
+                    let cap = self.capability_payload(capability);
+                    insts.insert(instance.to_string(), cap.clone());
+                    Some(cap)
+                }
+            };
+            // REGISTER and CLAIM are admitted through the capacity-EXEMPT
+            // control path (shedding only lower-priority traffic, never dropping
+            // the presence frame). The ordinary bounded `push` drops a control
+            // newcomer once the control lane is full (control never evicts
+            // control), which for presence is unrepairable on a LIVE connection:
+            // `in_flight` is updated below regardless, resync only re-emits on a
+            // *reconnect*, so a dropped CLAIM on a healthy link streams this
+            // job's transcript/RELEASE for ownership the hub never saw claimed.
+            // Presence is bounded by live instances + in-flight jobs, so
+            // admitting it exempt is safe (same policy as the shutdown snapshot).
+            if let Some(cap) = register {
+                buf.push_back_control_bounded(self.make_frame(
+                    Lane::Control,
+                    Family::Register,
+                    json!({ "instance": instance, "capability": cap }),
+                ));
+            }
+            // Job ownership: CLAIM {instance, jobKey}; track in-flight so a
+            // reconnect re-claims it.
+            self.in_flight
+                .lock()
+                .unwrap()
+                .entry(instance.to_string())
+                .or_default()
+                .insert(job_key.to_string());
+            buf.push_back_control_bounded(self.make_frame(
+                Lane::Control,
+                Family::Claim,
+                json!({ "instance": instance, "jobKey": job_key }),
+            ));
+        }
+        self.outbound_notify.notify_one();
+
+        // No RELEASE barrier is pre-registered here. A barrier exists only once
+        // `close` arms it, keyed by the unique `seq` of the RELEASE frame it
+        // enqueues (see `HubClient::release_job`/`release_barriers`). Keying on
+        // the per-frame `seq` rather than this session's (reusable) stream id is
+        // what lets a retry of the same job on the same slot coexist with a
+        // predecessor whose armed RELEASE is still buffered during an outage —
+        // the predecessor's barrier is no longer overwritten by this
+        // registration.
+
+        HubSession {
+            client: self.clone(),
+            instance: instance.to_string(),
+            job_key: job_key.to_string(),
+            stream,
+            session_id: None,
+            transcript: None,
+            steer: Some(steer_rx),
+            released: false,
+        }
+    }
+
+    /// Spawn the transcript bridge for one turn of `session` and store the
+    /// resulting sender + flush handle on it. A session is opened once per JOB
+    /// but bridges once per ACP TURN (the first turn and, on a result-nudge, the
+    /// second): each turn gets a fresh bounded updates channel and bridge task,
+    /// while the CLAIM/presence/RELEASE lifecycle stays job-level. Idempotent
+    /// per turn — `HubSession::open_turn` calls this only after the prior turn's
+    /// bridge has been detached.
+    fn spawn_bridge(self: &Arc<Self>, session: &mut HubSession) {
+        // Bridge ACP updates → transcript produce frames on a dedicated task.
+        // A *bounded* channel: it fronts the already-byte-bounded outbound
+        // buffer, so an unbounded (or loosely count-bounded) one here would let a
+        // fast agent's updates — each up to ~1 MiB — accumulate and defeat that
+        // memory cap. The bound is a FIXED per-slot share of the configured byte
+        // budget, precomputed once at `spawn` as `transcript_bridge_bound`
+        // (= `transcript_channel_bound(budget / slot_count)`), NOT a
+        // creation-time `budget / active_bridges` divisor. A dynamic divisor
+        // cannot bound aggregate memory: an mpsc channel's capacity is fixed at
+        // creation and cannot shrink, so an early bridge created when few were
+        // live would keep an oversized capacity forever and N bridges would
+        // retain ≈ `budget × H(N)` (e.g. 8 + 4 = 12 MiB for an 8 MiB budget).
+        // With a fixed `budget / slot_count` share and at most `slot_count`
+        // concurrent bridges, the SUM across all live bridges stays within
+        // `buffer_byte_budget`.
+        // Maintain the live-bridge counter. Its value now only gates the debug
+        // invariant below (one job per slot, one bridge per job-turn ⇒ at most
+        // `slot_count` concurrent bridges — the property that makes the fixed
+        // per-slot share bound the aggregate). Load it afresh inside the
+        // assertion rather than binding a local that would be unused in release
+        // builds, where `debug_assert!` compiles away. Skip the check when
+        // `slot_count == 0` (e.g. a slot-less test harness).
+        self.active_bridges.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            self.slot_count == 0
+                || self.active_bridges.load(Ordering::Relaxed) as usize <= self.slot_count,
+            "live bridges ({}) exceeded configured slots ({})",
+            self.active_bridges.load(Ordering::Relaxed),
+            self.slot_count
+        );
+        let channel_bound = self.transcript_bridge_bound;
+        let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(channel_bound);
+        let bridge_client = self.clone();
+        let bridge_stream = session.stream.clone();
+        // The bridge drains updates until EITHER the channel closes (all senders
+        // dropped) OR the session's drop signals a flush, whichever first — then
+        // it finishes and notifies the (synchronous) flush waiter. The flush
+        // signal lets a drop close input and wait for the tail without needing
+        // the last sender to be gone first.
+        let (close_tx, mut close_rx) = watch::channel(false);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let bridge_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Prioritise draining any queued update; only when none is
+                    // immediately ready does a flush signal take effect.
+                    biased;
+                    maybe = updates_rx.recv() => {
+                        match maybe {
+                            Some(update) => {
+                                if let Some(chunk) = acp_update_to_transcript_chunk(&update) {
+                                    let incarnation = bridge_client.generation.load(Ordering::Relaxed);
+                                    bridge_client.enqueue(
+                                        Lane::Bulk,
+                                        Family::Relay,
+                                        json!({
+                                            "op": "produce",
+                                            "stream": bridge_stream,
+                                            "incarnation": incarnation,
+                                            "chunk": chunk,
+                                        }),
+                                    );
+                                }
+                            }
+                            // Channel closed (all senders dropped): drained.
+                            None => break,
+                        }
+                    }
+                    // Flush requested by the session's drop: stop accepting and
+                    // finish so the tail already enqueued is what gets sent.
+                    _ = close_rx.changed() => break,
+                }
+            }
+            // Signal completion (ignore a gone waiter).
+            let _ = done_tx.send(());
+        });
+        // Retain the bridge's JoinHandle (do NOT detach it): `close` aborts and
+        // joins it on a flush timeout so a wedged bridge cannot keep producing
+        // transcript AFTER the RELEASE. Track the flush handle under a UNIQUE
+        // session id (not the stream id, which a later session for the same job
+        // would reuse and so could steal this session's flush handle), so this
+        // session's drop flushes exactly its own bridge before RELEASE.
+        let session_id = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
+        self.bridge_tasks.lock().unwrap().insert(
+            session_id,
+            BridgeFlush {
+                close_tx,
+                done_rx,
+                handle: bridge_handle,
+            },
+        );
+        session.session_id = Some(session_id);
+        session.transcript = Some(updates_tx);
+    }
+
+    /// Stop the hub: signal the connection task to deregister and exit, then
+    /// await it so this returns only once the worker's `DEREGISTER` has been
+    /// flushed and the socket torn down. Idempotent — the handle is taken on the
+    /// first call; later calls just re-signal and return.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        let handle = self.conn_task.lock().unwrap().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
+    /// Merge the hub's config-level advertisement fields (permission policy,
+    /// attribution, terminal flag, runtime) into the slot-supplied capability
+    /// object without overwriting any field the slot already set. The result is
+    /// always a JSON object, as the `register` validator requires.
+    fn capability_payload(&self, capability: Value) -> Value {
+        let mut cap = match capability {
+            Value::Object(map) => Value::Object(map),
+            _ => Value::Object(serde_json::Map::new()),
+        };
+        if let Some(obj) = cap.as_object_mut() {
+            if let Some(perm) = &self.config.permission {
+                obj.entry("permission")
+                    .or_insert_with(|| Value::String(perm.clone()));
+            }
+            if let Some(attr) = &self.config.attribution {
+                obj.entry("attribution")
+                    .or_insert_with(|| Value::String(attr.clone()));
+            }
+            // Advertise `terminal: false` unconditionally for now: the PTY/pipe
+            // terminal relay transport is NOT wired in this PR (hub sessions
+            // attach only in the ACP branch, and the pipe runner closes stdin
+            // after the initial payload and only captures stdout), so reporting
+            // `config.terminal` here would tell the hub a terminal is available
+            // while no PTY input/output can be relayed. The `NANO_AGENTIC_TERMINAL`
+            // mode is still parsed/validated in config, but it is intentionally
+            // NOT surfaced as a capability until the relay follow-up lands.
+            obj.entry("terminal").or_insert_with(|| Value::Bool(false));
+            obj.entry("runtime")
+                .or_insert_with(|| Value::String("nano-supervisor".into()));
+            // Advertise the harness-protocol version (issue #272) so
+            // nano-workforce (#802) does not flag this worker "stale harness"
+            // (absent => stale). Sourced from the single shared constant so the
+            // slot-supplied value and this default can never diverge.
+            obj.entry("harnessProtocol")
+                .or_insert_with(|| Value::from(HARNESS_PROTOCOL_VERSION));
+        }
+        cap
+    }
+
+    /// Build a frame with the next monotonic sequence number (but do not
+    /// enqueue it). Used where the caller must push into an already-held
+    /// outbound lock (e.g. [`HubClient::register_session`], which mutates
+    /// presence state and enqueues the matching control frame atomically so a
+    /// concurrent reconnect resync cannot delete it).
+    fn make_frame(&self, lane: Lane, family: Family, payload: Value) -> Frame {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        Frame::new(lane, family, seq, payload)
+    }
+
+    /// Enqueue a frame for delivery. Bounded and QoS-aware: see [`LaneBuffer`].
+    fn enqueue(&self, lane: Lane, family: Family, payload: Value) {
+        let frame = self.make_frame(lane, family, payload);
+        self.outbound.lock().unwrap().push(frame);
+        self.outbound_notify.notify_one();
+    }
+
+    /// Enqueue a CONTROL frame EXEMPT from the buffer bound (see
+    /// [`LaneBuffer::push_back_control_bounded`]): it sheds lower-priority
+    /// traffic to make room but is never itself dropped. Used for the shutdown
+    /// DEREGISTER snapshot so a clean shutdown deregisters every worker even when
+    /// capacity is smaller than the number of registered slots.
+    fn enqueue_control_exempt(&self, family: Family, payload: Value) {
+        let frame = self.make_frame(Lane::Control, family, payload);
+        self.outbound
+            .lock()
+            .unwrap()
+            .push_back_control_bounded(frame);
+        self.outbound_notify.notify_one();
+    }
+
+    /// RELEASE a job: remove it from the in-flight set (so a reconnect stops
+    /// re-claiming it) and enqueue the `release {instance, jobKey}` control
+    /// frame. Called by [`HubSession::close`] (behind the drain barrier) and, as
+    /// a best-effort fallback, by `Drop` when a session was never closed.
+    ///
+    /// The RELEASE is enqueued EXEMPT from the buffer bound (via
+    /// [`HubClient::enqueue_control_exempt`] /
+    /// [`LaneBuffer::push_back_control_bounded`]), NOT the ordinary bounded
+    /// [`HubClient::enqueue`]. Once the job is removed from `in_flight` the
+    /// reconnect resync can no longer recreate its CLAIM, so this RELEASE is the
+    /// ONLY frame that can retire the hub's ownership of the job. The bounded
+    /// `enqueue` drops a control newcomer when the control lane is full (control
+    /// never evicts control), which would silently strand the job's CLAIM on the
+    /// hub forever — an unrepairable ownership desync. The exempt admission sheds
+    /// lower-priority traffic to make room but never drops the RELEASE itself.
+    ///
+    /// WHILE DISCONNECTED this takes a different admission path: nothing drains,
+    /// so an unbounded exempt RELEASE (plus its armed drain barrier) would
+    /// accumulate for every job that completes during the outage. Because the
+    /// reconnect resync is AUTHORITATIVE for ownership (it re-derives every live
+    /// claim and the hub reconciles against it), a completed job's buffered
+    /// RELEASE is redundant once a reconnect lands, so the buffered RELEASE set
+    /// is held to [`RELEASE_OUTAGE_CAP`] via
+    /// [`LaneBuffer::push_back_release_bounded`] — collapsing the oldest when
+    /// full and disarming its orphaned barrier. The newest RELEASE is still
+    /// admitted exempt. (Until the hub treats resync as authoritative —
+    /// nano-workforce#893 — a RELEASE collapsed during an outage can leave a job
+    /// looking owned until the worker deregisters; ownership is advisory
+    /// visibility only, so this is accepted.)
+    /// Enqueue a job's RELEASE. `armed` is `true` from the preferred
+    /// [`HubSession::close`] path (the transcript tail was flushed and the
+    /// RELEASE must be deferred at the socket until that tail is written) and
+    /// `false` from the `Drop` fallback (no tail was awaited, so the RELEASE may
+    /// be sent immediately). An armed RELEASE records a drain barrier keyed by
+    /// the RELEASE frame's unique `seq`, so `drain`/`drain_control` can match it
+    /// exactly — even when a retry of the SAME job on the SAME slot has another
+    /// RELEASE (a different `seq`) for the identical stream still buffered.
+    fn release_job(&self, instance: &str, job_key: &str, armed: bool) {
+        let payload = json!({ "instance": instance, "jobKey": job_key });
+        // Hold the SINGLE outbound lock across BOTH the `in_flight` removal and
+        // the RELEASE admission, so the pair is atomic with respect to
+        // `resync_presence` (which takes the same lock while it snapshots
+        // `in_flight` and prunes/replaces buffered presence). This is the same
+        // atomic pattern `register_session` uses for its CLAIM. Without it, a
+        // reconnect resync landing in the gap — after the job is removed from
+        // `in_flight` but before its RELEASE is queued — would snapshot the job
+        // as finished and `drop_control_presence` would delete its buffered
+        // CLAIM, leaving the hub to receive transcript/RELEASE for an ownership
+        // it never saw. Lock order is always outbound → in_flight, so no
+        // deadlock. (`connected` is read inside the lock: a stale `true` at
+        // worst takes the exempt live path, which is safe because the resync
+        // itself runs under this same lock and therefore cannot interleave.)
+        let mut buf = self.outbound.lock().unwrap();
+        if let Some(jobs) = self.in_flight.lock().unwrap().get_mut(instance) {
+            jobs.remove(job_key);
+        }
+        let frame = self.make_frame(Lane::Control, Family::Release, payload);
+        // The unique identity the drain barrier is keyed on (see
+        // `release_barriers`). Captured BEFORE the frame is moved into the
+        // buffer.
+        let release_seq = frame.seq;
+        // Arm THIS RELEASE's barrier (if requested) while STILL holding the
+        // outbound lock and BEFORE the frame is enqueued, so a concurrent
+        // `drain` cannot pop the RELEASE and see it un-armed in the window
+        // between enqueue and arm — which would send it ahead of its transcript
+        // tail. `drain` always takes the outbound lock to pop, then the
+        // `release_barriers` lock in `release_gate`; arming here under the
+        // outbound lock keeps that outbound → release_barriers order (no
+        // deadlock) and makes "frame buffered" imply "barrier armed".
+        if armed {
+            self.release_barriers.lock().unwrap().insert(release_seq);
+        }
+        let collapsed = if self.connected.load(Ordering::Relaxed) {
+            // Live connection: enqueue EXEMPT and ordered — `drain`'s per-session
+            // barrier writes the transcript tail before this RELEASE, and the
+            // RELEASE itself is never dropped. Nothing is collapsed on the live
+            // path. An ARMED RELEASE is admitted with its closing stream's tail
+            // PRESERVED: making room by evicting that very tail would leave the
+            // armed barrier nothing to flush and send the RELEASE ahead of a
+            // tail that never reaches the socket (the round-26 finding), so
+            // eviction skips this stream's lower-lane frames.
+            let stream = compose_stream_id(instance, job_key);
+            if armed {
+                buf.push_back_release_preserving_stream(frame, &stream);
+            } else {
+                buf.push_back_control_bounded(frame);
+            }
+            None
+        } else {
+            // OUTAGE: nothing is draining, so an unbounded RELEASE+barrier set
+            // would otherwise grow with every completed job for the whole outage.
+            // Reconnect resync is AUTHORITATIVE for ownership (it re-derives every
+            // live claim), so the buffered RELEASE set is bounded under a fixed
+            // cap: a new RELEASE collapses the OLDEST completed-ownership one past
+            // the cap (see `RELEASE_OUTAGE_CAP`). The newest RELEASE is still
+            // admitted exempt. The collapsed RELEASE's orphaned drain barrier is
+            // disarmed below so armed barriers stay bounded too.
+            buf.push_back_release_bounded(frame, RELEASE_OUTAGE_CAP)
+        };
+        drop(buf);
+        // Disarm the barrier of any RELEASE the outage cap collapsed (keyed by
+        // that frame's own `seq`). It is distinct from `release_seq` — the newest
+        // RELEASE is always admitted, never collapsed — so this never undoes the
+        // arm above.
+        if let Some(collapsed_seq) = collapsed {
+            self.disarm_release_barrier(collapsed_seq);
+        }
+        self.outbound_notify.notify_one();
+    }
+
+    /// Decide what `drain` should do with a just-popped RELEASE. Looks the
+    /// barrier up by the RELEASE frame's unique `seq`. A RELEASE whose `seq` is
+    /// armed is deferred (`Defer`) so the transcript tail drains first; any
+    /// other RELEASE (a `Drop` fallback, or an already-consumed barrier) is sent
+    /// immediately (`SendNow`). `Defer` carries both the `seq` to consume and the
+    /// composed stream id whose tail must be flushed first.
+    fn release_gate(&self, frame: &Frame) -> ReleaseGate {
+        if !self.release_barriers.lock().unwrap().contains(&frame.seq) {
+            return ReleaseGate::SendNow;
+        }
+        // The barrier is armed. Derive the stream whose transcript tail must be
+        // flushed ahead of this RELEASE. An armed RELEASE always carries a valid
+        // `(instance, jobKey)` (built by `release_job`); if it somehow does not,
+        // consume the barrier and send now rather than leak it.
+        let (Some(instance), Some(job_key)) = (
+            frame.payload.get("instance").and_then(Value::as_str),
+            frame.payload.get("jobKey").and_then(Value::as_str),
+        ) else {
+            self.disarm_release_barrier(frame.seq);
+            return ReleaseGate::SendNow;
+        };
+        ReleaseGate::Defer {
+            stream: compose_stream_id(instance, job_key),
+            seq: frame.seq,
+        }
+    }
+
+    /// Consume a RELEASE barrier (by the RELEASE frame's `seq`) once `drain` has
+    /// finally written the RELEASE (so a late duplicate or a reconnect resync
+    /// does not re-defer), or when the outage cap collapses that RELEASE.
+    fn disarm_release_barrier(&self, seq: u32) {
+        self.release_barriers.lock().unwrap().remove(&seq);
+    }
+
+    /// Remove the bridge flush handle for `id` and decrement the live-bridge
+    /// counter that partitions the transcript byte budget. Returns the handle so
+    /// the caller can signal/join/abort it. A `None` `id` (a session that never
+    /// opened a turn) removes nothing and leaves the counter untouched — it owns
+    /// no bridge. The decrement is paired with the `fetch_add` in
+    /// [`HubClient::spawn_bridge`], so it happens exactly once per removed bridge
+    /// and only when a bridge was actually present (a missing entry means the
+    /// counter was already decremented by an earlier teardown).
+    fn remove_bridge(&self, id: Option<u64>) -> Option<BridgeFlush> {
+        let removed = id.and_then(|id| self.bridge_tasks.lock().unwrap().remove(&id));
+        if removed.is_some() {
+            // Saturating: a counter underflow would only follow a bookkeeping
+            // bug, and it must never panic a session teardown path.
+            self.active_bridges
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
+        }
+        removed
+    }
+
+    /// Test-only probe recording the order frames are enqueued (their `seq`),
+    /// so a test can assert enqueue order independent of the drain order
+    /// `buffered()` reports (which always pulls control lanes first).
+    #[cfg(test)]
+    fn enqueue_log(&self) -> Vec<(u32, Lane, Family)> {
+        self.outbound
+            .lock()
+            .unwrap()
+            .iter_frames()
+            .map(|f| (f.seq, f.lane, f.family))
+            .collect()
+    }
+
+    /// Rebuild worker presence + job ownership at the FRONT of the outbound
+    /// buffer on every (re)connect. Builds the ordered snapshot — every
+    /// REGISTER, then every CLAIM — then drops any REGISTER/CLAIM already
+    /// buffered (a disconnected `register_session` may have queued some) and
+    /// prepends the snapshot ahead of ordinary traffic. Prepending (rather than
+    /// tail-enqueuing) guarantees two invariants the hub relies on: REGISTER
+    /// strictly precedes CLAIM, and neither presence frame is duplicated —
+    /// a CLAIM buffered while disconnected can otherwise drain before the
+    /// tail-appended REGISTER and desync ownership.
+    fn resync_presence(&self) {
+        // Hold the outbound lock for the WHOLE snapshot-and-replace so it is
+        // atomic with `register_session` (which mutates presence state and
+        // enqueues its REGISTER/CLAIM under the same lock). Reading the state
+        // inside this lock guarantees the snapshot and the buffered frames we
+        // drop reflect the same instant: a concurrent registration either lands
+        // entirely before us (its instance is in the snapshot) or entirely after
+        // (its frames are enqueued after we replace) — never half-applied, which
+        // is what let `drop_control_presence` delete a just-enqueued REGISTER.
+        // Lock order is outbound → instances/in_flight everywhere, so no
+        // deadlock (heartbeat/shutdown snapshot their keys before enqueuing).
+        let mut buf = self.outbound.lock().unwrap();
+        // Build the ordered snapshot (REGISTERs first, then CLAIMs) with fresh
+        // sequence numbers. Reversed, so the capacity-aware re-admission below
+        // lands the snapshot in its intended front order (REGISTER…, CLAIM…).
+        let mut snapshot: Vec<Frame> = Vec::new();
+        // Covered worker instances, captured once so the REGISTER, per-job CLAIM,
+        // and per-instance snapshot CLAIM sections below all reflect the SAME set
+        // (and so `instances` and `in_flight` are never locked nested, preserving
+        // the flat outbound → leaf lock order).
+        let instance_names: Vec<String> = {
+            let instances = self.instances.lock().unwrap();
+            for (inst, cap) in instances.iter() {
+                snapshot.push(self.make_frame(
+                    Lane::Control,
+                    Family::Register,
+                    json!({ "instance": inst, "capability": cap }),
+                ));
+            }
+            instances.keys().cloned().collect()
+        };
+        // Per-job CLAIMs: the `{instance, jobKey}` ownership frames the hub's
+        // pinned per-job validator accepts (one per live job). Kept for normal
+        // claim/release semantics AND re-asserted here.
+        let in_flight_job_keys: HashSet<String> = {
+            let in_flight = self.in_flight.lock().unwrap();
+            let mut job_keys_set: HashSet<String> = HashSet::new();
+            for (inst, jobs) in in_flight.iter() {
+                for job_key in jobs {
+                    job_keys_set.insert(job_key.clone());
+                    snapshot.push(self.make_frame(
+                        Lane::Control,
+                        Family::Claim,
+                        json!({ "instance": inst, "jobKey": job_key }),
+                    ));
+                }
+            }
+            // Per-instance snapshot CLAIM: a `{instance, jobKeys: [...]}` frame.
+            // The PRESENCE of `jobKeys` is the discriminant the hub routes to its
+            // authoritative `ClaimRegistry.replaceInstance(instance, jobKeys)` —
+            // it REPLACES that instance's entire ownership set with exactly the
+            // listed jobs, so it closes each reconnect's resync authoritatively.
+            // Emitted for EVERY covered instance INCLUDING the empty set: an
+            // empty `jobKeys` means "owns nothing now" and is what drops a claim
+            // we did NOT re-assert (e.g. a RELEASE lost during the outage). An
+            // instance we omit would keep its stale claims additively — the bug
+            // this supplements the per-job CLAIMs to fix (nano-workforce#894).
+            // Every element is a non-empty job key (in_flight only holds claimed
+            // jobs); a snapshot ALONE carries no `jobKey`, so it never collides
+            // with the per-job validator (the hub validates the union locally).
+            for inst in &instance_names {
+                let job_keys: Vec<&String> = in_flight
+                    .get(inst)
+                    .map(|jobs| jobs.iter().collect())
+                    .unwrap_or_default();
+                snapshot.push(self.make_frame(
+                    Lane::Control,
+                    Family::Claim,
+                    json!({ "instance": inst, "jobKeys": job_keys }),
+                ));
+            }
+            job_keys_set
+        };
+        // Drop the superseded REGISTER/CLAIM frames first so the snapshot
+        // re-admits them deduplicated. Prepending in REVERSE via
+        // `push_front_control_bounded` lands the snapshot at the front in
+        // REGISTER-then-CLAIM order while shedding only lower-priority
+        // (bulk/interactive) traffic to make room — never another control frame
+        // — so presence ordering holds. Presence is EXEMPT from the buffer bound
+        // (see `push_front_control_bounded`): a presence set larger than a tiny
+        // configured capacity is prepended whole rather than dropped or
+        // fragmented, because it is already bounded by live instances+jobs and
+        // hiding a worker from the hub is worse than transiently exceeding the
+        // bulk-traffic memory budget by a few small control frames.
+        let disarmed = buf.drop_control_presence(&in_flight_job_keys);
+        for frame in snapshot.into_iter().rev() {
+            buf.push_front_control_bounded(frame);
+        }
+        drop(buf);
+        // Disarm the drain barriers of any superseded RELEASE dropped above (a
+        // completed earlier generation whose stream a live retry re-claimed), so
+        // orphaned armed barriers do not accumulate. Done after releasing the
+        // outbound lock, preserving the outbound → release_barriers order.
+        for seq in disarmed {
+            self.disarm_release_barrier(seq);
+        }
+        self.outbound_notify.notify_one();
+    }
+
+    /// Draw the next 64 bits of per-client jitter entropy (xorshift64*).
+    fn next_rand(&self) -> u64 {
+        let mut x = self.rng.load(Ordering::Relaxed);
+        loop {
+            let mut y = x;
+            y ^= y << 13;
+            y ^= y >> 7;
+            y ^= y << 17;
+            if y == 0 {
+                y = 0x9E37_79B9_7F4A_7C15;
+            }
+            match self
+                .rng
+                .compare_exchange_weak(x, y, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return y.wrapping_mul(0x2545_F491_4F6C_DD1D),
+                Err(current) => x = current,
+            }
+        }
+    }
+
+    /// Deliver an inbound relay delivery to the one session that owns its
+    /// `stream`. A delivery for an unknown/foreign/invalid stream is dropped —
+    /// never broadcast — so a targeted steer can only ever reach its own job.
+    fn route_inbound(&self, payload: &Value) {
+        // A relay *delivery* is `{stream, offset, chunk}` and carries NO `op`:
+        // only producer/control frames have an `op` (e.g. our own echoed
+        // `{op:"produce", stream, chunk}` transcript). Routing one of those as a
+        // delivery would decode our own produced transcript as inbound steer and
+        // inject it back into its own agent — a feedback loop. Accept only the
+        // full delivery shape; anything carrying `op`, or missing the integer
+        // `offset`, is dropped.
+        if payload.get("op").is_some() {
+            return; // not a delivery: producer/control frame echoed back
+        }
+        // A genuine delivery carries an unsigned integer byte `offset`; a
+        // producer/control frame (or a hand-rolled `{stream, chunk}` object)
+        // does not. Require it — a non-negative integer — BEFORE the session
+        // lookup, so a frame lacking an offset (or carrying a non-integer one)
+        // cannot masquerade as a delivery and inject steer into a live job.
+        if !payload.get("offset").is_some_and(Value::is_u64) {
+            return; // no integer offset: not a routable delivery
+        }
+        let Some(stream) = payload.get("stream").and_then(Value::as_str) else {
+            return; // no stream id: not a routable delivery
+        };
+        let Some(chunk) = payload.get("chunk").and_then(Value::as_str) else {
+            return;
+        };
+        // Byte-bound the chunk BEFORE it is decoded/cloned into a `ControlFrame`
+        // (which owns its text): the steer channel is only count-bounded, so an
+        // unbounded chunk lets a hub retain its depth in huge payloads per
+        // session. Drop an over-large chunk (fail closed) rather than truncate it
+        // into a silently-corrupted steer, and LOG the drop so a rejected control
+        // is observable rather than vanishing — the cap mirrors the ACP frame
+        // budget, far above any legitimate steer.
+        if chunk.len() > MAX_STEER_CHUNK_BYTES {
+            // Log only the integer sizes, never the hub-controlled `stream`/chunk
+            // text: `log` writes straight to stderr, so interpolating untrusted
+            // bytes would let a hostile hub inject terminal escapes/newlines.
+            log(&format!(
+                "agentic hub: dropped oversized inbound steer chunk ({} bytes > {} cap)",
+                chunk.len(),
+                MAX_STEER_CHUNK_BYTES
+            ));
+            return;
+        }
+        // The stream id MUST parse to a single `(instance, jobKey)` ref; a
+        // structurally-invalid id off the wire is dropped rather than guessed at.
+        if parse_stream_id(stream).is_none() {
+            return;
+        }
+        // Look up the owning session by exact stream id. Absent ⇒ foreign or
+        // stale stream: drop it rather than steering unrelated jobs.
+        let sink = {
+            let sessions = self.sessions.lock().unwrap();
+            match sessions.get(stream) {
+                Some(tx) => tx.clone(),
+                None => return,
+            }
+        };
+        let decoded = match parse_inbound_relay_chunk(chunk) {
+            Some(d) => d,
+            None => return, // tagged-but-malformed steer: ignore it
+        };
+        // Preserve the typed control end-to-end; the ACP steer task maps it to
+        // the matching session semantics (prompt injection / cancellation /
+        // permission outcome). The channel is bounded (`STEER_CHANNEL_BOUND`):
+        // on overflow drop the control rather than block the socket read loop
+        // or grow memory — a stalled turn must not wedge inbound routing. Log
+        // the drop so a discarded control (a denied/granted permission outcome
+        // the agent is still awaiting, a cancel) is observable rather than
+        // vanishing silently; report only the control KIND and channel depth,
+        // never the hub-controlled payload text.
+        let kind = decoded.frame.kind();
+        if sink.try_send(decoded.frame).is_err() {
+            log(&format!(
+                "agentic hub: dropped inbound {kind} control; steer channel full (depth {})",
+                sink.max_capacity()
+            ));
+        }
+    }
+}
+
+/// A handle to flush one session's transcript bridge: closing `close_tx` makes
+/// the bridge drain its accepted updates and exit, and `done_rx` resolves once
+/// the bridge task has finished (so the tail is enqueued before RELEASE).
+/// `done_rx` is a Tokio oneshot so the preferred async [`HubSession::close`] can
+/// await it WITHOUT parking a runtime worker thread; the synchronous `Drop`
+/// fallback never waits on it (it only signals `close_tx`).
+///
+/// `handle` is the bridge task's `JoinHandle`, retained (NOT detached) so
+/// `close` can ABORT-AND-JOIN the bridge if the flush times out: a detached,
+/// still-running bridge could otherwise keep enqueuing transcript chunks AFTER
+/// `close` has armed and enqueued the RELEASE, breaking tail-before-RELEASE.
+struct BridgeFlush {
+    close_tx: watch::Sender<bool>,
+    done_rx: tokio::sync::oneshot::Receiver<()>,
+    handle: JoinHandle<()>,
+}
+
+// RELEASE drain barriers (finding: a job's RELEASE must not overtake its
+// transcript tail ON THE WIRE) are tracked as a `HashSet<u32>` of ARMED RELEASE
+// frame `seq`s on `HubClient`, keyed by each RELEASE frame's unique `seq`
+// rather than by stream id. `LaneBuffer::pop` always drains the control lane
+// (RELEASE) before the bulk lane (transcript), so enqueue order alone does not
+// order them on the socket. While a RELEASE's `seq` is in the armed set,
+// `drain` flushes that stream's buffered lower-lane transcript tail to the
+// socket (`drain_lower_lanes`) BEFORE writing the RELEASE — so the tail is on
+// the wire first, without giving up control-over-bulk priority for any other
+// frame. Keying on the frame `seq` (unique per RELEASE) instead of the reusable
+// stream id lets a RETRIED job on the same slot carry its own barrier without
+// clobbering a predecessor RELEASE for the identical stream that is still
+// buffered during an outage. A barrier is armed by `HubSession::close` and
+// consumed by `drain` when it finally sends the RELEASE; a `Drop` fallback
+// RELEASE arms none, so it is sent immediately — best-effort, as documented.
+
+/// What `drain` should do with a just-popped RELEASE frame (see
+/// [`HubClient::release_gate`]).
+enum ReleaseGate {
+    /// No barrier applies — write the RELEASE to the socket immediately.
+    SendNow,
+    /// Flush this stream's buffered lower-lane tail to the socket first, then
+    /// write the RELEASE. `stream` identifies the lower-lane tail to flush and
+    /// `seq` the armed barrier to consume (the RELEASE frame's unique `seq`).
+    Defer { stream: String, seq: u32 },
+}
+
+/// A per-job hub session: worker presence is live for its instance, the job is
+/// CLAIMed for its lifetime, the agent's ACP updates are bridged to transcript
+/// produce frames, and inbound steer is routed here. Dropping it RELEASEs the
+/// job.
+pub struct HubSession {
+    client: Arc<HubClient>,
+    instance: String,
+    job_key: String,
+    /// The composed relay stream id for this `(instance, jobKey)` pair.
+    stream: String,
+    /// Unique per-session key into `HubClient::bridge_tasks` (NOT the stream
+    /// id, which a later session for the same job would reuse), so this drop
+    /// flushes exactly its own transcript bridge. `None` until `spawn_bridge`
+    /// allocates one at the first `open_turn`: a session whose agent fails
+    /// before any turn owns NO bridge, and the sentinel-free `Option` makes it
+    /// impossible for its `close`/`Drop` to remove `bridge_tasks[0]` — the first
+    /// REAL id `next_session_seq` hands out — and steal another session's flush
+    /// handle. Every removal is guarded on `Some`.
+    session_id: Option<u64>,
+    transcript: Option<mpsc::Sender<Value>>,
+    steer: Option<mpsc::Receiver<ControlFrame>>,
+    /// True once the job's RELEASE has been enqueued (by `close`, or by the
+    /// `Drop` fallback). Guards against a double-RELEASE when `close` runs after
+    /// `detach_turn` has already taken the transcript sender (so the sender can
+    /// no longer serve as the "already released" token).
+    released: bool,
+}
+
+impl HubSession {
+    /// The sink the ACP agent forwards each `session/update` to. Lazily opens
+    /// this turn's transcript bridge on first call (a session opened by
+    /// `register_session` has no bridge until a turn starts). Bounded: on
+    /// overflow the ACP side drops the update rather than blocking. Test-only:
+    /// production attaches a turn via [`open_turn`](Self::open_turn).
+    #[cfg(test)]
+    pub fn transcript_sink(&mut self) -> Option<mpsc::Sender<Value>> {
+        if self.transcript.is_none() {
+            let client = self.client.clone();
+            client.spawn_bridge(self);
+        }
+        self.transcript.clone()
+    }
+
+    /// The inbound-steer receiver handed to the ACP agent so a hub-delivered
+    /// control is applied to the running turn. Taken once. Bounded: on overflow
+    /// `route_inbound` drops the control rather than growing memory. Test-only:
+    /// production takes steer via [`open_turn`](Self::open_turn).
+    #[cfg(test)]
+    pub fn take_steer(&mut self) -> Option<mpsc::Receiver<ControlFrame>> {
+        self.steer.take()
+    }
+
+    /// Begin an ACP turn on this job-level session: spawn a fresh transcript
+    /// bridge and hand the agent its sink, plus this session's steer receiver on
+    /// the FIRST turn that asks for it.
+    ///
+    /// A session is opened once per JOB (`register_session`) but a job can run
+    /// TWO ACP turns — the first run and, on a result-nudge, a second — and each
+    /// turn needs a live bridge while the job's CLAIM/presence/RELEASE lifecycle
+    /// stays job-level. Keeping one session across both turns (the Node worker's
+    /// per-job `relaySession`) means the second turn reuses the same stream and
+    /// CLAIM rather than re-registering: a fresh `register_session` per turn
+    /// would re-CLAIM an already-claimed job and overwrite the stream-keyed
+    /// RELEASE barrier, letting the second turn's RELEASE/transcript overtake
+    /// the first turn's tail.
+    ///
+    /// Returns `(transcript_sink, steer)`. The transcript sink is re-created per
+    /// turn (the prior turn's bridge was detached by [`detach_turn`](Self::detach_turn)).
+    /// The steer receiver is job-keyed (steer routes by stream) and is lent to
+    /// the active turn: the turn's steer task keeps it while it runs, then
+    /// [`run`](crate::acp::Agent::run) recovers it on turn end and the caller
+    /// returns it via [`restore_steer`](Self::restore_steer), so a later
+    /// result-nudge turn gets it again and stays steerable. If a prior turn did
+    /// not return it, a later turn gets `None`.
+    pub fn open_turn(
+        &mut self,
+    ) -> Option<(mpsc::Sender<Value>, Option<mpsc::Receiver<ControlFrame>>)> {
+        // Clone the `Arc` first so the `&mut self` borrow (for `spawn_bridge`
+        // and the field reads) does not conflict with borrowing `self.client`.
+        let client = self.client.clone();
+        client.spawn_bridge(self);
+        let transcript = self.transcript.clone()?;
+        let steer = self.steer.take();
+        Some((transcript, steer))
+    }
+
+    /// Return the job-keyed steer receiver reclaimed from a finished turn so the
+    /// NEXT turn (a result-nudge) can be steered too. A no-op when the turn
+    /// recovered nothing (`None`) — e.g. a hub-less run or a turn that was torn
+    /// down before it ever held the receiver — so it never clobbers a receiver
+    /// already resident in the session.
+    pub fn restore_steer(&mut self, steer: Option<mpsc::Receiver<ControlFrame>>) {
+        if steer.is_some() {
+            self.steer = steer;
+        }
+    }
+
+    /// End an ACP turn WITHOUT releasing the job: flush this turn's transcript
+    /// tail into the outbound buffer and detach the bridge, leaving the CLAIM
+    /// and RELEASE barrier intact for the next turn (or for `close`/`Drop` to
+    /// release). Awaits the bridge drain on the runtime (never parks a worker
+    /// thread); bounded by `TRANSCRIPT_FLUSH_TIMEOUT`. After this, `transcript`
+    /// is `None`, so a later `close` still releases the job exactly once.
+    pub async fn detach_turn(&mut self) {
+        // Take the sender so the bridge sees the channel close and drains.
+        let Some(_tx) = self.transcript.take() else {
+            return; // no live bridge (already detached, or never opened)
+        };
+        // Remove only the bridge THIS session owns. `session_id` is `None` when
+        // no turn ever opened (agent failed first), so a never-bridged session
+        // removes nothing — it cannot steal another session's flush handle.
+        // `remove_bridge` also decrements the live-bridge budget divisor.
+        let flush = self.client.remove_bridge(self.session_id);
+        if let Some(flush) = flush {
+            let BridgeFlush {
+                close_tx,
+                done_rx,
+                handle,
+            } = flush;
+            let _ = close_tx.send(true);
+            if timeout(TRANSCRIPT_FLUSH_TIMEOUT, done_rx).await.is_err() {
+                // Wedged bridge: abort so it can enqueue no further chunks.
+                handle.abort();
+            }
+            let _ = handle.await;
+        }
+        // NOTE: no armed RELEASE barrier and no `release_job` here — the job
+        // stays CLAIMed; the tail is buffered for the NEXT turn's bridge (or
+        // the final `close`) to flush ahead of the single job-level RELEASE.
+    }
+
+    /// Asynchronously flush this session's transcript tail all the way toward
+    /// the socket, then enqueue the job's RELEASE behind a drain barrier so it
+    /// cannot overtake that tail on the wire. Steps: (1) close the bridge input
+    /// and await its accepted updates reaching the outbound buffer; (2) enqueue
+    /// the RELEASE with `armed = true`, which records this RELEASE's drain
+    /// barrier (keyed by its frame `seq`). When `drain` pops that
+    /// RELEASE it first flushes the buffered lower-lane tail to the socket
+    /// ([`drain_lower_lanes`]) and only then writes the RELEASE — so the
+    /// transcript tail is on the wire first even though the control lane
+    /// (RELEASE) drains before the bulk lane. This is the PREFERRED close path:
+    /// it awaits on the runtime, so (unlike `Drop`) it never parks a Tokio worker
+    /// thread. Bounded by `TRANSCRIPT_FLUSH_TIMEOUT` so a wedged bridge can never
+    /// hang the caller. Idempotent: after it runs, `released` is set, so neither
+    /// it nor `Drop` re-enqueues the RELEASE.
+    pub async fn close(&mut self) {
+        // Idempotent against a SECOND `close()` (or a `close` after a `Drop`
+        // fallback already released): once the RELEASE is enqueued, `released`
+        // is set — re-running would enqueue a DUPLICATE RELEASE for the same
+        // job. Bail out. (The transcript sender can NOT be this guard: a
+        // `detach_turn` after a result-nudge turn takes it without releasing.)
+        if self.released {
+            return;
+        }
+        // Do NOT set `released` here: this method awaits the bridge flush below,
+        // and the slot aborts `execute` on activation loss/shutdown
+        // (`slot.rs:518-524`). If this future is dropped mid-await, setting
+        // `released` early would make `Drop` skip its fallback `release_job`,
+        // leaving the job stuck in `in_flight` with no RELEASE ever queued.
+        // `released` is therefore set only immediately before the SYNCHRONOUS
+        // `release_job` at the end, after every await — so a cancelled `close`
+        // still lets `Drop` perform the best-effort release.
+        // Take the sender so no new update is accepted, remove the bridge handle
+        // (so Drop's fallback is a no-op), signal the bridge to finish, then
+        // await completion on the runtime. Bind the removed handle FIRST so the
+        // bridge_tasks MutexGuard drops before the `.await` (a held guard is not
+        // `Send` and would make the surrounding `execute` future non-`Send`).
+        // `transcript` may already be `None` (a nudge turn's `detach_turn` took
+        // it); the bridge handle is then already gone too and this is a no-op.
+        let _tx = self.transcript.take();
+        // Remove only the bridge THIS session actually owns (guard on `Some`):
+        // a session that never opened a turn has `session_id == None` and must
+        // not remove `bridge_tasks[0]`, which is the FIRST real id and belongs
+        // to another live session. `remove_bridge` also decrements the
+        // live-bridge budget divisor.
+        let flush = self.client.remove_bridge(self.session_id);
+        if let Some(flush) = flush {
+            let BridgeFlush {
+                close_tx,
+                done_rx,
+                handle,
+            } = flush;
+            let _ = close_tx.send(true);
+            if timeout(TRANSCRIPT_FLUSH_TIMEOUT, done_rx).await.is_err() {
+                // The bridge did not finish flushing within the timeout. ABORT it
+                // so it is guaranteed to enqueue NO further transcript chunks:
+                // otherwise the detached-but-live bridge (its biased `recv` branch
+                // can stay ready) would keep producing while we arm and enqueue
+                // the RELEASE below, and those chunks would reach the socket AFTER
+                // the RELEASE — breaking tail-before-RELEASE. Transcript loss on
+                // this wedged-bridge path is accepted and documented.
+                handle.abort();
+            }
+            // Join the (finished or aborted) task so it is provably stopped and
+            // can produce nothing more before we enqueue the RELEASE.
+            let _ = handle.await;
+        }
+        // Mark released ONLY now — after every await — so a `close` cancelled
+        // mid-flush leaves `released == false` and lets `Drop` fall back to a
+        // best-effort `release_job` (no job is ever stranded in `in_flight`).
+        // Past this point there are no more awaits, so `Drop` cannot interleave
+        // and double-RELEASE: it sees `released == true` and bails.
+        self.released = true;
+        // RELEASE the job now that its transcript tail is queued. Pass
+        // `armed = true`: `release_job` records a drain barrier keyed by the
+        // RELEASE frame's unique `seq`, so `drain` flushes that transcript tail
+        // ahead of the RELEASE on the wire. Worker REGISTER persists until
+        // shutdown/deregister.
+        self.client.release_job(&self.instance, &self.job_key, true);
+    }
+
+    /// Nonblocking transcript-flush fallback for drop paths that did not call
+    /// the async [`close`](Self::close) (e.g. a panic unwind). It signals the
+    /// bridge to stop accepting and finish, but — unlike `close` — NEVER waits:
+    /// a blocking wait inside `Drop` would park a Tokio worker thread, and the
+    /// bridge (spawned on the same runtime) might never make progress on a
+    /// saturated runtime, stalling every completing job. The tail is therefore
+    /// best-effort on this fallback path; `close` is what preserves it.
+    fn flush_transcript(&mut self) {
+        let _tx = self.transcript.take();
+        // Guard on `Some`: a session whose agent failed before `open_turn` owns
+        // no bridge (`session_id == None`), so it must remove NOTHING — removing
+        // by a sentinel id would steal the first real session's flush handle.
+        // `remove_bridge` also decrements the live-bridge budget divisor.
+        let Some(flush) = self.client.remove_bridge(self.session_id) else {
+            return; // already flushed by `close`, or never attached
+        };
+        // Signal the bridge to finish; do NOT wait (see the doc comment). ABORT
+        // the task too so a wedged bridge cannot keep producing transcript after
+        // this drop's best-effort RELEASE — abort only schedules cancellation
+        // (it does not block the way joining would), so `Drop` stays non-parking.
+        let _ = flush.close_tx.send(true);
+        flush.handle.abort();
+    }
+}
+
+impl Drop for HubSession {
+    fn drop(&mut self) {
+        // Nonblocking transcript-flush fallback (the preferred path is the async
+        // `close`, which awaits the tail first). Signals the bridge to finish but
+        // never waits, so drop can never park a Tokio worker thread.
+        self.flush_transcript();
+        self.client.sessions.lock().unwrap().remove(&self.stream);
+        // RELEASE the job — but ONLY if `close` did not already do so. `close`
+        // sets `released` before enqueueing; a session dropped without a `close`
+        // (e.g. a panic unwind) has `released == false`, so RELEASE best-effort
+        // with no drain barrier (the bridge tail was not awaited). The in_flight
+        // removal is idempotent.
+        if self.released {
+            return;
+        }
+        self.released = true;
+        // RELEASE best-effort with no drain barrier (`armed = false`): the
+        // bridge tail was not awaited on this fallback path.
+        self.client
+            .release_job(&self.instance, &self.job_key, false);
+    }
+}
+
+/// Seed the per-client jitter PRNG from a real entropy mix (wall-clock nanos,
+/// process id, and a stack address), never zero (xorshift's fixed point).
+fn seed_rng() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let stack = &nanos as *const u64 as u64;
+    let seed = nanos ^ pid.rotate_left(32) ^ stack.rotate_left(17);
+    if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    }
+}
+
+/// Jittered exponential backoff: `delay/2 + random(0, delay/2)`, so a fleet of
+/// daemons reconnecting after a shared hub outage does not thunder together.
+/// `rand` is a fresh draw from the per-client PRNG.
+fn jittered(delay: Duration, rand: u64) -> Duration {
+    let half = delay / 2;
+    let span = half.as_millis() as u64;
+    let extra = if span == 0 { 0 } else { rand % span };
+    half + Duration::from_millis(extra)
+}
+
+async fn connection_loop(client: Arc<HubClient>, mut shutdown: watch::Receiver<bool>) {
+    let mut backoff = BACKOFF_BASE;
+    let mut first_connect = true;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        // Race the connect/handshake against both a hard timeout and a shutdown
+        // request: an unbounded `connect().await` on a hung handshake would park
+        // here forever, starving reconnect backoff AND a requested shutdown
+        // (which otherwise only lands between attempts).
+        let attempt = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            result = timeout(CONNECT_TIMEOUT, connect(&client.config)) => result,
+        };
+        match attempt {
+            Ok(Ok(stream)) => {
+                backoff = BACKOFF_BASE;
+                // Bump the producer generation on every reconnect (never the
+                // first connect) so resumed transcript producers strictly
+                // outrank the predecessor.
+                if first_connect {
+                    first_connect = false;
+                } else {
+                    client.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                client.connected.store(true, Ordering::Relaxed);
+                log("agentic hub: connected");
+                // Resync BEFORE any transcript resumes: re-REGISTER every known
+                // worker instance, then re-CLAIM every in-flight job, so hub
+                // presence and ownership are whole again first. Ordering is the
+                // contract (presence + ownership before transcript): the snapshot
+                // is PREPENDED to the control lane (deduplicating any REGISTER/
+                // CLAIM a disconnected `register_session` already buffered) so a
+                // CLAIM can never drain ahead of its REGISTER, and neither is
+                // duplicated.
+                client.resync_presence();
+                pump(&client, stream, &mut shutdown).await;
+                client.connected.store(false, Ordering::Relaxed);
+                log("agentic hub: disconnected");
+            }
+            Ok(Err(e)) => {
+                log(&format!("agentic hub: connect failed: {e:#}"));
+            }
+            Err(_) => {
+                log(&format!(
+                    "agentic hub: connect timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ));
+            }
+        }
+        if *shutdown.borrow() {
+            break;
+        }
+        let wait = jittered(backoff, client.next_rand());
+        tokio::select! {
+            _ = sleep(wait) => {}
+            _ = shutdown.changed() => {}
+        }
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+    log("agentic hub: stopped");
+}
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The identity token this worker presents on the upgrade URL's `token` query
+/// parameter. The shared-secret authenticator (`sharedSecretAuthenticator` on
+/// the hub, mirrored by the Node worker) reads one `?token=` value as the
+/// worker's identity, so the two identity envs collapse to a single wire slot:
+/// `NANO_AGENTIC_SECRET` is the current name and takes precedence, while
+/// `NANO_AGENTIC_TOKEN` is only its deprecated alias and is used only when
+/// SECRET is unset. Sending SECRET on a separate `Authorization` header (as an
+/// earlier revision did) left the documented secure config — SECRET set, TOKEN
+/// unset — with NO `?token=` at all, so the hub rejected it before any
+/// `register`. Returning SECRET-first here keeps parity with the reference
+/// client, which carries exactly this resolved identity as `?token=`.
+fn identity_token(config: &HubConfig) -> Option<&str> {
+    config
+        .secret
+        .as_deref()
+        .or(config.token.as_deref())
+        .filter(|s| !s.is_empty())
+}
+
+/// Build the authenticated channel URL. The hub's shared-secret authenticator
+/// reads the identity `token` and capability `credential` as **query params on
+/// the upgrade URL** (the same `?token=…&capability=…` the Node worker sends),
+/// so they MUST be on the URL before the handshake — a payload-only token is
+/// rejected before any `register` can be read. The identity is resolved SECRET
+/// first, then the deprecated TOKEN alias (see [`identity_token`]); there is no
+/// separate `Authorization` header, matching the reference client.
+fn authenticated_url(config: &HubConfig) -> String {
+    let mut params: Vec<(&str, &str)> = Vec::new();
+    if let Some(token) = identity_token(config) {
+        params.push(("token", token));
+    }
+    if let Some(credential) = &config.credential {
+        params.push(("capability", credential));
+    }
+    if params.is_empty() {
+        return config.url.clone();
+    }
+    let mut url = config.url.clone();
+    let mut sep = if url.contains('?') { '&' } else { '?' };
+    for (key, value) in params {
+        url.push(sep);
+        url.push_str(key);
+        url.push('=');
+        url.push_str(&percent_encode_query(value));
+        sep = '&';
+    }
+    url
+}
+
+/// Percent-encode a query-parameter value, escaping everything outside the
+/// unreserved set so a routing token's `#`/`/`/`&`/`=` can never be mistaken for
+/// URL structure (a bare `#` would otherwise start a fragment and truncate it).
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Whether connecting with `config` would transmit a sensitive credential over
+/// an UNENCRYPTED, non-local WebSocket. `tokio-tungstenite` carries BOTH the
+/// identity (`?token=`) AND the capability credential (`?capability=`) as query
+/// params on the upgrade URL (see [`authenticated_url`]); over a plaintext
+/// `ws://` scheme that whole URL — every credential included — crosses the
+/// network in the clear, so anything secret sent to a remote host is exposed to
+/// anyone on-path. Returns `true` (meaning "refuse") only when ALL of these hold:
+///   * a SENSITIVE credential is configured — either a real identity
+///     (`identity_token` resolves to something that is NOT the sentinel
+///     [`LOCAL_AGENTIC_TOKEN`]) OR a non-empty capability `credential`. The
+///     capability credential is checked independently of the identity because
+///     the sentinel identity (`NANO_AGENTIC_TOKEN=nano-local`) keeps
+///     `config.credential` populated (it only forces `secure=true`), so a
+///     capability secret would otherwise ride plaintext under the local-token
+///     exemption. A bare local token with no capability credential carries
+///     nothing worth protecting, so it stays exempt, AND
+///   * the URL scheme is plaintext `ws://` (a `wss://` URL is encrypted — the
+///     `rustls-tls-native-roots` feature gives tungstenite a TLS backend so it
+///     can actually complete that handshake), AND
+///   * the host is NOT loopback/localhost (sending a credential to a process on
+///     the same machine never leaves it, so local plaintext is fine and keeps
+///     the default dev experience working).
+fn insecure_credential_exposure(config: &HubConfig) -> bool {
+    // "Sensitive" = a real (non-sentinel) identity OR any non-empty capability
+    // credential. Both ride the plaintext upgrade URL, so either one leaking is
+    // enough to refuse.
+    let real_identity = identity_token(config).is_some_and(|id| id != LOCAL_AGENTIC_TOKEN);
+    let has_capability = config.credential.as_deref().is_some_and(|c| !c.is_empty());
+    if !real_identity && !has_capability {
+        return false; // nothing secret to protect
+    }
+    let url = config.url.trim();
+    // URI schemes are case-insensitive (RFC 3986 §3.1) and `connect_async`
+    // accepts any spelling (`Ws://`, `WS://`, …), so fold the scheme to
+    // lowercase before comparing rather than matching a fixed set of spellings
+    // (a case-sensitive check let `Ws://` bypass this guard). `wss://` is
+    // TLS-encrypted; only bare `ws://` is in the clear. Anything else is not a
+    // plaintext WebSocket URL we would connect over.
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("ws") {
+        return false; // wss:// (TLS) or a non-WebSocket scheme
+    }
+    !is_local_host(host_of(rest))
+}
+
+/// Extract the host from the post-`ws://` remainder of a URL: drop any
+/// `userinfo@`, stop at the first `/`, `?`, or `#`, and strip a trailing
+/// `:port` (handling a bracketed `[ipv6]:port`). Best-effort — a value this
+/// cannot parse is treated as a (non-local) host by the caller, i.e. refused.
+fn host_of(rest: &str) -> &str {
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Drop userinfo (`user:pass@host`); the host is after the LAST `@`.
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(after_bracket) = hostport.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port` — the host is inside the brackets.
+        return after_bracket.split(']').next().unwrap_or(after_bracket);
+    }
+    // `host` or `host:port` — a bare IPv6 has multiple colons and no brackets,
+    // but such a URL is malformed; splitting on the first `:` is fine for the
+    // host:port case and still yields a non-local token for anything odd.
+    hostport.split(':').next().unwrap_or(hostport)
+}
+
+/// Whether `host` names the local machine (loopback), so a plaintext credential
+/// sent to it never leaves the host. Covers the `localhost` name (and any
+/// `*.localhost` per RFC 6761) plus every loopback IP literal — `127.0.0.0/8`
+/// and `::1` — via `IpAddr::is_loopback`, not just the `127.0.0.1`/`::1` spelling.
+fn is_local_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") || {
+        let lower = host.to_ascii_lowercase();
+        lower.ends_with(".localhost")
+    } {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+async fn connect(config: &HubConfig) -> anyhow::Result<WsStream> {
+    // Fail CLOSED before the handshake if connecting would leak a real
+    // credential over plaintext to a remote host (see
+    // `insecure_credential_exposure`). The identity rides the upgrade URL's
+    // `?token=` query param, so an unencrypted `ws://` to a non-local host would
+    // put the secret on the wire in the clear. Bailing here just fails this
+    // connect attempt; `connection_loop` logs it and retries with backoff,
+    // never exposing the credential. Use `wss://` (TLS) or a loopback host.
+    if insecure_credential_exposure(config) {
+        anyhow::bail!(
+            "agentic hub: refusing to send credential over plaintext ws:// to a non-local host; \
+             use wss:// (TLS) or point the URL at localhost"
+        );
+    }
+    let url = authenticated_url(config);
+    // The identity is carried on the `?token=` query param (see
+    // `authenticated_url`/`identity_token`), exactly as the reference client
+    // sends it — NOT on a separate `Authorization` header, which the hub does
+    // not read and which left a SECRET-only secure config unauthenticated.
+    //
+    // NOTE: `config.protocol` (`NANO_AGENTIC_PROTOCOL`) is deliberately NOT sent
+    // as a `Sec-WebSocket-Protocol` header. It names the worker's *harness*
+    // override (`pipe`/`acp`), not a WebSocket subprotocol; presenting it as one
+    // can make a configured hub handshake fail. It is applied when resolving the
+    // hire protocol (via `SlotConfig::protocol_override`), never on the wire.
+    let (stream, _response) = tokio_tungstenite::connect_async(url).await?;
+    Ok(stream)
+}
+
+/// Drive one live connection: drain outbound frames, heartbeat, and dispatch
+/// inbound frames until the socket drops or shutdown is requested.
+async fn pump(client: &Arc<HubClient>, stream: WsStream, shutdown: &mut watch::Receiver<bool>) {
+    let (mut write, mut read) = stream.split();
+    let mut heartbeat = interval(HEARTBEAT);
+    heartbeat.tick().await; // the first tick is immediate; skip it
+    loop {
+        tokio::select! {
+            _ = client.outbound_notify.notified() => {
+                if drain(client, &mut write, DRAIN_BATCH).await.is_err() { break; }
+            }
+            _ = heartbeat.tick() => {
+                // One heartbeat per registered worker instance. Snapshot the
+                // instance keys FIRST (releasing the instances lock) before
+                // `enqueue` takes the outbound lock, so this path never nests
+                // instances → outbound — preserving the outbound → instances
+                // lock order that `register_session`/`resync_presence` rely on.
+                let insts: Vec<String> =
+                    client.instances.lock().unwrap().keys().cloned().collect();
+                for inst in insts {
+                    client.enqueue(Lane::Control, Family::Heartbeat, json!({ "instance": inst }));
+                }
+                if drain(client, &mut write, DRAIN_BATCH).await.is_err() { break; }
+            }
+            incoming = read.next() => {
+                match incoming {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        match decode_frame(&bytes) {
+                            Ok(frame) if frame.family == Family::Relay => {
+                                client.route_inbound(&frame.payload);
+                            }
+                            Ok(_) => {}
+                            Err(code) => log(&format!(
+                                "agentic hub: dropped an undecodable inbound frame ({})",
+                                code.as_str()
+                            )),
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        // Bounded like every other write: a stalled socket must
+                        // not wedge the pump inside the Pong send.
+                        if !matches!(
+                            timeout(WRITE_TIMEOUT, write.send(Message::Pong(p))).await,
+                            Ok(Ok(()))
+                        ) {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    // Best-effort graceful deregister of every worker before exit.
+                    // Snapshot keys first (see the heartbeat note) to keep the
+                    // outbound → instances lock order. Enqueue EXEMPT from the
+                    // buffer bound so a clean shutdown sends a DEREGISTER for
+                    // every registered worker even when the configured capacity
+                    // is smaller than the number of registered slots (the bounded
+                    // `enqueue` would drop the overflow, since control never
+                    // evicts control).
+                    let insts: Vec<String> =
+                        client.instances.lock().unwrap().keys().cloned().collect();
+                    for inst in insts {
+                        client.enqueue_control_exempt(
+                            Family::Deregister,
+                            json!({ "instance": inst, "reason": "shutdown" }),
+                        );
+                    }
+                    // Terminal path: drain the control lane (the DEREGISTER
+                    // snapshot, plus any still-buffered RELEASE/HEARTBEAT) so
+                    // every DEREGISTER reaches the socket before the Close,
+                    // WITHOUT blocking shutdown on unrelated lower-lane (bulk
+                    // transcript / interactive steer) backlog. `drain_control`
+                    // still honours each armed RELEASE's barrier — it flushes
+                    // that job's OWN tail before its RELEASE — but any backlog
+                    // not owed to a closing job is discarded with the socket, so
+                    // draining it would only delay deregistration by up to
+                    // WRITE_TIMEOUT per buffered frame.
+                    //
+                    // ONE DEADLINE AROUND THE WHOLE TERMINAL DRAIN: each socket
+                    // write inside `drain_control` is individually bounded by
+                    // `WRITE_TIMEOUT`, but a peer that accepts every frame just
+                    // under that bound — across many control frames plus a closing
+                    // session's bulk tail — could otherwise keep `shutdown()` (and
+                    // so daemon exit) blocked for many multiples of 30s. Wrap the
+                    // complete drain + the final Close in a single
+                    // `SHUTDOWN_DRAIN_TIMEOUT` deadline so shutdown has a fixed
+                    // upper bound. On expiry the remaining backlog is discarded
+                    // with the socket (best-effort deregistration); ownership is
+                    // re-derived by reconnect resync (nano-workforce#893).
+                    let terminal = async {
+                        let _ = drain_control(client, &mut write).await;
+                        let _ = timeout(WRITE_TIMEOUT, write.send(Message::Close(None))).await;
+                    };
+                    if timeout(SHUTDOWN_DRAIN_TIMEOUT, terminal).await.is_err() {
+                        log(&format!(
+                            "agentic hub: shutdown drain exceeded {}s; closing the socket with the remaining backlog unsent",
+                            SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Send every currently buffered frame. A write error returns `Err` so the
+/// caller tears the connection down and reconnects (the frames stay buffered).
+///
+/// RELEASE DRAIN BARRIER: `LaneBuffer::pop` always drains the control lane
+/// (RELEASE) before the bulk lane (transcript), so a RELEASE can otherwise
+/// overtake the transcript tail that was enqueued before it. When `drain` pops a
+/// RELEASE whose session armed a barrier (`HubSession::close`), it first flushes
+/// the buffered lower-lane tail to the socket ([`drain_lower_lanes`]) and only
+/// then writes the RELEASE — so a job's transcript tail is always on the wire
+/// before its RELEASE. On a reconnect the not-yet-sent tail is re-buffered ahead
+/// of the still-armed RELEASE, so the ordering is re-established.
+///
+/// BOUNDED BATCH: `batch_limit` caps how many frames are written before `drain`
+/// yields back to the connection `select!` loop (re-arming the outbound notify
+/// if frames remain), so a sustained producer cannot keep `read.next()` and
+/// `shutdown.changed()` from being polled. `0` means unbounded (drain the entire
+/// buffer in a single pass). The barrier tail flush above is bounded by the SAME
+/// budget: an armed RELEASE whose job has a large buffered tail yields and
+/// resumes across passes (RELEASE + barrier held pending) rather than flushing
+/// the whole tail in one unpolled burst.
+async fn drain(
+    client: &Arc<HubClient>,
+    write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+    batch_limit: usize,
+) -> anyhow::Result<()> {
+    // The incarnation fences a transcript producer to the connection that
+    // generated it. It is stamped HERE — at drain on the live socket — not at
+    // buffer-enqueue time: a transcript chunk queued during an outage (or
+    // re-buffered after a failed write) would otherwise keep the previous
+    // generation even though the reconnect bumped `generation`, so frames sent
+    // on the new socket would fail to fence the stale producer. Re-stamping at
+    // drain guarantees every relay produce frame carries the CURRENT generation.
+    let incarnation = client.generation.load(Ordering::Relaxed);
+    let mut written = 0usize;
+    loop {
+        let mut frame = {
+            let mut buf = client.outbound.lock().unwrap();
+            match buf.pop() {
+                Some(f) => f,
+                None => return Ok(()),
+            }
+        };
+        if frame.family == Family::Relay && frame.payload.get("op") == Some(&Value::from("produce"))
+        {
+            frame.payload["incarnation"] = Value::from(incarnation);
+        }
+        // RELEASE drain barrier: a RELEASE armed by `close` must not reach the
+        // socket before the transcript tail that was buffered ahead of it. Since
+        // `pop` drains control before bulk, the RELEASE would otherwise win. So
+        // when an armed RELEASE is popped while the lower lanes still hold the
+        // tail, FIRST drain THIS SESSION'S OWN buffered tail to the socket
+        // (preserving its order), THEN write the RELEASE. The flush is fenced to
+        // the closing session's own stream, never the global lower-lane queue —
+        // a busy neighbour's transcript cannot starve this barrier, and steer /
+        // shutdown stay serviceable. This holds tail-before-RELEASE on the wire
+        // without yielding control-over-bulk priority for any OTHER frame (a
+        // different session's control frame already drained ahead).
+        if frame.family == Family::Release {
+            if let ReleaseGate::Defer { stream, seq } = client.release_gate(&frame) {
+                // Write this session's own buffered bulk/interactive tail first,
+                // but in BOUNDED batches: an armed RELEASE must not let its tail
+                // flush bypass `batch_limit` and keep `read.next()` /
+                // `shutdown.changed()` unpolled while a large tail drains (one
+                // slow closing session could otherwise stall cancel/steer and
+                // shutdown for minutes-to-hours). Give the flush only this pass's
+                // remaining budget; if the tail outlasts it, re-buffer the held
+                // RELEASE (barrier still armed) and yield — the next pass resumes
+                // the remaining tail before the RELEASE, so ordering holds.
+                let budget = if batch_limit == 0 {
+                    0
+                } else {
+                    batch_limit - written
+                };
+                match drain_lower_lanes(client, write, incarnation, &stream, budget).await {
+                    Ok(flush) => {
+                        written += flush.written;
+                        if !flush.exhausted {
+                            client.outbound.lock().unwrap().requeue_front(frame);
+                            client.outbound_notify.notify_one();
+                            return Ok(());
+                        }
+                    }
+                    // On a write error the connection is torn down: re-buffer the
+                    // held RELEASE too (its barrier stays armed) so it is retried
+                    // on reconnect AFTER the not-yet-written tail — ordering
+                    // preserved.
+                    Err(e) => {
+                        client.outbound.lock().unwrap().requeue_front(frame);
+                        return Err(e);
+                    }
+                }
+                // The tail is now fully on the socket: consume the barrier and
+                // let the RELEASE be written.
+                client.disarm_release_barrier(seq);
+            }
+        }
+        match encode_frame(&frame) {
+            Ok(bytes) => {
+                // Bound the write: a hub that stops reading must not park the
+                // connection task (and its shutdown branch) inside `send`
+                // forever. On error OR timeout, re-buffer the popped frame (so
+                // it is retried on reconnect) and tear the connection down.
+                match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        client.outbound.lock().unwrap().requeue_front(frame);
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        client.outbound.lock().unwrap().requeue_front(frame);
+                        return Err(anyhow::anyhow!(
+                            "agentic hub: socket write timed out; tearing down the stalled connection"
+                        ));
+                    }
+                }
+            }
+            // An unserialisable/too-large frame is dropped, not retried forever.
+            Err(_) => continue,
+        }
+        written += 1;
+        if batch_limit != 0 && written >= batch_limit {
+            // Yield back to the `select!` loop so reads and shutdown stay
+            // serviceable under a sustained producer. Re-arm the notify if the
+            // backlog is non-empty so the next loop iteration re-enters `drain`.
+            if !client.outbound.lock().unwrap().is_empty() {
+                client.outbound_notify.notify_one();
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Outcome of one bounded [`drain_lower_lanes`] pass over a closing session's
+/// buffered tail.
+struct LowerDrain {
+    /// Frames written to the socket during this pass.
+    written: usize,
+    /// `true` when the stream's buffered tail was fully flushed; `false` when
+    /// `budget` was hit first and more tail remains for a later pass.
+    exhausted: bool,
+}
+
+/// Write the CLOSING session's own buffered NON-control tail (interactive, then
+/// bulk frames whose [`frame_stream`] equals `stream`) to the socket, leaving
+/// the control lane AND every other session's lower-lane frames untouched. Used
+/// by the per-session RELEASE drain barrier: when an armed RELEASE is popped,
+/// that job's transcript tail is flushed to the socket FIRST so the RELEASE
+/// cannot overtake it on the wire. Fencing to `stream` (rather than draining the
+/// whole lower-lane queue) means a busy neighbour's transcript flood can never
+/// starve this barrier or block steer/shutdown behind an unbounded flush. Shares
+/// `drain`'s write-timeout/re-buffer behaviour; a write error tears the
+/// connection down (the not-yet-written frames stay buffered and are retried on
+/// reconnect, ahead of the RELEASE, whose barrier is still armed — so ordering
+/// is re-established).
+///
+/// BOUNDED: `budget` caps how many frames this pass may write (`0` = unbounded).
+/// When the budget is exhausted before the tail is empty the flush stops and
+/// returns `exhausted == false`, so the caller can yield (keeping the RELEASE and
+/// its barrier pending) and resume the remaining tail on a later pass — a single
+/// large closing tail can never monopolise the connection task.
+async fn drain_lower_lanes(
+    client: &Arc<HubClient>,
+    write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+    incarnation: u32,
+    stream: &str,
+    budget: usize,
+) -> anyhow::Result<LowerDrain> {
+    let mut written = 0usize;
+    loop {
+        if budget != 0 && written >= budget {
+            return Ok(LowerDrain {
+                written,
+                exhausted: false,
+            });
+        }
+        let mut frame = {
+            let mut buf = client.outbound.lock().unwrap();
+            match buf.pop_lower_lane_for_stream(stream) {
+                Some(f) => f,
+                None => {
+                    return Ok(LowerDrain {
+                        written,
+                        exhausted: true,
+                    })
+                }
+            }
+        };
+        if frame.family == Family::Relay && frame.payload.get("op") == Some(&Value::from("produce"))
+        {
+            frame.payload["incarnation"] = Value::from(incarnation);
+        }
+        match encode_frame(&frame) {
+            Ok(bytes) => match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    client.outbound.lock().unwrap().push_front(frame);
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    client.outbound.lock().unwrap().push_front(frame);
+                    return Err(anyhow::anyhow!(
+                        "agentic hub: socket write timed out; tearing down the stalled connection"
+                    ));
+                }
+            },
+            Err(_) => continue,
+        }
+        written += 1;
+    }
+}
+
+/// Terminal shutdown drain: write the control lane (the DEREGISTER snapshot,
+/// plus any still-buffered RELEASE/HEARTBEAT) to the socket, then return so the
+/// caller can send the Close. Unlike [`drain`], it deliberately leaves the bulk
+/// transcript / interactive steer backlog that does NOT belong to a closing
+/// job buffered and UNSENT: a clean shutdown must deregister every worker
+/// promptly and must not block for up to `WRITE_TIMEOUT` per frame on a
+/// potentially large backlog the process is about to discard with the socket
+/// anyway.
+///
+/// It DOES honour the per-session RELEASE drain barrier, like [`drain`]: when it
+/// pops an armed RELEASE it first flushes THAT job's own transcript tail
+/// ([`drain_lower_lanes`], fenced to the job's stream) so the RELEASE never
+/// reaches the hub ahead of the transcript it orders against. If flushing that
+/// tail fails the connection is already gone — the RELEASE is DROPPED (not sent
+/// ahead of a tail that will never be written); reconnect resync re-derives the
+/// job's ownership (authoritative; nano-workforce#893). A write error or timeout
+/// ends the drain WITHOUT re-buffering: this is the terminal path, so there is
+/// no reconnect to retry on.
+async fn drain_control(
+    client: &Arc<HubClient>,
+    write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+) -> anyhow::Result<()> {
+    // Re-stamp any flushed transcript tail with the current incarnation, exactly
+    // as `drain` does (a tail buffered during the outage would otherwise carry a
+    // stale generation).
+    let incarnation = client.generation.load(Ordering::Relaxed);
+    loop {
+        let frame = {
+            let mut buf = client.outbound.lock().unwrap();
+            match buf.pop_control() {
+                Some(f) => f,
+                None => return Ok(()),
+            }
+        };
+        // Shutdown tail-before-RELEASE: an armed RELEASE must not reach the
+        // socket ahead of its job's own transcript tail. Flush ONLY that job's
+        // buffered tail first (other sessions' backlog stays discarded). If that
+        // write fails the connection is gone — DROP the RELEASE rather than send
+        // it ahead of a tail that will never be written, and end the terminal
+        // drain (ownership is re-derived by reconnect resync).
+        if frame.family == Family::Release {
+            if let ReleaseGate::Defer { stream, seq } = client.release_gate(&frame) {
+                // Terminal path: flush the whole tail (budget `0` = unbounded).
+                // There are no reads to keep serviceable here — the socket is
+                // about to close — so bounding would only add round-trips.
+                if let Err(e) = drain_lower_lanes(client, write, incarnation, &stream, 0).await {
+                    client.disarm_release_barrier(seq);
+                    return Err(e);
+                }
+                client.disarm_release_barrier(seq);
+            }
+        }
+        match encode_frame(&frame) {
+            Ok(bytes) => match timeout(WRITE_TIMEOUT, write.send(Message::Binary(bytes))).await {
+                Ok(Ok(())) => {}
+                // Terminal path: a failed/stalled socket ends the drain. Do not
+                // re-buffer — the process is exiting and will not reconnect.
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "agentic hub: socket write timed out during the shutdown deregister drain"
+                    ))
+                }
+            },
+            // An unserialisable/too-large control frame is skipped, not retried.
+            Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::stream::parse_stream_id;
+
+    fn test_config() -> HubConfig {
+        HubConfig {
+            url: "ws://127.0.0.1:1/na".into(),
+            token: Some("implementation.ci.fix#red".into()),
+            secret: None,
+            credential: None,
+            permission: Some("yolo".into()),
+            terminal: false,
+            attribution: Some("nano".into()),
+            buffer_capacity: 8,
+            buffer_byte_budget: 0,
+        }
+    }
+
+    fn capability() -> Value {
+        json!({ "cognition": "opus", "family": "senior", "host": "mac-01" })
+    }
+
+    /// Drain every buffered frame into a `(lane, family, payload)` list for
+    /// assertions.
+    fn buffered(client: &Arc<HubClient>) -> Vec<(Lane, Family, Value)> {
+        let mut buf = client.outbound.lock().unwrap();
+        let mut out = Vec::new();
+        while let Some(f) = buf.pop() {
+            out.push((f.lane, f.family, f.payload));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn buffer_drops_oldest_at_capacity() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 3;
+        let client = HubClient::spawn(cfg, &[]);
+        // The connection cannot establish (port 1), so nothing drains: the ring
+        // buffer must cap at `buffer_capacity`, dropping the oldest frames.
+        for i in 0..10 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": i }));
+        }
+        assert!(client.outbound.lock().unwrap().len() <= 3);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_flood_never_evicts_control_frames() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 4;
+        let client = HubClient::spawn(cfg, &[]);
+        // Two control frames, then a bulk flood far past capacity.
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
+        client.enqueue(Lane::Control, Family::Claim, json!({ "instance": "w" }));
+        for i in 0..50 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": i }));
+        }
+        let frames = buffered(&client);
+        // Both control frames survive; only bulk was shed.
+        let controls = frames
+            .iter()
+            .filter(|(l, _, _)| *l == Lane::Control)
+            .count();
+        assert_eq!(controls, 2, "control frames must not be evicted by bulk");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn control_drains_before_bulk() {
+        let client = HubClient::spawn(test_config(), &[]);
+        client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": 1 }));
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
+        let frames = buffered(&client);
+        assert_eq!(frames[0].0, Lane::Control, "control lane drains first");
+        client.shutdown().await;
+    }
+
+    #[test]
+    fn push_front_retry_respects_count_cap() {
+        // A write failed/timed out: `drain` popped a frame, then producers
+        // refilled the freed slot while the write was awaiting. Re-admitting the
+        // retry frame at the front must NOT grow the buffer past its count cap —
+        // otherwise repeated failures keep the "bounded" buffer growing.
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 2 })));
+        let popped = buf.pop().expect("a frame to send");
+        assert_eq!(buf.len(), 1);
+        // Producers refill the freed slot (and more) during the await.
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 3, json!({ "n": 3 })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 4, json!({ "n": 4 })));
+        assert_eq!(buf.len(), 2, "buffer back at capacity before the retry");
+        buf.push_front(popped);
+        assert!(
+            buf.len() <= 2,
+            "retry re-admission must honour the count cap"
+        );
+    }
+
+    #[test]
+    fn push_front_retry_respects_byte_budget() {
+        // Same race, byte budget instead of count. The budget holds two frames;
+        // after a refill fills it, a retry must shed to fit rather than exceed.
+        let one = frame_bytes(&Frame::new(Lane::Bulk, Family::Relay, 0, json!({ "n": 0 })));
+        let mut buf = LaneBuffer::with_limits(1000, one * 2);
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
+        let popped = buf.pop().expect("a frame");
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 2 })));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 3, json!({ "n": 3 })));
+        buf.push_front(popped);
+        assert!(
+            buf.bytes <= one * 2,
+            "retry re-admission must honour the byte budget"
+        );
+    }
+
+    #[test]
+    fn push_front_retry_never_evicts_higher_priority() {
+        // When a full buffer holds only strictly-higher-priority traffic, a
+        // low-priority retry is dropped rather than displacing control frames.
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        let popped = Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 }));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            2,
+            json!({ "instance": "w" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            3,
+            json!({ "instance": "w" }),
+        ));
+        assert_eq!(buf.len(), 2);
+        buf.push_front(popped);
+        assert_eq!(buf.len(), 2, "bulk retry dropped; control preserved");
+        assert_eq!(buf.control.len(), 2, "both control frames survive");
+    }
+
+    // Finding (round 10, HIGH): a RELEASE must survive a saturated control lane.
+    // `release_job` removes the job from `in_flight` BEFORE enqueuing the
+    // RELEASE, so the reconnect resync can no longer recreate its CLAIM — the
+    // RELEASE is the ONLY frame that can retire the hub's ownership of the job.
+    // The ordinary bounded `push` drops a control newcomer once the control lane
+    // fills (control never evicts control), which would strand the CLAIM on the
+    // hub forever. The exempt admission (`push_back_control_bounded`, used by
+    // `enqueue_control_exempt`/`release_job`) must keep it instead.
+    #[test]
+    fn release_survives_a_full_control_lane() {
+        let has_release = |buf: &LaneBuffer| buf.iter_frames().any(|f| f.family == Family::Release);
+
+        // Baseline (red without the fix): the ordinary bounded `push` DROPS the
+        // RELEASE when the control lane is already at capacity.
+        let mut dropped = LaneBuffer::with_limits(2, 0);
+        dropped.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "a" }),
+        ));
+        dropped.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        dropped.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            3,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        assert!(!has_release(&dropped), "ordinary push drops the RELEASE");
+
+        // The fix: exempt admission sheds lower lanes (none here) but never
+        // drops the RELEASE itself, so the ownership-retiring frame survives.
+        let mut kept = LaneBuffer::with_limits(2, 0);
+        kept.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "a" }),
+        ));
+        kept.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        kept.push_back_control_bounded(Frame::new(
+            Lane::Control,
+            Family::Release,
+            3,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        assert!(has_release(&kept), "exempt admission keeps the RELEASE");
+    }
+
+    // Finding (round 10, HIGH, sibling): a write failure/timeout that re-buffers
+    // a popped frame must not silently drop a must-deliver control frame either.
+    // `requeue_front` re-admits RELEASE/DEREGISTER EXEMPT from the bound (while a
+    // sheddable transcript/steer frame still goes through the bounded path).
+    #[test]
+    fn requeue_front_preserves_must_deliver_control() {
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "a" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        // Control lane is full; a plain `push_front` would drop this RELEASE.
+        buf.requeue_front(Frame::new(
+            Lane::Control,
+            Family::Release,
+            3,
+            json!({ "instance": "a", "jobKey": "j" }),
+        ));
+        assert!(
+            buf.iter_frames().any(|f| f.family == Family::Release),
+            "requeue_front must not drop a re-buffered RELEASE"
+        );
+
+        // A DEREGISTER (the only frame that retires a worker's presence) is
+        // likewise exempt on re-buffer.
+        buf.requeue_front(Frame::new(
+            Lane::Control,
+            Family::Deregister,
+            4,
+            json!({ "instance": "a", "reason": "shutdown" }),
+        ));
+        assert!(
+            buf.iter_frames().any(|f| f.family == Family::Deregister),
+            "requeue_front must not drop a re-buffered DEREGISTER"
+        );
+
+        // A sheddable bulk retry still honours the bound (dropped, not grown).
+        let before = buf.len();
+        buf.requeue_front(Frame::new(Lane::Bulk, Family::Relay, 5, json!({ "n": 1 })));
+        assert_eq!(buf.len(), before, "a sheddable bulk retry stays bounded");
+    }
+
+    // Finding (round 10, MEDIUM): the terminal shutdown drain must flush the
+    // control lane (DEREGISTER snapshot) WITHOUT draining the lower-lane backlog,
+    // so deregistration is not delayed by up to WRITE_TIMEOUT per buffered bulk
+    // transcript / interactive steer frame. `pop_control` pops ONLY control.
+    #[test]
+    fn pop_control_drains_only_the_control_lane() {
+        let mut buf = LaneBuffer::with_limits(100, 0);
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Deregister,
+            1,
+            json!({ "instance": "a" }),
+        ));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 2, json!({ "n": 1 })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Deregister,
+            3,
+            json!({ "instance": "b" }),
+        ));
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 4, json!({ "n": 2 })));
+
+        // Yields ONLY the control frames (DEREGISTERs), in order...
+        assert_eq!(
+            buf.pop_control().map(|f| f.family),
+            Some(Family::Deregister)
+        );
+        assert_eq!(
+            buf.pop_control().map(|f| f.family),
+            Some(Family::Deregister)
+        );
+        assert!(buf.pop_control().is_none(), "no control frames left");
+        // ...leaving the two bulk (transcript) frames buffered to be discarded
+        // with the socket rather than blocking the shutdown.
+        assert_eq!(buf.len(), 2, "lower lanes are retained, not drained");
+        assert_eq!(buf.pop().map(|f| f.lane), Some(Lane::Bulk));
+        assert_eq!(buf.pop().map(|f| f.lane), Some(Lane::Bulk));
+    }
+
+    // Finding (round 8): control admission must NEVER evict an earlier control
+    // frame. Presence frames are an ordered, interdependent set — a CLAIM is
+    // meaningless without its prerequisite REGISTER — so under a tiny capacity a
+    // `register_session`'s CLAIM must not evict the REGISTER it was enqueued
+    // after. The newcomer is dropped instead, preserving the ordering of what is
+    // already queued (the reconnect resync rebuilds the full set from state).
+    #[test]
+    fn control_push_never_evicts_control() {
+        let mut buf = LaneBuffer::with_limits(1, 0);
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "w" }),
+        ));
+        // Capacity 1 and already holding a control frame: a second control frame
+        // must NOT evict the REGISTER — it is dropped on the floor instead.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "w", "jobKey": "j" }),
+        ));
+        assert_eq!(
+            buf.len(),
+            1,
+            "a full control-only buffer drops the newcomer"
+        );
+        assert_eq!(
+            buf.control.len(),
+            1,
+            "the REGISTER must survive the CLAIM's admission"
+        );
+        assert_eq!(
+            buf.control[0].frame.family,
+            Family::Register,
+            "REGISTER (not the later CLAIM) is what remains buffered"
+        );
+    }
+
+    #[test]
+    fn control_push_sheds_lower_priority_to_make_room() {
+        // A control frame may still evict bulk/interactive traffic to make room
+        // — only control-vs-control eviction is forbidden.
+        let mut buf = LaneBuffer::with_limits(1, 0);
+        buf.push(Frame::new(Lane::Bulk, Family::Relay, 1, json!({ "n": 1 })));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            2,
+            json!({ "instance": "w" }),
+        ));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(
+            buf.control.len(),
+            1,
+            "control evicts the bulk frame and is admitted"
+        );
+        assert!(buf.bulk.is_empty(), "the bulk frame was shed for control");
+    }
+
+    #[tokio::test]
+    async fn session_register_claims_and_release_on_drop() {
+        let client = HubClient::spawn(test_config(), &[]);
+        {
+            let _session = client.register_session("w-1", capability(), "job-1");
+            assert!(client.sessions.lock().unwrap().contains_key("3:w-1/job-1"));
+            assert!(client.instances.lock().unwrap().contains_key("w-1"));
+            let frames = buffered(&client);
+            // First session for the instance: a REGISTER then a CLAIM.
+            assert_eq!(frames[0].1, Family::Register);
+            assert_eq!(frames[0].2["instance"], "w-1");
+            assert!(frames[0].2["capability"].is_object());
+            assert_eq!(frames[1].1, Family::Claim);
+            assert_eq!(frames[1].2["jobKey"], "job-1");
+        }
+        // Dropping the session RELEASEs the job and drops its route.
+        assert!(!client.sessions.lock().unwrap().contains_key("3:w-1/job-1"));
+        let frames = buffered(&client);
+        assert!(frames
+            .iter()
+            .any(|(_, fam, p)| *fam == Family::Release && p["jobKey"] == "job-1"));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn second_job_for_same_instance_does_not_reregister() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let _s1 = client.register_session("w-1", capability(), "job-1");
+        let _ = buffered(&client);
+        let _s2 = client.register_session("w-1", capability(), "job-2");
+        let frames = buffered(&client);
+        // The instance is already registered: only a CLAIM for job-2, no second
+        // REGISTER.
+        assert!(frames.iter().all(|(_, fam, _)| *fam != Family::Register));
+        assert!(frames
+            .iter()
+            .any(|(_, fam, p)| *fam == Family::Claim && p["jobKey"] == "job-2"));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_steer_is_routed_by_stream_to_its_session() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-7", capability(), "job-7");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-7", "job-7");
+        client.route_inbound(&json!({ "stream": stream, "offset": 0, "chunk": "do the thing" }));
+        let got = steer.recv().await.expect("steer delivered");
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "do the thing".into()
+            }
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_steer_for_foreign_stream_is_dropped_not_broadcast() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-7", capability(), "job-7");
+        let mut steer = session.take_steer().expect("steer receiver");
+        // A delivery for a different stream must NOT reach this session.
+        let foreign = compose_stream_id("w-7", "other-job");
+        client.route_inbound(&json!({ "stream": foreign, "offset": 0, "chunk": "nope" }));
+        // And a structurally-invalid stream id is dropped too.
+        client.route_inbound(&json!({ "stream": "garbage", "offset": 0, "chunk": "nope" }));
+        assert!(
+            steer.try_recv().is_err(),
+            "foreign stream must not be routed here"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_cancel_is_delivered_as_a_typed_control() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-8", capability(), "job-8");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-8", "job-8");
+        client.route_inbound(&json!({
+            "stream": stream,
+            "offset": 0,
+            "chunk": r#"{"nanoControlFrame":1,"kind":"cancel","reason":"stop"}"#,
+        }));
+        let got = steer.recv().await.expect("steer delivered");
+        assert_eq!(
+            got,
+            ControlFrame::Cancel {
+                reason: Some("stop".into())
+            }
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_sink_bridges_updates_to_produce_frames() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-9", capability(), "job-9");
+        let sink = session.transcript_sink().expect("transcript sink");
+        let _ = buffered(&client); // discard the register/claim frames
+        sink.try_send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "hello" }
+        }))
+        .unwrap();
+        // Give the bridge task a moment to enqueue the transcript frame.
+        let mut produce = None;
+        for _ in 0..50 {
+            if let Some(f) = client
+                .outbound
+                .lock()
+                .unwrap()
+                .bulk
+                .iter()
+                .find(|bf| bf.frame.family == Family::Relay)
+                .map(|bf| bf.frame.clone())
+            {
+                produce = Some(f);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let produce = produce.expect("transcript update was not bridged to a relay frame");
+        assert_eq!(produce.lane, Lane::Bulk);
+        assert_eq!(produce.payload["op"], "produce");
+        assert_eq!(produce.payload["incarnation"], 0);
+        // The stream id round-trips back to (instance, jobKey).
+        let stream = produce.payload["stream"].as_str().unwrap();
+        assert_eq!(
+            parse_stream_id(stream),
+            Some(("w-9".to_string(), "job-9".to_string()))
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_advertises_harness_protocol_version() {
+        // nano-workforce (#802) flags a worker with no `harnessProtocol` as a
+        // stale harness and can refuse routing; the REGISTER capability must
+        // carry the shared version constant (issue #272).
+        let client = HubClient::spawn(test_config(), &[]);
+        let _session = client.register_session("w-proto", capability(), "job-proto");
+        let frames = buffered(&client);
+        let register = frames
+            .iter()
+            .find(|(_, family, _)| *family == Family::Register)
+            .expect("a REGISTER frame was enqueued");
+        assert_eq!(
+            register.2["capability"]["harnessProtocol"],
+            json!(HARNESS_PROTOCOL_VERSION),
+            "REGISTER capability carries the harness-protocol version"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_session_claims_and_releases_once_across_two_turns() {
+        // A job runs its first ACP turn and, on a result-nudge, a SECOND turn on
+        // the SAME session. The job must be CLAIMed once and RELEASEd once
+        // across both turns — re-registering per turn would double-CLAIM and
+        // overwrite the stream-keyed RELEASE barrier (the finding this guards).
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-2t", capability(), "job-2t");
+        let _ = buffered(&client); // discard the initial register/claim
+
+        // First turn: open + detach (flush tail, no release).
+        let (sink1, steer1) = session.open_turn().expect("first turn opens");
+        sink1.try_send(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t1"}})).unwrap();
+        session.detach_turn().await;
+        // The turn returns the job-keyed steer receiver (as `Agent::run` does via
+        // `take_steer`); hand it back so the nudge turn stays steerable.
+        session.restore_steer(steer1);
+
+        // Second (nudge) turn on the SAME session: open + detach again.
+        let (sink2, steer2) = session.open_turn().expect("second turn opens");
+        sink2.try_send(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t2"}})).unwrap();
+        session.detach_turn().await;
+        // Steer is preserved across turns: the restored receiver is lent to the
+        // nudge turn, so the second ACP turn remains steerable.
+        assert!(
+            steer2.is_some(),
+            "steer receiver is preserved for the nudge turn"
+        );
+
+        // Close the job: exactly one RELEASE total, enqueued on close. Use the
+        // non-draining enqueue log (the buffer still holds the transcript tail).
+        session.close().await;
+        let log = client.enqueue_log();
+        let claims = log.iter().filter(|(_, _, f)| *f == Family::Claim).count();
+        let releases = log.iter().filter(|(_, _, f)| *f == Family::Release).count();
+        assert_eq!(claims, 0, "no second CLAIM after the initial registration");
+        assert_eq!(
+            releases, 1,
+            "exactly one RELEASE for the job across both turns"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restore_steer_preserves_receiver_and_ignores_none() {
+        // A turn hands the job-keyed steer receiver back via `restore_steer`.
+        // Restoring `Some` makes the next `open_turn` steerable again; restoring
+        // `None` (a hub-less/torn-down turn recovered nothing) must NOT clobber a
+        // receiver already resident in the session.
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-rs", capability(), "job-rs");
+        let _ = buffered(&client);
+
+        // Take the receiver out (as `open_turn` does for a turn).
+        let (_sink, steer) = session.open_turn().expect("first turn opens");
+        assert!(steer.is_some(), "first turn receives the steer receiver");
+        session.detach_turn().await;
+
+        // A turn that recovered nothing must not wipe the (currently absent)
+        // receiver into existence, nor overwrite a present one.
+        session.restore_steer(None);
+        let (_sink2, steer_after_none) = session.open_turn().expect("turn opens");
+        assert!(
+            steer_after_none.is_none(),
+            "restore_steer(None) is a no-op — no phantom receiver appears"
+        );
+        session.detach_turn().await;
+
+        // Returning the real receiver makes the next turn steerable again.
+        session.restore_steer(steer);
+        let (_sink3, steer_restored) = session.open_turn().expect("turn opens");
+        assert!(
+            steer_restored.is_some(),
+            "restored receiver is lent to the next turn"
+        );
+        session.close().await;
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn never_bridged_session_close_does_not_steal_another_sessions_bridge() {
+        // Regression for the sentinel-session-id finding: `register_session` used
+        // to set `session_id = 0`, which is ALSO the first real id
+        // `next_session_seq` hands out. A session whose agent fails before
+        // `open_turn` therefore kept the sentinel, and its `close`/`Drop` did
+        // `bridge_tasks.remove(&0)` — stealing the FIRST active session's flush
+        // handle. With `Option<u64>`, a never-bridged session owns NO bridge and
+        // must remove nothing.
+        let client = HubClient::spawn(test_config(), &[]);
+        let _ = buffered(&client);
+
+        // Session A opens a turn: it owns the FIRST real bridge (id 0).
+        let mut active = client.register_session("w-a", capability(), "job-a");
+        let _ = buffered(&client);
+        let (_sink_a, _steer_a) = active.open_turn().expect("active session opens a turn");
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            1,
+            "the active session owns exactly one bridge"
+        );
+
+        // Session B is registered but its agent fails BEFORE any `open_turn`, so
+        // it never spawns a bridge (`session_id` stays `None`).
+        let mut failed = client.register_session("w-b", capability(), "job-b");
+        let _ = buffered(&client);
+        assert!(
+            failed.session_id.is_none(),
+            "a session that never opened a turn owns no bridge id"
+        );
+
+        // Closing the failed session must NOT remove the active session's
+        // bridge. Pre-fix this removed bridge_tasks[0] via the sentinel.
+        failed.close().await;
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            1,
+            "closing a never-bridged session must not steal the active session's bridge"
+        );
+        assert!(
+            client
+                .bridge_tasks
+                .lock()
+                .unwrap()
+                .contains_key(&active.session_id.expect("active session has a bridge id")),
+            "the active session's own bridge is still tracked"
+        );
+
+        // Same guarantee on the Drop fallback path (a panic-unwind drop of a
+        // never-bridged session).
+        let failed2 = client.register_session("w-c", capability(), "job-c");
+        let _ = buffered(&client);
+        drop(failed2);
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            1,
+            "dropping a never-bridged session must not steal the active session's bridge"
+        );
+
+        active.close().await;
+        assert_eq!(
+            client.bridge_tasks.lock().unwrap().len(),
+            0,
+            "the active session's own close still flushes exactly its own bridge"
+        );
+        client.shutdown().await;
+    }
+
+    #[test]
+    fn authenticated_url_appends_token_and_capability_query_params() {
+        let mut cfg = test_config();
+        cfg.url = "ws://host:8787/agentic".into();
+        cfg.token = Some("implementation.ci.fix#red".into());
+        cfg.credential = Some("cred/1".into());
+        let url = authenticated_url(&cfg);
+        // `#` and `/` are percent-encoded so they are not URL structure.
+        assert_eq!(
+            url,
+            "ws://host:8787/agentic?token=implementation.ci.fix%23red&capability=cred%2F1"
+        );
+    }
+
+    #[test]
+    fn authenticated_url_preserves_an_existing_query() {
+        let mut cfg = test_config();
+        cfg.url = "ws://host/agentic?v=1".into();
+        cfg.token = Some("tok".into());
+        cfg.credential = None;
+        assert_eq!(authenticated_url(&cfg), "ws://host/agentic?v=1&token=tok");
+    }
+
+    // Finding (round 15): `NANO_AGENTIC_SECRET` is the current shared identity
+    // and the hub reads it from the `?token=` query param; `NANO_AGENTIC_TOKEN`
+    // is only a deprecated alias. A SECRET-only secure config (the documented
+    // one) MUST still produce a `?token=`, and SECRET MUST win when both are set
+    // — otherwise the hub rejects the worker before `register`.
+    #[test]
+    fn identity_token_prefers_secret_over_token_alias() {
+        let mut cfg = test_config();
+        cfg.secret = Some("the-secret".into());
+        cfg.token = Some("legacy-alias".into());
+        assert_eq!(identity_token(&cfg), Some("the-secret"));
+        // SECRET unset: fall back to the deprecated TOKEN alias.
+        cfg.secret = None;
+        assert_eq!(identity_token(&cfg), Some("legacy-alias"));
+        // Neither set: no identity to present.
+        cfg.token = None;
+        assert_eq!(identity_token(&cfg), None);
+        // Empty strings are not an identity.
+        cfg.secret = Some(String::new());
+        cfg.token = Some(String::new());
+        assert_eq!(identity_token(&cfg), None);
+    }
+
+    #[test]
+    fn authenticated_url_carries_secret_identity_as_token_param() {
+        let mut cfg = test_config();
+        cfg.url = "ws://host:8787/agentic".into();
+        // The documented secure config: SECRET set, TOKEN unset.
+        cfg.secret = Some("sh/secret#1".into());
+        cfg.token = None;
+        cfg.credential = None;
+        assert_eq!(
+            authenticated_url(&cfg),
+            "ws://host:8787/agentic?token=sh%2Fsecret%231"
+        );
+        // When both are set, SECRET (not the deprecated TOKEN alias) is on `?token=`.
+        cfg.token = Some("legacy".into());
+        assert_eq!(
+            authenticated_url(&cfg),
+            "ws://host:8787/agentic?token=sh%2Fsecret%231"
+        );
+    }
+
+    #[tokio::test]
+    async fn jitter_spans_the_half_delay_with_real_entropy() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let delay = Duration::from_millis(1000);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let j = jittered(delay, client.next_rand());
+            // Always within [half, delay).
+            assert!(j >= Duration::from_millis(500));
+            assert!(j < Duration::from_millis(1000));
+            seen.insert(j.as_millis());
+        }
+        // A real RNG produces many distinct delays, not one lockstep value.
+        assert!(
+            seen.len() > 8,
+            "jitter is not varying: {} distinct",
+            seen.len()
+        );
+        client.shutdown().await;
+    }
+
+    // --- In-process live WebSocket acceptance (#10) ----------------------
+
+    /// An IN-PROCESS SMOKE TEST against a real (in-process) hub server: the
+    /// upgrade handshake carries the auth query params, the exact
+    /// REGISTER/CLAIM/produce frames arrive on the wire, a targeted inbound relay
+    /// steers this session, and shutdown emits a DEREGISTER. It asserts selected
+    /// decoded fields only — it does NOT replay or byte-compare the golden corpus,
+    /// so it does NOT close issue #5's live-worker acceptance seam. That corpus
+    /// acceptance gap stays open and is tracked separately (follow-up #15); this
+    /// test only proves the client drives a real WebSocket end to end.
+    #[tokio::test]
+    // The `accept_hdr_async` callback must return `Result<Response, ErrorResponse>`;
+    // `ErrorResponse` is large but the type is imposed by tokio-tungstenite, so
+    // boxing it is impossible — allow the lint for this externally-dictated shape.
+    #[allow(clippy::result_large_err)]
+    async fn live_connection_handshake_presence_transcript_steer_and_shutdown() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<String>();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<(Family, Value)>();
+        let steer_stream = compose_stream_id("w-live", "job-live");
+        let steer_stream_srv = steer_stream.clone();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let callback = move |req: &Request, resp: Response| {
+                let _ = uri_tx.send(req.uri().to_string());
+                Ok::<Response, ErrorResponse>(resp)
+            };
+            let ws = accept_hdr_async(sock, callback).await.unwrap();
+            let (mut write, mut read) = ws.split();
+            let mut claimed = false;
+            while let Some(Ok(msg)) = read.next().await {
+                match msg {
+                    Message::Binary(bytes) => {
+                        let frame = decode_frame(&bytes).expect("server decodes a client frame");
+                        let is_claim = frame.family == Family::Claim;
+                        let _ = frames_tx.send((frame.family, frame.payload));
+                        if is_claim && !claimed {
+                            claimed = true;
+                            // Targeted inbound steer for this exact stream.
+                            let relay = Frame::new(
+                                Lane::Interactive,
+                                Family::Relay,
+                                0,
+                                json!({
+                                    "stream": steer_stream_srv,
+                                    "offset": 0,
+                                    "chunk": "steer-me",
+                                }),
+                            );
+                            let _ = write
+                                .send(Message::Binary(encode_frame(&relay).unwrap()))
+                                .await;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        cfg.token = Some("tkn#1".into());
+        cfg.credential = Some("cap/1".into());
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-live", capability(), "job-live");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let sink = session.transcript_sink().expect("transcript sink");
+
+        // Auth: the upgrade URL carried percent-encoded token + capability.
+        let uri = tokio::time::timeout(Duration::from_secs(5), uri_rx)
+            .await
+            .expect("handshake did not arrive")
+            .expect("uri channel closed");
+        assert!(
+            uri.contains("token=tkn%231"),
+            "upgrade URL missing token: {uri}"
+        );
+        assert!(
+            uri.contains("capability=cap%2F1"),
+            "upgrade URL missing capability: {uri}"
+        );
+
+        // A transcript update must bridge to a produce relay on the wire.
+        sink.send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "hi" }
+        }))
+        .await
+        .unwrap();
+
+        // Collect frames until REGISTER, CLAIM, and the produce relay all land,
+        // recording arrival order to assert presence+ownership precede transcript.
+        let mut order: Vec<Family> = Vec::new();
+        let (mut reg, mut claim, mut produce) = (None, None, None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while reg.is_none() || claim.is_none() || produce.is_none() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (fam, payload) = tokio::time::timeout(remaining, frames_rx.recv())
+                .await
+                .expect("timed out awaiting wire frames")
+                .expect("server frame channel closed");
+            order.push(fam);
+            match fam {
+                Family::Register => reg = Some(payload),
+                // Capture the per-job CLAIM (carries `jobKey`); the resync also
+                // emits a per-instance snapshot CLAIM (`jobKeys`, no `jobKey`),
+                // which this ownership assertion skips.
+                Family::Claim if payload.get("jobKey").is_some() => claim = Some(payload),
+                Family::Relay => produce = Some(payload),
+                _ => {}
+            }
+        }
+        let reg = reg.unwrap();
+        assert_eq!(reg["instance"], "w-live");
+        assert!(
+            reg["capability"].is_object(),
+            "REGISTER capability must be an object"
+        );
+        let claim = claim.unwrap();
+        assert_eq!(claim["instance"], "w-live");
+        assert_eq!(claim["jobKey"], "job-live");
+        let produce = produce.unwrap();
+        assert_eq!(produce["op"], "produce");
+        assert_eq!(produce["stream"], steer_stream);
+        assert_eq!(produce["incarnation"], 0);
+        // Presence (REGISTER) and ownership (CLAIM) precede the transcript relay.
+        let idx = |f: Family| order.iter().position(|x| *x == f).unwrap();
+        assert!(idx(Family::Register) < idx(Family::Claim));
+        assert!(idx(Family::Claim) < idx(Family::Relay));
+
+        // Targeted steer: the server's relay for this stream reached THIS session.
+        let got = tokio::time::timeout(Duration::from_secs(5), steer.recv())
+            .await
+            .expect("steer timed out")
+            .expect("steer channel closed");
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "steer-me".into()
+            }
+        );
+
+        // Shutdown deregisters the worker instance.
+        drop(session);
+        client.shutdown().await;
+        let mut saw_deregister = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !saw_deregister {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, frames_rx.recv()).await {
+                Ok(Some((Family::Deregister, payload))) => {
+                    assert_eq!(payload["instance"], "w-live");
+                    saw_deregister = true;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(saw_deregister, "shutdown did not emit a DEREGISTER");
+        let _ = server.await;
+    }
+
+    /// On reconnect the client must resync presence before ownership: every
+    /// worker is re-REGISTERed and only then is each in-flight job re-CLAIMed,
+    /// so the hub never sees a claim from an unknown worker.
+    #[tokio::test]
+    async fn live_reconnect_reregisters_before_reclaiming() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<(u8, Family)>();
+
+        let server = tokio::spawn(async move {
+            // First connection: accept, read one frame, then drop it to force a
+            // reconnect.
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(sock).await.unwrap();
+            let _ = ws.next().await; // let at least the REGISTER arrive
+            drop(ws); // close → client reconnects
+
+            // Second connection: record the control-frame order of the resync.
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Binary(bytes) = msg {
+                    if let Ok(frame) = decode_frame(&bytes) {
+                        if frames_tx.send((1, frame.family)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let client = HubClient::spawn(cfg, &[]);
+        let _session = client.register_session("w-rc", capability(), "job-rc");
+
+        // On the reconnect, REGISTER must be observed before CLAIM.
+        let mut first_register = None;
+        let mut first_claim = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut i = 0usize;
+        while first_register.is_none() || first_claim.is_none() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (_conn, fam) = tokio::time::timeout(remaining, frames_rx.recv())
+                .await
+                .expect("timed out awaiting reconnect resync")
+                .expect("server frame channel closed");
+            match fam {
+                Family::Register if first_register.is_none() => first_register = Some(i),
+                Family::Claim if first_claim.is_none() => first_claim = Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        assert!(
+            first_register.unwrap() < first_claim.unwrap(),
+            "reconnect re-CLAIMed before re-REGISTERing"
+        );
+        client.shutdown().await;
+        let _ = server.await;
+    }
+
+    // --- Regression tests for round-3 review findings ---
+
+    // Finding A: eviction must respect lane priority. A buffer holding only
+    // control frames must DROP an incoming bulk frame rather than evict a
+    // control frame to admit it (the old eviction shed the least-important
+    // *non-empty* lane, which was control here).
+    #[tokio::test]
+    async fn bulk_push_is_dropped_rather_than_evicting_control() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 2;
+        let client = HubClient::spawn(cfg, &[]);
+        client.enqueue(
+            Lane::Control,
+            Family::Register,
+            json!({ "instance": "w", "n": 1 }),
+        );
+        client.enqueue(
+            Lane::Control,
+            Family::Claim,
+            json!({ "instance": "w", "n": 2 }),
+        );
+        // Buffer is now full of control. A bulk push must be dropped on the floor.
+        client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": 3 }));
+        let frames = buffered(&client);
+        assert_eq!(frames.len(), 2, "bulk must be dropped, not buffered");
+        assert!(
+            frames.iter().all(|(l, _, _)| *l == Lane::Control),
+            "both control frames must survive a bulk push at capacity"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding A sibling: an interactive frame may evict bulk but never control.
+    #[tokio::test]
+    async fn interactive_push_evicts_bulk_not_control_at_capacity() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 2;
+        let client = HubClient::spawn(cfg, &[]);
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
+        client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": 1 }));
+        // Full: one control + one bulk. Interactive evicts the bulk, keeps control.
+        client.enqueue(Lane::Interactive, Family::Relay, json!({ "steer": true }));
+        let frames = buffered(&client);
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames.iter().any(|(l, _, _)| *l == Lane::Control),
+            "control must survive an interactive push"
+        );
+        assert!(
+            frames.iter().any(|(l, _, _)| *l == Lane::Interactive),
+            "interactive frame must be admitted"
+        );
+        assert!(
+            !frames.iter().any(|(l, _, _)| *l == Lane::Bulk),
+            "bulk must be the evicted lane"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding C: route_inbound must reject a payload carrying `op` — our own
+    // `{op:"produce", stream, chunk}` transcript echoed back must NOT be decoded
+    // as inbound steer and re-injected into its own agent.
+    #[tokio::test]
+    async fn inbound_produce_echo_with_op_is_not_routed_as_steer() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-op", capability(), "job-op");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-op", "job-op");
+        client.route_inbound(&json!({
+            "op": "produce",
+            "stream": stream,
+            "chunk": "do the thing",
+        }));
+        assert!(
+            steer.try_recv().is_err(),
+            "a produce echo (has `op`) must not be routed as steer"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding F: resync must not duplicate a REGISTER/CLAIM already buffered
+    // while disconnected, and must emit REGISTER before CLAIM.
+    #[tokio::test]
+    async fn resync_dedups_buffered_presence_and_orders_register_before_claim() {
+        let client = HubClient::spawn(test_config(), &[]);
+        // Buffered by register_session while "disconnected": a REGISTER + CLAIM.
+        let _session = client.register_session("w-rs", capability(), "job-rs");
+        client.resync_presence();
+        let frames = buffered(&client);
+        let registers = frames
+            .iter()
+            .filter(|(_, f, _)| *f == Family::Register)
+            .count();
+        let per_job_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKey").is_some())
+            .count();
+        let snapshot_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKeys").is_some())
+            .count();
+        assert_eq!(registers, 1, "REGISTER must not be duplicated by resync");
+        assert_eq!(
+            per_job_claims, 1,
+            "per-job CLAIM must not be duplicated by resync"
+        );
+        assert_eq!(
+            snapshot_claims, 1,
+            "exactly one snapshot CLAIM per covered instance"
+        );
+        let reg_pos = frames.iter().position(|(_, f, _)| *f == Family::Register);
+        let claim_pos = frames.iter().position(|(_, f, _)| *f == Family::Claim);
+        assert!(
+            reg_pos < claim_pos,
+            "REGISTER must drain before CLAIM after resync"
+        );
+        client.shutdown().await;
+    }
+
+    // Round-20 escalation (human-directed, nano-workforce#894): the reconnect
+    // resync must additionally emit ONE per-instance snapshot CLAIM
+    // `{instance, jobKeys: [...]}` for EVERY covered instance — including an idle
+    // slot (empty `jobKeys`), which authoritatively drops any stale claim not
+    // re-asserted. `jobKeys` carries exactly the instance's live job set and the
+    // snapshot never carries a `jobKey` (so the hub's per-job validator and the
+    // snapshot union never collide).
+    #[tokio::test]
+    async fn resync_emits_per_instance_snapshot_claim_including_idle_slot() {
+        // One idle pre-seeded slot (no job) + one slot that runs a job.
+        let client = HubClient::spawn(test_config(), &[("w-idle".to_string(), capability())]);
+        let _session = client.register_session("w-busy", capability(), "job-x");
+        client.resync_presence();
+        let frames = buffered(&client);
+        let snapshots: Vec<&Value> = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKeys").is_some())
+            .map(|(_, _, p)| p)
+            .collect();
+        // Exactly one snapshot per covered instance (idle + busy), no more.
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "one snapshot CLAIM per covered instance (idle + busy)"
+        );
+        // Every snapshot's `jobKeys` is an array of NON-EMPTY job-key strings and
+        // never carries a per-job `jobKey` alongside it.
+        for snap in &snapshots {
+            assert!(snap.get("jobKey").is_none(), "snapshot carries no jobKey");
+            let jobs = snap["jobKeys"].as_array().expect("jobKeys is an array");
+            assert!(
+                jobs.iter()
+                    .all(|j| j.as_str().is_some_and(|s| !s.is_empty())),
+                "every jobKeys element is a non-empty string"
+            );
+        }
+        // The idle slot resyncs with the EMPTY set (owns nothing now); the busy
+        // slot resyncs with exactly its live job.
+        let idle = snapshots
+            .iter()
+            .find(|p| p["instance"] == "w-idle")
+            .expect("idle slot has a snapshot");
+        assert_eq!(
+            idle["jobKeys"].as_array().unwrap().len(),
+            0,
+            "idle slot snapshot carries the empty jobKeys set"
+        );
+        let busy = snapshots
+            .iter()
+            .find(|p| p["instance"] == "w-busy")
+            .expect("busy slot has a snapshot");
+        let busy_jobs: Vec<&str> = busy["jobKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            busy_jobs,
+            ["job-x"],
+            "busy slot snapshot carries its live job"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding B: the transcript sink is bounded, so a stalled consumer cannot
+    // grow it without limit.
+    #[tokio::test]
+    async fn transcript_sink_is_bounded() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-b", capability(), "job-b");
+        let sink = session.transcript_sink().expect("transcript sink");
+        assert_eq!(sink.max_capacity(), TRANSCRIPT_CHANNEL_BOUND);
+        client.shutdown().await;
+    }
+
+    // Finding (round 6): the pre-buffer transcript channel is byte-aware. It
+    // fronts the byte-bounded outbound buffer, so a flat 1024-item count bound
+    // (each item up to ~1 MiB) could hold ~1 GiB before the byte budget bites.
+    // `transcript_channel_bound` derives the item count from the byte budget.
+    #[test]
+    fn transcript_channel_bound_derives_from_byte_budget() {
+        // Disabled byte budget (0) falls back to the flat count ceiling.
+        assert_eq!(transcript_channel_bound(0), TRANSCRIPT_CHANNEL_BOUND);
+        // 64 MiB / 1 MiB = 64 items (matches the outbound buffer's worst case).
+        assert_eq!(transcript_channel_bound(64 * 1024 * 1024), 64);
+        // A tiny-but-nonzero budget still admits at least one update.
+        assert_eq!(transcript_channel_bound(1), 1);
+        assert_eq!(transcript_channel_bound(MAX_TRANSCRIPT_UPDATE_BYTES - 1), 1);
+        // A huge budget is clamped to the count ceiling, never above it.
+        assert_eq!(
+            transcript_channel_bound(usize::MAX),
+            TRANSCRIPT_CHANNEL_BOUND
+        );
+    }
+
+    // Finding (round 6): a session's transcript sink capacity actually follows
+    // the configured byte budget, not the flat ceiling.
+    #[tokio::test]
+    async fn transcript_sink_capacity_follows_byte_budget() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB => 8 items
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-bb", capability(), "job-bb");
+        let sink = session.transcript_sink().expect("transcript sink");
+        assert_eq!(sink.max_capacity(), 8);
+        client.shutdown().await;
+    }
+
+    // Finding (round 20): the transcript byte budget is partitioned by a FIXED
+    // per-slot share, not a creation-time `budget / active_bridges` divisor. An
+    // mpsc channel's capacity is fixed at creation and cannot shrink, so a
+    // dynamic divisor would leave an early bridge oversized: bridge #1 (alone)
+    // would get 8 items and bridge #2 would get 4, retaining 12 MiB for an 8 MiB
+    // budget (N bridges ≈ `budget × H(N)`). A fixed `budget / slot_count` share
+    // bounds the aggregate: every bridge gets the same share and at most
+    // `slot_count` are ever live, so their SUM stays within the budget.
+    #[tokio::test]
+    async fn transcript_budget_is_partitioned_by_fixed_slot_share() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB
+                                                  // Two configured slots ⇒ each bridge gets a FIXED 8 MiB / 2 = 4 items,
+                                                  // whether it is the first live bridge or the second.
+        let slots = vec![
+            ("w-p1".to_string(), capability()),
+            ("w-p2".to_string(), capability()),
+        ];
+        let client = HubClient::spawn(cfg, &slots);
+
+        // First session: the fixed per-slot share, NOT the whole budget — this
+        // is the heart of the fix (a dynamic divisor would hand it all 8 items).
+        let mut s1 = client.register_session("w-p1", capability(), "job-p1");
+        let sink1 = s1.transcript_sink().expect("s1 transcript sink");
+        assert_eq!(
+            sink1.max_capacity(),
+            4,
+            "first bridge gets the fixed per-slot share, not the full budget"
+        );
+
+        // Second concurrent bridge: same fixed share, so the SUM (4 + 4 = 8)
+        // stays within the configured 8-item budget.
+        let mut s2 = client.register_session("w-p2", capability(), "job-p2");
+        let sink2 = s2.transcript_sink().expect("s2 transcript sink");
+        assert_eq!(
+            sink2.max_capacity(),
+            4,
+            "both live: 4 + 4 = 8 within budget"
+        );
+
+        // The share is FIXED: after s1 detaches, a fresh bridge still gets the
+        // same per-slot share — it never grows to reclaim the freed capacity,
+        // which is exactly what keeps the aggregate bounded across churn.
+        s1.detach_turn().await;
+        let mut s3 = client.register_session("w-p1", capability(), "job-p3");
+        let sink3 = s3.transcript_sink().expect("s3 transcript sink");
+        assert_eq!(
+            sink3.max_capacity(),
+            4,
+            "the per-slot share is fixed and never grows back to the full budget"
+        );
+        s2.detach_turn().await;
+        s3.detach_turn().await;
+        client.shutdown().await;
+    }
+
+    // Finding (round 20), edge case: a NON-zero budget whose per-slot share
+    // integer-divides to 0 (more slots than budget bytes) must NOT fall into the
+    // disabled (`0`) path, which would hand every bridge the full count ceiling.
+    // The per-slot share is clamped to the 1-item floor instead, so a tiny
+    // budget across many slots still bounds each channel rather than multiplying
+    // the ceiling by the slot count.
+    #[tokio::test]
+    async fn transcript_budget_partition_never_falls_into_disabled_path() {
+        let mut cfg = test_config();
+        // 1 byte of budget across 2 slots ⇒ 1 / 2 = 0 bytes per slot. Without the
+        // `.max(1)` floor that 0 would mean "disabled" ⇒ the full count ceiling
+        // (1024); the floor keeps every bridge clamped to the 1-item minimum.
+        cfg.buffer_byte_budget = 1;
+        let slots = vec![
+            ("w-t1".to_string(), capability()),
+            ("w-t2".to_string(), capability()),
+        ];
+        let client = HubClient::spawn(cfg, &slots);
+        let mut s1 = client.register_session("w-t1", capability(), "job-t1");
+        assert_eq!(
+            s1.transcript_sink().expect("s1 sink").max_capacity(),
+            1,
+            "a per-slot share of 0 bytes clamps to the 1-item floor, not the ceiling"
+        );
+        let mut s2 = client.register_session("w-t2", capability(), "job-t2");
+        assert_eq!(
+            s2.transcript_sink().expect("s2 sink").max_capacity(),
+            1,
+            "a tiny budget stays at the floor, never the disabled ceiling"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 20): `close` is cancellation-safe. The slot aborts
+    // `execute` on activation loss/shutdown, so the `close` future can be
+    // dropped mid-flush (parked on the bridge-drain await). It must NOT mark the
+    // session `released` before that await completes — otherwise `Drop` would
+    // see `released == true` and skip its fallback `release_job`, stranding the
+    // job in `in_flight` with no RELEASE ever queued. Drive `close` to its first
+    // suspension (the bridge flush await), drop the future to simulate the
+    // cancellation, and assert the session still releases the job on `Drop`.
+    #[tokio::test]
+    async fn close_cancelled_mid_flush_still_releases_via_drop() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll};
+
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-cx", capability(), "job-cx");
+        // Open a turn so `close` has a live bridge to flush — that flush is the
+        // await point where a cancellation can land. Keep the sink alive so the
+        // bridge does not finish early on all-senders-dropped.
+        let _sink = session.open_turn().expect("open_turn").0;
+        assert!(
+            client
+                .in_flight
+                .lock()
+                .unwrap()
+                .get("w-cx")
+                .is_some_and(|jobs| jobs.contains("job-cx")),
+            "the job is in-flight once registered"
+        );
+
+        {
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = pin!(session.close());
+            // One manual poll: `close` takes the sender, removes the bridge,
+            // signals it, and awaits the bridge-done oneshot. The spawned bridge
+            // task has not been polled yet (we never yielded to the runtime), so
+            // the await is still Pending.
+            assert!(
+                matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+                "close should suspend at the bridge flush await"
+            );
+            // `fut` drops here — the cancelled `close`.
+        }
+        // A `close` cancelled before it finished must NOT have marked the
+        // session released, or the fallback below is skipped.
+        assert!(
+            !session.released,
+            "a cancelled close must leave `released` false for Drop's fallback"
+        );
+        // Dropping the session now performs the best-effort RELEASE.
+        drop(session);
+        assert!(
+            !client
+                .in_flight
+                .lock()
+                .unwrap()
+                .get("w-cx")
+                .is_some_and(|jobs| jobs.contains("job-cx")),
+            "Drop's fallback release removes the job from in_flight"
+        );
+        let releases = client
+            .outbound
+            .lock()
+            .unwrap()
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .count();
+        assert_eq!(
+            releases, 1,
+            "exactly one RELEASE is enqueued by Drop after the cancelled close"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 15): the inbound-steer channel is byte-aware the same way
+    // the transcript pre-buffer is. A flat 256-item count bound (each control up
+    // to ~1 MiB) could hold ~256 MiB before the byte budget bites, so
+    // `steer_channel_bound` derives the item count from the byte budget.
+    #[test]
+    fn steer_channel_bound_derives_from_byte_budget() {
+        // Disabled byte budget (0) falls back to the flat count ceiling.
+        assert_eq!(steer_channel_bound(0), STEER_CHANNEL_BOUND);
+        // 64 MiB / 1 MiB = 64 controls (bounds worst-case memory to the budget).
+        assert_eq!(steer_channel_bound(64 * 1024 * 1024), 64);
+        // A tiny-but-nonzero budget still admits at least one control.
+        assert_eq!(steer_channel_bound(1), 1);
+        assert_eq!(steer_channel_bound(MAX_STEER_CHUNK_BYTES - 1), 1);
+        // A huge budget is clamped to the count ceiling, never above it.
+        assert_eq!(steer_channel_bound(usize::MAX), STEER_CHANNEL_BOUND);
+    }
+
+    // Finding (round 15): a session's steer channel capacity actually follows
+    // the configured byte budget, not the flat ceiling — so the queued-control
+    // worst-case memory stays bounded by `buffer_byte_budget` even though each
+    // control may be up to `MAX_STEER_CHUNK_BYTES`.
+    #[tokio::test]
+    async fn steer_channel_capacity_follows_byte_budget() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB => 8 controls
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-sbc", capability(), "job-sbc");
+        let steer = session.take_steer().expect("steer receiver");
+        assert_eq!(steer.max_capacity(), 8);
+        client.shutdown().await;
+    }
+
+    // Finding (round 6): the async `close` flushes the transcript tail BEFORE
+    // the session is dropped (and thus before RELEASE), and returns promptly —
+    // it must never park a worker the way the old blocking Drop could.
+    #[tokio::test]
+    async fn session_close_flushes_transcript_tail_and_returns_promptly() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-cl", capability(), "job-cl");
+        let sink = session.transcript_sink().expect("transcript sink");
+        let _ = buffered(&client); // discard register/claim frames
+        sink.try_send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "tail" }
+        }))
+        .unwrap();
+        // close() awaits the bridge drain on the runtime, bounded by the flush
+        // timeout, so it must return well within it.
+        tokio::time::timeout(TRANSCRIPT_FLUSH_TIMEOUT, session.close())
+            .await
+            .expect("close must return promptly, not hang");
+        // The tail update was flushed to a relay frame before any RELEASE.
+        let relay = client
+            .outbound
+            .lock()
+            .unwrap()
+            .bulk
+            .iter()
+            .find(|bf| bf.frame.family == Family::Relay)
+            .map(|bf| bf.frame.clone());
+        assert!(
+            relay.is_some(),
+            "close() must flush the queued transcript update before returning"
+        );
+        // A second close is a no-op (idempotent) and still returns promptly.
+        tokio::time::timeout(TRANSCRIPT_FLUSH_TIMEOUT, session.close())
+            .await
+            .expect("second close must be a prompt no-op");
+        client.shutdown().await;
+    }
+
+    // Findings D + E: shutdown signals AND awaits the connection task, and the
+    // connect loop is racing shutdown — so shutdown returns promptly even when
+    // the client has never managed to connect (and is mid-backoff/connect).
+    #[tokio::test]
+    async fn shutdown_awaits_task_and_returns_promptly_when_never_connected() {
+        let client = HubClient::spawn(test_config(), &[]); // port 1: never connects
+        let _session = client.register_session("w-sd", capability(), "job-sd");
+        tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("shutdown must return promptly, not hang on connect/backoff");
+    }
+
+    // Finding (round 4): the inbound steer channel is bounded, so a hub flooding
+    // controls faster than the turn consumes them cannot grow memory without
+    // limit — overflow is dropped, not queued.
+    #[tokio::test]
+    async fn inbound_steer_channel_is_bounded_and_drops_on_overflow() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-sb", capability(), "job-sb");
+        let steer = session.take_steer().expect("steer receiver");
+        assert_eq!(steer.max_capacity(), STEER_CHANNEL_BOUND);
+        let stream = compose_stream_id("w-sb", "job-sb");
+        // Flood well past the bound without consuming; the receiver must cap at
+        // the bound (the rest are dropped), never grow to the full flood.
+        for _ in 0..(STEER_CHANNEL_BOUND * 4) {
+            client.route_inbound(&json!({
+                "stream": stream,
+                "offset": 0,
+                "chunk": "x",
+            }));
+        }
+        let mut drained = 0usize;
+        let mut steer = steer;
+        while steer.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert!(
+            drained <= STEER_CHANNEL_BOUND,
+            "steer channel grew past its bound: {drained} > {STEER_CHANNEL_BOUND}"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 14): the steer channel is only count-bounded, so without a
+    // per-chunk byte cap a hub could retain `STEER_CHANNEL_BOUND` arbitrarily
+    // large chunk strings per session. `route_inbound` must drop an over-large
+    // chunk (fail closed) BEFORE it is decoded into a `ControlFrame`, while a
+    // chunk at the bound still routes.
+    #[tokio::test]
+    async fn inbound_steer_chunk_is_byte_bounded() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-sbb", capability(), "job-sbb");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-sbb", "job-sbb");
+        // An over-large chunk (one byte past the cap) must be dropped, not
+        // queued — even though the channel has count capacity to spare.
+        let oversized = "x".repeat(MAX_STEER_CHUNK_BYTES + 1);
+        client.route_inbound(&json!({
+            "stream": stream,
+            "offset": 0,
+            "chunk": oversized,
+        }));
+        assert!(
+            steer.try_recv().is_err(),
+            "an over-large steer chunk must be dropped, not queued"
+        );
+        // A chunk exactly at the bound still routes as a legacy prompt.
+        let at_bound = "y".repeat(MAX_STEER_CHUNK_BYTES);
+        client.route_inbound(&json!({
+            "stream": stream,
+            "offset": 0,
+            "chunk": at_bound,
+        }));
+        let got = steer.try_recv().expect("at-bound chunk routes");
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "y".repeat(MAX_STEER_CHUNK_BYTES)
+            }
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 4): the transcript incarnation is re-stamped at DRAIN time
+    // from the current generation, so a chunk buffered during an outage (or
+    // re-buffered after a failed write) fences the stale producer on the new
+    // connection rather than carrying the old generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_restamps_relay_incarnation_to_current_generation() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Value>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                let frame = decode_frame(&bytes).expect("server decodes a frame");
+                if frame.family == Family::Relay {
+                    let _ = frames_tx.send(frame.payload);
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let client = HubClient::spawn(cfg, &[]);
+        // Buffer a relay produce frame stamped with the OLD generation (0) while
+        // "disconnected", as if queued during an outage.
+        client.enqueue(
+            Lane::Bulk,
+            Family::Relay,
+            json!({ "op": "produce", "stream": "s", "incarnation": 0, "chunk": "c" }),
+        );
+        // Simulate the reconnect bump: the new connection is generation 1.
+        client.generation.fetch_add(1, Ordering::Relaxed);
+        client.connected.store(true, Ordering::Relaxed);
+        // Wait for the produce frame to arrive on the wire.
+        let payload = tokio::time::timeout(Duration::from_secs(5), frames_rx.recv())
+            .await
+            .expect("produce frame did not drain")
+            .expect("server channel closed");
+        assert_eq!(
+            payload["incarnation"], 1,
+            "drain must re-stamp the incarnation to the current generation"
+        );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // Finding (round 4): the reconnect resync snapshot is admitted within the
+    // shared buffer capacity — it sheds lower-priority (bulk) traffic to make
+    // room rather than bypassing the bound with a raw push_front.
+    #[tokio::test]
+    async fn resync_snapshot_respects_buffer_capacity() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 4;
+        let client = HubClient::spawn(cfg, &[]);
+        // Fill the buffer with bulk traffic while "disconnected".
+        for i in 0..4 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "n": i }));
+        }
+        assert_eq!(client.outbound.lock().unwrap().len(), 4);
+        // Register a session so the resync snapshot has a REGISTER + a CLAIM.
+        let _session = client.register_session("w-cap", capability(), "job-cap");
+        client.resync_presence();
+        let frames = buffered(&client);
+        // The snapshot's REGISTER + CLAIM are present, and the total stays
+        // within the advertised capacity (bulk was shed to make room).
+        assert!(frames.iter().any(|(_, f, _)| *f == Family::Register));
+        assert!(frames.iter().any(|(_, f, _)| *f == Family::Claim));
+        assert!(
+            frames.len() <= 4,
+            "resync must not exceed buffer capacity: {} > 4",
+            frames.len()
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 4 → round 6): the flush-before-RELEASE guarantee now lives
+    // on the async `close` (Drop is nonblocking so it can never park a worker).
+    // Closing a session flushes its accepted transcript tail into the buffer
+    // BEFORE the RELEASE is enqueued, so no chunk is emitted for a job the hub
+    // has already released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_is_enqueued_after_transcript_tail() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-fl", capability(), "job-fl");
+        let sink = session.transcript_sink().expect("transcript sink");
+        let _ = buffered(&client); // discard register/claim
+        sink.try_send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "tail" }
+        }))
+        .unwrap();
+        // `close` awaits the bridged chunk into the buffer; the subsequent drop
+        // enqueues the RELEASE.
+        session.close().await;
+        drop(session);
+        // Assert ENQUEUE order (frame `seq`), not drain order: the buffer always
+        // drains control (RELEASE) before bulk (transcript), so the guarantee
+        // being tested is that the tail was enqueued first — i.e. it sits in the
+        // buffer ahead of the RELEASE in insertion order.
+        let log = client.enqueue_log();
+        let relay_seq = log
+            .iter()
+            .find(|(_, _, f)| *f == Family::Relay)
+            .map(|(s, _, _)| *s);
+        let release_seq = log
+            .iter()
+            .find(|(_, _, f)| *f == Family::Release)
+            .map(|(s, _, _)| *s);
+        let relay_seq = relay_seq.expect("the accepted transcript chunk must be flushed, not lost");
+        let release_seq = release_seq.expect("drop must enqueue a RELEASE");
+        assert!(
+            relay_seq < release_seq,
+            "transcript tail (seq {relay_seq}) must be enqueued before RELEASE (seq {release_seq})"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 11): a CLAIM (and REGISTER) must be admitted through the
+    // capacity-EXEMPT control path. On a LIVE connection the ordinary bounded
+    // push drops a control newcomer once the control lane is full (control never
+    // evicts control), and because `in_flight` is updated regardless while the
+    // reconnect resync only re-emits on a *reconnect*, a dropped CLAIM on a
+    // healthy link would stream this job's transcript/RELEASE for ownership the
+    // hub never saw claimed.
+    #[tokio::test]
+    async fn register_and_claim_are_admitted_when_control_lane_is_full() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 2;
+        let client = HubClient::spawn(cfg, &[]);
+        // Saturate the control lane so nothing lower-priority remains to shed.
+        client.enqueue(Lane::Control, Family::Heartbeat, json!({ "n": 1 }));
+        client.enqueue(Lane::Control, Family::Heartbeat, json!({ "n": 2 }));
+        let _session = client.register_session("w-full", capability(), "job-full");
+        let frames = buffered(&client);
+        assert!(
+            frames
+                .iter()
+                .any(|(_, fam, p)| *fam == Family::Register && p["instance"] == "w-full"),
+            "REGISTER must be admitted even when the control lane is full"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(_, fam, p)| *fam == Family::Claim && p["jobKey"] == "job-full"),
+            "CLAIM must be admitted even when the control lane is full"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 11): `close()` must be idempotent. A second `close` (or a
+    // `close` followed by the Drop fallback) must NOT arm the barrier again and
+    // enqueue a DUPLICATE RELEASE for the same job.
+    #[tokio::test]
+    async fn second_close_does_not_enqueue_a_duplicate_release() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-idem", capability(), "job-idem");
+        session.close().await;
+        session.close().await;
+        drop(session);
+        let releases = client
+            .enqueue_log()
+            .into_iter()
+            .filter(|(_, _, f)| *f == Family::Release)
+            .count();
+        assert_eq!(
+            releases, 1,
+            "a job must be RELEASEd exactly once across repeated close/drop"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): `route_inbound` must require the protocol's integer
+    // `offset` before routing a delivery. A `{stream, chunk}` object lacking an
+    // offset (or carrying a non-integer one) is NOT a delivery frame and must be
+    // dropped, so it cannot masquerade as one and inject steer into a live job.
+    #[tokio::test]
+    async fn route_inbound_requires_integer_offset_to_route_steer() {
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut session = client.register_session("w-of", capability(), "job-of");
+        let mut steer = session.take_steer().expect("steer receiver");
+        let stream = compose_stream_id("w-of", "job-of");
+        let chunk = r#"{"nanoControlFrame":1,"kind":"cancel","reason":"x"}"#;
+        // Missing offset: dropped.
+        client.route_inbound(&json!({ "stream": stream, "chunk": chunk }));
+        // Non-integer offset (string): dropped.
+        client.route_inbound(&json!({ "stream": stream, "offset": "0", "chunk": chunk }));
+        // Negative offset (not a u64): dropped.
+        client.route_inbound(&json!({ "stream": stream, "offset": -1, "chunk": chunk }));
+        assert!(
+            steer.try_recv().is_err(),
+            "a payload without a valid integer offset must not be routed as steer"
+        );
+        // A genuine delivery (integer offset) IS routed.
+        client.route_inbound(&json!({ "stream": stream, "offset": 7, "chunk": chunk }));
+        let got = steer.recv().await.expect("valid delivery must be routed");
+        assert_eq!(
+            got,
+            ControlFrame::Cancel {
+                reason: Some("x".into())
+            }
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): a frame-COUNT cap alone cannot bound memory because a
+    // single transcript chunk may be ~1 MiB. The buffer also enforces a BYTE
+    // budget: pushing many large bulk frames never retains more than the budget
+    // of bytes, regardless of how far the count cap would otherwise allow.
+    #[tokio::test]
+    async fn buffer_byte_budget_bounds_retained_memory_regardless_of_count() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 10_000; // a very permissive COUNT cap
+        cfg.buffer_byte_budget = 64 * 1024; // but a tight BYTE budget
+        let client = HubClient::spawn(cfg, &[]);
+        let big = "x".repeat(16 * 1024); // ~16 KiB payload each
+        for _ in 0..1000 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "chunk": big }));
+        }
+        let (bytes, byte_capacity, len) = {
+            let buf = client.outbound.lock().unwrap();
+            (buf.bytes, buf.byte_capacity, buf.len())
+        };
+        assert!(
+            bytes <= byte_capacity,
+            "retained bytes {bytes} exceeded the byte budget {byte_capacity}"
+        );
+        // A handful of 16 KiB frames, not the full 1000-frame count cap.
+        assert!(
+            len < 10,
+            "count should be bounded by the byte budget, got {len}"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): a control frame must never be dropped by the byte
+    // budget to admit lower-priority bulk — presence/steer is never sacrificed
+    // for transcript, and a control frame exceeding the budget is still admitted.
+    #[tokio::test]
+    async fn byte_budget_never_sheds_control_for_bulk() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 10_000;
+        cfg.buffer_byte_budget = 8 * 1024;
+        let client = HubClient::spawn(cfg, &[]);
+        client.enqueue(Lane::Control, Family::Register, json!({ "instance": "w" }));
+        let big = "x".repeat(16 * 1024); // larger than the whole budget
+        for _ in 0..50 {
+            client.enqueue(Lane::Bulk, Family::Relay, json!({ "chunk": big.clone() }));
+        }
+        let buf_control_len = {
+            let buf = client.outbound.lock().unwrap();
+            buf.control.len()
+        };
+        assert_eq!(
+            buf_control_len, 1,
+            "the control REGISTER must survive a bulk flood under the byte budget"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 5): the reconnect snapshot is atomic with session
+    // registration. Under concurrent `register_session` and `resync_presence`,
+    // no live job's presence may be lost — every in-flight job keeps exactly one
+    // buffered CLAIM and every instance exactly one REGISTER. (The old
+    // non-atomic snapshot could `drop_control_presence` a just-enqueued frame.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resync_is_atomic_with_concurrent_registration() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 100_000; // never shed presence during the stress
+        let client = HubClient::spawn(cfg, &[]);
+        let resync_client = client.clone();
+        let resyncer = tokio::task::spawn_blocking(move || {
+            for _ in 0..2000 {
+                resync_client.resync_presence();
+            }
+        });
+        let mut sessions = Vec::new();
+        for i in 0..200 {
+            sessions.push(client.register_session("w-atomic", capability(), &format!("job-{i}")));
+            if i % 7 == 0 {
+                std::thread::yield_now();
+            }
+        }
+        resyncer.await.unwrap();
+        // One final resync establishes a clean, fully-rebuilt presence snapshot.
+        client.resync_presence();
+        let frames = buffered(&client);
+        let registers = frames
+            .iter()
+            .filter(|(_, f, _)| *f == Family::Register)
+            .count();
+        let per_job_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKey").is_some())
+            .count();
+        let snapshot_claims = frames
+            .iter()
+            .filter(|(_, f, p)| *f == Family::Claim && p.get("jobKeys").is_some())
+            .count();
+        assert_eq!(registers, 1, "exactly one REGISTER for the single instance");
+        assert_eq!(
+            per_job_claims, 200,
+            "every registered job must retain its per-job CLAIM after concurrent resync, got {per_job_claims}"
+        );
+        assert_eq!(
+            snapshot_claims, 1,
+            "exactly one snapshot CLAIM for the single instance"
+        );
+        drop(sessions);
+        client.shutdown().await;
+    }
+
+    // --- Round-8 design decisions (human-directed) ----------------------
+
+    // Decision 3 (register-on-connect): every configured slot's identity is
+    // REGISTERed at spawn, independently of any job, so idle capacity is visible
+    // on the hub. A daemon spawned with two slots must REGISTER both before any
+    // `register_session` runs, and heartbeat them while connected.
+    #[tokio::test]
+    async fn spawn_registers_every_configured_slot_before_any_job() {
+        let client = HubClient::spawn(
+            test_config(),
+            &[
+                ("host-nanod-a-0".to_string(), capability()),
+                ("host-nanod-a-1".to_string(), capability()),
+            ],
+        );
+        // No register_session call at all: both slots are already present.
+        {
+            let insts = client.instances.lock().unwrap();
+            assert!(
+                insts.contains_key("host-nanod-a-0"),
+                "slot 0 must be pre-registered"
+            );
+            assert!(
+                insts.contains_key("host-nanod-a-1"),
+                "slot 1 must be pre-registered"
+            );
+            assert_eq!(insts.len(), 2, "exactly the two configured slots");
+        }
+        // The resync snapshot (what the first connect sends) covers both slots.
+        client.resync_presence();
+        let frames = buffered(&client);
+        let registers: Vec<&Value> = frames
+            .iter()
+            .filter(|(_, f, _)| *f == Family::Register)
+            .map(|(_, _, p)| p)
+            .collect();
+        assert_eq!(registers.len(), 2, "both slots REGISTERed on connect");
+        assert!(registers.iter().any(|p| p["instance"] == "host-nanod-a-0"));
+        assert!(registers.iter().any(|p| p["instance"] == "host-nanod-a-1"));
+        // The config-level advertisement is folded into each slot's capability.
+        assert!(registers.iter().all(|p| p["capability"].is_object()));
+        client.shutdown().await;
+    }
+
+    // Decision 3 (sibling): a slot that later runs a job must NOT be
+    // re-REGISTERed (it is already present from spawn) — only CLAIMed.
+    #[tokio::test]
+    async fn job_on_preregistered_slot_claims_without_reregistering() {
+        let client = HubClient::spawn(test_config(), &[("w-idle".to_string(), capability())]);
+        let _ = buffered(&client); // discard the spawn-time REGISTER
+        let _session = client.register_session("w-idle", capability(), "job-1");
+        let frames = buffered(&client);
+        assert!(
+            frames.iter().all(|(_, f, _)| *f != Family::Register),
+            "an already-registered slot must not be re-REGISTERed on its first job"
+        );
+        assert!(frames
+            .iter()
+            .any(|(_, f, p)| *f == Family::Claim && p["jobKey"] == "job-1"));
+        client.shutdown().await;
+    }
+
+    // Decision 1 (presence exempt from the buffer bound): a presence set larger
+    // than a tiny configured capacity is prepended WHOLE, not dropped or
+    // fragmented — it is bounded by live instances+jobs, not by the buffer.
+    #[tokio::test]
+    async fn resync_presence_is_exempt_from_buffer_capacity() {
+        let mut cfg = test_config();
+        cfg.buffer_capacity = 1; // absurdly tiny: cannot hold even REGISTER+CLAIM
+        let client = HubClient::spawn(cfg, &[("w-x".to_string(), capability())]);
+        let _session = client.register_session("w-x", capability(), "job-x");
+        client.resync_presence();
+        let frames = buffered(&client);
+        // Both presence frames survive even though capacity is 1: presence is
+        // exempt from the bound (bounded by live instances+jobs instead).
+        assert!(
+            frames.iter().any(|(_, f, _)| *f == Family::Register),
+            "REGISTER must survive a tiny capacity (presence is exempt)"
+        );
+        assert!(
+            frames.iter().any(|(_, f, _)| *f == Family::Claim),
+            "CLAIM must survive a tiny capacity (presence is exempt)"
+        );
+        client.shutdown().await;
+    }
+
+    // Decision 2 (RELEASE never overtakes the transcript tail ON THE WIRE): a
+    // live-socket test. The transcript tail is buffered (bulk lane) BEFORE the
+    // RELEASE is enqueued (control lane). Because `LaneBuffer::pop` drains the
+    // control lane first, the RELEASE would reach the socket ahead of the bulk
+    // tail without the drain barrier. With it, the hub must observe the produce
+    // frame(s) BEFORE the release. To make the race deterministic, the tail is
+    // enqueued while the socket is NOT yet draining (the client connects only
+    // after both frames are buffered), so the RELEASE genuinely starts behind
+    // the tail in lane order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_is_written_after_transcript_tail_on_the_wire() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Family>();
+        // Gate the server so the client connects only once we release it.
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let _ = accept_rx.await;
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send(frame.family).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-ord", capability(), "job-ord");
+        let sink = session.transcript_sink().expect("transcript sink");
+        // Enqueue the transcript tail and immediately close — the server is not
+        // accepting yet, so NOTHING has drained: the bulk tail sits in the buffer
+        // behind the (control) REGISTER/CLAIM, and the RELEASE is enqueued after
+        // it. close() commits the barrier over the whole pre-close backlog.
+        sink.send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "tail" }
+        }))
+        .await
+        .unwrap();
+        session.close().await;
+        drop(session);
+        // Now let the connection happen: control drains first, so without the
+        // barrier the RELEASE would precede the bulk produce on the wire.
+        let _ = accept_tx.send(());
+
+        // Collect the wire order until we have seen a produce relay AND a release.
+        let mut order: Vec<Family> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_produce = false;
+        let mut saw_release = false;
+        while !(saw_produce && saw_release) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let fam = tokio::time::timeout(remaining, frames_rx.recv())
+                .await
+                .expect("timed out awaiting wire frames")
+                .expect("server frame channel closed");
+            order.push(fam);
+            match fam {
+                Family::Relay => saw_produce = true,
+                Family::Release => saw_release = true,
+                _ => {}
+            }
+        }
+        let idx = |f: Family| order.iter().position(|x| *x == f).unwrap();
+        assert!(
+            idx(Family::Relay) < idx(Family::Release),
+            "the transcript tail must be written to the socket BEFORE the RELEASE, got {order:?}"
+        );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // Decision 2 (sibling): the barrier holds even when OTHER control frames are
+    // queued ahead of the RELEASE. A heartbeat (control) enqueued alongside the
+    // tail must not let the RELEASE jump the bulk transcript — the RELEASE still
+    // waits for the tail to be written first. Deterministic: the tail is buffered
+    // while the socket is not yet draining (gated accept), so the RELEASE starts
+    // behind it in lane order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_waits_for_tail_even_with_control_frames_queued() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Family>();
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let _ = accept_rx.await;
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send(frame.family).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-ord2", capability(), "job-ord2");
+        let sink = session.transcript_sink().expect("transcript sink");
+        sink.send(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "tail" }
+        }))
+        .await
+        .unwrap();
+        // Queue an unrelated control frame (a heartbeat) BEFORE closing, so the
+        // control lane is non-empty when the RELEASE is enqueued.
+        client.enqueue(
+            Lane::Control,
+            Family::Heartbeat,
+            json!({ "instance": "w-ord2" }),
+        );
+        session.close().await;
+        drop(session);
+        let _ = accept_tx.send(());
+
+        let mut order: Vec<Family> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_produce = false;
+        let mut saw_release = false;
+        while !(saw_produce && saw_release) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let fam = tokio::time::timeout(remaining, frames_rx.recv())
+                .await
+                .expect("timed out awaiting wire frames")
+                .expect("server frame channel closed");
+            order.push(fam);
+            match fam {
+                Family::Relay => saw_produce = true,
+                Family::Release => saw_release = true,
+                _ => {}
+            }
+        }
+        let idx = |f: Family| order.iter().position(|x| *x == f).unwrap();
+        assert!(
+            idx(Family::Relay) < idx(Family::Release),
+            "RELEASE must wait for the transcript tail even with control frames queued, got {order:?}"
+        );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // Finding 1 (round 9): the reconnect presence prune must NOT drop a CLAIM
+    // for a job that STARTED AND FINISHED during the outage. Such a job has a
+    // buffered CLAIM, transcript tail, and RELEASE, and `release_job` already
+    // removed it from `in_flight` — so the resync snapshot cannot recreate its
+    // CLAIM. Dropping the buffered CLAIM would ship the RELEASE/transcript with
+    // no prerequisite ownership frame, desyncing the hub. A CLAIM for a still
+    // live job (no buffered RELEASE) IS pruned — the snapshot rebuilds it — as
+    // is every REGISTER.
+    #[test]
+    fn drop_control_presence_keeps_claim_paired_with_a_pending_release() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        // Live job on w: REGISTER + CLAIM, no RELEASE -> both pruned.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            1,
+            json!({ "instance": "w" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            2,
+            json!({ "instance": "w", "jobKey": "live" }),
+        ));
+        // Completed-during-outage job on w: CLAIM + RELEASE -> CLAIM survives.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            3,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            4,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        buf.drop_control_presence(&HashSet::new());
+        let claims: Vec<&Value> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Claim)
+            .map(|bf| &bf.frame.payload)
+            .collect();
+        assert_eq!(
+            claims.len(),
+            1,
+            "only the completed job's CLAIM survives the prune"
+        );
+        assert_eq!(
+            claims[0]["jobKey"], "done",
+            "the preserved CLAIM is the one paired with a buffered RELEASE"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the buffered RELEASE is preserved (its CLAIM→tail→RELEASE stays intact)"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Register),
+            "every REGISTER is pruned — the resync snapshot rebuilds it"
+        );
+    }
+
+    // Finding 1 (round 22): retry-during-outage. A prior generation of
+    // `(instance, jobKey)` completes during an outage — its CLAIM + RELEASE are
+    // buffered — and an identical-keyed retry re-claims the SAME stream and is
+    // live again (its stream is in `in_flight`). `drop_control_presence` must
+    // treat that buffered RELEASE (and its paired CLAIM) as a SUPERSEDED
+    // generation and DROP both, returning the RELEASE seq to disarm: the resync
+    // snapshot rebuilds the live retry's CLAIM, and draining the stale RELEASE
+    // after it would clear the active retry's ownership on the hub.
+    #[test]
+    fn drop_control_presence_drops_superseded_release_for_a_live_retry() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        // Prior generation that completed during the outage: CLAIM + RELEASE.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            1,
+            json!({ "instance": "w", "jobKey": "retried" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            2,
+            json!({ "instance": "w", "jobKey": "retried" }),
+        ));
+        // The retry is live again on the same stream. The prune discriminates on
+        // the job KEY, so the in-flight set carries the bare job key.
+        let mut in_flight = HashSet::new();
+        in_flight.insert("retried".to_string());
+        let disarmed = buf.drop_control_presence(&in_flight);
+        assert_eq!(
+            disarmed,
+            vec![2],
+            "the superseded RELEASE's seq is returned so its drain barrier is disarmed"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the stale RELEASE is dropped so it cannot clear the live retry's ownership"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "its paired CLAIM is dropped too — the resync snapshot rebuilds the live CLAIM"
+        );
+    }
+
+    // Finding (round 29): CROSS-SLOT retry-during-outage. Job J finishes on slot
+    // A during an outage (its `(A, J)` CLAIM + RELEASE are buffered) and is
+    // retried on a DIFFERENT slot B, so `(B, J)` is live in `in_flight` at
+    // reconnect. The supersession prune must recognise the superseded generation
+    // by JOB KEY — not by the composed `(instance, jobKey)` stream, which differs
+    // across slots — and drop A's stale CLAIM + RELEASE. Otherwise the resync
+    // snapshot asserts B's CLAIM, but A's buffered CLAIM then drains and moves J's
+    // ownership back to the finished slot A in the hub's `ClaimRegistry`, and A's
+    // RELEASE removes it — leaving the running retry on B with no ownership.
+    #[test]
+    fn drop_control_presence_drops_superseded_release_for_a_cross_slot_retry() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        // Prior generation that completed during the outage on slot A.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            1,
+            json!({ "instance": "a", "jobKey": "retried" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            2,
+            json!({ "instance": "a", "jobKey": "retried" }),
+        ));
+        // The retry is live on a DIFFERENT slot B: the composed stream id
+        // (`b/retried`) differs from the buffered one (`a/retried`), so only a
+        // job-key-keyed prune collapses the stale pair.
+        let mut in_flight = HashSet::new();
+        in_flight.insert("retried".to_string());
+        let disarmed = buf.drop_control_presence(&in_flight);
+        assert_eq!(
+            disarmed,
+            vec![2],
+            "the superseded cross-slot RELEASE's seq is returned so its drain barrier is disarmed"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the stale cross-slot RELEASE is dropped so it cannot clear the live retry's ownership"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "its paired CLAIM is dropped too — the resync snapshot rebuilds the live CLAIM for slot B"
+        );
+    }
+
+    // A buffered RELEASE whose stream is NOT in-flight is a genuinely completed
+    // job with no live retry, so it (and its CLAIM) must still be preserved —
+    // the superseded-generation collapse must not regress the normal case.
+    #[test]
+    fn drop_control_presence_keeps_release_when_no_live_retry() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            1,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            2,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        let disarmed = buf.drop_control_presence(&HashSet::new());
+        assert!(
+            disarmed.is_empty(),
+            "no RELEASE is dropped when its stream is not in-flight"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the completed job's RELEASE is preserved"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "its CLAIM→tail→RELEASE sequence stays intact"
+        );
+    }
+
+    // Finding 3 (round 9): the shutdown DEREGISTER snapshot must be exempt from
+    // the control bound. With a capacity smaller than the registered-slot count,
+    // the ordinary bounded `push` drops control newcomers once the control lane
+    // fills (control never evicts control), so only a subset would DEREGISTER.
+    // The exempt back-push admits the whole snapshot.
+    #[test]
+    fn deregister_snapshot_is_exempt_from_the_control_bound() {
+        let mut exempt = LaneBuffer::with_limits(2, 0);
+        for i in 0..5u32 {
+            exempt.push_back_control_bounded(Frame::new(
+                Lane::Control,
+                Family::Deregister,
+                i,
+                json!({ "instance": format!("w-{i}"), "reason": "shutdown" }),
+            ));
+        }
+        assert_eq!(
+            exempt.control.len(),
+            5,
+            "every DEREGISTER is admitted despite a capacity of 2"
+        );
+        // Contrast: the ordinary bounded push drops the control overflow.
+        let mut bounded = LaneBuffer::with_limits(2, 0);
+        for i in 0..5u32 {
+            bounded.push(Frame::new(
+                Lane::Control,
+                Family::Deregister,
+                i,
+                json!({ "instance": format!("w-{i}"), "reason": "shutdown" }),
+            ));
+        }
+        assert_eq!(
+            bounded.control.len(),
+            2,
+            "the bounded push drops the control overflow once the lane is full"
+        );
+    }
+
+    // Finding 3 (round 9), end-to-end: a worker with MORE registered slots than
+    // the buffer capacity must still DEREGISTER every slot on shutdown. Before
+    // the exempt back-push, the surplus DEREGISTERs were dropped on the floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_deregisters_every_slot_even_below_capacity() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<(Family, Value)>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send((frame.family, frame.payload)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        cfg.buffer_capacity = 1; // far smaller than the slot count below
+        let slots: Vec<(String, Value)> =
+            (0..4).map(|i| (format!("w-{i}"), capability())).collect();
+        let client = HubClient::spawn(cfg, &slots);
+
+        // Wait until all four slots have REGISTERed on the wire (connection up).
+        let mut registered = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registered.len() < 4 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, frames_rx.recv()).await {
+                Ok(Some((Family::Register, p))) => {
+                    registered.insert(p["instance"].as_str().unwrap().to_string());
+                }
+                Ok(Some(_)) => {}
+                _ => panic!("timed out before all slots REGISTERed, saw {registered:?}"),
+            }
+        }
+
+        client.shutdown().await;
+
+        // Every slot must now DEREGISTER, despite the capacity-1 control lane.
+        let mut deregistered = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while deregistered.len() < 4 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, frames_rx.recv()).await {
+                Ok(Some((Family::Deregister, p))) => {
+                    deregistered.insert(p["instance"].as_str().unwrap().to_string());
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert_eq!(
+            deregistered.len(),
+            4,
+            "every slot must be DEREGISTERed at shutdown, got {deregistered:?}"
+        );
+        server.abort();
+    }
+
+    // Finding 4 (round 9): the outbound drain must yield a bounded batch so a
+    // sustained transcript producer cannot starve `read.next()`. With an
+    // UNBOUNDED drain the notified branch loops as long as the buffer keeps
+    // refilling, so an inbound steer frame on the socket is never polled and the
+    // session is never steered. The bounded batch returns to the `select!` loop
+    // between batches, so inbound routing stays responsive even under a flood.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_routing_stays_responsive_under_a_transcript_flood() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let steer_stream = compose_stream_id("w-flood", "job-flood");
+        let steer_stream_srv = steer_stream.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The server drains the socket fast and, on the first CLAIM, sends a
+        // targeted inbound steer for this session's stream — then keeps reading.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (mut write, mut read) = ws.split();
+            let mut steered = false;
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Binary(bytes) = msg {
+                    if let Ok(frame) = decode_frame(&bytes) {
+                        if frame.family == Family::Claim && !steered {
+                            steered = true;
+                            let relay = Frame::new(
+                                Lane::Interactive,
+                                Family::Relay,
+                                0,
+                                json!({
+                                    "stream": steer_stream_srv,
+                                    "offset": 0,
+                                    "chunk": "steer-me",
+                                }),
+                            );
+                            let _ = write
+                                .send(Message::Binary(encode_frame(&relay).unwrap()))
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        cfg.buffer_capacity = 4096;
+        let client = HubClient::spawn(cfg, &[]);
+        let mut session = client.register_session("w-flood", capability(), "job-flood");
+        let mut steer = session.take_steer().expect("steer receiver");
+
+        // A sustained producer that keeps the outbound buffer saturated: it
+        // enqueues directly (no bridge back-pressure) in a tight loop, so the
+        // buffer is continuously non-empty until `stop` is set.
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_client = client.clone();
+        let producer_stop = stop.clone();
+        let producer = tokio::spawn(async move {
+            while !producer_stop.load(Ordering::Relaxed) {
+                producer_client.enqueue(
+                    Lane::Bulk,
+                    Family::Relay,
+                    json!({ "op": "produce", "stream": "w-flood/job-flood", "chunk": "x" }),
+                );
+            }
+        });
+
+        // The inbound steer must reach THIS session despite the ongoing flood —
+        // only a bounded drain yields the select loop back to `read.next()`.
+        let got = tokio::time::timeout(Duration::from_secs(10), steer.recv()).await;
+        stop.store(true, Ordering::Relaxed);
+        let _ = producer.await;
+        let got = got
+            .expect("inbound steer was starved by the transcript flood (drain did not yield)")
+            .expect("steer channel closed");
+        assert_eq!(
+            got,
+            ControlFrame::Prompt {
+                text: "steer-me".into()
+            }
+        );
+
+        drop(session);
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // --- Authoritative-resync RELEASE-barrier fixes (round 12) -----------
+
+    // #6: during an OUTAGE the buffered completed-ownership RELEASE set must be
+    // bounded. `push_back_release_bounded` collapses the OLDEST RELEASE once the
+    // cap is reached (reconnect resync re-derives ownership, so a collapsed one
+    // is redundant) and names its stream so the caller can disarm the orphaned
+    // barrier — while NEVER touching the transcript tail (ownership only).
+    #[test]
+    fn push_back_release_bounded_collapses_oldest_over_cap() {
+        let mut buf = LaneBuffer::with_limits(64, 0);
+        let s0 = compose_stream_id("w", "j0");
+        // A transcript frame the RELEASE cap must never collapse.
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": s0, "chunk": "t" }),
+        ));
+        let rel = |j: &str, seq: u32| {
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                seq,
+                json!({ "instance": "w", "jobKey": j }),
+            )
+        };
+        assert!(buf.push_back_release_bounded(rel("j0", 10), 2).is_none());
+        assert!(buf.push_back_release_bounded(rel("j1", 11), 2).is_none());
+        // Third RELEASE at cap=2 collapses the OLDEST (j0) and names its seq.
+        let collapsed = buf.push_back_release_bounded(rel("j2", 12), 2);
+        assert_eq!(
+            collapsed,
+            Some(10),
+            "collapsed RELEASE's own frame seq is returned"
+        );
+        let releases: Vec<String> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            releases,
+            vec!["j1".to_string(), "j2".to_string()],
+            "oldest RELEASE collapsed, newest kept, count held at the cap"
+        );
+        assert!(
+            buf.bulk.iter().any(|bf| bf.frame.payload["chunk"] == "t"),
+            "the transcript tail is never collapsed by the RELEASE cap (ownership only)"
+        );
+    }
+
+    // Finding (round 16): collapsing the oldest outage RELEASE must also compact
+    // its matching CLAIM — the CLAIM is capacity-exempt like the RELEASE, so
+    // leaving it orphaned let the "bounded" outage buffer grow one CLAIM per
+    // completed job without limit.
+    #[test]
+    fn push_back_release_bounded_compacts_the_matching_claim() {
+        let mut buf = LaneBuffer::with_limits(64, 0);
+        let claim = |j: &str| {
+            Frame::new(
+                Lane::Control,
+                Family::Claim,
+                0,
+                json!({ "instance": "w", "jobKey": j }),
+            )
+        };
+        let rel = |j: &str| {
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": j }),
+            )
+        };
+        // Two in-flight jobs: CLAIM then RELEASE each (cap=2).
+        buf.push(claim("j0"));
+        buf.push(rel("j0"));
+        buf.push(claim("j1"));
+        buf.push(rel("j1"));
+        // A third job completes over the cap: it collapses j0's RELEASE AND CLAIM.
+        buf.push(claim("j2"));
+        assert!(buf.push_back_release_bounded(rel("j2"), 2).is_some());
+        let claims: Vec<String> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Claim)
+            .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            claims,
+            vec!["j1".to_string(), "j2".to_string()],
+            "the collapsed RELEASE's CLAIM is compacted with it — no orphaned CLAIM left behind"
+        );
+        let releases: Vec<String> = buf
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .map(|bf| bf.frame.payload["jobKey"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(releases, vec!["j1".to_string(), "j2".to_string()]);
+    }
+
+    // Round-26 finding: admitting an ARMED RELEASE under buffer pressure must NOT
+    // evict the CLOSING stream's own transcript tail — that tail is what the armed
+    // drain barrier flushes before the RELEASE, so shedding it would send the
+    // RELEASE ahead of a tail that never reaches the socket. Eviction must skip
+    // the closing stream and shed OTHER streams' lower-lane frames first.
+    #[test]
+    fn push_back_release_preserving_stream_keeps_the_closing_tail() {
+        // capacity 3: fill with [closing tail, other tail, unrelated control].
+        let mut buf = LaneBuffer::with_limits(3, 0);
+        let closing = compose_stream_id("w", "job-close");
+        let other = compose_stream_id("w", "job-other");
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": closing, "chunk": "tail" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": other, "chunk": "other" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Heartbeat,
+            0,
+            json!({ "instance": "w" }),
+        ));
+        assert_eq!(buf.len(), 3, "precondition: buffer is full");
+
+        // Admit the ARMED RELEASE for the closing stream: it must make room by
+        // evicting the OTHER stream's tail, never the closing stream's tail.
+        buf.push_back_release_preserving_stream(
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": "job-close" }),
+            ),
+            &closing,
+        );
+
+        let bulk_chunks: Vec<String> = buf
+            .bulk
+            .iter()
+            .map(|bf| bf.frame.payload["chunk"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            bulk_chunks,
+            vec!["tail".to_string()],
+            "the closing stream's tail is preserved; the other stream's tail was evicted"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the RELEASE itself is admitted (exempt, never dropped)"
+        );
+        // The preserved tail is still drained ahead of the RELEASE by the barrier.
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&closing)
+                .map(|f| f.payload["chunk"].as_str().unwrap().to_string()),
+            Some("tail".to_string()),
+            "the barrier can still find and flush the closing tail first"
+        );
+    }
+
+    // Round-26 finding (sibling): when ONLY the closing stream's tail and control
+    // frames remain, the armed RELEASE is still admitted (exempt) without shedding
+    // that tail — it never drops the RELEASE and never eats the kept stream.
+    #[test]
+    fn push_back_release_preserving_stream_never_drops_release_or_own_tail() {
+        let mut buf = LaneBuffer::with_limits(2, 0);
+        let closing = compose_stream_id("w", "job-close");
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            0,
+            json!({ "op": "produce", "stream": closing, "chunk": "tail" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Heartbeat,
+            0,
+            json!({ "instance": "w" }),
+        ));
+        assert_eq!(
+            buf.len(),
+            2,
+            "precondition: full with only own tail + control"
+        );
+
+        buf.push_back_release_preserving_stream(
+            Frame::new(
+                Lane::Control,
+                Family::Release,
+                0,
+                json!({ "instance": "w", "jobKey": "job-close" }),
+            ),
+            &closing,
+        );
+
+        assert!(
+            buf.bulk
+                .iter()
+                .any(|bf| bf.frame.payload["chunk"] == "tail"),
+            "the closing tail survives even when nothing else is evictable"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the RELEASE is admitted exempt even past the count cap"
+        );
+    }
+
+    // #6 (end-to-end on the client): completing more jobs than the cap while
+    // DISCONNECTED keeps the buffered RELEASE set bounded, and disarms the
+    // orphaned drain barrier of every collapsed RELEASE.
+    #[tokio::test]
+    async fn release_job_bounds_buffered_releases_during_an_outage() {
+        let client = HubClient::spawn(test_config(), &[]); // port 1: never connects
+        assert!(
+            !client.connected.load(Ordering::Relaxed),
+            "precondition: the client is disconnected (outage)"
+        );
+        // Arm a barrier for the oldest job exactly as `close()` would — by
+        // enqueueing its RELEASE with `armed = true`, which records the drain
+        // barrier keyed by that RELEASE frame's own seq. Capture that seq.
+        client.release_job("w", "job-0", true);
+        let first_seq = {
+            let set = client.release_barriers.lock().unwrap();
+            assert_eq!(set.len(), 1, "exactly the oldest job's barrier is armed");
+            *set.iter().next().unwrap()
+        };
+        for i in 1..RELEASE_OUTAGE_CAP + 5 {
+            client.release_job("w", &format!("job-{i}"), false);
+        }
+        let releases = client
+            .outbound
+            .lock()
+            .unwrap()
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .count();
+        assert_eq!(
+            releases, RELEASE_OUTAGE_CAP,
+            "the buffered RELEASE set stays bounded during an outage"
+        );
+        assert!(
+            !client.release_barriers.lock().unwrap().contains(&first_seq),
+            "a collapsed RELEASE's orphaned drain barrier is disarmed"
+        );
+        client.shutdown().await;
+    }
+
+    // #6 (sibling): a LIVE connection keeps the old behaviour — every RELEASE is
+    // admitted exempt and ordered, with NO outage cap (the cap must only bite
+    // while disconnected, or a busy worker would lose completions it can deliver).
+    #[tokio::test]
+    async fn release_job_is_unbounded_on_a_live_connection() {
+        let client = HubClient::spawn(test_config(), &[]); // never truly connects
+        client.connected.store(true, Ordering::Relaxed); // but drive the live path
+        for i in 0..RELEASE_OUTAGE_CAP + 5 {
+            client.release_job("w", &format!("job-{i}"), false);
+        }
+        let releases = client
+            .outbound
+            .lock()
+            .unwrap()
+            .control
+            .iter()
+            .filter(|bf| bf.frame.family == Family::Release)
+            .count();
+        assert_eq!(
+            releases,
+            RELEASE_OUTAGE_CAP + 5,
+            "a live connection keeps every RELEASE (no outage cap applies)"
+        );
+        client.shutdown().await;
+    }
+
+    // #7 (round 13): `release_job` removes the job from `in_flight` AND enqueues
+    // its RELEASE under the SINGLE outbound lock, so the pair is atomic with
+    // respect to a concurrent `resync_presence` (which snapshots `in_flight` and
+    // prunes/replaces buffered presence under the same lock). A resync that lands
+    // in the gap must never observe the job as finished and prune its CLAIM while
+    // the RELEASE has not yet been queued — that would leave the hub holding a
+    // RELEASE for an ownership it never saw. This test drives the live path and
+    // asserts the CLAIM is still buffered alongside the RELEASE (i.e. the resync
+    // could not have pruned it mid-release).
+    #[tokio::test]
+    async fn release_job_is_atomic_with_resync_presence() {
+        let client = HubClient::spawn(test_config(), &[]);
+        client.connected.store(true, Ordering::Relaxed); // live path
+        let _session = client.register_session("w", capability(), "job-1");
+        // Sanity: the CLAIM is buffered for the in-flight job.
+        assert!(
+            client
+                .outbound
+                .lock()
+                .unwrap()
+                .control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "precondition: CLAIM buffered for the live job"
+        );
+        // Complete the job. Under the fix this is one atomic outbound-locked
+        // step; a concurrent resync cannot interleave between the in_flight
+        // removal and the RELEASE enqueue.
+        client.release_job("w", "job-1", false);
+        {
+            let buf = client.outbound.lock().unwrap();
+            let has_claim = buf
+                .control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim);
+            let has_release = buf
+                .control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release);
+            assert!(
+                has_claim && has_release,
+                "CLAIM and RELEASE stay paired: a resync cannot prune the CLAIM before the RELEASE is queued"
+            );
+        }
+        client.shutdown().await;
+    }
+
+    // #8: the RELEASE drain barrier must be fenced to the CLOSING session's own
+    // queued transcript tail. `pop_lower_lane_for_stream` drains only frames of
+    // the named stream (oldest first), leaving every other session's frames —
+    // and the control lane — untouched, so a busy neighbour cannot starve the
+    // barrier or block steer/shutdown behind an unbounded global flush.
+    #[test]
+    fn pop_lower_lane_for_stream_drains_only_that_stream() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        let a = compose_stream_id("w", "A");
+        let b = compose_stream_id("w", "B");
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Register,
+            0,
+            json!({ "instance": "w" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            1,
+            json!({ "op": "produce", "stream": a, "chunk": "a1" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            2,
+            json!({ "op": "produce", "stream": b, "chunk": "b1" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Bulk,
+            Family::Relay,
+            3,
+            json!({ "op": "produce", "stream": a, "chunk": "a2" }),
+        ));
+        // Stream A yields only A's frames, oldest first.
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&a).unwrap().payload["chunk"],
+            "a1"
+        );
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&a).unwrap().payload["chunk"],
+            "a2"
+        );
+        assert!(
+            buf.pop_lower_lane_for_stream(&a).is_none(),
+            "A's tail is fully drained — the barrier stops at its own stream"
+        );
+        // Stream B's frame and the control frame are left in place.
+        assert_eq!(
+            buf.pop_lower_lane_for_stream(&b).unwrap().payload["chunk"],
+            "b1"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Register),
+            "a per-stream drain never touches the control lane"
+        );
+    }
+
+    // #3: on the TERMINAL shutdown drain, a job's transcript tail must reach the
+    // socket BEFORE its RELEASE (the RELEASE must never overtake the tail it
+    // orders against). `drain_control` now honours the armed barrier, flushing
+    // the job's own tail first. Driven over a hand-held socket so the test
+    // deterministically exercises `drain_control` rather than the live `drain`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drain_writes_a_jobs_tail_before_its_release() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<(Family, Value)>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send((frame.family, frame.payload)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // The HubClient itself targets a dead port (its own loop never connects),
+        // so the only traffic on the server is from the socket we drive by hand.
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let ws = connect(&cfg).await.expect("connect to the in-process hub");
+        let (mut write, _read) = ws.split();
+
+        let instance = "w-sd3";
+        let job = "job-sd3";
+        let stream = compose_stream_id(instance, job);
+        // Reproduce the shutdown state `close()` leaves: this job's transcript
+        // tail buffered (bulk) behind an ARMED RELEASE (control) still queued.
+        // The barrier is keyed by the RELEASE frame's seq (2, below).
+        client.release_barriers.lock().unwrap().insert(2);
+        {
+            let mut buf = client.outbound.lock().unwrap();
+            buf.push(Frame::new(
+                Lane::Bulk,
+                Family::Relay,
+                1,
+                json!({ "op": "produce", "stream": stream, "chunk": "tail" }),
+            ));
+            buf.push(Frame::new(
+                Lane::Control,
+                Family::Release,
+                2,
+                json!({ "instance": instance, "jobKey": job }),
+            ));
+        }
+
+        drain_control(&client, &mut write)
+            .await
+            .expect("shutdown drain writes the tail then the RELEASE");
+
+        let mut order: Vec<Family> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_produce = false;
+        let mut saw_release = false;
+        while !(saw_produce && saw_release) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (fam, _payload) = tokio::time::timeout(remaining, frames_rx.recv())
+                .await
+                .expect("timed out awaiting wire frames")
+                .expect("server frame channel closed");
+            order.push(fam);
+            match fam {
+                Family::Relay => saw_produce = true,
+                Family::Release => saw_release = true,
+                _ => {}
+            }
+        }
+        let idx = |f: Family| order.iter().position(|x| *x == f).unwrap();
+        assert!(
+            idx(Family::Relay) < idx(Family::Release),
+            "shutdown must write the transcript tail BEFORE the RELEASE, got {order:?}"
+        );
+        assert!(
+            !client.release_barriers.lock().unwrap().contains(&2),
+            "the barrier is consumed once its RELEASE is written"
+        );
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // #3: the per-session RELEASE drain barrier must flush a large transcript
+    // tail in BOUNDED batches, not one unpolled burst. With a tail longer than
+    // `batch_limit`, a single `drain` pass writes at most `batch_limit` tail
+    // frames and then YIELDS with the RELEASE still buffered and its barrier
+    // still armed — so cancel/steer/shutdown stay serviceable between passes. A
+    // later unbounded pass flushes the remainder and only then writes the
+    // RELEASE (after the tail, never before). Driven over a hand-held socket so
+    // the test exercises the live `drain` batch path deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_barrier_tail_flush_is_bounded_by_the_batch_limit() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Family>();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let ws = accept_async(sock).await.unwrap();
+            let (_write, mut read) = ws.split();
+            while let Some(Ok(Message::Binary(bytes))) = read.next().await {
+                if let Ok(frame) = decode_frame(&bytes) {
+                    if frames_tx.send(frame.family).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // The HubClient targets a dead port; the only socket traffic is the one
+        // we drive by hand.
+        let client = HubClient::spawn(test_config(), &[]);
+        let mut cfg = test_config();
+        cfg.url = format!("ws://127.0.0.1:{port}/na");
+        let ws = connect(&cfg).await.expect("connect to the in-process hub");
+        let (mut write, _read) = ws.split();
+
+        let instance = "w-bnd";
+        let job = "job-bnd";
+        let stream = compose_stream_id(instance, job);
+        // The shutdown state `close()` leaves, but with a MULTI-frame tail (3
+        // produce chunks) buffered behind an armed RELEASE. The barrier is keyed
+        // by the RELEASE frame's seq (9, below).
+        client.release_barriers.lock().unwrap().insert(9);
+        {
+            let mut buf = client.outbound.lock().unwrap();
+            for i in 0..3 {
+                buf.push(Frame::new(
+                    Lane::Bulk,
+                    Family::Relay,
+                    i + 1,
+                    json!({ "op": "produce", "stream": stream, "chunk": format!("c{i}") }),
+                ));
+            }
+            buf.push(Frame::new(
+                Lane::Control,
+                Family::Release,
+                9,
+                json!({ "instance": instance, "jobKey": job }),
+            ));
+        }
+
+        // First pass: batch_limit 2 may write at most two tail frames, then it
+        // yields with the RELEASE held back and the barrier still armed.
+        drain(&client, &mut write, 2)
+            .await
+            .expect("first bounded drain pass yields without error");
+
+        let mut first: Vec<Family> = Vec::new();
+        while let Ok(Some(fam)) =
+            tokio::time::timeout(Duration::from_millis(500), frames_rx.recv()).await
+        {
+            first.push(fam);
+        }
+        assert_eq!(
+            first,
+            vec![Family::Relay, Family::Relay],
+            "a bounded pass writes exactly batch_limit tail frames and no RELEASE, got {first:?}"
+        );
+        assert!(
+            client.release_barriers.lock().unwrap().contains(&9),
+            "the barrier stays armed while the tail is only partially flushed"
+        );
+
+        // Second pass: unbounded (0) flushes the remaining tail frame, consumes
+        // the barrier, and writes the RELEASE last.
+        drain(&client, &mut write, 0)
+            .await
+            .expect("final drain pass flushes the remaining tail then the RELEASE");
+
+        let mut rest: Vec<Family> = Vec::new();
+        while let Ok(Some(fam)) =
+            tokio::time::timeout(Duration::from_millis(500), frames_rx.recv()).await
+        {
+            rest.push(fam);
+        }
+        assert_eq!(
+            rest,
+            vec![Family::Relay, Family::Release],
+            "the final pass flushes the remaining tail, then the RELEASE, got {rest:?}"
+        );
+        assert!(
+            !client.release_barriers.lock().unwrap().contains(&9),
+            "the barrier is consumed once the whole tail and the RELEASE are written"
+        );
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    // Finding (round 21): the inbound-steer byte budget, like the transcript
+    // budget, must be partitioned by a FIXED per-slot share — NOT handed to each
+    // session in full. An mpsc channel's capacity is fixed at creation, so with
+    // up to `slot_count` concurrent sessions each holding a full-budget steer
+    // queue the aggregate retained memory would reach `slot_count ×
+    // buffer_byte_budget`. A fixed `budget / slot_count` share bounds the sum.
+    #[tokio::test]
+    async fn steer_budget_is_partitioned_by_fixed_slot_share() {
+        let mut cfg = test_config();
+        cfg.buffer_byte_budget = 8 * 1024 * 1024; // 8 MiB
+        let slots = vec![
+            ("w-s1".to_string(), capability()),
+            ("w-s2".to_string(), capability()),
+        ];
+        // Each of the 2 slots gets a FIXED 8 MiB / 2 = 4 MiB steer share.
+        let per_slot = steer_channel_bound(8 * 1024 * 1024 / 2);
+        assert!(
+            per_slot < steer_channel_bound(8 * 1024 * 1024),
+            "precondition: the per-slot share is strictly smaller than the whole budget"
+        );
+        let client = HubClient::spawn(cfg, &slots);
+        assert_eq!(
+            client.steer_bridge_bound, per_slot,
+            "the precomputed steer bound is the fixed per-slot share, not the whole budget"
+        );
+
+        // Each registered session's steer channel is created at exactly that
+        // fixed share — the first session does NOT get the whole budget.
+        let s1 = client.register_session("w-s1", capability(), "job-s1");
+        let s2 = client.register_session("w-s2", capability(), "job-s2");
+        let cap_of = |instance: &str, job: &str| {
+            let stream = compose_stream_id(instance, job);
+            client
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&stream)
+                .expect("steer channel registered")
+                .max_capacity()
+        };
+        assert_eq!(cap_of("w-s1", "job-s1"), per_slot);
+        assert_eq!(
+            cap_of("w-s2", "job-s2"),
+            per_slot,
+            "both live: each steer queue holds the same fixed share, so the sum stays in budget"
+        );
+        drop(s1);
+        drop(s2);
+        client.shutdown().await;
+    }
+
+    // Finding (round 21): a RELEASE drain barrier is keyed by the RELEASE frame's
+    // unique `seq`, NOT by the reusable stream id. A retried job on the SAME slot
+    // (identical instance+jobKey ⇒ identical stream) must get its OWN barrier
+    // without clobbering a predecessor RELEASE for that stream still buffered
+    // during an outage — otherwise the older barrier is lost and its transcript
+    // tail could be overtaken by its RELEASE on the wire. Each generation's
+    // barrier must coexist.
+    #[tokio::test]
+    async fn retried_job_on_the_same_slot_keeps_each_generations_barrier() {
+        let client = HubClient::spawn(test_config(), &[]); // port 1: never connects
+        assert!(
+            !client.connected.load(Ordering::Relaxed),
+            "precondition: disconnected, so RELEASEs buffer instead of draining"
+        );
+
+        // First generation of the job on this slot: close() arms its barrier.
+        let mut first = client.register_session("w-retry", capability(), "job-retry");
+        first.close().await;
+        assert_eq!(
+            client.release_barriers.lock().unwrap().len(),
+            1,
+            "the first generation's RELEASE barrier is armed"
+        );
+
+        // A RETRY of the SAME job on the SAME slot (identical stream). Arming its
+        // barrier must NOT drop the predecessor's — the core of the seq-keyed fix.
+        let mut second = client.register_session("w-retry", capability(), "job-retry");
+        assert_eq!(
+            client.release_barriers.lock().unwrap().len(),
+            1,
+            "registering the retry must not disturb the predecessor's armed barrier"
+        );
+        second.close().await;
+        assert_eq!(
+            client.release_barriers.lock().unwrap().len(),
+            2,
+            "both generations' barriers coexist, keyed by each RELEASE's unique seq"
+        );
+        client.shutdown().await;
+    }
+
+    // Finding (round 21): never send a real credential over plaintext ws:// to a
+    // remote host — the identity rides the upgrade URL's `?token=` query param,
+    // so an unencrypted remote ws:// puts it on the wire in the clear. `connect`
+    // fails closed for exactly that case and ONLY that case.
+    #[test]
+    fn insecure_credential_exposure_only_fires_for_remote_plaintext_with_a_real_secret() {
+        let with = |url: &str, secret: Option<&str>, token: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.url = url.into();
+            cfg.secret = secret.map(Into::into);
+            cfg.token = token.map(Into::into);
+            insecure_credential_exposure(&cfg)
+        };
+
+        // The one case that must be refused: a real secret over remote ws://.
+        assert!(with("ws://hub.example.com/na", Some("s3cr3t"), None));
+        assert!(
+            with("ws://hub.example.com:9000/na?x=1", None, Some("tok")),
+            "the deprecated token alias is a real credential too"
+        );
+
+        // Encrypted transport is always fine, remote or not.
+        assert!(!with("wss://hub.example.com/na", Some("s3cr3t"), None));
+
+        // Loopback / localhost never leaves the machine, so plaintext is fine.
+        assert!(!with("ws://127.0.0.1:8080/na", Some("s3cr3t"), None));
+        assert!(!with("ws://localhost/na", Some("s3cr3t"), None));
+        assert!(!with("ws://[::1]:8080/na", Some("s3cr3t"), None));
+        assert!(!with("ws://sub.localhost/na", Some("s3cr3t"), None));
+        assert!(
+            !with("ws://user:pass@127.0.0.1/na", Some("s3cr3t"), None),
+            "userinfo is stripped before the loopback host check"
+        );
+
+        // No real credential ⇒ nothing to protect, even remote plaintext.
+        assert!(!with("ws://hub.example.com/na", None, None));
+        assert!(
+            !with("ws://hub.example.com/na", Some(LOCAL_AGENTIC_TOKEN), None),
+            "the local no-auth dev token carries no secret worth protecting"
+        );
+    }
+
+    // Finding 2 (round 22): a non-empty capability `credential` is ALSO
+    // sensitive — it rides the same plaintext upgrade URL as `?capability=`.
+    // The gap: `NANO_AGENTIC_TOKEN=nano-local` is the sentinel, so the identity
+    // check exempts it, yet `from_env` keeps `config.credential` populated (the
+    // sentinel only forces `secure=true`). The guard must refuse remote ws://
+    // whenever a capability credential is present, independent of the identity.
+    #[test]
+    fn insecure_credential_exposure_fires_for_remote_plaintext_capability_credential() {
+        let with_cred = |url: &str, token: Option<&str>, credential: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.url = url.into();
+            cfg.secret = None;
+            cfg.token = token.map(Into::into);
+            cfg.credential = credential.map(Into::into);
+            insecure_credential_exposure(&cfg)
+        };
+
+        // The exact bypass: sentinel identity + capability credential + remote
+        // plaintext. The sentinel exempts the identity, but the capability
+        // credential must still force a refusal.
+        assert!(
+            with_cred(
+                "ws://hub.example.com/na",
+                Some(LOCAL_AGENTIC_TOKEN),
+                Some("cap-secret")
+            ),
+            "a capability credential over remote plaintext must be refused even with the local token"
+        );
+        // A capability credential with no identity at all is still sensitive.
+        assert!(with_cred(
+            "ws://hub.example.com/na",
+            None,
+            Some("cap-secret")
+        ));
+
+        // Encrypted transport is fine even with a capability credential.
+        assert!(!with_cred(
+            "wss://hub.example.com/na",
+            Some(LOCAL_AGENTIC_TOKEN),
+            Some("cap-secret")
+        ));
+        // Loopback is fine — the credential never leaves the machine.
+        assert!(!with_cred(
+            "ws://127.0.0.1/na",
+            Some(LOCAL_AGENTIC_TOKEN),
+            Some("cap-secret")
+        ));
+        // An empty credential is not a secret worth protecting.
+        assert!(!with_cred(
+            "ws://hub.example.com/na",
+            Some(LOCAL_AGENTIC_TOKEN),
+            Some("")
+        ));
+    }
+
+    // Finding (round 23): URI schemes are case-insensitive (RFC 3986 §3.1) and
+    // `connect_async` accepts mixed-case spellings like `Ws://`. A
+    // case-sensitive guard would let `Ws://hub…` carry a real credential over
+    // plaintext. The guard must fold the scheme before deciding — and must keep
+    // treating every case variant of `wss://` as encrypted (never refused).
+    #[test]
+    fn insecure_credential_exposure_is_case_insensitive_about_the_scheme() {
+        let with = |url: &str, secret: Option<&str>, token: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.url = url.into();
+            cfg.secret = secret.map(Into::into);
+            cfg.token = token.map(Into::into);
+            insecure_credential_exposure(&cfg)
+        };
+
+        // Every case spelling of a remote plaintext `ws://` must still be
+        // refused when a real secret is present.
+        for url in [
+            "Ws://hub.example.com/na",
+            "wS://hub.example.com/na",
+            "WS://hub.example.com/na",
+            "ws://hub.example.com/na",
+        ] {
+            assert!(
+                with(url, Some("s3cr3t"), None),
+                "mixed-case plaintext scheme {url} must not bypass the guard"
+            );
+        }
+
+        // Every case spelling of `wss://` is TLS-encrypted and must never be
+        // refused, even with a real secret.
+        for url in [
+            "Wss://hub.example.com/na",
+            "wSS://hub.example.com/na",
+            "WSS://hub.example.com/na",
+            "wss://hub.example.com/na",
+        ] {
+            assert!(
+                !with(url, Some("s3cr3t"), None),
+                "encrypted scheme {url} must never be refused"
+            );
+        }
+
+        // Loopback remains exempt regardless of scheme case.
+        assert!(!with("WS://127.0.0.1/na", Some("s3cr3t"), None));
+    }
+
+    #[test]
+    fn is_local_host_recognises_every_loopback_spelling() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("LOCALHOST"));
+        assert!(is_local_host("app.localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("127.5.6.7")); // all of 127.0.0.0/8 is loopback
+        assert!(is_local_host("::1"));
+        assert!(!is_local_host("hub.example.com"));
+        assert!(!is_local_host("10.0.0.1"));
+        assert!(!is_local_host("localhost.example.com"));
+        assert!(!is_local_host(""));
+    }
+}

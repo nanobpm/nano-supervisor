@@ -203,6 +203,35 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 
     let mut handles = Vec::new();
     let mut running_hires = 0usize;
+    // Agentic hub (issue #10): one WebSocket per daemon, shared across every
+    // slot. `HubConfig::from_env()` enables it by default (local-first) and
+    // returns `None` only when `NANO_AGENTIC` is an explicit off value
+    // (`off`/`0`/`false`/`no`); with the hub off the daemon runs with no
+    // connection, exactly as before. The connection task reconnects on its own
+    // and buffers while down.
+    //
+    // Build the slot identities FIRST so the client can REGISTER every
+    // configured slot at spawn (register-on-connect): each `(worker_name,
+    // capability)` pair is one slot's presence identity, making idle capacity
+    // visible on the hub independently of any job. The capability mirrors what
+    // the slot's ACP arm would declare for a job (`slot.rs`), so a slot's
+    // presence is identical whether it is idle or running.
+    let mut slot_identities: Vec<(String, serde_json::Value)> = Vec::new();
+    for hire in &runnable {
+        for slot_idx in 0..opts.slots {
+            let worker_name = format!("{host}-nanod-{}-{slot_idx}", hire.name);
+            slot_identities.push((
+                worker_name,
+                serde_json::json!({
+                    "cognition": hire.rank,
+                    "family": hire.model,
+                    "host": host,
+                }),
+            ));
+        }
+    }
+    let hub = crate::hub::HubConfig::from_env()
+        .map(|cfg| crate::hub::HubClient::spawn(cfg, &slot_identities));
     // The in-process slots this daemon runs, as (worker id, profile) pairs — the
     // control socket's `status` reply reports each as a worker
     // (nanobpm/nano-supervisor#8).
@@ -233,6 +262,8 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 keep_runs: false,
                 connection: decision.pin.clone(),
                 connection_profile: decision.profile.clone(),
+                hub: hub.clone(),
+                protocol_override: std::env::var("NANO_AGENTIC_PROTOCOL").ok(),
             });
             // Issue #41 sanity guard: judge each SLOT's own job-type matrix, not
             // the daemon-wide aggregate `all_types` the shared `jobs` was built
@@ -307,6 +338,7 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
                 // surfacing the error.
                 abort_slots_and_cleanup(
                     handles,
+                    hub.as_ref(),
                     &shutdown_tx,
                     &sock_path,
                     &state_home.join("supervisor.json"),
@@ -359,8 +391,13 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
     // (via `request_shutdown`) keeps that escalation, so re-read the SETTLED
     // reason after draining rather than trusting the snapshot — otherwise the
     // daemon would exit zero and mask the fatal fencing failure.
+    // Drain the slots, but KEEP the `JoinHandle`s: on a timeout they are needed
+    // to abort the still-running slots below. Consuming them here would only
+    // DETACH a stuck slot (dropping a `JoinHandle` never aborts its task),
+    // leaving it free to enqueue hub frames after the hub has deregistered.
+    let mut handles = handles;
     let drain = async {
-        for h in handles {
+        for h in &mut handles {
             let _ = h.await;
         }
     };
@@ -412,6 +449,34 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
         log("fatal: a slot could not fence its work while leasing is enabled (the default; engine not issuing leases); the fatal escalation arrived during the drain — exiting non-zero");
     }
 
+    // Reap any slot that outlived the drain BEFORE the hub deregisters. When the
+    // drain timed out, `drain_within_deadline` dropped the drain future — which
+    // only DETACHES the not-yet-completed slots (dropping a `JoinHandle` never
+    // aborts its task). A detached slot still holds its hub session and can keep
+    // enqueueing CLAIM/transcript/RELEASE frames, so shutting the hub down first
+    // would emit DEREGISTER (false offline presence) while those slots run on and
+    // push frames into a buffer nothing drains. Abort every handle (`abort()` is
+    // a no-op on an already-finished task), then join ONLY the ones still
+    // running: the drain above already polled the finished handles to completion,
+    // and awaiting a completed `JoinHandle` a second time panics (`JoinHandle
+    // polled after completion`). Finished unconsumed handles are simply dropped —
+    // their tasks have already ended — so no slot outlives the hub deregistration
+    // below.
+    for h in &handles {
+        h.abort();
+    }
+    for h in &mut handles {
+        if !h.is_finished() {
+            let _ = h.await;
+        }
+    }
+
+    // Stop the agentic hub (issue #10): deregister the worker and let its
+    // connection task exit. Best-effort — a never-connected hub is a no-op.
+    if let Some(hub) = &hub {
+        hub.shutdown().await;
+    }
+
     // Tear the control socket down: stop accepting, remove the socket file and
     // the `supervisor.json` descriptor so a later `supervisor status` reports
     // "not running" rather than probing a stale socket.
@@ -438,10 +503,13 @@ pub async fn run(opts: DaemonOptions) -> Result<()> {
 /// and leave the bound socket pathname and any published descriptor behind as
 /// stale leftovers. Instead, tell the slots to abort in-flight work, join every
 /// one, and remove the socket + descriptor, so a half-started daemon never
-/// orphans live slots or a stale socket file.
+/// orphans live slots or a stale socket file. The hub client (if any) is also
+/// shut down here — its task holds its own `Arc`, so merely dropping the local
+/// handle would leave it running without ever emitting its DEREGISTER.
 #[cfg(unix)]
 async fn abort_slots_and_cleanup(
     handles: Vec<tokio::task::JoinHandle<()>>,
+    hub: Option<&Arc<crate::hub::HubClient>>,
     shutdown_tx: &watch::Sender<slot::Shutdown>,
     sock_path: &Path,
     descriptor_path: &Path,
@@ -450,6 +518,13 @@ async fn abort_slots_and_cleanup(
     for h in handles {
         h.abort();
         let _ = h.await;
+    }
+    // The hub task holds its own `Arc<HubClient>`, so dropping the local handle
+    // on the fail path would NOT stop it — it would keep running without ever
+    // emitting the clean-shutdown DEREGISTER. Await its shutdown here so a
+    // half-started daemon tears the hub down just like the normal exit path.
+    if let Some(hub) = hub {
+        hub.shutdown().await;
     }
     let _ = std::fs::remove_file(sock_path);
     let _ = std::fs::remove_file(descriptor_path);
@@ -2360,6 +2435,40 @@ mod tests {
         assert!(drained, "an immediately-finished drain must report success");
     }
 
+    // Regression (JoinHandle polled after completion): on a NORMAL drain the
+    // drain future has already polled every slot `JoinHandle` to completion, so
+    // the post-drain reap must NOT await them again — awaiting a completed
+    // `JoinHandle` panics. This mirrors the production sequence (drain to
+    // completion, then abort + re-join only the unfinished handles) and would
+    // panic before the fix.
+    #[tokio::test]
+    async fn reap_after_clean_drain_does_not_reawait_finished_handles() {
+        let (tx, _rx0) = watch::channel(slot::Shutdown::Drain);
+        let mut rx = tx.subscribe();
+        let mut handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..3).map(|_| tokio::spawn(async {})).collect();
+
+        // The drain awaits every handle to completion (the normal-shutdown path).
+        let drain = async {
+            for h in &mut handles {
+                let _ = h.await;
+            }
+        };
+        let drained = drain_within_deadline(drain, &mut rx, DRAIN_GRACE, FORCE_DRAIN_GRACE).await;
+        assert!(drained, "all slots finished, so the drain reports success");
+
+        // The reap must not panic on the already-completed handles: abort all,
+        // then await only the ones still running.
+        for h in &handles {
+            h.abort();
+        }
+        for h in &mut handles {
+            if !h.is_finished() {
+                let _ = h.await;
+            }
+        }
+    }
+
     // A parsed `stop` must publish the shutdown BEFORE the reply is written, so a
     // client that disconnects after sending the request (or a failed interim
     // frame write) cannot leave the daemon running forever (nanobpm/nano-supervisor#8).
@@ -2432,7 +2541,7 @@ mod tests {
             .collect();
         let probes: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
 
-        abort_slots_and_cleanup(handles, &tx, &sock_path, &descriptor_path).await;
+        abort_slots_and_cleanup(handles, None, &tx, &sock_path, &descriptor_path).await;
 
         for p in &probes {
             assert!(p.is_finished(), "every slot must be stopped, not detached");

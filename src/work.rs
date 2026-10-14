@@ -364,6 +364,19 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         "worker {worker_name} for hire \"{}\" [{}] over job types {job_types:?}",
         hire.name, hire.rank
     ));
+    // Agentic hub (issue #10): register this worker's single slot identity at
+    // spawn (register-on-connect), so it is visible on the hub even before its
+    // first job. The capability mirrors what the slot's ACP arm declares.
+    let slot_identities = vec![(
+        worker_name.clone(),
+        serde_json::json!({
+            "cognition": hire.rank,
+            "family": hire.model,
+            "host": short_hostname(),
+        }),
+    )];
+    let hub = crate::hub::HubConfig::from_env()
+        .map(|cfg| crate::hub::HubClient::spawn(cfg, &slot_identities));
     let cfg = Arc::new(SlotConfig {
         hire,
         worker_name,
@@ -380,6 +393,8 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         keep_runs: opts.keep_runs,
         connection: decision.pin.clone(),
         connection_profile: decision.profile.clone(),
+        hub: hub.clone(),
+        protocol_override: std::env::var("NANO_AGENTIC_PROTOCOL").ok(),
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));
@@ -425,6 +440,11 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         }
     }
     reaper.abort();
+    // Stop the agentic hub (issue #10) before cleanup: deregister and let its
+    // connection task exit. A never-configured hub is `None` and a no-op.
+    if let Some(hub) = &hub {
+        hub.shutdown().await;
+    }
     // Drop this worker's namespace on a clean exit, unless `--keep-runs`. Only
     // remove it when EMPTY: `execute` intentionally retains failed run dirs for
     // post-mortem and age-based reaping, so a recursive delete here would erase

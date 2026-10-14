@@ -29,6 +29,19 @@ impl Protocol {
             _ => Protocol::Pipe,
         }
     }
+
+    /// Parse a protocol override token (`acp`/`pipe`), returning `None` for an
+    /// unrecognised value so the caller keeps the hire's configured protocol
+    /// rather than forcing a wrong one. Used for the `NANO_AGENTIC_PROTOCOL`
+    /// harness override (issue #10), which must not silently coerce a typo to
+    /// `pipe` the way the tolerant hire-field parse does.
+    pub fn parse_override(raw: &str) -> Option<Protocol> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "acp" => Some(Protocol::Acp),
+            "pipe" => Some(Protocol::Pipe),
+            _ => None,
+        }
+    }
 }
 
 /// One hire (persisted agent profile) from `config.json`.

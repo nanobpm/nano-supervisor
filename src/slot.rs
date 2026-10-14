@@ -136,6 +136,17 @@ pub struct SlotConfig {
     /// The pinned connection fully resolved, when it names a c8ctl profile —
     /// the seed content for the agent's isolated `profiles.json`.
     pub connection_profile: Option<crate::profile::Profile>,
+    /// The shared agentic-hub client (issue #10), when `NANO_AGENTIC` enabled it.
+    /// One connection per daemon is multiplexed across all slots; each job opens
+    /// a session on it for presence, live transcript, and inbound steer. `None`
+    /// runs every job exactly as before, with no hub connection.
+    pub hub: Option<std::sync::Arc<crate::hub::HubClient>>,
+    /// The `NANO_AGENTIC_PROTOCOL` harness override (`pipe`/`acp`), resolved
+    /// INDEPENDENTLY of the hub connection: it is a work-time harness override
+    /// (the reference worker applies it with or without visibility enabled), so
+    /// it must reach protocol dispatch even when `hub` is `None`. `None` means
+    /// no override — the hire's configured protocol stands.
+    pub protocol_override: Option<String>,
 }
 
 /// Run the slot until `shutdown` is set. Never returns an error — a slot is
@@ -2334,11 +2345,54 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Some(prepared.agent_cwd()),
     )?;
     let payload = build_agent_payload(&cfg, &job, &env);
-    let acp = cfg.hire.protocol == Protocol::Acp;
+    // Use the EFFECTIVE protocol (the hub's `NANO_AGENTIC_PROTOCOL` override, if
+    // any), resolved in one place, so this `acp` flag — which selects the
+    // result-nudge encoding below — never diverges from how `run_agent` actually
+    // drives the agent. Computing it from `cfg.hire.protocol` alone would wrap a
+    // `pipe → acp` nudge in pipe framing (or send raw ACP text to a pipe harness)
+    // on the override path.
+    let acp = effective_protocol(&cfg) == Protocol::Acp;
+
+    // Agentic hub (issue #10): open ONE session for this job, shared across the
+    // first turn and any result-nudge turn (the Node worker's per-job
+    // `relaySession`). Opening it here — not per `run_agent` call — means the
+    // job is CLAIMed exactly once and RELEASEd exactly once (on `close` below),
+    // so the nudge turn reuses the same stream + CLAIM instead of re-registering
+    // and overwriting the stream-keyed RELEASE barrier. Absent the hub, this is
+    // `None` and both turns run unchanged.
+    //
+    // Gate on the EFFECTIVE `acp` protocol: only ACP turns attach a transcript
+    // bridge or steer (see `run_agent`), so a `Protocol::Pipe` job has nothing
+    // to relay. CLAIMing a session for a pipe job would make a default pipe job
+    // appear owned on the hub with no transcript/steer ever flowing — the
+    // pipe/PTY relay adapter is deferred scope (#10). Skip the session entirely
+    // until it exists.
+    let mut hub_session = cfg.hub.as_ref().filter(|_| acp).map(|hub| {
+        // Worker identity (instance) + declared capability for presence,
+        // matching the Node emit client's `register {instance, capability}`
+        // (`cognition` = hire rank, `family` = hire model). Gated by
+        // `should_register_hub_session` (ACP-only); `acp` here is that same
+        // effective-protocol flag computed above.
+        debug_assert_eq!(acp, should_register_hub_session(&cfg));
+        let capability = serde_json::json!({
+            "cognition": cfg.hire.rank,
+            "family": cfg.hire.model,
+            "host": crate::daemon::short_hostname(),
+        });
+        hub.register_session(&cfg.worker_name, capability, &key)
+    });
 
     // First turn: every protocol receives the JSON job payload (Node's
     // `buildAgentStdin` — ACP delivers it verbatim as the `session/prompt` text).
-    let first = run_agent(&cfg, &key, &agent_cwd, &payload.to_string(), &agent_env).await;
+    let first = run_agent(
+        &cfg,
+        &key,
+        &agent_cwd,
+        &payload.to_string(),
+        &agent_env,
+        hub_session.as_mut(),
+    )
+    .await;
 
     // Result-nudge (Node #678): a clean run that produced output but no usable
     // result gets exactly ONE bounded "emit your result now" turn, in a fresh
@@ -2370,7 +2424,15 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         } else {
             nudge_payload(&payload, &nudge_text).to_string()
         };
-        let nudge = run_agent(&cfg, &key, &agent_cwd, &stdin, &agent_env).await;
+        let nudge = run_agent(
+            &cfg,
+            &key,
+            &agent_cwd,
+            &stdin,
+            &agent_env,
+            hub_session.as_mut(),
+        )
+        .await;
         if let Some(e) = &nudge.error {
             log(&format!("job {key}: re-emit nudge rerun failed — {e}"));
         }
@@ -2411,6 +2473,17 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
                 "re-emit nudge did not recover one"
             }
         ));
+    }
+
+    // Agentic hub (issue #10): both turns are done — close the job's session.
+    // This flushes the final turn's transcript tail on the runtime (bounded,
+    // non-parking) and enqueues the job's single RELEASE behind its drain
+    // barrier, so the RELEASE never overtakes the tail on the wire. After this
+    // the session's `Drop` is a no-op (the barrier is already armed). Opened
+    // once before the first turn and shared across the nudge, the job is thus
+    // CLAIMed once and RELEASEd once.
+    if let Some(session) = hub_session.as_mut() {
+        session.close().await;
     }
 
     // Read the agent's structured result, selecting the first EFFECTIVE source
@@ -2650,6 +2723,33 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     Ok(settle)
 }
 
+/// Resolve the EFFECTIVE harness protocol for this hire: the `NANO_AGENTIC_PROTOCOL`
+/// override (`pipe`/`acp`) when present and recognised, otherwise the hire's
+/// configured protocol. Resolved in ONE place so every consumer — `run_agent`'s
+/// dispatch and the caller's result-nudge encoding — agrees on the protocol under
+/// an override (an unrecognised value is ignored, so the configured protocol
+/// stands). The override is a work-time harness selector, NOT a hub setting: it
+/// is read from `SlotConfig::protocol_override`, which is populated independently
+/// of the optional hub client, so it applies even when visibility is off or has
+/// no URL (matching the reference worker).
+fn effective_protocol(cfg: &SlotConfig) -> Protocol {
+    cfg.protocol_override
+        .as_deref()
+        .and_then(crate::state::Protocol::parse_override)
+        .unwrap_or(cfg.hire.protocol)
+}
+
+/// Whether to open (and CLAIM) a job-level hub session for this job. True only
+/// when the hub is configured AND the effective protocol is ACP: only ACP turns
+/// attach a transcript bridge or steer, so a `Protocol::Pipe` job has nothing to
+/// relay. CLAIMing a session for a pipe job would make a default pipe job appear
+/// owned on the hub with no transcript/steer ever flowing — the pipe/PTY relay
+/// adapter is deferred scope (#10). Gating here keeps ownership honest until it
+/// exists.
+fn should_register_hub_session(cfg: &SlotConfig) -> bool {
+    cfg.hub.is_some() && effective_protocol(cfg) == Protocol::Acp
+}
+
 /// Run the hired agent once with `stdin` (the ACP prompt text, or the pipe
 /// harness's stdin) and report what happened. Never errors: a harness failure is
 /// a failed [`RunResult`], settled by the caller.
@@ -2659,8 +2759,15 @@ async fn run_agent(
     cwd: &crate::safecwd::CwdHandle,
     stdin: &str,
     env: &[(String, String)],
+    hub_session: Option<&mut crate::hub::HubSession>,
 ) -> RunResult {
-    match cfg.hire.protocol {
+    // `NANO_AGENTIC_PROTOCOL` is a harness-protocol override (the referenced
+    // worker's `pipe`/`acp` selector), not a WebSocket subprotocol. Resolve it
+    // through the shared `effective_protocol` so this dispatch and the caller's
+    // nudge encoding can never disagree — an unrecognised value is ignored (the
+    // hire's configured protocol stands) rather than coerced.
+    let protocol = effective_protocol(cfg);
+    match protocol {
         Protocol::Acp => {
             // Plugin 1.70.1 parity: a plain ACP hire whose command carries no
             // ACP selector is launched with `--acp` appended, so the agent starts
@@ -2677,6 +2784,21 @@ async fn run_agent(
                     }
                 }
             };
+            // Agentic hub (issue #10): attach this turn to the job's session so
+            // its live transcript appears on the hub and inbound steer reaches
+            // the running ACP turn. The session is opened ONCE per job by the
+            // caller (`execute`) and shared across both the first run and any
+            // result-nudge turn (the Node worker's per-job relaySession), so the
+            // job is CLAIMed/RELEASEd exactly once and its stream-keyed RELEASE
+            // barrier is never overwritten by a second registration. This opens
+            // a fresh transcript bridge for THIS turn; `detach_turn` below
+            // flushes its tail without releasing the job.
+            let mut hub_session = hub_session;
+            if let Some(session) = hub_session.as_mut() {
+                if let Some((transcript, steer)) = session.open_turn() {
+                    agent.attach_hub(transcript, steer);
+                }
+            }
             // Name the pinned directory for the log line, recovered through
             // the fd so a post-prepare rename cannot put a stale pathname in
             // the log; fall back to the raw handle debug if it cannot be read.
@@ -2690,7 +2812,22 @@ async fn run_agent(
                 whereami
             ));
             let out = agent.run(cwd, stdin, cfg.idle_timeout).await;
+            // Reclaim the job-keyed steer receiver BEFORE `shutdown` consumes
+            // the agent, so it can be returned to the session for the next turn.
+            let steer_back = agent.take_steer();
             agent.shutdown().await;
+            // Flush THIS turn's transcript tail on the runtime (bounded) WITHOUT
+            // releasing the job: the session is job-level and shared with any
+            // result-nudge turn, so the RELEASE is enqueued only when the caller
+            // (`execute`) closes the session after the final turn. `detach_turn`
+            // awaits the bridge drain without parking a Tokio worker thread, so
+            // this turn's tail is buffered ahead of the next turn (or the single
+            // job-level RELEASE), preserving tail-before-RELEASE on the wire.
+            // Returning the steer receiver first keeps the next turn steerable.
+            if let Some(session) = hub_session.as_mut() {
+                session.restore_steer(steer_back);
+                session.detach_turn().await;
+            }
             match out {
                 Ok(o) => {
                     log(&format!(
@@ -3598,7 +3735,116 @@ mod tests {
                 base_url: Some("http://merlin:8080".into()),
                 ..Default::default()
             }),
+            hub: None,
+            protocol_override: None,
         }
+    }
+
+    // Finding (round 6): the `NANO_AGENTIC_PROTOCOL` override is resolved in ONE
+    // place, so `run_agent`'s dispatch and the result-nudge caller never disagree
+    // about the effective protocol. A recognised override flips the hire protocol
+    // both ways; an unrecognised one is ignored. Finding (round 16): the override
+    // is a work-time harness selector resolved INDEPENDENTLY of the hub client,
+    // so it applies even when no hub is configured (`hub: None`).
+    #[tokio::test]
+    async fn effective_protocol_honours_the_override() {
+        // No override: the hire's configured protocol stands.
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Pipe;
+        assert_eq!(effective_protocol(&c), Protocol::Pipe);
+        c.hire.protocol = Protocol::Acp;
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+
+        // Override pipe -> acp (flips a Pipe hire) — with NO hub configured,
+        // proving the override is independent of the hub connection.
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Pipe;
+        c.hub = None;
+        c.protocol_override = Some("acp".into());
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+
+        // Override acp -> pipe (flips an Acp hire), still hub-less.
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Acp;
+        c.hub = None;
+        c.protocol_override = Some("pipe".into());
+        assert_eq!(effective_protocol(&c), Protocol::Pipe);
+
+        // Unrecognised / empty override is ignored: the hire protocol stands.
+        let mut c = cfg();
+        c.hire.protocol = Protocol::Acp;
+        c.protocol_override = Some("garbage".into());
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+        c.protocol_override = Some(String::new());
+        assert_eq!(effective_protocol(&c), Protocol::Acp);
+    }
+
+    // Finding (round 18): a hub session is opened/CLAIMed ONLY for ACP jobs. A
+    // `Protocol::Pipe` job attaches no transcript or steer in `run_agent`, so
+    // CLAIMing it would make a default pipe job appear owned on the hub with no
+    // relay flowing — the pipe/PTY relay adapter is deferred scope (#10). The
+    // gate keys on the EFFECTIVE protocol, so a `pipe → acp` override opens a
+    // session and an `acp → pipe` override does not.
+    #[tokio::test]
+    async fn hub_session_is_opened_only_for_acp_jobs() {
+        fn hub() -> std::sync::Arc<crate::hub::HubClient> {
+            let hub_cfg = crate::hub::HubConfig {
+                url: "ws://127.0.0.1:1/agentic".into(),
+                token: Some("t".into()),
+                secret: None,
+                credential: None,
+                permission: Some("yolo".into()),
+                terminal: false,
+                attribution: Some("nano".into()),
+                buffer_capacity: 8,
+                buffer_byte_budget: 0,
+            };
+            crate::hub::HubClient::spawn(hub_cfg, &[])
+        }
+
+        // No hub → never, regardless of protocol.
+        let mut c = cfg();
+        c.hub = None;
+        c.hire.protocol = Protocol::Acp;
+        assert!(!should_register_hub_session(&c), "no hub, no session");
+
+        // Hub + Pipe hire → gated OFF (nothing to relay yet).
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Pipe;
+        assert!(
+            !should_register_hub_session(&c),
+            "pipe job must not CLAIM a hub session"
+        );
+
+        // Hub + ACP hire → ON.
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Acp;
+        assert!(
+            should_register_hub_session(&c),
+            "acp job opens a hub session"
+        );
+
+        // Override wins: pipe hire forced to acp → ON.
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Pipe;
+        c.protocol_override = Some("acp".into());
+        assert!(
+            should_register_hub_session(&c),
+            "pipe→acp override opens a session"
+        );
+
+        // Override wins the other way: acp hire forced to pipe → OFF.
+        let mut c = cfg();
+        c.hub = Some(hub());
+        c.hire.protocol = Protocol::Acp;
+        c.protocol_override = Some("pipe".into());
+        assert!(
+            !should_register_hub_session(&c),
+            "acp→pipe override suppresses the session"
+        );
     }
 
     /// A hermetic, unique `result.json` path for a `build_agent_env` test.

@@ -28,7 +28,14 @@ clap = { version = "4", features = ["derive"] }
 # or argument containing spaces can be preserved by quoting (src/main.rs).
 shlex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps JSON object keys in insertion order through the live hub
+# codec (src/hub/frame.rs), so REGISTER/CLAIM/transcript payloads serialize
+# byte-exactly as the golden corpus and the hub expect. Without it the root-only
+# `cargo build` backs `serde_json::Value` with a sorted `BTreeMap` and reorders
+# keys (e.g. `{instance, capability}` -> `{capability, instance}`), diverging
+# from the wire contract — the workspace build only gets this feature
+# transitively from `contract-tests`, so it MUST be declared here too.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Derive the supervisor control-socket path exactly like the Node plugin
 # (`join(tmpdir(), "c8ctl-nano-sup-<sha1(home)[:8]>.sock")`) so `supervisor
 # status` / `workforce status` can probe a running daemon. Already in the
@@ -50,6 +57,15 @@ ryu = "1"
 # mutual exclusion) and the lock file never persists under the state home.)
 fs2 = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal", "fs", "net"] }
+# Worker-side agentic-hub client (issue #10): one WebSocket per daemon,
+# multiplexed across all slots. `rustls-tls-native-roots` reuses the SDK's
+# already-locked rustls stack (same rustls/tokio-rustls/rustls-native-certs the
+# `camunda-orchestration-sdk`/`reqwest` `rustls` features pull), so `wss://`
+# connects over TLS without a second TLS backend and `--locked` stays satisfied.
+# Plaintext `ws://` to a non-local host is refused when a real secret/token is
+# configured (see `connect`), so a credential is never sent in cleartext.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Parent-death cleanup: PR_SET_PDEATHSIG (Linux) and the kqueue watchdog (macOS).
 # Also the `kill(pid, 0)` liveness probe for cross-process run-dir sweep safety (worker.rs).
 [target.'cfg(unix)'.dependencies]

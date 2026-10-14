@@ -59,6 +59,12 @@ struct Shared {
     effective_turns: usize,
     permissions_granted: usize,
     last_activity: Option<Instant>,
+    /// Optional live sink for raw ACP `session/update` objects (issue #10): when
+    /// a job runs under the agentic hub, every update is forwarded here so the
+    /// hub session can bridge it to a transcript frame. `None` keeps the agent's
+    /// behaviour identical to a hub-less run. Bounded (see `register_session`):
+    /// on overflow the update is dropped rather than blocking the ACP read loop.
+    transcript: Option<mpsc::Sender<Value>>,
 }
 
 pub struct Agent {
@@ -81,6 +87,15 @@ pub struct Agent {
     /// `execute` on lease loss instead of calling `shutdown`), so descendants the
     /// agent started cannot survive and overlap the job's redelivery.
     group_guard: crate::pdeath::GroupGuard,
+    /// Optional inbound-steer receiver (issue #10): typed hub-delivered controls
+    /// applied to the running ACP turn. SUPPORTED CONTRACT: `prompt` and `cancel`
+    /// ONLY — a `prompt` is injected as additional `session/prompt` input and a
+    /// `cancel` is mapped to `session/cancel`. A `permission` steer is NOT
+    /// routed: this client auto-answers every ACP `session/request_permission`
+    /// itself under the `yolo` policy, so there is never an outstanding request
+    /// for a hub outcome to resolve; the steer task logs and drops it (see
+    /// [`Agent::run`]). `None` runs the turn exactly as a hub-less agent does.
+    steer: Option<mpsc::Receiver<crate::hub::control::ControlFrame>>,
 }
 
 impl Agent {
@@ -152,10 +167,53 @@ impl Agent {
             shared,
             next_id: 1,
             group_guard,
+            steer: None,
         })
     }
 
+    /// Attach the hub session's sinks (issue #10) before `run`: `transcript`
+    /// receives every ACP `session/update` for live bridging, and `steer` (when
+    /// this turn holds it) delivers hub-inbound prompt text to inject into the
+    /// running turn. A hub-less run never calls this and behaves identically.
+    /// The steer receiver is job-keyed and shared across a job's turns: `run`
+    /// recovers it when the turn ends (rather than dropping it), and the caller
+    /// hands it back to the session via [`take_steer`](Self::take_steer) so a
+    /// later result-nudge turn stays steerable.
+    pub fn attach_hub(
+        &mut self,
+        transcript: mpsc::Sender<Value>,
+        steer: Option<mpsc::Receiver<crate::hub::control::ControlFrame>>,
+    ) {
+        self.shared.lock().unwrap().transcript = Some(transcript);
+        self.steer = steer;
+    }
+
+    /// Reclaim the steer receiver after a turn so the caller can return it to
+    /// the job's session for the next turn. `run` stores the recovered receiver
+    /// in `self.steer` when the turn ends; this hands ownership back out.
+    pub fn take_steer(&mut self) -> Option<mpsc::Receiver<crate::hub::control::ControlFrame>> {
+        self.steer.take()
+    }
+
     async fn request(&mut self, method: &str, params: Value, idle: Duration) -> Result<Value> {
+        self.request_signalling(method, params, idle, None).await
+    }
+
+    /// Like [`request`](Self::request), but fires `on_sent` the instant the
+    /// request frame has been accepted by `out` (before awaiting the response).
+    /// Used to GATE inbound steer behind the original `session/prompt`: a steer
+    /// control delivered while ACP init was still running must never reach `out`
+    /// before the turn it is meant to steer has been enqueued, or a pre-turn
+    /// `cancel` no-ops and an injected `prompt` becomes the FIRST turn (issue
+    /// #10). If the send fails/times out, `on_sent` is dropped un-fired, which
+    /// the waiting steer task observes as a closed channel and declines to run.
+    async fn request_signalling(
+        &mut self,
+        method: &str,
+        params: Value,
+        idle: Duration,
+        on_sent: Option<oneshot::Sender<()>>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = oneshot::channel();
@@ -172,7 +230,13 @@ impl Agent {
             .out
             .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         match tokio::time::timeout(idle, send).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // The request frame is queued ahead of anything the gated steer
+                // task may later enqueue; release the gate so steer can proceed.
+                if let Some(on_sent) = on_sent {
+                    let _ = on_sent.send(());
+                }
+            }
             Ok(Err(_)) => {
                 self.shared.lock().unwrap().pending.remove(&id);
                 bail!("agent stdin closed");
@@ -261,14 +325,155 @@ impl Agent {
             .as_str()
             .context("session/new returned no sessionId")?
             .to_string();
+        // Inbound steer (issue #10): while the prompt turn is in flight, apply
+        // each hub-delivered typed control to the SAME session. A `prompt` is
+        // injected as an additional `session/prompt` (the agent folds it into
+        // the running turn); a `cancel` is mapped to the ACP `session/cancel`
+        // notification so it actually interrupts the turn.
+        //
+        // SUPPORTED STEER CONTRACT (this PR): `prompt` and `cancel` ONLY.
+        // `permission` is explicitly NOT part of the supported steer contract:
+        // this client answers every ACP `session/request_permission` itself,
+        // immediately and unconditionally, under the `yolo` policy (see
+        // `handle_message`/`permission_choice`). There is therefore never an
+        // outstanding agent permission request for a hub `permission` outcome to
+        // resolve, so the outcome cannot affect the active turn. Rather than
+        // silently swallow it, a `permission` steer is logged loudly as
+        // unsupported-and-dropped (see below). Routing a hub permission decision
+        // back into ACP is a deliberate follow-up, not claimed by this PR.
+        //
+        // The injected prompts use ids far above the turn's own sequence and are
+        // never tracked as pending, so their responses are simply ignored and the
+        // original turn's response still completes the run.
+        // Gate the steer task behind the original prompt: a steer control that
+        // arrived during ACP init must not be written to `out` before the very
+        // `session/prompt` below has been enqueued (see `request_signalling`).
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        // Turn-scoped stop signal: at turn end we signal the steer task to
+        // break and RETURN its receiver, instead of `abort()`ing it (which would
+        // DROP the receiver). The steer receiver is job-keyed and shared across
+        // a job's turns (first run + result-nudge); dropping it after the first
+        // turn would leave a second ACP turn unsteerable — prompt/cancel frames
+        // sent during the nudge would hit a closed channel and be discarded.
+        let (steer_stop_tx, mut steer_stop_rx) = oneshot::channel::<()>();
+        let steer_task = self.steer.take().map(|mut rx| {
+            use crate::hub::control::ControlFrame;
+            let out = self.out.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                // Wait until the original prompt has been enqueued, or the turn
+                // ends first. A closed gate (sender dropped without firing) means
+                // the prompt send failed or the turn is being torn down — process
+                // no steer, but STILL return the receiver so the next turn stays
+                // steerable.
+                tokio::select! {
+                    g = gate_rx => { if g.is_err() { return Some(rx); } }
+                    _ = &mut steer_stop_rx => return Some(rx),
+                }
+                let mut id: u64 = 1 << 32;
+                loop {
+                    let control = tokio::select! {
+                        c = rx.recv() => match c {
+                            Some(c) => c,
+                            None => break, // steer channel closed by the hub
+                        },
+                        _ = &mut steer_stop_rx => break, // turn ended
+                    };
+                    let frame = match control {
+                        ControlFrame::Prompt { text } => {
+                            id += 1;
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "session/prompt",
+                                "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": text }] }
+                            })
+                        }
+                        ControlFrame::Cancel { .. } => json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": { "sessionId": sid }
+                        }),
+                        ControlFrame::Permission {
+                            request_id,
+                            outcome,
+                        } => {
+                            // `permission` is NOT in the supported steer
+                            // contract (see the steer-task doc above): this
+                            // client auto-answers every ACP permission request
+                            // under `yolo`, so no hub outcome can re-decide an
+                            // outstanding request. Log loudly and drop — never
+                            // silently swallow an unsupported steer.
+                            // `request_id` is arbitrary hub-controlled text
+                            // (newlines, escapes, up to ~1 MiB), so logging it
+                            // verbatim would enable log injection/amplification;
+                            // log only its byte length, mirroring the inbound
+                            // size-only logging in `route_inbound`. `outcome` is
+                            // validated to the closed `{granted,denied}` set in
+                            // `control::validate_envelope`, so it is safe to log.
+                            crate::runtime::log(&format!(
+                                "agentic hub: dropping inbound permission steer (request_id {} bytes) → {outcome}: permission is not in the supported steer contract (ACP permissions are auto-answered under yolo)",
+                                request_id.len()
+                            ));
+                            continue;
+                        }
+                    };
+                    // Byte-bound the injected frame BEFORE admission: `out` is
+                    // only count-bounded (`OUT_CHANNEL_CAP`), so without this a
+                    // hub could queue `OUT_CHANNEL_CAP` prompts of up to 1 MiB
+                    // each (~1 GiB/slot) while a wedged agent keeps emitting
+                    // updates that hold off the idle timeout. Drop (and log) an
+                    // over-large frame rather than queue it; the steer loop
+                    // continues so a single abusive prompt does not end steering.
+                    if !inject_frame_within_budget(&frame) {
+                        crate::runtime::log(&format!(
+                            "agentic hub: dropping oversized injected steer frame ({} bytes > {} cap)",
+                            frame.to_string().len(),
+                            MAX_ACP_INJECT
+                        ));
+                        continue;
+                    }
+                    // Race the send against the turn's stop signal, exactly as
+                    // the receive path above does: `out` is bounded
+                    // (`OUT_CHANNEL_CAP`), so when the agent stops reading stdin
+                    // `write_loop` stalls and this send can block forever. A
+                    // blocked send could not observe `steer_stop_rx`, and
+                    // `Agent::run` awaits this task after the prompt finishes —
+                    // so the slot would hang past its idle timeout. Losing the
+                    // race (stop fired, or the send failed) ends the turn's
+                    // steer loop; the receiver is still returned below so the
+                    // next turn stays steerable.
+                    let sent = tokio::select! {
+                        r = out.send(frame) => r.is_ok(),
+                        _ = &mut steer_stop_rx => false,
+                    };
+                    if !sent {
+                        break;
+                    }
+                }
+                Some(rx)
+            })
+        });
         let done = self
-            .request(
+            .request_signalling(
                 "session/prompt",
                 json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": prompt }] }),
                 idle,
+                Some(gate_tx),
             )
-            .await
-            .context("ACP session/prompt")?;
+            .await;
+        // End the steer task gracefully and RECOVER its receiver so the job's
+        // next ACP turn (a result-nudge) can be steered too. `abort()` would
+        // drop the receiver; instead we signal it to stop and `await` the handle
+        // for the returned receiver, then stash it back in `self.steer` for the
+        // caller to hand to the session (`take_steer`).
+        self.steer = if let Some(task) = steer_task {
+            let _ = steer_stop_tx.send(());
+            task.await.ok().flatten()
+        } else {
+            None
+        };
+        let done = done.context("ACP session/prompt")?;
         let s = self.shared.lock().unwrap();
         Ok(Outcome {
             stop_reason: done["stopReason"].as_str().unwrap_or("unknown").to_string(),
@@ -370,6 +575,25 @@ const OUT_CHANNEL_CAP: usize = 1024;
 /// (see [`handle_message`]), capping queued outbound memory at
 /// `OUT_CHANNEL_CAP * MAX_ACP_REPLY`.
 const MAX_ACP_REPLY: usize = 64 * 1024; // 64 KiB
+
+/// Per-frame byte budget for an injected steer frame (a hub-delivered
+/// `session/prompt` / `session/cancel`) queued into `out`. The steer channel is
+/// byte-bounded upstream (`hub::client::MAX_STEER_CHUNK_BYTES`), but `out` is only
+/// COUNT-bounded ([`OUT_CHANNEL_CAP`]): once a steer prompt is injected it sits in
+/// `out` until `write_loop` drains it, so `OUT_CHANNEL_CAP` prompts of up to 1 MiB
+/// each could retain ~1 GiB per slot while a wedged agent keeps emitting updates
+/// (which holds off the idle timeout). A steering prompt is short operator text —
+/// far under this budget — so a frame exceeding it is an abusive/amplifying
+/// payload: it is dropped (and logged) rather than queued, capping queued injected
+/// memory at `OUT_CHANNEL_CAP * MAX_ACP_INJECT`. Mirrors [`MAX_ACP_REPLY`].
+const MAX_ACP_INJECT: usize = 64 * 1024; // 64 KiB
+
+/// True when a serialized steer frame fits within [`MAX_ACP_INJECT`]. The steer
+/// task drops (rather than queues) an over-large frame so a hub cannot amplify a
+/// wedged agent into unbounded per-slot memory through repeated injected prompts.
+fn inject_frame_within_budget(frame: &Value) -> bool {
+    frame.to_string().len() <= MAX_ACP_INJECT
+}
 
 async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     mut reader: BufReader<R>,
@@ -606,6 +830,15 @@ fn handle_message(line: &str, shared: &Arc<Mutex<Shared>>, out: &mpsc::Sender<Va
         (Some("session/update"), None) => {
             s.updates += 1;
             let update = &msg["params"]["update"];
+            // Live transcript bridge (issue #10): forward the raw update to the
+            // hub session, if one is attached, BEFORE the local accounting below.
+            // The sink is BOUNDED, and this runs under the shared lock, so use a
+            // non-blocking `try_send`: on a full channel (a transcript consumer
+            // falling behind) or a closed receiver (the session ended) the update
+            // is dropped rather than stalling the ACP read loop under the lock.
+            if let Some(tx) = &s.transcript {
+                let _ = tx.try_send(update.clone());
+            }
             // Count effective transcript turns / valid plans the Node way, BEFORE
             // the narrower match below (which only tracks message text and tool
             // calls): `updates` alone overcounts ignored/intermediate updates.
@@ -846,6 +1079,31 @@ mod tests {
         assert!(handle_message(&line, &shared, &out));
         let reply = rx.try_recv().expect("a normal reply must be enqueued");
         assert_eq!(reply["id"], 7);
+    }
+
+    #[test]
+    fn oversized_injected_steer_frame_is_rejected() {
+        // A hub steer prompt whose serialized frame exceeds MAX_ACP_INJECT must
+        // NOT be admitted into `out`: the channel is only count-bounded, so
+        // OUT_CHANNEL_CAP such frames (~1 MiB each) would retain ~1 GiB per slot
+        // while a wedged agent keeps emitting updates. The budget check is the
+        // admission gate the steer task applies before `out.send`.
+        let mut frame = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64 << 32,
+            "method": "session/prompt",
+            "params": { "sessionId": "s", "prompt": [{ "type": "text", "text": "x".repeat(MAX_ACP_INJECT) }] }
+        });
+        assert!(
+            !inject_frame_within_budget(&frame),
+            "an over-large injected prompt frame must be rejected"
+        );
+        // A normal-sized steer prompt is admitted.
+        frame["params"]["prompt"][0]["text"] = json!("do the thing");
+        assert!(
+            inject_frame_within_budget(&frame),
+            "a normal injected prompt frame must be admitted"
+        );
     }
 
     #[test]
@@ -1295,6 +1553,135 @@ done
             std::fs::canonicalize(evil.join("run")).unwrap(),
             "session/new cwd must not resolve into the attacker's tree"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A fake ACP agent for steering tests: answers `initialize`/`session/new`,
+    /// records every `session/prompt` and `session/cancel` it receives (in wire
+    /// order) to the capture file, and ends the in-flight turn by answering its
+    /// ORIGINAL prompt only when it sees the `session/cancel`. It never answers
+    /// the injected steer prompts (their huge ids are untracked by the client),
+    /// so the turn stays open until the cancel, letting us observe the full
+    /// steer sequence. `session/new` resets the remembered original-prompt id so
+    /// a second turn works too.
+    #[cfg(unix)]
+    fn steer_fake_agent_script() -> &'static str {
+        r#"#!/bin/sh
+: > "$NANO_FAKE_AGENT_CAPTURE"
+promptid=""
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1}}\n' "$id"
+      ;;
+    *'"session/new"'*)
+      promptid=""
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id"
+      ;;
+    *'"session/cancel"'*)
+      printf 'cancel\n' >> "$NANO_FAKE_AGENT_CAPTURE"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$promptid"
+      ;;
+    *'"session/prompt"'*)
+      printf 'prompt\n' >> "$NANO_FAKE_AGENT_CAPTURE"
+      if [ -z "$promptid" ]; then promptid="$id"; fi
+      ;;
+  esac
+done
+"#
+    }
+
+    /// Boundary test for issue #10 steering: inject a `prompt` then a `cancel`
+    /// into the steer channel and drive a real `Agent::run` over a fake ACP
+    /// agent. Asserts the injected controls reach the agent in wire order
+    /// (original prompt → injected prompt → cancel), the cancel maps to a turn
+    /// end, and the job-keyed steer receiver is RECOVERED (not dropped) so a
+    /// second turn stays steerable — the exact regressions the receiver-only
+    /// hub tests cannot catch.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn steer_prompt_and_cancel_reach_the_agent_in_order_and_survive_the_turn() {
+        use crate::hub::control::ControlFrame;
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "nano-acp-steer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&run).unwrap();
+
+        let script = base.join("steer-agent.sh");
+        std::fs::write(&script, steer_fake_agent_script()).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = base.join("capture.txt");
+        let env = vec![(
+            "NANO_FAKE_AGENT_CAPTURE".to_string(),
+            capture.to_string_lossy().into_owned(),
+        )];
+
+        let mut agent = Agent::spawn(
+            "sh",
+            &[script.to_string_lossy().into_owned()],
+            &handle,
+            &env,
+        )
+        .expect("spawn steer fake agent");
+
+        // Attach a job-keyed steer receiver and a (here unused) transcript sink.
+        let (tx, rx) = mpsc::channel::<ControlFrame>(8);
+        let (transcript_tx, _transcript_rx) = mpsc::channel::<Value>(8);
+        agent.attach_hub(transcript_tx, Some(rx));
+
+        // Pre-queue the controls: a prompt injection then a cancel. The steer
+        // task drains them FIFO once the original prompt is enqueued (gated), so
+        // they reach the agent in that order.
+        tx.send(ControlFrame::Prompt {
+            text: "steer-1".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(ControlFrame::Cancel { reason: None })
+            .await
+            .unwrap();
+
+        let out = agent
+            .run(&handle, "original", Duration::from_secs(10))
+            .await
+            .expect("steered turn");
+        // The cancel maps to ACP `session/cancel`, ending the turn.
+        assert_eq!(out.stop_reason, "cancelled");
+
+        // The agent observed exactly: original prompt, injected steer prompt,
+        // then the cancel — proving the gate ordering and the prompt→cancel wire
+        // mapping end to end.
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        let lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["prompt", "prompt", "cancel"],
+            "wire order must be original prompt, injected prompt, then cancel"
+        );
+
+        // Second-turn behavior: `run` must RECOVER the job-keyed steer receiver
+        // (an `abort()` would have dropped it), so a later result-nudge turn
+        // stays steerable.
+        assert!(
+            agent.take_steer().is_some(),
+            "steer receiver must survive the turn for the next one"
+        );
+
+        drop(tx);
+        agent.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }
 }
