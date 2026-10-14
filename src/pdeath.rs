@@ -207,6 +207,232 @@ pub(crate) fn group_alive(_pid: u32) -> bool {
     false
 }
 
+/// True while at least one **non-zombie** process remains in the group led by
+/// `pid`. This is the distinction [`group_alive`] cannot draw: an exited-but-held
+/// leader zombie (the identity anchor [`terminate_group_and_reap`] keeps unreaped
+/// through its grace loop) still answers `kill(-pid, 0)`, so `group_alive` reads
+/// the group as live even after every real member has exited — which forced the
+/// full grace wait on every clean shutdown (issue #50). Enumerating the group's
+/// members and excluding zombies lets the grace loop break the instant the group
+/// has drained to just that anchor, so a clean exit finishes immediately instead
+/// of waiting out `grace`.
+///
+/// This enumeration is best-effort and non-atomic. It fails *open* only for the
+/// unavoidable race — a member that forks+exits mid-scan, so its
+/// `/proc`/`proc_pidinfo` entry vanishes with a *process-gone* error (`NotFound`
+/// on Linux, `ESRCH` on macOS) — because that member is already leaving, so
+/// missing it is harmless. It does **not** treat any other inspection failure as
+/// proof of absence: a per-member read that errors for any reason other than
+/// process-gone (a permission or transient I/O error), a directory read that
+/// errors partway through the enumeration, or a whole-enumeration failure (an
+/// unreadable `/proc`, a failed `proc_listpids`) all degrade to [`group_alive`]
+/// — the pre-#50 behaviour (never break early) — because the unreadable member
+/// could be a still-live one and a false `false` would bypass the grace period
+/// and SIGKILL it. Linux reads one snapshot of each `/proc/<pid>/stat` (a live
+/// member always has a `/proc` entry naming the group, so a member alive *and
+/// readable* at scan time is seen); macOS enumerates with
+/// `proc_listpids(PROC_PGRP_ONLY)` and rejects each member whose `proc_pidinfo`
+/// status is `SZOMB`.
+///
+/// Because the scan can still under-report (a racing fork, an unreadable
+/// `/proc`/`proc_pidinfo` entry), callers must **not** treat a `false` as proof
+/// that the group holds nothing worth SIGKILLing. [`terminate_group_and_reap`]'s
+/// fast path guards against that by sending an identity-gated group SIGKILL
+/// *before* it breaks on a `false` (a no-op when only the held zombie anchor
+/// remains), so a false negative cannot leak a `TERM`-resistant descendant.
+#[cfg(target_os = "linux")]
+pub(crate) fn group_has_live_member(pgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        // Cannot enumerate: fall back to the numeric probe so the grace loop
+        // never breaks early on a group it could not inspect.
+        return group_alive(pgid);
+    };
+    for entry in entries {
+        // A readdir error mid-enumeration makes the listing unreliable: keep the
+        // grace loop open rather than conclude the group drained from a partial
+        // scan that may have skipped a still-live member.
+        let Ok(entry) = entry else {
+            return group_alive(pgid);
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // Read raw bytes, not a `String`: a process can set an arbitrary
+        // non-UTF-8 byte sequence as its `comm`, and `read_to_string` would then
+        // fail the whole scan with `InvalidData` for one unrelated process. The
+        // fields we parse (state, pgrp) are ASCII in the suffix after the final
+        // ')', so classify the bytes directly.
+        let read = std::fs::read(format!("/proc/{name}/stat"));
+        match classify_proc_stat(read.as_deref().map_err(std::io::Error::kind), pgid) {
+            MemberVerdict::LiveMember => return true,
+            MemberVerdict::Skip => continue,
+            // An inspection failure (not a clean process-gone race) means we
+            // cannot prove this member is absent: degrade to the numeric probe so
+            // a false negative cannot bypass the grace period and SIGKILL a
+            // running process early.
+            MemberVerdict::Unknown => return group_alive(pgid),
+        }
+    }
+    false
+}
+
+/// Per-member verdict for the Linux `/proc` scan in [`group_has_live_member`].
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq, Debug)]
+enum MemberVerdict {
+    /// A readable, non-zombie member of the target pgid: the group still has live
+    /// work, so the grace loop must not break.
+    LiveMember,
+    /// Readable but not a live member of the target pgid (a different group, a
+    /// zombie), or a genuine *process-gone* race — safe to pass over.
+    Skip,
+    /// The member could not be inspected for a reason other than process-gone:
+    /// the scan is unreliable and must fall back to [`group_alive`] rather than
+    /// read the unknown as absence.
+    Unknown,
+}
+
+/// Classify one `/proc/<pid>/stat` read against `pgid`. Pure so the fail-safe
+/// contract — only a *process-gone* (`NotFound`) read error is `Skip`; any other
+/// read error is `Unknown` (never silently dropped) — is unit-tested directly.
+///
+/// Takes the raw file **bytes**: a process can set an arbitrary non-UTF-8 `comm`,
+/// so the scan must not require UTF-8. Only the suffix after the final ')' is
+/// parsed, and the fields there (state, pgrp) are ASCII.
+#[cfg(target_os = "linux")]
+fn classify_proc_stat(read: Result<&[u8], std::io::ErrorKind>, pgid: u32) -> MemberVerdict {
+    let stat = match read {
+        Ok(stat) => stat,
+        // The process exited between the readdir and this read: it is gone, so it
+        // cannot be the live member we are looking for.
+        Err(std::io::ErrorKind::NotFound) => return MemberVerdict::Skip,
+        // Any other read error (permission, transient I/O) is an *inspection*
+        // failure, not proof of absence.
+        Err(_) => return MemberVerdict::Unknown,
+    };
+    // `comm` (field 2) may contain spaces, parentheses, and arbitrary non-UTF-8
+    // bytes, so parse from just past the final ')': field 3 (state) is the first
+    // whitespace-separated token, field 5 (pgrp) the third. Both are ASCII.
+    let Some(rparen) = stat.iter().rposition(|&b| b == b')') else {
+        return MemberVerdict::Skip;
+    };
+    let mut fields = stat[rparen + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|t| !t.is_empty());
+    let state = fields.next();
+    let _ppid = fields.next();
+    let pgrp = fields
+        .next()
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .and_then(|s| s.parse::<u32>().ok());
+    let live = !matches!(state, Some(b"Z") | Some(b"X") | Some(b"x"));
+    if pgrp == Some(pgid) && live {
+        MemberVerdict::LiveMember
+    } else {
+        MemberVerdict::Skip
+    }
+}
+
+/// macOS counterpart of the Linux `/proc` scan: enumerate the process group with
+/// `proc_listpids(PROC_PGRP_ONLY, pgid)` and report `true` on the first member
+/// whose `proc_pidinfo(PROC_PIDTBSDINFO)` status is not `SZOMB`. A failed
+/// enumeration degrades to [`group_alive`] (never break early on a group we
+/// could not inspect). See [`group_has_live_member`] (Linux) for the contract.
+#[cfg(target_os = "macos")]
+pub(crate) fn group_has_live_member(pgid: u32) -> bool {
+    // `proc_listpids`'s group selector; not exposed by the `libc` crate at this
+    // version, so define it locally (sys/proc_info.h: `PROC_PGRP_ONLY = 2`).
+    const PROC_PGRP_ONLY: u32 = 2;
+    let pid_sz = std::mem::size_of::<libc::pid_t>() as libc::c_int;
+    // Size the buffer from a null-buffer probe (returns the byte count), then
+    // read the pids into it.
+    // SAFETY: a null-buffer `proc_listpids` only reports the required size.
+    let needed = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pgid, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        // Empty (or failed) enumeration: no readable members. Fall back to the
+        // numeric probe only on an outright error so a transient failure does not
+        // break the grace loop early; `needed == 0` is a genuinely empty group.
+        return if needed < 0 { group_alive(pgid) } else { false };
+    }
+    let count = (needed as usize) / (pid_sz as usize);
+    let mut pids = vec![0 as libc::pid_t; count];
+    // SAFETY: `pids` owns `count * size_of::<pid_t>()` writable bytes.
+    let got = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            pgid,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() as libc::c_int) * pid_sz,
+        )
+    };
+    if got <= 0 {
+        return if got < 0 { group_alive(pgid) } else { false };
+    }
+    pids.truncate((got as usize) / (pid_sz as usize));
+    for pid in pids {
+        if pid <= 0 {
+            continue;
+        }
+        match pid_liveness(pid as u32) {
+            // A readable, non-zombie member: the group still has live work.
+            Some(true) => return true,
+            // A zombie or an already-exited member: not a live member, keep going.
+            Some(false) => {}
+            // The member could not be inspected (an error other than process-gone):
+            // we cannot prove it is absent, so degrade to the numeric probe rather
+            // than read the unknown as absence and break the grace loop early.
+            None => return group_alive(pgid),
+        }
+    }
+    false
+}
+
+/// Per-member liveness for the macOS [`group_has_live_member`] scan, read from
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_status`:
+/// - `Some(true)`  — a live, non-zombie process;
+/// - `Some(false)` — a zombie (`SZOMB`) or an already-exited pid (`ESRCH`): not a
+///   live member, safe to skip;
+/// - `None`        — the status read failed for any other reason: an *inspection*
+///   failure, not proof of absence, so the caller must not treat it as gone.
+#[cfg(target_os = "macos")]
+fn pid_liveness(pid: u32) -> Option<bool> {
+    // SAFETY: `proc_pidinfo` fills a `proc_bsdinfo` for a live or zombie pid.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        );
+        if n > 0 {
+            return Some(info.pbi_status != libc::SZOMB);
+        }
+        // A non-positive return filled no `bsdinfo`. `ESRCH` is a genuine
+        // process-gone race (treat as not-a-live-member); any other errno is an
+        // inspection failure that must not read as proof of absence.
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// Other-unix fallback: no per-member state source, so a zombie anchor cannot be
+/// told apart from a live member. Report the group as having a live member while
+/// *any* member (including the held leader zombie) keeps the pgid, preserving the
+/// pre-#50 behaviour — the grace loop waits out `grace` rather than risk breaking
+/// early on a group that may still hold a live descendant.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn group_has_live_member(pgid: u32) -> bool {
+    group_alive(pgid)
+}
+
 /// Whether `pid` names a live process. Best-effort; a reused PID can read as
 /// alive, which only ever *delays* the owner-death reaction below — never a
 /// wrongful exit, so the fail-open direction is the safe one here.
@@ -674,12 +900,12 @@ pub fn owner_watchdog(
 /// grace loop (the zombie keeps the pgid un-recyclable and the identity
 /// readable), so [`PgidGuard::still_ours`] stays fail-**closed** on a real match
 /// and all three windows are **closed** for those paths (an un-recyclable pgid
-/// cannot be taken over by a colliding group, closing window 3 too). Deferring the
-/// leader reap
-/// until after the group SIGKILL on the reaped-first sub-paths — which would
-/// close the window there too — and shrinking the watchdog window by detecting
-/// whether any non-zombie member still remains (so clean exits finish without
-/// waiting out the grace) are both tracked in #50. Everywhere else — a live
+/// cannot be taken over by a colliding group, closing window 3 too). The grace
+/// loop no longer waits out `grace` on a clean shutdown: [`group_has_live_member`]
+/// detects when the group has drained to just the held zombie anchor and breaks
+/// immediately (issue #50). Deferring the
+/// leader reap until after the group SIGKILL on the reaped-first sub-paths —
+/// which would close the window there too — is tracked in #69. Everywhere else — a live
 /// recycled leader, or any group whose leader is still readable — the identity
 /// check refuses the signal.
 #[cfg(unix)]
@@ -945,7 +1171,7 @@ impl PgidGuard {
     ///   paths (`acp.rs`'s normal shutdown, `pipe.rs`'s idle timeout) keep the
     ///   leader as a zombie through the grace loop and so *close* them (see the
     ///   module *Scope of the guarantee*; deferring the reap on the reaped-first
-    ///   sub-paths to close them there too is tracked in #50).
+    ///   sub-paths to close them there too is tracked in #69).
     pub(crate) fn still_ours(&self) -> bool {
         if !group_alive(self.pgid) {
             return false;
@@ -1024,16 +1250,74 @@ pub(crate) async fn terminate_group_and_reap(
                 // gone leader, keeping the leader as a zombie keeps the identity
                 // positively verifiable (and the pgid un-recyclable) for the whole
                 // window, so the deadline SIGKILL below is gated on a real match.
-                // The cost is that `group_alive` stays true on the zombie, so a
-                // clean shutdown waits out the full grace period rather than
-                // breaking early; correctness is preferred over that latency.
                 // This grace runs after every ACP job (`acp::shutdown`), so the
-                // accepted cost is ~`grace` per clean ACP shutdown. Detecting
-                // whether any non-zombie member still remains (so a clean exit
-                // breaks early while the zombie stays as the identity anchor) is
-                // tracked in #50.
+                // accepted cost would be ~`grace` per clean ACP shutdown — except
+                // that the clean-exit fast path below breaks as soon as the group
+                // has drained to just the held zombie anchor (issue #50).
                 if !guard.still_ours() {
                     // The group is gone (every member exited). Don't re-signal.
+                    break;
+                }
+                // Clean-exit fast path (issue #50). The held leader zombie keeps
+                // `still_ours`/`group_alive` true even after every *real* member
+                // has exited, which otherwise forced the full `grace` wait on a
+                // clean shutdown. `group_has_live_member` enumerates the group and
+                // excludes zombies, so once nothing but the anchor remains there is
+                // nothing left to SIGKILL — break immediately. The zombie anchor is
+                // still held until the final `child.wait()` below, so the identity
+                // stays verifiable for the gating above right up to this break.
+                //
+                // That enumeration is best-effort and non-atomic, and it fails
+                // *open*: a member that forks+exits mid-scan can be missed and
+                // so read as absent. A bare break would then skip the SIGKILL
+                // and leak that `TERM`-resistant member. So make a false
+                // negative harmless: SIGKILL the group (identity-gated, exactly
+                // like the deadline branch) *before* breaking. When the scan was
+                // right and only the held zombie anchor remains, SIGKILL to a
+                // zombie is a no-op and adds no grace wait; when the scan
+                // under-reported, it still reaps the missed member on the fast
+                // path instead of leaking it.
+                //
+                // Only that process-list race under-reports. A per-member
+                // inspection failure does *not*: a non-`NotFound` `/proc` read
+                // error or a non-`ESRCH` `proc_pidinfo` error falls back to
+                // `group_alive`, i.e. it reads as *live* — the fail-safe
+                // direction — so the grace loop keeps waiting rather than
+                // breaking early. The false negative this SIGKILL covers comes
+                // from the non-atomic enumeration, not from inspection failures.
+                //
+                // Run the scan on the blocking pool: it is a synchronous,
+                // potentially system-wide traversal (Linux reads one
+                // `/proc/<pid>/stat` per PID) and this loop repeats it every
+                // 50 ms, so running it inline on a Tokio worker can starve
+                // unrelated async work on a high-PID host — the same reason
+                // `slot::prepare_run_dir_blocking` offloads its traversal. A join
+                // failure (the scan task panicked) is treated as "still a live
+                // member", so the grace loop keeps waiting rather than breaking
+                // early — the fail-safe direction.
+                //
+                // Bound the wait by the grace remaining: awaiting an unbounded
+                // `spawn_blocking` job before checking `deadline` would break the
+                // "poll up to `grace`, then SIGKILL" contract if the blocking pool
+                // is saturated or the system-wide `/proc` scan stalls, letting a
+                // TERM-resistant group survive arbitrarily past the deadline. A
+                // timeout conservatively means "live", so the deadline branch
+                // below fires the SIGKILL as soon as `grace` is exhausted.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let has_live_member = tokio::time::timeout(
+                    remaining,
+                    tokio::task::spawn_blocking(move || group_has_live_member(pgid)),
+                )
+                .await
+                // `Err(_)` = the scan did not finish within the remaining grace:
+                // treat as "still a live member" so the deadline branch SIGKILLs.
+                .unwrap_or(Ok(true))
+                // `Err(_)` = the scan task panicked: fail safe as "live" too.
+                .unwrap_or(true);
+                if !has_live_member {
+                    if guard.still_ours() {
+                        sigkill_group(pgid);
+                    }
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -1380,7 +1664,7 @@ pub fn reap_watchdog(
         // the leader-still-alive paths (acp normal shutdown, pipe idle timeout)
         // hold the leader unreaped through the grace loop and do close it (see the
         // module *Scope of the guarantee*). Where open it is accepted to avoid
-        // leaking orphans. Shrinking it is tracked in #50.
+        // leaking orphans. Shrinking it is tracked in #69.
         if wait_parent_or_group_gone(parent_pid, pgid, expected_start)
             && group_identity_matches(pgid, expected_group)
         {
@@ -1411,7 +1695,7 @@ pub fn reap_watchdog(
 /// success, acp mid-request exit) reap it first too, so neither closes them,
 /// while the leader-still-alive paths (acp normal shutdown, pipe idle timeout)
 /// hold the leader unreaped through the grace loop and close them (see the module
-/// *Scope of the guarantee*); shrinking the window is tracked in #50. A same-tick,
+/// *Scope of the guarantee*); shrinking the window is tracked in #69. A same-tick,
 /// same-uid recycle (window 3) collides on the identity token on those same
 /// reaped-first paths and is likewise closed where the leader is held unreaped.
 /// See [`PgidGuard::still_ours`].
@@ -2143,6 +2427,265 @@ mod tests {
         // Cleanup: kill the surviving descendant.
         let _ = member.kill();
         let _ = member.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_proc_stat_only_process_gone_counts_as_absent() {
+        use std::io::ErrorKind;
+        // A process-gone race is the *only* read error that proves absence.
+        assert_eq!(
+            classify_proc_stat(Err(ErrorKind::NotFound), 1234),
+            MemberVerdict::Skip,
+            "a vanished /proc entry is a clean exit race"
+        );
+        // Every other inspection failure must keep the grace loop open (Unknown),
+        // never be silently dropped as absence — otherwise a transiently
+        // unreadable but still-live member would bypass the grace period.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                classify_proc_stat(Err(kind), 1234),
+                MemberVerdict::Unknown,
+                "inspection failure {kind:?} must fail safe, not read as absent"
+            );
+        }
+        // A readable, non-zombie member of the group is detected.
+        assert_eq!(
+            classify_proc_stat(Ok(b"999 (wo rk) R 1 1234 1234 0 -1"), 1234),
+            MemberVerdict::LiveMember,
+            "a live member of the target pgid counts"
+        );
+        // A zombie of the group is not a live member.
+        assert_eq!(
+            classify_proc_stat(Ok(b"999 (wo rk) Z 1 1234 1234 0 -1"), 1234),
+            MemberVerdict::Skip,
+            "a zombie of the group is not a live member"
+        );
+        // A live process in a different group is skipped.
+        assert_eq!(
+            classify_proc_stat(Ok(b"999 (wo rk) R 1 5678 5678 0 -1"), 1234),
+            MemberVerdict::Skip,
+            "a live process in another group does not count"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_proc_stat_tolerates_non_utf8_comm() {
+        // A process can set an arbitrary non-UTF-8 byte sequence as its `comm`
+        // (field 2). The scan must still parse the ASCII state/pgrp suffix after
+        // the final ')' — a `read_to_string` would fail the whole scan with
+        // `InvalidData` and restore the full grace delay on every clean shutdown.
+        // 0xFF and 0x80 are not valid UTF-8.
+        let stat = b"999 (\xFF\x80 bad name) R 1 1234 1234 0 -1";
+        assert_eq!(
+            classify_proc_stat(Ok(stat), 1234),
+            MemberVerdict::LiveMember,
+            "a non-UTF-8 comm must not defeat parsing of the ASCII suffix"
+        );
+        // Same, but a zombie in the target group.
+        let stat = b"999 (\xFF\x80 bad name) Z 1 1234 1234 0 -1";
+        assert_eq!(
+            classify_proc_stat(Ok(stat), 1234),
+            MemberVerdict::Skip,
+            "a non-UTF-8 zombie of the group is still not a live member"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pid_liveness_reports_self_live() {
+        // Our own process is a live, non-zombie member — the one deterministic
+        // anchor for the macOS per-member probe. (The zombie -> `Some(false)`
+        // path is covered by `group_has_live_member_false_for_held_zombie_anchor`.)
+        assert_eq!(
+            pid_liveness(std::process::id()),
+            Some(true),
+            "the running test process must read as a live member"
+        );
+    }
+
+    #[test]
+    fn group_has_live_member_true_for_live_group() {
+        // A live leader is itself a non-zombie member, so the grace loop must not
+        // treat the group as drained while it is still running.
+        let (mut child, pgid) = spawn_group_leader();
+        assert!(
+            group_has_live_member(pgid),
+            "a live leader must count as a live member"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !group_has_live_member(pgid),
+            "a reaped, empty group has no live member"
+        );
+    }
+
+    #[test]
+    fn group_has_live_member_sees_descendant_after_leader_reaped() {
+        // A `TERM`-resistant descendant that outlives a reaped leader must still
+        // be reported as a live member, so the grace loop keeps waiting (and
+        // ultimately SIGKILLs) rather than breaking early and leaking it.
+        let (mut leader, pgid) = spawn_group_leader();
+        let mut member = spawn_group_member(pgid);
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert!(group_alive(pgid), "the descendant keeps the group alive");
+        assert!(
+            group_has_live_member(pgid),
+            "a live descendant counts as a live member even after the leader is reaped"
+        );
+        let _ = member.kill();
+        let _ = member.wait();
+    }
+
+    #[test]
+    fn group_has_live_member_false_for_held_zombie_anchor() {
+        // The exact #50 scenario: the leader has exited but is held UNREAPED as
+        // the identity anchor, with no other member. `group_alive` still reads the
+        // group as live (the zombie holds the pgid), but there is no *non-zombie*
+        // member — so `group_has_live_member` must report `false`, letting the
+        // grace loop break immediately instead of waiting out the full grace.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("0")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fast-exiting leader");
+        let pgid = child.id();
+        // Wait for the leader to exit and linger as an unreaped zombie (we never
+        // call `wait` until the assertion below has run).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && group_has_live_member(pgid) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !group_has_live_member(pgid),
+            "a held leader zombie with no live member must not count as a live member"
+        );
+        // Now reap the zombie we deliberately held.
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn terminate_breaks_grace_early_on_clean_exit() {
+        // A leader that exits promptly on SIGTERM must not hold the grace loop for
+        // the full `grace`: the live-member fast path breaks as soon as the group
+        // has drained to the held zombie anchor (issue #50). `sleep` terminates on
+        // SIGTERM by default, so the group empties well within the generous grace
+        // below — the elapsed time proves the early break, not a timeout.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").process_group(0).kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn leader");
+        let pgid = child.id().expect("leader pid");
+        let guard = PgidGuard::capture(pgid);
+        let grace = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        terminate_group_and_reap(&mut child, Some(guard), grace).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "a clean SIGTERM exit must break the grace loop early rather than wait \
+             out the {grace:?} grace (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_reaps_a_term_resistant_member() {
+        // The class the fast-path SIGKILL guards (review r4266146398): a
+        // `TERM`-resistant descendant must NEVER survive teardown, whichever path
+        // the grace loop takes. `group_has_live_member` is best-effort and fails
+        // open, so a missed live member would break the fast path early; the
+        // identity-gated group SIGKILL (fast path *and* deadline) is what keeps a
+        // false negative harmless. Here the member ignores SIGTERM, so the group
+        // SIGKILL — not SIGTERM — is the only thing that can reap it. After
+        // `terminate_group_and_reap` returns, nothing in the group may be alive.
+        let mut leader_cmd = tokio::process::Command::new("sh");
+        leader_cmd
+            .arg("-c")
+            // Leader exits on SIGTERM; it is held unreaped as the identity anchor.
+            .arg("exec sleep 30")
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = leader_cmd.spawn().expect("spawn leader");
+        let pgid = child.id().expect("leader pid");
+
+        // A descendant in the leader's group that blocks SIGTERM: only SIGKILL
+        // can reap it.
+        use std::os::unix::process::CommandExt;
+        // The member signals readiness (by creating this file) only *after* it
+        // has installed its SIGTERM trap, so teardown never races the trap
+        // install. A fixed sleep would be scheduling-dependent: on a loaded
+        // runner the shell may not have run `trap` yet, and teardown's SIGTERM
+        // would then kill the member before it becomes TERM-resistant, making
+        // the test pass for the wrong reason (or fail nondeterministically).
+        let ready_file =
+            std::env::temp_dir().join(format!("nano-pdeath-ready-{}-{}", std::process::id(), pgid));
+        let _ = std::fs::remove_file(&ready_file);
+        let mut member_cmd = std::process::Command::new("sh");
+        member_cmd
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > \"{}\"; sleep 30",
+                ready_file.display()
+            ))
+            .process_group(pgid as i32)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut member = member_cmd.spawn().expect("spawn TERM-resistant member");
+        // Wait until the member has installed its SIGTERM trap (readiness file)
+        // before teardown, instead of a fixed sleep.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "the TERM-resistant member never signalled SIGTERM-handler readiness"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&ready_file);
+
+        let guard = PgidGuard::capture(pgid);
+        let grace = std::time::Duration::from_secs(2);
+        terminate_group_and_reap(&mut child, Some(guard), grace).await;
+
+        // The group SIGKILL must have reaped the resistant member. It ignores
+        // SIGTERM and sleeps 30s, so the only way it can have exited inside this
+        // window is the teardown's SIGKILL. `try_wait` reports its real exit
+        // (a bare `kill(pid,0)` can't: a SIGKILLed-but-unreaped member lingers as
+        // a zombie that still answers the liveness probe).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            match member.try_wait() {
+                Ok(Some(s)) => {
+                    status = Some(s);
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        // Reap the member so the test leaves no zombie, regardless of outcome.
+        let _ = member.kill();
+        let _ = member.wait();
+        let status = status
+            .expect("a TERM-resistant group member must be SIGKILLed by teardown, not leaked");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the resistant member must be reaped by the group SIGKILL, got {status:?}"
+        );
     }
 
     #[test]
