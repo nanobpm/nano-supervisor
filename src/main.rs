@@ -7,6 +7,7 @@
 //! Both share one job core ([`slot`]) that mirrors the Node plugin's behaviour.
 
 mod acp;
+mod checkpoint;
 mod control;
 mod daemon;
 mod engine;
