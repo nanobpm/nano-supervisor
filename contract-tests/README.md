@@ -58,11 +58,15 @@ fake-agent and redaction tests run with no engine, so CI stays green.
 ## Issue-numbered worker fixes covered
 
 Every issue-numbered fix in the plugin's worker code that changes behavior gets a
-test. Keep this list current as tests are added:
+test. Keep this list current as tests are added. The full parity ledger — one row
+per behaviour-changing plugin change, with a `contract-test` / `rust-issue` /
+`n/a` disposition — lives in [`PARITY.md`](PARITY.md) (issue #57), which this
+table will fold into.
 
 | Fix | Behavior | Test |
 | --- | --- | --- |
 | jwulf/c8ctl-plugin-nano#275 | Empty agent result → **fail**, never complete | `worker_result::empty_result_fails_never_completes`, `worker_result::empty_agent_turn_is_observably_empty` |
+| jwulf/c8ctl-plugin-nano#285 | A successful producerless job completes with its vars; an empty result **fails** the job (one retry consumed), never completes. The JS `preGuardDrainTimedOut` scope bug is n/a in Rust (see [`PARITY.md`](PARITY.md)). **Not covered:** no test injects a settlement-path exception, so the "settlement throw fails the job" claim is asserted only by `src/slot.rs` reconciliation, not by a test | `worker_result::non_empty_result_completes_the_job`, `worker_result::empty_result_fails_never_completes` (result behavior only; settlement reconciliation in `src/slot.rs` is untested) |
 | nanobpm/nano-bpm#1283 | Lease token name mismatch (`leaseToken` vs `jobLeaseToken`): the worker takes a lease on every activation (engine 0.0.24 issues `jobLeaseToken`) | `worker_lease::*` |
 | Settlement fencing | Complete/fail are fenced by the lease token and land exactly once | `worker_lease::settling_commands_are_fenced_by_the_lease_token` |
 | Refresh cadence | Refresh the activation every third of `--recovery-window` | `worker_lease::leased_worker_refreshes_every_third_of_the_window` |
