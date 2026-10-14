@@ -186,6 +186,18 @@ fn presence_stream_id(payload: &Value) -> Option<String> {
     Some(compose_stream_id(instance, job_key))
 }
 
+/// Extract the `jobKey` from a presence frame payload (`CLAIM`/`RELEASE`).
+/// `None` when the field is absent, so a malformed frame never matches a real
+/// job. Used by the resync supersession prune, which discriminates on the job
+/// key (the hub reconciles ownership by job key, not by `(instance, jobKey)`
+/// stream) so a cross-slot retry is collapsed exactly like a same-slot one.
+fn presence_job_key(payload: &Value) -> Option<String> {
+    payload
+        .get("jobKey")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// The relay `stream` a buffered transcript `produce` frame (or any lower-lane
 /// frame) belongs to, if it carries one. Control/presence frames and any frame
 /// without a string `stream` return `None`, so they never match a session's
@@ -640,50 +652,62 @@ impl LaneBuffer {
     /// the `CLAIM` keeps the whole `CLAIM → tail → RELEASE` sequence intact.
     /// Other control families (`DEREGISTER`/`HEARTBEAT`) are preserved.
     ///
-    /// A buffered `RELEASE` WHOSE STREAM IS CURRENTLY IN-FLIGHT is a SUPERSEDED
-    /// earlier generation and is DROPPED (its drain barrier disarmed via the
-    /// returned `seq`). This is the retry-during-outage hazard: a prior
-    /// `(instance, jobKey)` completes during the outage (its `RELEASE` buffered,
-    /// its slot removed from `in_flight`), then an identical-keyed retry
-    /// re-claims the SAME stream and is live again. The resync snapshot prepends
-    /// an authoritative `CLAIM` for that live retry, but the stale `RELEASE`
-    /// drains AFTER it and would clear the retry's ownership — the hub then has
-    /// no claim for a job that is still running. Barriers key on the `RELEASE`
-    /// `seq` and the tail flushes by stream id, so neither can tell the two
-    /// generations apart; collapsing the superseded `RELEASE`/`CLAIM` here (the
-    /// snapshot rebuilds the live `CLAIM`) is the fence. A `RELEASE` for a stream
-    /// that is NOT in-flight is a genuinely completed job with no live retry and
-    /// is preserved. Returns the `seq` of every dropped `RELEASE` so the caller
-    /// can disarm its drain barrier.
-    fn drop_control_presence(&mut self, in_flight_streams: &HashSet<String>) -> Vec<u32> {
-        // Streams with a buffered RELEASE whose job is NOT currently in-flight:
-        // a job that started and finished during the outage with no live retry.
-        // Its CLAIM is for a completed job the snapshot cannot rebuild, so it
-        // must survive this prune (keeping CLAIM → tail → RELEASE intact). A
-        // RELEASE whose stream IS in-flight is excluded here — that CLAIM is
-        // rebuilt by the snapshot and the stale RELEASE is dropped below.
+    /// A buffered `RELEASE` WHOSE JOB KEY IS CURRENTLY IN-FLIGHT — on ANY
+    /// instance — is a SUPERSEDED earlier generation and is DROPPED (its drain
+    /// barrier disarmed via the returned `seq`). This is the retry-during-outage
+    /// hazard: a prior generation of the job completes during the outage (its
+    /// `RELEASE` buffered, its slot removed from `in_flight`), then an
+    /// identical-keyed retry re-claims the job and is live again. The resync
+    /// snapshot prepends an authoritative `CLAIM` for that live retry, but the
+    /// stale `RELEASE` drains AFTER it and would clear the retry's ownership —
+    /// the hub then has no claim for a job that is still running. Barriers key
+    /// on the `RELEASE` `seq` and the tail flushes by stream id, so neither can
+    /// tell the two generations apart; collapsing the superseded `RELEASE`/`CLAIM`
+    /// here (the snapshot rebuilds the live `CLAIM`) is the fence.
+    ///
+    /// The supersession discriminant is the **job key**, not the composed
+    /// `(instance, jobKey)` stream id: the hub reconciles ownership by job key
+    /// (its `ClaimRegistry` moves a job's ownership on any `CLAIM` naming that
+    /// key), so a retry on a DIFFERENT slot is the same hazard as a retry on the
+    /// same slot. A stale `(A, jobKey)` `CLAIM`/`RELEASE` pair would otherwise
+    /// survive a `(B, jobKey)` live retry — the `CLAIM` moves the job's ownership
+    /// back to the finished slot A and the `RELEASE` then removes it, leaving the
+    /// running retry on B absent from ownership visibility. Keying the prune on
+    /// the job key collapses the superseded pair across instances too.
+    ///
+    /// A `RELEASE` whose job key is NOT in-flight anywhere is a genuinely
+    /// completed job with no live retry and is preserved. Returns the `seq` of
+    /// every dropped `RELEASE` so the caller can disarm its drain barrier.
+    fn drop_control_presence(&mut self, in_flight_job_keys: &HashSet<String>) -> Vec<u32> {
+        // Job keys with a buffered RELEASE whose job is NOT currently in-flight
+        // on any instance: a job that started and finished during the outage
+        // with no live retry. Its CLAIM is for a completed job the snapshot
+        // cannot rebuild, so it must survive this prune (keeping
+        // CLAIM → tail → RELEASE intact). A RELEASE whose job key IS in-flight
+        // is excluded here — that CLAIM is rebuilt by the snapshot and the stale
+        // RELEASE is dropped below.
         let pending_release: HashSet<String> = self
             .control
             .iter()
             .filter(|bf| bf.frame.family == Family::Release)
-            .filter_map(|bf| presence_stream_id(&bf.frame.payload))
-            .filter(|s| !in_flight_streams.contains(s))
+            .filter_map(|bf| presence_job_key(&bf.frame.payload))
+            .filter(|jk| !in_flight_job_keys.contains(jk))
             .collect();
         let mut freed = 0;
         let mut disarmed: Vec<u32> = Vec::new();
         self.control.retain(|bf| {
-            let stream = presence_stream_id(&bf.frame.payload);
+            let job_key = presence_job_key(&bf.frame.payload);
             let drop_it = match bf.frame.family {
                 Family::Register => true,
-                Family::Claim => stream
+                Family::Claim => job_key
                     .as_ref()
-                    .map(|s| !pending_release.contains(s))
+                    .map(|jk| !pending_release.contains(jk))
                     .unwrap_or(true),
-                // Superseded RELEASE for a re-claimed (live) stream: drop it so
+                // Superseded RELEASE for a re-claimed (live) job key: drop it so
                 // it cannot clear the retry's snapshot-asserted ownership.
-                Family::Release => stream
+                Family::Release => job_key
                     .as_ref()
-                    .map(|s| in_flight_streams.contains(s))
+                    .map(|jk| in_flight_job_keys.contains(jk))
                     .unwrap_or(false),
                 _ => false,
             };
@@ -1430,12 +1454,12 @@ impl HubClient {
         // Per-job CLAIMs: the `{instance, jobKey}` ownership frames the hub's
         // pinned per-job validator accepts (one per live job). Kept for normal
         // claim/release semantics AND re-asserted here.
-        let in_flight_streams: HashSet<String> = {
+        let in_flight_job_keys: HashSet<String> = {
             let in_flight = self.in_flight.lock().unwrap();
-            let mut streams: HashSet<String> = HashSet::new();
+            let mut job_keys_set: HashSet<String> = HashSet::new();
             for (inst, jobs) in in_flight.iter() {
                 for job_key in jobs {
-                    streams.insert(compose_stream_id(inst, job_key));
+                    job_keys_set.insert(job_key.clone());
                     snapshot.push(self.make_frame(
                         Lane::Control,
                         Family::Claim,
@@ -1467,7 +1491,7 @@ impl HubClient {
                     json!({ "instance": inst, "jobKeys": job_keys }),
                 ));
             }
-            streams
+            job_keys_set
         };
         // Drop the superseded REGISTER/CLAIM frames first so the snapshot
         // re-admits them deduplicated. Prepending in REVERSE via
@@ -1480,7 +1504,7 @@ impl HubClient {
         // fragmented, because it is already bounded by live instances+jobs and
         // hiding a worker from the hub is worse than transiently exceeding the
         // bulk-traffic memory budget by a few small control frames.
-        let disarmed = buf.drop_control_presence(&in_flight_streams);
+        let disarmed = buf.drop_control_presence(&in_flight_job_keys);
         for frame in snapshot.into_iter().rev() {
             buf.push_front_control_bounded(frame);
         }
@@ -4747,9 +4771,10 @@ mod tests {
             2,
             json!({ "instance": "w", "jobKey": "retried" }),
         ));
-        // The retry is live again on the same stream.
+        // The retry is live again on the same stream. The prune discriminates on
+        // the job KEY, so the in-flight set carries the bare job key.
         let mut in_flight = HashSet::new();
-        in_flight.insert(compose_stream_id("w", "retried"));
+        in_flight.insert("retried".to_string());
         let disarmed = buf.drop_control_presence(&in_flight);
         assert_eq!(
             disarmed,
@@ -4767,6 +4792,56 @@ mod tests {
                 .iter()
                 .any(|bf| bf.frame.family == Family::Claim),
             "its paired CLAIM is dropped too — the resync snapshot rebuilds the live CLAIM"
+        );
+    }
+
+    // Finding (round 29): CROSS-SLOT retry-during-outage. Job J finishes on slot
+    // A during an outage (its `(A, J)` CLAIM + RELEASE are buffered) and is
+    // retried on a DIFFERENT slot B, so `(B, J)` is live in `in_flight` at
+    // reconnect. The supersession prune must recognise the superseded generation
+    // by JOB KEY — not by the composed `(instance, jobKey)` stream, which differs
+    // across slots — and drop A's stale CLAIM + RELEASE. Otherwise the resync
+    // snapshot asserts B's CLAIM, but A's buffered CLAIM then drains and moves J's
+    // ownership back to the finished slot A in the hub's `ClaimRegistry`, and A's
+    // RELEASE removes it — leaving the running retry on B with no ownership.
+    #[test]
+    fn drop_control_presence_drops_superseded_release_for_a_cross_slot_retry() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        // Prior generation that completed during the outage on slot A.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            1,
+            json!({ "instance": "a", "jobKey": "retried" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            2,
+            json!({ "instance": "a", "jobKey": "retried" }),
+        ));
+        // The retry is live on a DIFFERENT slot B: the composed stream id
+        // (`b/retried`) differs from the buffered one (`a/retried`), so only a
+        // job-key-keyed prune collapses the stale pair.
+        let mut in_flight = HashSet::new();
+        in_flight.insert("retried".to_string());
+        let disarmed = buf.drop_control_presence(&in_flight);
+        assert_eq!(
+            disarmed,
+            vec![2],
+            "the superseded cross-slot RELEASE's seq is returned so its drain barrier is disarmed"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the stale cross-slot RELEASE is dropped so it cannot clear the live retry's ownership"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "its paired CLAIM is dropped too — the resync snapshot rebuilds the live CLAIM for slot B"
         );
     }
 
