@@ -370,21 +370,21 @@ fn inspect_supervisor(
             .cloned()
     });
 
-    // A protocol-level error frame (`{ok:false,error,…,final:true}`) is NOT a
-    // healthy status answer: the daemon answered but rejected the op. The normal
-    // status path surfaces the same frame as a failure (`fleet.rs`
-    // `terminal_frame_error`), so it must not mark the endpoint responsive here —
-    // otherwise an erroring daemon renders as a healthy-looking `pid ?`
-    // supervisor. Only a non-error terminal frame counts as responsive.
-    let is_protocol_error = frame
-        .as_ref()
-        .and_then(|f| f.get("ok"))
-        .and_then(|v| v.as_bool())
-        == Some(false);
+    // The terminal frame only counts as a healthy status answer when it has the
+    // *positive* documented shape — `ok:true`, `type:"status"`, and a `daemon`
+    // descriptor object. A merely "not an explicit error" test (`ok != false`)
+    // would accept any other terminal JSON: a response for a different op, a
+    // malformed descriptor, or a peer that answered with something unrecognised
+    // would all be parsed and rendered as a healthy/phantom supervisor. Validate
+    // the positive shape before extracting peer data or marking the endpoint
+    // responsive, so only a genuine status reply counts.
+    let is_status_frame = frame.as_ref().is_some_and(is_status_frame_shape);
 
     let (pid, home) = match &frame {
-        Some(f) if !is_protocol_error => {
-            let pid = f["daemon"]["pid"].as_u64().map(|p| p as u32);
+        Some(f) if is_status_frame => {
+            // A peer-reported pid that does not fit in u32 must not wrap to an
+            // unrelated local pid (`as u32` truncates); treat it as absent.
+            let pid = status_frame_pid(f);
             let home = f["daemon"]["logFile"]
                 .as_str()
                 .and_then(|lf| home_from_log_file(Path::new(lf)));
@@ -392,7 +392,7 @@ fn inspect_supervisor(
         }
         _ => (None, None),
     };
-    let responsive = frame.is_some() && !is_protocol_error;
+    let responsive = is_status_frame;
     let cwd = pid.and_then(process_cwd);
     // A relative `logFile` (a daemon launched with a relative `C8CTL_NANO_HOME`)
     // yields a relative home that `path_under` would never flag. Resolve it
@@ -409,6 +409,29 @@ fn inspect_supervisor(
         reasons,
         responsive,
     }
+}
+
+/// Whether a terminal control frame is a genuine `status` answer. Positive
+/// shape only: `ok:true`, `type:"status"`, and a `daemon` descriptor object.
+/// Anything else — an explicit error, a reply for another op, or a malformed
+/// descriptor — is not a healthy status answer and must not mark the endpoint
+/// responsive or supply peer data.
+#[cfg(unix)]
+fn is_status_frame_shape(f: &serde_json::Value) -> bool {
+    f.get("ok").and_then(|v| v.as_bool()) == Some(true)
+        && f.get("type").and_then(|v| v.as_str()) == Some("status")
+        && f.get("daemon").map(|d| d.is_object()).unwrap_or(false)
+}
+
+/// The peer-reported daemon pid from a validated status frame, or `None` when
+/// it is absent or does not fit in `u32`. A checked conversion is used so an
+/// out-of-range value cannot wrap (via `as u32` truncation) onto an unrelated
+/// local pid.
+#[cfg(unix)]
+fn status_frame_pid(f: &serde_json::Value) -> Option<u32> {
+    f["daemon"]["pid"]
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
 }
 
 /// Resolve a daemon's recovered state home to an absolute path. A daemon that
@@ -493,8 +516,20 @@ fn process_cwd(pid: u32) -> Option<Cwd> {
             return None;
         }
         let path = PathBuf::from(OsString::from_vec(bytes));
-        let exists = path.exists();
-        Some(Cwd { path, exists })
+        // Distinguish a confirmed absence from a probe failure. `Path::exists()`
+        // maps EVERY metadata error to `false`, so an existing cwd that cannot be
+        // traversed or statted (a permission error, or a transient I/O error)
+        // would be misclassified as `DeletedCwd`. Only a `NotFound` error is a
+        // confirmed deletion; any other error preserves this function's
+        // "unknown on probe failure" contract by returning `None`.
+        match std::fs::metadata(&path) {
+            Ok(_) => Some(Cwd { path, exists: true }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Cwd {
+                path,
+                exists: false,
+            }),
+            Err(_) => None,
+        }
     }
 }
 
@@ -968,6 +1003,47 @@ mod tests {
     }
 
     #[test]
+    fn status_frame_shape_requires_the_positive_documented_form() {
+        // A genuine status answer is accepted.
+        assert!(is_status_frame_shape(
+            &serde_json::json!({"ok": true, "type": "status", "daemon": {"pid": 1}})
+        ));
+        // An explicit protocol error is not a healthy status answer.
+        assert!(!is_status_frame_shape(
+            &serde_json::json!({"ok": false, "error": "boom", "final": true})
+        ));
+        // A reply for a different op (no `type:"status"`) must not be treated as
+        // a healthy status answer even though it is not an explicit error.
+        assert!(!is_status_frame_shape(
+            &serde_json::json!({"ok": true, "type": "stopped", "final": true})
+        ));
+        // A well-formed status shape missing the daemon descriptor is rejected.
+        assert!(!is_status_frame_shape(
+            &serde_json::json!({"ok": true, "type": "status"})
+        ));
+        // A `daemon` that is not an object is rejected.
+        assert!(!is_status_frame_shape(
+            &serde_json::json!({"ok": true, "type": "status", "daemon": "x"})
+        ));
+    }
+
+    #[test]
+    fn status_frame_pid_rejects_an_out_of_range_value() {
+        // An in-range pid is recovered.
+        assert_eq!(
+            status_frame_pid(&serde_json::json!({"daemon": {"pid": 4242}})),
+            Some(4242)
+        );
+        // A pid beyond u32::MAX must not wrap onto an unrelated local pid.
+        assert_eq!(
+            status_frame_pid(&serde_json::json!({"daemon": {"pid": 4294967296u64}})),
+            None
+        );
+        // A missing pid is absent, not a crash.
+        assert_eq!(status_frame_pid(&serde_json::json!({"daemon": {}})), None);
+    }
+
+    #[test]
     fn render_escapes_control_characters_in_peer_paths() {
         // Peer-derived paths (home, cwd, and the reason paths they feed) must
         // never reach the terminal bearing control characters or newlines: a
@@ -1171,6 +1247,28 @@ mod tests {
             assert_eq!(sup.home, Some(PathBuf::from("/tmp/nshome-x")));
             // The /tmp home flags it as a phantom.
             assert!(sup.is_phantom(), "a /tmp home must flag: {sup:?}");
+        }
+
+        /// A terminal frame for a DIFFERENT op (`ok:true, type:"stopped"`) is not
+        /// an explicit error, but it is not a status answer either: the stricter
+        /// positive-shape gate must not mark the endpoint responsive from it.
+        #[test]
+        fn wrong_op_frame_is_not_responsive() {
+            let sock = serve_frame(
+                "stop",
+                serde_json::json!({"ok": true, "type": "stopped", "final": true}),
+            );
+            let sup = inspect_supervisor(
+                sock,
+                &[PathBuf::from("/tmp")],
+                std::time::Duration::from_secs(2),
+            );
+            assert!(
+                !sup.responsive,
+                "a non-status terminal frame must not mark the supervisor responsive: {sup:?}"
+            );
+            assert_eq!(sup.pid, None);
+            assert_eq!(sup.home, None);
         }
     }
 }
