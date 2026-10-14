@@ -1268,15 +1268,23 @@ pub(crate) async fn terminate_group_and_reap(
                 // stays verifiable for the gating above right up to this break.
                 //
                 // That enumeration is best-effort and non-atomic, and it fails
-                // *open*: a member that forks+exits mid-scan, or one whose
-                // `/proc` stat / `proc_pidinfo` read fails, reads as absent. A
-                // bare break would then skip the SIGKILL and leak that
-                // `TERM`-resistant member. So make a false negative harmless:
-                // SIGKILL the group (identity-gated, exactly like the deadline
-                // branch) *before* breaking. When the scan was right and only the
-                // held zombie anchor remains, SIGKILL to a zombie is a no-op and
-                // adds no grace wait; when the scan under-reported, it still reaps
-                // the missed member on the fast path instead of leaking it.
+                // *open*: a member that forks+exits mid-scan can be missed and
+                // so read as absent. A bare break would then skip the SIGKILL
+                // and leak that `TERM`-resistant member. So make a false
+                // negative harmless: SIGKILL the group (identity-gated, exactly
+                // like the deadline branch) *before* breaking. When the scan was
+                // right and only the held zombie anchor remains, SIGKILL to a
+                // zombie is a no-op and adds no grace wait; when the scan
+                // under-reported, it still reaps the missed member on the fast
+                // path instead of leaking it.
+                //
+                // Only that process-list race under-reports. A per-member
+                // inspection failure does *not*: a non-`NotFound` `/proc` read
+                // error or a non-`ESRCH` `proc_pidinfo` error falls back to
+                // `group_alive`, i.e. it reads as *live* — the fail-safe
+                // direction — so the grace loop keeps waiting rather than
+                // breaking early. The false negative this SIGKILL covers comes
+                // from the non-atomic enumeration, not from inspection failures.
                 //
                 // Run the scan on the blocking pool: it is a synchronous,
                 // potentially system-wide traversal (Linux reads one
@@ -2614,17 +2622,38 @@ mod tests {
         // A descendant in the leader's group that blocks SIGTERM: only SIGKILL
         // can reap it.
         use std::os::unix::process::CommandExt;
+        // The member signals readiness (by creating this file) only *after* it
+        // has installed its SIGTERM trap, so teardown never races the trap
+        // install. A fixed sleep would be scheduling-dependent: on a loaded
+        // runner the shell may not have run `trap` yet, and teardown's SIGTERM
+        // would then kill the member before it becomes TERM-resistant, making
+        // the test pass for the wrong reason (or fail nondeterministically).
+        let ready_file =
+            std::env::temp_dir().join(format!("nano-pdeath-ready-{}-{}", std::process::id(), pgid));
+        let _ = std::fs::remove_file(&ready_file);
         let mut member_cmd = std::process::Command::new("sh");
         member_cmd
             .arg("-c")
-            .arg("trap '' TERM; sleep 30")
+            .arg(format!(
+                "trap '' TERM; : > \"{}\"; sleep 30",
+                ready_file.display()
+            ))
             .process_group(pgid as i32)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let mut member = member_cmd.spawn().expect("spawn TERM-resistant member");
-        // Let the member install its SIGTERM trap before teardown.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait until the member has installed its SIGTERM trap (readiness file)
+        // before teardown, instead of a fixed sleep.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_file.exists() {
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "the TERM-resistant member never signalled SIGTERM-handler readiness"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&ready_file);
 
         let guard = PgidGuard::capture(pgid);
         let grace = std::time::Duration::from_secs(2);
