@@ -105,10 +105,14 @@ const STEER_CHANNEL_BOUND: usize = 256;
 /// over-large control. Legitimate steering prompts (a prompt body, a cancel
 /// reason, a permission outcome) sit far below 1 MiB.
 const MAX_STEER_CHUNK_BYTES: usize = 1 << 20; // 1 MiB, mirrors acp::MAX_ACP_FRAME
-/// Ceiling on how long `HubSession::drop` waits for the transcript bridge to
-/// drain its accepted updates before RELEASE (finding: RELEASE must not
-/// overtake the transcript tail). Bounded so a wedged bridge can never hang the
-/// dropping task; on timeout the RELEASE proceeds (the tail is best-effort).
+/// Ceiling on how long the async teardown paths ([`HubSession::close`] and
+/// [`HubSession::detach_turn`]) wait for the transcript bridge to drain its
+/// accepted updates before RELEASE (finding: RELEASE must not overtake the
+/// transcript tail). Bounded so a wedged bridge can never hang the awaiting
+/// task; on timeout the RELEASE proceeds (the tail is best-effort). The
+/// synchronous `Drop` fallback does NOT use this timeout — it signals the
+/// bridge and aborts it without waiting (see [`HubSession::flush_transcript`]),
+/// so `Drop` can never park a worker thread.
 const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// The harness-protocol version this worker advertises on REGISTER
 /// (`capability.harnessProtocol`). nano-workforce (#802) treats an absent
@@ -676,10 +680,12 @@ pub struct HubClient {
     conn_task: Mutex<Option<JoinHandle<()>>>,
     /// Per-session transcript-bridge flush handles, keyed by a unique session
     /// sequence (NOT the stream id, which a later session for the same job
-    /// would reuse and so could steal a predecessor's flush handle). Lets a
-    /// dropping [`HubSession`] close its bridge's input and synchronously wait
-    /// for its accepted updates to reach the outbound buffer BEFORE enqueuing
-    /// the job's RELEASE (see [`HubSession::flush_transcript`]).
+    /// would reuse and so could steal a predecessor's flush handle). Lets the
+    /// async teardown paths ([`HubSession::close`]/[`HubSession::detach_turn`])
+    /// close a bridge's input and synchronously wait for its accepted updates
+    /// to reach the outbound buffer BEFORE enqueuing the job's RELEASE. The
+    /// synchronous `Drop` fallback ([`HubSession::flush_transcript`]) closes the
+    /// input and aborts the bridge but does NOT wait, so `Drop` never parks.
     bridge_tasks: Mutex<HashMap<u64, BridgeFlush>>,
     /// Allocates the unique per-session key for `bridge_tasks`.
     next_session_seq: AtomicU64,
@@ -2009,14 +2015,18 @@ fn insecure_credential_exposure(config: &HubConfig) -> bool {
         return false; // nothing secret to protect
     }
     let url = config.url.trim();
-    // `wss://` is TLS-encrypted; only bare `ws://` is in the clear. Any other
-    // scheme is not a WebSocket URL we would connect over plaintext.
-    let Some(rest) = url
-        .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("WS://"))
-    else {
+    // URI schemes are case-insensitive (RFC 3986 §3.1) and `connect_async`
+    // accepts any spelling (`Ws://`, `WS://`, …), so fold the scheme to
+    // lowercase before comparing rather than matching a fixed set of spellings
+    // (a case-sensitive check let `Ws://` bypass this guard). `wss://` is
+    // TLS-encrypted; only bare `ws://` is in the clear. Anything else is not a
+    // plaintext WebSocket URL we would connect over.
+    let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
+    if !scheme.eq_ignore_ascii_case("ws") {
+        return false; // wss:// (TLS) or a non-WebSocket scheme
+    }
     !is_local_host(host_of(rest))
 }
 
@@ -5550,6 +5560,53 @@ mod tests {
             Some(LOCAL_AGENTIC_TOKEN),
             Some("")
         ));
+    }
+
+    // Finding (round 23): URI schemes are case-insensitive (RFC 3986 §3.1) and
+    // `connect_async` accepts mixed-case spellings like `Ws://`. A
+    // case-sensitive guard would let `Ws://hub…` carry a real credential over
+    // plaintext. The guard must fold the scheme before deciding — and must keep
+    // treating every case variant of `wss://` as encrypted (never refused).
+    #[test]
+    fn insecure_credential_exposure_is_case_insensitive_about_the_scheme() {
+        let with = |url: &str, secret: Option<&str>, token: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.url = url.into();
+            cfg.secret = secret.map(Into::into);
+            cfg.token = token.map(Into::into);
+            insecure_credential_exposure(&cfg)
+        };
+
+        // Every case spelling of a remote plaintext `ws://` must still be
+        // refused when a real secret is present.
+        for url in [
+            "Ws://hub.example.com/na",
+            "wS://hub.example.com/na",
+            "WS://hub.example.com/na",
+            "ws://hub.example.com/na",
+        ] {
+            assert!(
+                with(url, Some("s3cr3t"), None),
+                "mixed-case plaintext scheme {url} must not bypass the guard"
+            );
+        }
+
+        // Every case spelling of `wss://` is TLS-encrypted and must never be
+        // refused, even with a real secret.
+        for url in [
+            "Wss://hub.example.com/na",
+            "wSS://hub.example.com/na",
+            "WSS://hub.example.com/na",
+            "wss://hub.example.com/na",
+        ] {
+            assert!(
+                !with(url, Some("s3cr3t"), None),
+                "encrypted scheme {url} must never be refused"
+            );
+        }
+
+        // Loopback remains exempt regardless of scheme case.
+        assert!(!with("WS://127.0.0.1/na", Some("s3cr3t"), None));
     }
 
     #[test]

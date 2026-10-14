@@ -103,16 +103,18 @@ fn env_off(value: &str) -> bool {
 /// mangled URL.
 fn agentic_channel_url(base: &str) -> String {
     let trimmed = base.trim();
-    let (rest, scheme_ws) = if let Some(r) = trimmed.strip_prefix("http://") {
-        (r, "ws://")
-    } else if let Some(r) = trimmed.strip_prefix("https://") {
-        (r, "wss://")
-    } else if let Some(r) = trimmed.strip_prefix("ws://") {
-        (r, "ws://")
-    } else if let Some(r) = trimmed.strip_prefix("wss://") {
-        (r, "wss://")
-    } else {
-        return trimmed.to_string();
+    // Match the scheme case-insensitively (URI schemes are case-insensitive,
+    // RFC 3986 §3.1): `Http://`, `WSS://`, … are valid spellings. Recognised
+    // schemes are folded to their canonical lowercase `ws`/`wss` form (which
+    // the downstream plaintext guard also relies on); any other scheme is
+    // returned unchanged so the connector surfaces a clear unsupported-scheme
+    // error rather than a silently mangled URL.
+    let (rest, scheme_ws) = match trimmed.split_once("://") {
+        Some((s, r)) if s.eq_ignore_ascii_case("http") => (r, "ws://"),
+        Some((s, r)) if s.eq_ignore_ascii_case("https") => (r, "wss://"),
+        Some((s, r)) if s.eq_ignore_ascii_case("ws") => (r, "ws://"),
+        Some((s, r)) if s.eq_ignore_ascii_case("wss") => (r, "wss://"),
+        _ => return trimmed.to_string(),
     };
     // Split off any query/fragment so the path join does not corrupt them; the
     // channel carries its own auth query params, so they are dropped here.
@@ -259,6 +261,23 @@ mod tests {
         // An unsupported scheme is returned unchanged so the connector surfaces
         // a clear unsupported-scheme error rather than a mangled URL.
         assert_eq!(agentic_channel_url("ftp://x/y"), "ftp://x/y");
+        // URI schemes are case-insensitive (RFC 3986 §3.1): mixed-case schemes
+        // are recognised and folded to the canonical lowercase `ws`/`wss` form
+        // (so a mixed-case `Ws://` can never slip past the downstream plaintext
+        // guard as an unrecognised scheme).
+        assert_eq!(
+            agentic_channel_url("HTTP://localhost:8080"),
+            "ws://localhost:8080/agentic"
+        );
+        assert_eq!(
+            agentic_channel_url("Https://app.example.com"),
+            "wss://app.example.com/agentic"
+        );
+        assert_eq!(
+            agentic_channel_url("Ws://127.0.0.1:8787"),
+            "ws://127.0.0.1:8787/agentic"
+        );
+        assert_eq!(agentic_channel_url("WSS://h:1"), "wss://h:1/agentic");
     }
 
     #[test]

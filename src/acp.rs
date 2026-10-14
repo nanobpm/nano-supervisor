@@ -1496,4 +1496,133 @@ done
         );
         std::fs::remove_dir_all(&base).ok();
     }
+
+    /// A fake ACP agent for steering tests: answers `initialize`/`session/new`,
+    /// records every `session/prompt` and `session/cancel` it receives (in wire
+    /// order) to the capture file, and ends the in-flight turn by answering its
+    /// ORIGINAL prompt only when it sees the `session/cancel`. It never answers
+    /// the injected steer prompts (their huge ids are untracked by the client),
+    /// so the turn stays open until the cancel, letting us observe the full
+    /// steer sequence. `session/new` resets the remembered original-prompt id so
+    /// a second turn works too.
+    #[cfg(unix)]
+    fn steer_fake_agent_script() -> &'static str {
+        r#"#!/bin/sh
+: > "$NANO_FAKE_AGENT_CAPTURE"
+promptid=""
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1}}\n' "$id"
+      ;;
+    *'"session/new"'*)
+      promptid=""
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id"
+      ;;
+    *'"session/cancel"'*)
+      printf 'cancel\n' >> "$NANO_FAKE_AGENT_CAPTURE"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$promptid"
+      ;;
+    *'"session/prompt"'*)
+      printf 'prompt\n' >> "$NANO_FAKE_AGENT_CAPTURE"
+      if [ -z "$promptid" ]; then promptid="$id"; fi
+      ;;
+  esac
+done
+"#
+    }
+
+    /// Boundary test for issue #10 steering: inject a `prompt` then a `cancel`
+    /// into the steer channel and drive a real `Agent::run` over a fake ACP
+    /// agent. Asserts the injected controls reach the agent in wire order
+    /// (original prompt → injected prompt → cancel), the cancel maps to a turn
+    /// end, and the job-keyed steer receiver is RECOVERED (not dropped) so a
+    /// second turn stays steerable — the exact regressions the receiver-only
+    /// hub tests cannot catch.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn steer_prompt_and_cancel_reach_the_agent_in_order_and_survive_the_turn() {
+        use crate::hub::control::ControlFrame;
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "nano-acp-steer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let run = base.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&run).unwrap();
+
+        let script = base.join("steer-agent.sh");
+        std::fs::write(&script, steer_fake_agent_script()).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = base.join("capture.txt");
+        let env = vec![(
+            "NANO_FAKE_AGENT_CAPTURE".to_string(),
+            capture.to_string_lossy().into_owned(),
+        )];
+
+        let mut agent = Agent::spawn(
+            "sh",
+            &[script.to_string_lossy().into_owned()],
+            &handle,
+            &env,
+        )
+        .expect("spawn steer fake agent");
+
+        // Attach a job-keyed steer receiver and a (here unused) transcript sink.
+        let (tx, rx) = mpsc::channel::<ControlFrame>(8);
+        let (transcript_tx, _transcript_rx) = mpsc::channel::<Value>(8);
+        agent.attach_hub(transcript_tx, Some(rx));
+
+        // Pre-queue the controls: a prompt injection then a cancel. The steer
+        // task drains them FIFO once the original prompt is enqueued (gated), so
+        // they reach the agent in that order.
+        tx.send(ControlFrame::Prompt {
+            text: "steer-1".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(ControlFrame::Cancel { reason: None })
+            .await
+            .unwrap();
+
+        let out = agent
+            .run(&handle, "original", Duration::from_secs(10))
+            .await
+            .expect("steered turn");
+        // The cancel maps to ACP `session/cancel`, ending the turn.
+        assert_eq!(out.stop_reason, "cancelled");
+
+        // The agent observed exactly: original prompt, injected steer prompt,
+        // then the cancel — proving the gate ordering and the prompt→cancel wire
+        // mapping end to end.
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        let lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["prompt", "prompt", "cancel"],
+            "wire order must be original prompt, injected prompt, then cancel"
+        );
+
+        // Second-turn behavior: `run` must RECOVER the job-keyed steer receiver
+        // (an `abort()` would have dropped it), so a later result-nudge turn
+        // stays steerable.
+        assert!(
+            agent.take_steer().is_some(),
+            "steer receiver must survive the turn for the next one"
+        );
+
+        drop(tx);
+        agent.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
