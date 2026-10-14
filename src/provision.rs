@@ -3729,12 +3729,22 @@ fn gh_repo_slug(url: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
-    let mut segs = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim_end_matches(".git"));
-    let owner = segs.next().filter(|s| !s.is_empty())?;
-    let repo = segs.next().filter(|s| !s.is_empty())?;
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    // Percent-DECODE and validate each `owner`/`repo` path segment. `gh -R
+    // OWNER/REPO` keeps the argument literal — go-gh's parser never
+    // percent-decodes it — so an encoded remote such as
+    // `https://github.com/org/%72epo.git` (which identifies `org/repo`) would
+    // otherwise build `-R org/%72epo`, target a non-existent repository, and
+    // silently miss the PR. `decode_repo_segment` also fails CLOSED on an
+    // encoded separator (`%2F` → `/`) or any other byte a real owner/repo
+    // cannot hold, so an encoded path can never widen or inject the slug.
+    let owner = decode_repo_segment(segs.next()?)?;
+    let owner = owner.trim_end_matches(".git");
+    let repo = decode_repo_segment(segs.next()?)?;
+    let repo = repo.trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
     // `gh`'s `-R` accepts a bare `owner/repo` for github.com and
     // `host/owner/repo` elsewhere (GitHub Enterprise). Keep the host prefix only
     // when it is not a github.com alias so the common case is unchanged. A bare
@@ -3747,6 +3757,43 @@ fn gh_repo_slug(url: &str) -> Option<String> {
     } else {
         Some(format!("{host}/{owner}/{repo}"))
     }
+}
+
+/// Percent-decode a single `OWNER` or `REPO` path segment from a repository
+/// URL and validate it is a literal GitHub name. GitHub owner/repo names are
+/// drawn only from `[A-Za-z0-9._-]`, and `gh -R OWNER/REPO` keeps the argument
+/// literal (go-gh never percent-decodes it), so this both yields the correct
+/// slug for an encoded remote (`%72epo` → `repo`) AND fails CLOSED — returning
+/// `None` so the caller falls back to `gh`'s cwd inference — on an encoded
+/// separator (`%2F` → `/`), a malformed `%XX` escape, non-UTF-8 bytes, or any
+/// other character a real owner/repo cannot contain, so an attacker-influenced
+/// encoding can never widen (`org/%2F../other`) or inject the slug.
+fn decode_repo_segment(seg: &str) -> Option<String> {
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+            let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    if decoded.is_empty()
+        || decoded == "."
+        || decoded == ".."
+        || !decoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// Whether `authority` (credential-free `host[:port]`) is a GitHub.com alias
@@ -4608,6 +4655,40 @@ mod tests {
         assert!(gh_repo_slug("/tmp/local/repo").is_none());
         // A URL with no repo path segment yields nothing to act on.
         assert!(gh_repo_slug("https://github.com/org").is_none());
+    }
+
+    #[test]
+    fn gh_repo_slug_decodes_and_validates_encoded_paths() {
+        // A percent-encoded path component identifies the DECODED name, and
+        // `gh -R` keeps its argument literal — so the slug must decode it (not
+        // pass `org/%72epo` through, which would miss the PR).
+        assert_eq!(
+            gh_repo_slug("https://github.com/org/%72epo.git").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://github.com/%6Frg/repo").as_deref(),
+            Some("org/repo")
+        );
+        // Enterprise host keeps its prefix while the path is still decoded.
+        assert_eq!(
+            gh_repo_slug("https://ghe.example.com/%6Frg/%72epo.git").as_deref(),
+            Some("ghe.example.com/org/repo")
+        );
+        // Fail CLOSED on an encoded separator (`%2F` → `/`): decoding it would
+        // widen/inject the slug (`-R org/bad/evil`), so fall back to cwd
+        // inference instead.
+        assert!(gh_repo_slug("https://github.com/org/bad%2Fevil").is_none());
+        assert!(gh_repo_slug("https://github.com/org/..%2F..%2Fother").is_none());
+        // A malformed `%XX` escape, an encoded control byte, or an encoded
+        // space is not a real name — reject rather than guess.
+        assert!(gh_repo_slug("https://github.com/org/re%zzpo").is_none());
+        assert!(gh_repo_slug("https://github.com/org/re%00po").is_none());
+        assert!(gh_repo_slug("https://github.com/org/re%20po").is_none());
+        // A decoded `.`/`..` component is not a real repository and would make
+        // a degenerate `org/..` slug — reject it too.
+        assert!(gh_repo_slug("https://github.com/org/%2E%2E").is_none());
+        assert!(gh_repo_slug("https://github.com/%2E/repo").is_none());
     }
 
     #[test]
