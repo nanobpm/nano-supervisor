@@ -2510,7 +2510,20 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // `gitResult`, so no branch/commits/pushed completion variables).
     let git_result = match (env.repository.as_ref(), git_prep.as_ref()) {
         (Some(repo), Some(prep)) if run.ok => {
-            Some(crate::provision::finalize_git(&agent_cwd, prep, repo, cfg.clone_timeout).await)
+            // `task.allowPr` gates PR reconciliation (issue #49): only a run that
+            // was asked to open a PR looks the provider PR up to populate the
+            // `pullRequest` completion variable. Mirrors Node's
+            // `envelope.task?.allowPr` gate in `finalizeGit`.
+            let allow_pr = env
+                .normalized
+                .get("task")
+                .and_then(|t| t.get("allowPr"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(
+                crate::provision::finalize_git(&agent_cwd, prep, repo, allow_pr, cfg.clone_timeout)
+                    .await,
+            )
         }
         _ => None,
     };
@@ -4829,6 +4842,7 @@ mod tests {
             pushed: true,
             pr: None,
             retain: false,
+            push_failed: false,
             work_found: true,
             unborn_no_ref: false,
             scan_incomplete: false,

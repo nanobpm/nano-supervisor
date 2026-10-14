@@ -835,6 +835,23 @@ pub struct GitResult {
     /// that is not being pushed. The caller must RETAIN the run dir: the only
     /// copy of that work may live in it, so reaping would destroy it.
     pub retain: bool,
+    /// Set when PUBLICATION of the prepared work branch failed, could not be
+    /// confirmed, or was deliberately refused this run — the push admin context
+    /// could not be built, the push errored and the trusted remote tip could not
+    /// be verified to contain its commits, OR an earlier incomplete/stranded
+    /// scan set `retain` so the push path REFUSED to publish (a retain-skipped,
+    /// uncertain publication). In every case this run's prepared branch is NOT
+    /// confirmed on the remote. This is the Rust analogue of the Node plugin's
+    /// `pushFailed`, and it is DELIBERATELY distinct from [`retain`]: `retain`
+    /// is also set by many unrelated incomplete/stranded-scan guards that leave
+    /// publication itself intact (and even by a run whose push then succeeds),
+    /// so gating PR reconciliation on `retain` would skip reconcile for a run
+    /// whose branch IS published — falsely reporting `pullRequest: null` and
+    /// diverging from Node's `!pushFailed` parity. Reconciliation is gated on
+    /// `!push_failed` so a confirmed OR un-attempted/no-new-commit publication
+    /// still looks its PR up, while a failed/uncertain/retain-skipped push does
+    /// not claim one.
+    pub push_failed: bool,
     /// Set when finalize found real agent work, independent of whether it was
     /// pushed or even enumerated onto the work branch. Distinct from `retain`
     /// (which only marks an incomplete/stranded scan) and from `commits` (which
@@ -1313,10 +1330,16 @@ fn finalize_deadline_budget(timeout: Duration) -> Duration {
 /// `timeout` bounds each individual git subprocess, but finalize launches many
 /// of them serially, so without a stage-level budget an agent-controlled
 /// repository could stretch settlement to scan-cap × timeout (hours).
+///
+/// `allow_pr` mirrors the Node plugin's `envelope.task.allowPr` gate on PR
+/// reconciliation (`finalizeGit`: `if (workingBranch && envelope.task?.allowPr
+/// && !out.pushFailed)`): only a run that was asked to open a PR looks the
+/// provider PR up, so a plain fallback-branch push never spends a `gh` call.
 pub async fn finalize_git(
     workspace: &CwdHandle,
     prep: &GitPrep,
     repo: &Repository,
+    allow_pr: bool,
     timeout: Duration,
 ) -> GitResult {
     // ONE overall finalize deadline. `timeout` bounds each INDIVIDUAL git
@@ -1333,7 +1356,7 @@ pub async fn finalize_git(
     // overrun it. On expiry the scan is incomplete — fail CLOSED (`retain`) so
     // the run dir is kept rather than reaped on a half-finished sweep.
     let deadline = Instant::now() + finalize_deadline_budget(timeout);
-    finalize_git_with_deadline(workspace, prep, repo, timeout, deadline).await
+    finalize_git_with_deadline(workspace, prep, repo, allow_pr, timeout, deadline).await
 }
 
 /// The body of [`finalize_git`] with the overall stage `deadline` supplied by
@@ -1344,6 +1367,7 @@ async fn finalize_git_with_deadline(
     workspace: &CwdHandle,
     prep: &GitPrep,
     repo: &Repository,
+    allow_pr: bool,
     timeout: Duration,
     deadline: Instant,
 ) -> GitResult {
@@ -1353,6 +1377,7 @@ async fn finalize_git_with_deadline(
         pushed: false,
         pr: None,
         retain: false,
+        push_failed: false,
         work_found: false,
         unborn_no_ref: false,
         scan_incomplete: false,
@@ -1833,6 +1858,14 @@ async fn finalize_git_with_deadline(
                         out.commits.clear();
                         out.retain = true;
                         out.work_found = true;
+                        // This run deliberately REFUSED to publish the prepared
+                        // branch (a stranded/incomplete scan), so it is not
+                        // confirmed on the remote this run. Set the dedicated
+                        // `push_failed` state — exactly as the other retain-skip
+                        // refusal does — so the PR reconcile gate (`!push_failed`,
+                        // mirroring Node) does not claim a PR for a branch this
+                        // run never published.
+                        out.push_failed = true;
                         return out;
                     }
                 }
@@ -2265,6 +2298,15 @@ async fn finalize_git_with_deadline(
                      stranded work (retain set), so the push would publish only a partial account \
                      of the agent's commits; leaving the run dir retained"
                 ));
+                // This is a retain-skipped / uncertain publication: the prepared
+                // branch was deliberately NOT published, so it is not confirmed
+                // on the remote. Mark it with the DEDICATED failure state so the
+                // reconcile gate (keyed on `!push_failed`, mirroring Node's
+                // `!pushFailed`) does not report a PR for a branch this run never
+                // published — WITHOUT the gate having to globally require that a
+                // push occurred, which would wrongly drop valid lookups for an
+                // un-attempted or no-new-commit branch that already has a PR.
+                out.push_failed = true;
             } else if !out.commits.is_empty() {
                 // This push runs AFTER arbitrary agent code controlled the
                 // checkout, so it must not trust agent-mutable state:
@@ -2303,6 +2345,7 @@ async fn finalize_git_with_deadline(
                                  pushed to a possibly rewritten/MITM'd destination"
                             ));
                             out.retain = true;
+                            out.push_failed = true;
                             None
                         }
                     };
@@ -2377,6 +2420,7 @@ async fn finalize_git_with_deadline(
                                          retaining the run dir so the work is not lost"
                                     ));
                                     out.retain = true;
+                                    out.push_failed = true;
                                 }
                             }
                         }
@@ -2389,8 +2433,49 @@ async fn finalize_git_with_deadline(
     // UNBORN/NO-REF verdict (see the helper): a proven-still-unborn run's
     // `retain` is only the fail-closed guard of a repo with no anchor, not
     // evidence a commit exists — mark it so the caller's empty-result check
-    // does not read that retain as `has_commits`.
+    // does not read that retain as `has_commits`. This SAFETY-CRITICAL probe
+    // runs BEFORE the best-effort PR reconciliation below: a hung `gh` could
+    // otherwise consume the remaining finalize deadline, leaving this
+    // `git_raw_status` probe a ~1 ns budget and an actually-empty unborn run
+    // with `unborn_no_ref = false` — its `retain` then misread as evidence of
+    // commits, bypassing empty-result detection.
     mark_unborn_no_ref(&mut out, prep, workspace, remaining!()).await;
+
+    // PR reconciliation (the Node plugin's `reconcileAgentPr`, c8ctl-plugin.js
+    // ~L6627): with a prepared work branch AND `task.allowPr`, look the
+    // branch's provider PR up so the completion's `pullRequest` variable is
+    // populated (issue #49 — it was previously always null). Gate on
+    // `!push_failed`, exactly mirroring Node's `workingBranch && allowPr &&
+    // !pushFailed`: reconcile runs whenever publication did not fail or come up
+    // uncertain. `push_failed` is set when publication errored and could not be
+    // confirmed, when the push admin context could not be built, OR when the
+    // push was deliberately refused because an earlier incomplete/stranded scan
+    // set `retain` (fail-closed) — all cases where this run's prepared branch is
+    // NOT confirmed on the remote, so reporting a PR for it could attach one that
+    // does not carry this run's commits. Crucially the gate does NOT require a
+    // push to have OCCURRED: an un-attempted publication (push disabled) or a
+    // prepared branch with no new commits leaves `push_failed` false and still
+    // looks up an existing provider PR, matching Node. Best-effort: it never
+    // fails the job — any `gh`/parse error becomes `{ found: false, error }`,
+    // exactly as Node does.
+    if reconcile_gate(allow_pr, out.push_failed) {
+        if let Some(branch) = &prep.working_branch {
+            // Cap this BEST-EFFORT lookup at 30s (the decision on #49: the Node
+            // plugin's `reconcileAgentPr` runs `gh pr list` with a 30s timeout),
+            // never the full per-command git budget (`remaining!()` is bounded by
+            // the git timeout, which defaults to 120s). A stalled `gh` must not
+            // hold an otherwise-completed job and its slot for the whole git
+            // timeout. `remaining!()` first, so an expired overall deadline still
+            // collapses the lookup to the ~1ns fail-closed budget rather than
+            // reviving a full 30s.
+            let lookup_budget = remaining!().min(Duration::from_secs(30));
+            out.pr = Some(
+                reconcile_agent_pr(workspace, &repo.provider, &repo.url, branch, lookup_budget)
+                    .await,
+            );
+        }
+    }
+
     out
 }
 
@@ -2542,8 +2627,14 @@ async fn git_raw_status(
     timeout: Duration,
 ) -> Option<i32> {
     use std::process::Stdio;
-    let mut cmd = Command::new("git");
+    // Trusted absolute `git` on a sanitized PATH (see `trusted_cli`): the child
+    // `fchdir`s into the cwd, so a bare name could resolve an agent-planted
+    // binary via a relative PATH entry. Fail closed (`None`) if git is not on an
+    // absolute PATH — callers already treat that as a scan failure → retain.
+    let (git_exe, safe_path) = trusted_cli("git").ok()?;
+    let mut cmd = Command::new(git_exe);
     cmd.args(args);
+    cmd.env("PATH", &safe_path);
     cmd.kill_on_drop(true);
     if let Some(dir) = cwd {
         dir.apply(&mut cmd).ok()?;
@@ -3112,6 +3203,26 @@ struct CredFile;
 /// already read this process's environment and open descriptors, so it cannot be
 /// defended against here (#62).
 ///
+/// Resolve the system temp root (`std::env::temp_dir()`) to an ABSOLUTE path
+/// before it is used to build a path handed to a child process.
+///
+/// `std::env::temp_dir()` honours a relative `TMPDIR` (e.g. `tmp`) verbatim, so
+/// it can return a relative path. The children we hand these temp-derived paths
+/// to — `gh` (via `GH_CONFIG_DIR`) and git's credential helper (via
+/// `NANO_GIT_CRED_FILE`) — run with a DIFFERENT working directory (the agent
+/// workspace), and resolve a relative path against *that* cwd. A relative temp
+/// root would therefore miss the private supervisor-owned directory and resolve
+/// against an agent-controlled location in the checkout — handing the child
+/// agent-planted config or secret instead of ours. Absolutize up front (against
+/// the daemon's own cwd, the same cwd `mkdtemp` creates under) and **fail
+/// closed** if resolution fails, so no child ever sees a relative,
+/// workspace-resolvable config/secret path.
+fn absolute_temp_root() -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir();
+    std::path::absolute(&dir)
+        .with_context(|| format!("resolving the system temp root {dir:?} to an absolute path"))
+}
+
 /// Unix-only: built on `libc::mkdtemp` and the unix permission/raw-fd APIs.
 #[cfg(unix)]
 fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
@@ -3136,7 +3247,7 @@ fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
     // umask, and picks a unique name so concurrent slots never collide. Build a
     // mutable NUL-terminated template ending in the six `X`s it requires.
     let mut template = {
-        let mut dir = std::env::temp_dir();
+        let mut dir = absolute_temp_root()?;
         dir.push("nano-git-cred-XXXXXX");
         let mut bytes = dir.into_os_string().into_vec();
         bytes.push(0);
@@ -3283,7 +3394,15 @@ async fn git_with_env_capture(
     extra_env: &[(&str, &str)],
 ) -> Result<(String, bool)> {
     use std::process::Stdio;
-    let mut cmd = Command::new("git");
+    // Resolve `git` to a trusted absolute path on a sanitized PATH BEFORE the
+    // cwd is applied: the child `fchdir`s into the (agent-controlled) checkout
+    // in `pre_exec`, so a bare `git` would let a relative PATH entry resolve an
+    // agent-planted binary — which would then run with this run's credential
+    // helper. The sanitized PATH also protects git's own transport/credential
+    // helper subprocesses.
+    let (git_exe, safe_path) = trusted_cli("git")?;
+    let mut cmd = Command::new(git_exe);
+    cmd.env("PATH", &safe_path);
     // A credential is delivered out of band via git's credential-helper
     // protocol so the secret never reaches argv (world-readable
     // `/proc/<pid>/cmdline`) NOR the stable `/proc/<pid>/environ` (readable by
@@ -3580,9 +3699,851 @@ where
     (buf, truncated)
 }
 
+/// Bytes of `gh`'s captured stdout retained. A `--limit 1 --json …` PR listing
+/// is a single small JSON object; 256 KiB bounds even a pathological provider
+/// response while leaving every legitimate payload intact.
+const GH_STDOUT_CAP: usize = 256 * 1024;
+
+/// Replace every literal occurrence of `token` in `text` with `***`, then strip
+/// any `scheme://user:pass@` userinfo — the Node plugin's `redactToken`
+/// (c8ctl-plugin.js ~L4579). Used on every `gh` error surfaced into a
+/// completion variable / log so a PAT handed to `gh` can never leak through a
+/// diagnostic.
+fn redact_token(text: &str, token: Option<&str>) -> String {
+    let mut s = text.to_string();
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        s = s.replace(t, "***");
+    }
+    // Mirror `redactToken`'s `/(https?:\/\/)[^@/\s]+@/gi → $1`: drop any
+    // `user:secret@` userinfo an http(s) URL in the text still carries.
+    scrub_url_credentials(&s)
+}
+
+/// The non-secret `[HOST/]OWNER/REPO` `gh` should act on, parsed from the
+/// TRUSTED configured `repo.url` rather than the agent-mutable `origin` in the
+/// checkout's `.git/config`: the PR lookup carries the operator's token, so the
+/// repository it targets must be chosen from supervisor-controlled state, never
+/// a value an agent could rewrite to point the token at a repo of its choosing.
+/// `None` for any URL that is not an http(s) GitHub-style `host/owner/repo`
+/// (e.g. the `file://` origins the finalize tests push to) — the caller then
+/// lets `gh` infer the repository from the checkout's remotes (the cwd-based
+/// fallback; see [`reconcile_agent_pr`]), exactly as the Node plugin always
+/// does. It does NOT skip the lookup: `gh` is still invoked.
+fn gh_repo_slug(url: &str) -> Option<String> {
+    let sanitized = scrub_url_credentials(url);
+    let after_scheme = sanitized
+        .split_once("://")
+        .filter(|(scheme, _)| {
+            let s = scheme_of(scheme);
+            s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https")
+        })
+        .map(|(_, rest)| rest)?;
+    // `rest` is `[userinfo@]host[:port]/owner/repo[.git][/…]`; the scrub already
+    // dropped http(s) userinfo, so split host from path on the first slash.
+    let (authority, path) = after_scheme.split_once('/')?;
+    // Keep the COMPLETE credential-free authority as the host — including a
+    // GitHub Enterprise custom port (`ghe.example:8443`) or a bracketed IPv6
+    // literal (`[2001:db8::1]:8443`). Splitting on the first `:` would drop the
+    // port and truncate an IPv6 host, reconciling against the wrong `GH_HOST`.
+    // The ONE normalization: strip a default `:443` from a managed-cloud
+    // `*.ghe.com` host (see `strip_managed_cloud_default_port`), so the slug,
+    // the derived `GH_HOST`, and the token selection all stay on gh's tenancy
+    // path instead of being misrouted to a self-hosted endpoint.
+    let host = strip_managed_cloud_default_port(authority);
+    if host.is_empty() {
+        return None;
+    }
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    // Percent-DECODE and validate each `owner`/`repo` path segment. `gh -R
+    // OWNER/REPO` keeps the argument literal — go-gh's parser never
+    // percent-decodes it — so an encoded remote such as
+    // `https://github.com/org/%72epo.git` (which identifies `org/repo`) would
+    // otherwise build `-R org/%72epo`, target a non-existent repository, and
+    // silently miss the PR. `decode_repo_segment` also fails CLOSED on an
+    // encoded separator (`%2F` → `/`) or any other byte a real owner/repo
+    // cannot hold, so an encoded path can never widen or inject the slug.
+    let owner = decode_repo_segment(segs.next()?)?;
+    let owner = owner.trim_end_matches(".git");
+    let repo = decode_repo_segment(segs.next()?)?;
+    let repo = repo.trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    // `gh`'s `-R` accepts a bare `owner/repo` for github.com and
+    // `host/owner/repo` elsewhere (GitHub Enterprise). Keep the host prefix only
+    // when it is not a github.com alias so the common case is unchanged. A bare
+    // exact match would misclassify the alias/default-port forms `gh` itself
+    // normalizes to github.com (`www.github.com`, `github.com:443`) as an
+    // Enterprise slug, routing the lookup to `GH_ENTERPRISE_TOKEN` + a GHES
+    // `/api/v3` endpoint and leaving it unauthenticated.
+    if is_github_com_authority(host) {
+        Some(format!("{owner}/{repo}"))
+    } else {
+        Some(format!("{host}/{owner}/{repo}"))
+    }
+}
+
+/// Percent-decode a single `OWNER` or `REPO` path segment from a repository
+/// URL and validate it is a literal GitHub name. GitHub owner/repo names are
+/// drawn only from `[A-Za-z0-9._-]`, and `gh -R OWNER/REPO` keeps the argument
+/// literal (go-gh never percent-decodes it), so this both yields the correct
+/// slug for an encoded remote (`%72epo` → `repo`) AND fails CLOSED — returning
+/// `None` so the caller falls back to `gh`'s cwd inference — on an encoded
+/// separator (`%2F` → `/`), a malformed `%XX` escape, non-UTF-8 bytes, or any
+/// other character a real owner/repo cannot contain, so an attacker-influenced
+/// encoding can never widen (`org/%2F../other`) or inject the slug.
+fn decode_repo_segment(seg: &str) -> Option<String> {
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+            let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    if decoded.is_empty()
+        || decoded == "."
+        || decoded == ".."
+        || !decoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(decoded)
+}
+
+/// Strip a default `:443` from a managed-cloud `*.ghe.com` GitHub host,
+/// returning the authority otherwise unchanged.
+///
+/// gh's tenancy model treats a bare `tenant.ghe.com` as GitHub's managed
+/// Enterprise cloud and routes its API to `https://api.tenant.ghe.com/graphql`.
+/// But gh's tenancy check does NOT strip a default `:443`, so the equivalent
+/// `tenant.ghe.com:443` fails that check and is misrouted to a self-hosted
+/// `https://tenant.ghe.com:443/api/graphql` endpoint — missing the PR — AND
+/// trips `gh_uses_standard_token` (the `:443` suffix breaks its `.ghe.com`
+/// match, selecting `GH_ENTERPRISE_TOKEN` instead of `GH_TOKEN`). Normalizing
+/// the port here, before the slug and `GH_HOST`/token host are derived from it,
+/// keeps the managed-cloud form on the tenancy path.
+///
+/// Only the default HTTPS port on a `*.ghe.com` host is stripped: a NON-default
+/// port is a distinct endpoint and is preserved, and a bracketed IPv6 literal
+/// (never a `.ghe.com` host) and every non-managed host (github.com aliases,
+/// handled by [`is_github_com_authority`], and self-hosted GHES) are returned
+/// verbatim.
+fn strip_managed_cloud_default_port(authority: &str) -> &str {
+    // A bracketed IPv6 literal is never a `.ghe.com` host; never split its `::`.
+    if authority.starts_with('[') {
+        return authority;
+    }
+    if let Some((host, "443")) = authority.rsplit_once(':') {
+        if !host.is_empty() && host.to_ascii_lowercase().ends_with(".ghe.com") {
+            return host;
+        }
+    }
+    authority
+}
+
+/// Whether `authority` (credential-free `host[:port]`) is a GitHub.com alias
+/// `gh` collapses to the single host `github.com`, where it reads `GH_TOKEN`
+/// (not `GH_ENTERPRISE_TOKEN`) and the default endpoint (no `/api/v3`).
+///
+/// `gh` normalizes any `*.github.com` subdomain — including `www.github.com`
+/// and `api.github.com` — to `github.com`, so the exact string `github.com` is
+/// NOT the only form that authenticates there. It also ignores the default
+/// HTTPS port, so `github.com:443` is still github.com. Classifying any of
+/// these as an Enterprise slug sets the wrong token env var and/or pins a bogus
+/// `GH_HOST`, so the PR lookup runs unauthenticated or against a GHES endpoint.
+///
+/// A genuine Enterprise host, a bracketed IPv6 literal, and a NON-default port
+/// (even on a github.com alias — a distinct endpoint) are all rejected so their
+/// host/port is retained verbatim by the caller.
+fn is_github_com_authority(authority: &str) -> bool {
+    // A bracketed IPv6 literal is never a github.com alias; reject it before any
+    // `:port` split so an inner `::` is not mistaken for a port separator.
+    if authority.starts_with('[') {
+        return false;
+    }
+    // Split an optional trailing `:port`. Only an all-ASCII-digit, non-empty
+    // port counts; anything else means there is no port to strip.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (authority, None),
+    };
+    // Only the default HTTPS port (or none) collapses to github.com; a custom
+    // port is a distinct endpoint that must keep its port.
+    if !matches!(port, None | Some("443")) {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    host == "github.com" || host.ends_with(".github.com")
+}
+
+/// The trusted GitHub host a resolved [`gh_repo_slug`] targets: the bare
+/// `owner/repo` form is github.com; the 3-segment `host/owner/repo` form is
+/// that GitHub Enterprise host. Used to pick the token env var `gh` actually
+/// honours for the host (`GH_TOKEN` vs `GH_ENTERPRISE_TOKEN` + `GH_HOST`).
+fn gh_host_of_slug(slug: &str) -> String {
+    let mut segs = slug.splitn(3, '/');
+    match (segs.next(), segs.next(), segs.next()) {
+        (Some(host), Some(_owner), Some(_repo)) => host.to_string(),
+        _ => "github.com".to_string(),
+    }
+}
+
+/// Whether finalize should run PR reconciliation this round. Mirrors the Node
+/// plugin's gate `workingBranch && allowPr && !pushFailed`: reconcile runs when
+/// the job was asked to open a PR (`allow_pr`) AND publication did not fail or
+/// come up uncertain (`!push_failed`). `push_failed` is set whenever this run's
+/// prepared branch is NOT confirmed on the remote — publication errored and
+/// could not be verified, the push admin context could not be built, or the
+/// push was deliberately refused because an earlier incomplete/stranded scan set
+/// `retain` (fail-closed). The gate deliberately does NOT require a push to have
+/// OCCURRED: an un-attempted publication (push disabled) or a prepared branch
+/// with no new commits leaves `push_failed` false and still looks up an existing
+/// provider PR, so a valid existing-branch lookup is never dropped. Keeping this
+/// a pure predicate makes the gate's semantics unit-testable in isolation.
+fn reconcile_gate(allow_pr: bool, push_failed: bool) -> bool {
+    allow_pr && !push_failed
+}
+
+/// Look the provider PR up for a pushed branch, mirroring the Node plugin's
+/// `reconcileAgentPr` (c8ctl-plugin.js ~L5636): `gh pr list --head <branch>
+/// --state all --json number,url,state,isDraft,title,author --limit 1`, run with
+/// the job workspace as cwd. Always returns a JSON object — `{ openedBy, found:
+/// true, number, url, state, isDraft, title }` for the first PR, or `{ openedBy:
+/// null, found: false[, error] }` otherwise — and NEVER fails the job.
+///
+/// Credential handling (the decision on #49): `gh` is handed the SAME job token
+/// the worker already passes to `git()` for clone/push (lifted out of the
+/// configured `repo.url`). There is no separate provider credential.
+async fn reconcile_agent_pr(
+    workspace: &CwdHandle,
+    provider: &str,
+    repo_url: &str,
+    branch: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    use serde_json::json;
+    // A non-GitHub provider has no `gh` PR surface — report unsupported, exactly
+    // as Node's `provider !== 'github'` guard does.
+    if !provider.is_empty() && provider != "github" {
+        return json!({
+            "openedBy": null,
+            "found": false,
+            "error": format!("PR reconcile unsupported for provider \"{provider}\""),
+        });
+    }
+    // The token the worker uses for clone/push: the userinfo lifted out of the
+    // trusted `repo.url`. `gh` is handed it via `GH_TOKEN`/`GH_ENTERPRISE_TOKEN`
+    // (see `gh_auth_env`); absent one, the anonymous path scrubs every ambient
+    // gh credential. The token is the userinfo PASSWORD for the `user:pass@`
+    // form, but the USERNAME for the token-as-username `https://<pat>@host`
+    // form (`split_url_credential` leaves the password empty there) — reading
+    // only the password would hand `gh` an empty token and clear every auth
+    // source, so fall back to the username when the password is empty.
+    let (_fetch_url, cred) = trusted_fetch_source(repo_url);
+    let token = cred.as_ref().map(|c| {
+        if c.password.is_empty() {
+            c.username.as_str()
+        } else {
+            c.password.as_str()
+        }
+    });
+    // When the configured `repo.url` resolves to a GitHub `[host/]owner/repo`,
+    // pin `gh` to it with `-R` so the token-bearing lookup targets a repository
+    // chosen from SUPERVISOR-controlled state, never the agent-mutable `origin`
+    // in the checkout. For any other URL (e.g. the `file://` origins the finalize
+    // tests push to) there is no slug to pin, so fall back to `gh`'s cwd-based
+    // remote inference — matching the Node plugin, which always runs cwd-based.
+    let slug = gh_repo_slug(repo_url);
+    // The trusted host is derived the same way — from the configured `repo.url`
+    // (github.com when there is no slug/host to derive) — and decides whether
+    // the token travels as `GH_TOKEN` (github.com) or `GH_ENTERPRISE_TOKEN` +
+    // `GH_HOST` (a GitHub Enterprise host), since `gh` ignores `GH_TOKEN` for a
+    // custom host.
+    let host = slug
+        .as_deref()
+        .map(gh_host_of_slug)
+        .unwrap_or_else(|| "github.com".to_string());
+    match gh_pr_list(workspace, slug.as_deref(), branch, token, &host, timeout).await {
+        Ok(GhRun { status, stdout, .. }) if status_is_success(&status) => parse_pr_list(&stdout),
+        Ok(GhRun { status, stderr, .. }) => {
+            let detail = redact_token(stderr.trim(), token);
+            let detail = detail.trim();
+            let msg = if detail.is_empty() {
+                format!("gh pr list failed (exit {})", exit_desc(&status))
+            } else {
+                detail.chars().take(200).collect()
+            };
+            json!({ "openedBy": null, "found": false, "error": msg })
+        }
+        Err(e) => json!({
+            "openedBy": null,
+            "found": false,
+            "error": format!(
+                "gh not runnable: {}",
+                redact_token(&e.to_string(), token).trim().chars().take(200).collect::<String>()
+            ),
+        }),
+    }
+}
+
+/// Parse `gh pr list`'s JSON array into the reconcile result object. An empty
+/// stdout or an empty array is `{ openedBy: null, found: false }` (no error —
+/// simply no PR); the first element maps `author.login → openedBy` and carries
+/// `number/url/state/isDraft/title`, exactly as Node's `reconcileAgentPr` does.
+/// A NON-EMPTY stdout that fails to parse (or parses to a non-array) is NOT
+/// "no PR": it is truncated/corrupt `gh` output, so it surfaces as
+/// `{ found: false, error }` — the PR's stated best-effort contract — instead
+/// of being silently indistinguishable from "this branch has no PR".
+fn parse_pr_list(stdout: &str) -> serde_json::Value {
+    use serde_json::json;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return json!({ "openedBy": null, "found": false });
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({
+                "openedBy": null,
+                "found": false,
+                "error": format!("gh pr list returned malformed JSON: {e}"),
+            });
+        }
+    };
+    let Some(first) = parsed.as_array().and_then(|a| a.first()) else {
+        // A parsed-but-non-array payload (or an empty array) is not a PR list:
+        // the empty array is "no PR"; any other shape is malformed output.
+        if parsed.as_array().is_some() {
+            return json!({ "openedBy": null, "found": false });
+        }
+        return json!({
+            "openedBy": null,
+            "found": false,
+            "error": "gh pr list returned a non-array JSON payload",
+        });
+    };
+    // Fail closed on a non-object entry (`[null]`, `[1]`, `["x"]`): `gh pr list`
+    // yields an array of PR objects, so a non-object first element is corrupt
+    // output, not a PR. Mapping it would report `found: true` with all-null
+    // fields — a false "PR found" from malformed CLI output.
+    if !first.is_object() {
+        return json!({
+            "openedBy": null,
+            "found": false,
+            "error": "gh pr list returned a non-object array entry",
+        });
+    }
+    let pr = first;
+    let opened_by = pr
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(|l| l.as_str())
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    json!({
+        "openedBy": opened_by,
+        "found": true,
+        "number": pr.get("number").cloned().unwrap_or(serde_json::Value::Null),
+        "url": pr.get("url").cloned().unwrap_or(serde_json::Value::Null),
+        "state": pr.get("state").cloned().unwrap_or(serde_json::Value::Null),
+        "isDraft": pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false),
+        "title": pr.get("title").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// The captured outcome of a `gh` invocation.
+struct GhRun {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn status_is_success(status: &std::process::ExitStatus) -> bool {
+    status.success()
+}
+
+/// A human-readable `exit N`/`signal N` suffix for a `gh` failure message,
+/// mirroring Node's `exit ${status}${signal ? …}`.
+fn exit_desc(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("null, signal {sig}");
+        }
+    }
+    status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "null".into())
+}
+
+/// Build the `gh pr list` argument vector for `branch`, pinning the repository
+/// with `-R <slug>` when a trusted GitHub slug resolved from the configured
+/// `repo.url` is available. Keeping this a pure builder makes the `-R` pin —
+/// the control that forces the token-bearing lookup onto a SUPERVISOR-chosen
+/// repository rather than the agent-mutable `origin` remote — independently
+/// testable: a regression that dropped `-R` for a resolved slug would otherwise
+/// pass every spawn-based test (the finalize contract test uses a `file://`
+/// origin with no slug, so it never exercises `-R`).
+fn gh_pr_list_args(slug: Option<&str>, branch: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["pr".into(), "list".into()];
+    // Pin the repository when we could resolve a trusted GitHub slug; otherwise
+    // let `gh` infer it from the checkout's remotes (cwd-based, as Node does).
+    if let Some(slug) = slug {
+        args.push("-R".into());
+        args.push(slug.into());
+    }
+    args.extend(
+        [
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,url,state,isDraft,title,author",
+            "--limit",
+            "1",
+        ]
+        .map(String::from),
+    );
+    args
+}
+
+/// Resolve `program` to a trusted absolute executable plus a sanitized `PATH`,
+/// searching a copy of the daemon's `PATH` with every empty or relative entry
+/// removed.
+///
+/// Our `git`/`gh` children `fchdir` into the (often AGENT-controlled) workspace
+/// in a `pre_exec` hook BEFORE `execvp` runs, so a bare program name would have
+/// its `PATH` search performed from inside that workspace. An empty, `.`, or any
+/// other relative `PATH` entry then resolves against agent-planted files —
+/// letting an agent shadow `gh`/`git` with a forgery that runs with the job
+/// token and could fake the provider PR result (#49). Resolving to an ABSOLUTE
+/// path here, in the daemon's own cwd, bypasses `execvp`'s `PATH` search
+/// entirely, and the returned sanitized `PATH` lets the caller hand the child a
+/// `PATH` with no relative entry so any HELPER the CLI itself spawns (after the
+/// same `fchdir`) resolves only against trusted absolute directories too. Fails
+/// closed: a program not found on an absolute `PATH` is an error, never a
+/// fallback to the vulnerable bare-name search.
+fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+    let raw = std::env::var_os("PATH").unwrap_or_default();
+    trusted_cli_from(program, &raw)
+}
+
+/// Pure core of [`trusted_cli`], taking the raw `PATH` explicitly so the
+/// sanitization/resolution can be unit-tested without mutating the shared
+/// process environment (which parallel tests spawning real `git`/`gh` rely on).
+#[cfg(unix)]
+fn trusted_cli_from(
+    program: &str,
+    raw_path: &std::ffi::OsStr,
+) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+    use std::path::{Path, PathBuf};
+    // Drop empty ("" — a leading/trailing/`::` gap, which `execvp` treats as the
+    // cwd) and every relative entry (".", "bin", "../x"): only an absolute
+    // directory is immune to the child's post-`fchdir` cwd.
+    let dirs: Vec<PathBuf> = std::env::split_paths(raw_path)
+        .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
+        .collect();
+    let sanitized = std::env::join_paths(&dirs).context("rebuilding a sanitized PATH")?;
+    // An already-absolute program is trusted as given — no `PATH` search runs.
+    if Path::new(program).is_absolute() {
+        return Ok((PathBuf::from(program), sanitized));
+    }
+    // A program carrying a slash but not absolute (e.g. `./gh`) resolves against
+    // the child cwd — exactly the attack — so refuse it rather than search.
+    if program.contains('/') {
+        bail!("refusing to resolve relative program path {program:?}");
+    }
+    for dir in &dirs {
+        let candidate = dir.join(program);
+        // A regular file the DAEMON can actually execute. An execute BIT for any
+        // user is not sufficient: for a non-root daemon a daemon-owned file with
+        // mode `0601` (owner rw-, other --x) passes a `mode & 0o111` check but
+        // `execvp` fails it with EACCES, and a real `PATH` search would skip it
+        // and fall through to a LATER executable on the path. Returning that
+        // absolute path here would pre-empt the fallback and break the spawn even
+        // when a usable binary exists in a later dir. `access(X_OK)` asks the
+        // kernel for the EFFECTIVE credential's execute permission (it is
+        // euid/egid-aware, so it answers "can THIS daemon execute it"), matching
+        // the spawn exactly and skipping the EACCES tease. Root is unaffected
+        // (the kernel grants root X_OK when any execute bit is set).
+        if executable_by_daemon(&candidate) {
+            return Ok((candidate, sanitized));
+        }
+    }
+    bail!("{program} not found on a trusted absolute PATH");
+}
+
+/// Unix: whether `path` is a regular file the daemon's EFFECTIVE credentials can
+/// execute, via `access(2)`/`X_OK`. Unlike a mode-bit test this is euid/egid
+/// aware, so it answers "can THIS process exec it" exactly as `execvp` will —
+/// skipping a file whose execute bit is set for some other user (e.g. a
+/// daemon-owned `0601` file a non-root daemon cannot run) instead of returning
+/// it and breaking the spawn. Follows symlinks (they point within the trusted
+/// absolute dirs). Any `access` error (ENOENT, EACCES, …) is "not executable".
+#[cfg(unix)]
+fn executable_by_daemon(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !md.is_file() {
+        return false;
+    }
+    let bytes = path.as_os_str().as_bytes();
+    let mut c = Vec::with_capacity(bytes.len() + 1);
+    c.extend_from_slice(bytes);
+    c.push(0);
+    // SAFETY: `c` is a writable, NUL-terminated buffer that outlives the call.
+    unsafe { libc::access(c.as_ptr() as *const libc::c_char, libc::X_OK) == 0 }
+}
+
+/// Non-Unix fallback: the out-of-band credential path is unsupported off Unix
+/// (see [`git_with_env_capture`]), and there is no `fchdir`/`pre_exec` cwd race
+/// to defend against, so resolve the program name as given.
+#[cfg(not(unix))]
+fn trusted_cli_from(
+    program: &str,
+    raw_path: &std::ffi::OsStr,
+) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+    Ok((std::path::PathBuf::from(program), raw_path.to_os_string()))
+}
+
+/// Spawn `gh pr list` for `branch` in `workspace`, returning its captured
+/// outcome. Best-effort and bounded by `timeout`; the credential and ambient-gh
+/// scrubbing live in [`gh_auth_env`]. `host` is the TRUSTED GitHub host derived
+/// from the configured `repo.url` (github.com when no slug resolved), and
+/// decides which token env var `gh` honours.
+async fn gh_pr_list(
+    workspace: &CwdHandle,
+    slug: Option<&str>,
+    branch: &str,
+    token: Option<&str>,
+    host: &str,
+    timeout: Duration,
+) -> Result<GhRun> {
+    use std::process::Stdio;
+    // Resolve `gh` to a trusted absolute path on a sanitized PATH BEFORE the
+    // workspace cwd is applied, so an agent-planted `gh` in the checkout cannot
+    // shadow the real CLI (which runs with the job token and could otherwise
+    // forge the provider PR result).
+    let (gh_exe, safe_path) = trusted_cli("gh")?;
+    let mut cmd = Command::new(gh_exe);
+    cmd.args(gh_pr_list_args(slug, branch));
+    cmd.env("PATH", &safe_path);
+    // Run with the job workspace as cwd, exactly as Node's `spawnSync(..., { cwd
+    // }); `gh` reads the checkout's git remotes for host/auth resolution.
+    workspace
+        .apply(&mut cmd)
+        .context("binding gh working directory")?;
+    // The anonymous path's private GH_CONFIG_DIR guard: bound BEFORE the spawn
+    // and kept alive until after `gh` has exited (the wait/timeout joins below),
+    // so the directory exists for the whole run and is removed on every exit
+    // path — error, timeout, and cancellation included.
+    let _gh_cfg_guard = gh_auth_env(&mut cmd, token, host)?;
+    cmd.kill_on_drop(true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(unix)]
+    crate::pdeath::arm(&mut cmd);
+    let mut child = cmd.spawn().context("spawning gh")?;
+    #[cfg(unix)]
+    let gpid = child.id();
+    #[cfg(unix)]
+    if let Some(pid) = gpid {
+        crate::pdeath::watch(pid);
+    }
+    #[cfg(unix)]
+    let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let wait = async {
+        let drain_err = async {
+            match stderr {
+                Some(e) => drain_capped(e, GIT_STDERR_TAIL).await.0,
+                None => Vec::new(),
+            }
+        };
+        let drain_out = async {
+            match stdout {
+                Some(o) => drain_capped(o, GH_STDOUT_CAP).await.0,
+                None => Vec::new(),
+            }
+        };
+        let (status, err, out) = tokio::join!(child.wait(), drain_err, drain_out);
+        (status, (err, out))
+    };
+    let (status, (stderr_tail, stdout_tail)) = match tokio::time::timeout(timeout, wait).await {
+        Ok(res) => {
+            #[cfg(unix)]
+            {
+                crate::pdeath::terminate_group_and_reap(
+                    &mut child,
+                    group_guard.guard(),
+                    Duration::from_secs(3),
+                )
+                .await;
+                group_guard.disarm();
+            }
+            res
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                group_guard.kill_group_if_ours();
+                group_guard.disarm();
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            bail!("gh pr list timed out after {}s", timeout.as_secs());
+        }
+    };
+    let status = status.context("waiting for gh")?;
+    Ok(GhRun {
+        status,
+        stdout: String::from_utf8_lossy(&stdout_tail).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_tail).into_owned(),
+    })
+}
+
+/// Build `gh`'s environment, mirroring the Node plugin's `ghAuthEnv`
+/// (c8ctl-plugin.js ~L5660):
+///
+///   * Every path: disable `gh`'s interactive auth/update prompts
+///     (`GH_PROMPT_DISABLED`/`GH_NO_UPDATE_NOTIFIER`) so a non-interactive
+///     worker fails fast instead of blocking, and scrub EVERY ambient gh
+///     credential source — all four token env vars AND any stored
+///     `hosts.yml`/keychain (via a private empty `GH_CONFIG_DIR`) — so no path
+///     can silently authenticate as the daemon/operator with an inherited
+///     credential. An inherited `GH_HOST`/`GH_REPO` is scrubbed too: for the
+///     bare `owner/repo` (github.com) form `GH_HOST` would otherwise redirect
+///     the lookup to an attacker-chosen default host, and `GH_REPO` would
+///     override the repository target on the cwd-inference path; `GH_HOST` is
+///     restored only in the Enterprise branch, pinned to the trusted host.
+///   * With a token: deliver it as `GH_TOKEN` for github.com, or as
+///     `GH_ENTERPRISE_TOKEN` + `GH_HOST` for a GitHub Enterprise host (`gh`
+///     ignores `GH_TOKEN` for a custom host). `host` comes from the TRUSTED
+///     configured `repo.url`, never the agent-mutable checkout.
+///   * Anonymous (no token): the scrub above IS the whole defence — a
+///     token-less job cannot authenticate as the operator through an inherited
+///     env var, a stored `hosts.yml`, or the OS keychain. This scrub is a
+///     security property, not a nicety.
+///
+/// The `GH_CONFIG_DIR` is a supervisor-owned `0700` directory created with
+/// `mkdtemp` under the system temp root — OUTSIDE the agent-controlled
+/// checkout, so an agent cannot pre-create it as a symlink to an ambient gh
+/// config (the `create_dir_all`-follows-symlinks defeat documented in
+/// src/slot.rs) — and the returned [`GhConfigGuard`] removes it on drop, once
+/// `gh` has exited. Any failure to create it FAILS CLOSED (an `Err`): the
+/// reconcile degrades to `{ found: false, error }` rather than running `gh`
+/// with the ambient config exposed.
+///
+/// `gh` is handed the `mkdtemp` directory *name* directly. A same-UID process
+/// could in principle `rename` the `nano-gh-config-*` entry aside after
+/// `mkdtemp` and swap a symlink into its place before `gh` opens `hosts.yml`
+/// (mode `0700` and the sticky bit do not bar a directory from its same-UID
+/// owner), redirecting the read at the stale name. That same-UID
+/// rename/symlink swap is OUT OF SCOPE here, consistent with [`CredFile`]
+/// (which explicitly declares same-UID exposure out of scope) and with #49's
+/// sanctioned same-UID `/proc/<pid>/environ` token exposure on the token path
+/// below: a same-UID attacker can already read the operator's `~/.config/gh`
+/// credentials — or the job token out of `environ` — directly, so hardening
+/// only this one path against it buys nothing. This scrub defends against the
+/// agent-controlled checkout and ambient operator/daemon credentials, not a
+/// same-UID process.
+///
+/// Token delivery via an env var re-creates, for `gh`, the
+/// `/proc/<pid>/environ` token exposure that #24 removed for `git` (which now
+/// delivers the password through a per-command 0600 file read by a credential
+/// helper). `gh` has no comparable file/FD secret-input channel short of
+/// writing the token into a `hosts.yml` under `GH_CONFIG_DIR`, so this port
+/// matches the Node plugin's `GH_TOKEN` delivery EXPLICITLY (not silently) —
+/// see #24 and #49's decision note, which sanctions accepting the env exposure
+/// for the `gh` path. The daemon's own engine-connection secrets are still
+/// scrubbed below (as the `git()` launch does) since `gh` shells out to `git`
+/// inside the agent-controlled checkout.
+fn gh_auth_env(
+    cmd: &mut Command,
+    token: Option<&str>,
+    host: &str,
+) -> Result<Option<GhConfigGuard>> {
+    // Strip the daemon's engine-connection secrets, exactly as the git launch
+    // does: `gh` runs `git` against agent-controlled remotes/config, so a hostile
+    // checkout must not be able to read `CAMUNDA_*`/`ZEEBE_*` client secrets out
+    // of the inherited environment.
+    for k in crate::slot::SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+    // BOTH paths: remove every ambient gh token env var so an inherited
+    // operator/daemon credential is never picked up — on the token path the
+    // job token is then set on the exact var `gh` honours for the host, and on
+    // the anonymous path the scrub below leaves no credential source at all.
+    for k in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        cmd.env_remove(k);
+    }
+    // BOTH paths: scrub any inherited `GH_HOST`/`GH_REPO`. For the bare
+    // `owner/repo` form used for github.com, `gh` resolves the omitted host
+    // through its DEFAULT host, so an ambient `GH_HOST` could silently redirect
+    // the lookup away from the trusted host; an ambient `GH_REPO` likewise
+    // overrides the repository target on the cwd-inference (no-`-R`) path. Both
+    // are cleared here; `GH_HOST` is set back below only in the GitHub
+    // Enterprise branch, pinned to the host derived from the configured
+    // `repo.url`.
+    for k in ["GH_HOST", "GH_REPO"] {
+        cmd.env_remove(k);
+    }
+    // BOTH paths: point `gh` at a private, supervisor-owned, empty config dir
+    // OUTSIDE the agent-controlled checkout so a stored `hosts.yml` or OS
+    // keychain can never authenticate the lookup as the operator. Fail closed
+    // when it cannot be created. (A same-UID rename/symlink swap of the
+    // `mkdtemp` name is OUT OF SCOPE — see the function doc above.)
+    let guard = GhConfigGuard::create()?;
+    cmd.env("GH_CONFIG_DIR", guard.path());
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        if gh_uses_standard_token(host) {
+            // github.com AND GitHub's managed Enterprise cloud (`*.ghe.com`,
+            // e.g. `https://tenant.ghe.com/org/repo.git`) both authenticate via
+            // GH_TOKEN/GITHUB_TOKEN — gh's tenancy model treats a `*.ghe.com`
+            // host as github.com and reads GH_TOKEN for it, NOT
+            // GH_ENTERPRISE_TOKEN (which is for self-hosted GHES). Selecting
+            // GH_ENTERPRISE_TOKEN for `*.ghe.com` would leave the lookup
+            // unauthenticated (GH_TOKEN/GITHUB_TOKEN and stored credentials are
+            // scrubbed above) and return `found:false`. GH_HOST is still pinned
+            // to the trusted host below so the lookup targets the configured
+            // `repo.url` host, not gh's default.
+            cmd.env("GH_TOKEN", t);
+            if !host.eq_ignore_ascii_case("github.com") {
+                cmd.env("GH_HOST", host);
+            }
+        } else {
+            // A self-hosted GitHub Enterprise Server host: `gh` authenticates via
+            // GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN — GH_TOKEN is ignored
+            // there — and GH_HOST pins the default host so the lookup targets
+            // the trusted host from the configured `repo.url`.
+            cmd.env("GH_ENTERPRISE_TOKEN", t);
+            cmd.env("GH_HOST", host);
+        }
+    }
+    Ok(Some(guard))
+}
+
+/// Whether `gh` reads the STANDARD `GH_TOKEN`/`GITHUB_TOKEN` (not
+/// `GH_ENTERPRISE_TOKEN`) for `host`. True for github.com and for GitHub's
+/// managed Enterprise cloud tenancy hosts `*.ghe.com`, which gh treats as
+/// github.com for auth; false for a self-hosted GitHub Enterprise Server host.
+/// Case-insensitive; a bare `ghe.com` (no tenant subdomain) is NOT a valid
+/// tenancy host and is treated as self-hosted.
+fn gh_uses_standard_token(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "github.com" || h.ends_with(".ghe.com")
+}
+
+/// Guards the supervisor-owned `0700` `GH_CONFIG_DIR` created for one `gh`
+/// invocation. Its `Drop` removes the directory, so the anonymous-auth scrub's
+/// empty config never outlives the `gh` run — on every exit path, including
+/// error, timeout, and cancellation. Mirrors [`CredFile`]'s RAII contract.
+struct GhConfigGuard {
+    dir: std::path::PathBuf,
+}
+
+impl GhConfigGuard {
+    /// Create a fresh private `0700` directory under the system temp root —
+    /// outside any agent-controlled checkout — via `mkdtemp` (which creates
+    /// with mode `0700` regardless of umask and picks a unique name, so an
+    /// agent cannot pre-create or symlink the path). Fails closed with an
+    /// `Err` when the directory cannot be created, so `gh` is never run with
+    /// the ambient config exposed.
+    #[cfg(unix)]
+    fn create() -> Result<GhConfigGuard> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut template = {
+            let mut dir = absolute_temp_root()?;
+            dir.push("nano-gh-config-XXXXXX");
+            let mut bytes = dir.into_os_string().into_vec();
+            bytes.push(0);
+            bytes
+        };
+        // SAFETY: `template` is a writable, NUL-terminated buffer whose final
+        // component is `XXXXXX`; mkdtemp replaces those in place and returns
+        // the same pointer (or NULL on failure). We never move the buffer
+        // during the call.
+        let res = unsafe { libc::mkdtemp(template.as_mut_ptr() as *mut libc::c_char) };
+        if res.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("creating the private gh config directory");
+        }
+        template.pop();
+        let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(template));
+        Ok(GhConfigGuard { dir })
+    }
+
+    /// Non-Unix hosts have no `mkdtemp` here; fail closed rather than fall
+    /// back to a guessable or checkout-local directory (these are not
+    /// supported daemon hosts).
+    #[cfg(not(unix))]
+    fn create() -> Result<GhConfigGuard> {
+        Err(anyhow::anyhow!(
+            "the private gh config directory is not supported on this (non-Unix) \
+             platform; cannot run gh with a guaranteed-anonymous auth scrub"
+        ))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.dir
+    }
+}
+
+impl Drop for GhConfigGuard {
+    fn drop(&mut self) {
+        // Best-effort: remove the private 0700 directory. We created and own it
+        // (mkdtemp), so this is a simple recursive remove of a directory no
+        // other UID can have written to. A failure cannot be meaningfully
+        // handled at drop time; the directory is owner-only regardless.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read the environment a production [`gh_auth_env`]-configured Tokio
+    /// command will run with, via its underlying `std::process::Command`
+    /// (`as_std`). `get_envs` reports an explicitly-removed var as a `None`
+    /// value — treat those as absent so a scrubbed var reads as "not set".
+    fn env_of(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
 
     #[test]
     fn hex_sha_validation() {
@@ -3709,6 +4670,761 @@ mod tests {
         let (argv_url, cred) = split_url_credential(ssh);
         assert_eq!(argv_url, ssh);
         assert!(cred.is_none());
+    }
+
+    #[test]
+    fn gh_repo_slug_parses_github_http_urls_only() {
+        // Canonical github.com → bare owner/repo; `.git` and any path tail dropped.
+        assert_eq!(
+            gh_repo_slug("https://github.com/org/repo.git").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("http://github.com/org/repo").as_deref(),
+            Some("org/repo")
+        );
+        // A `user:token@` userinfo is scrubbed before parsing; the slug carries no secret.
+        let url = format!("https://{}:{}@github.com/org/repo.git", "x", "s3cr3t");
+        let slug = gh_repo_slug(&url).expect("github slug");
+        assert_eq!(slug, "org/repo");
+        assert!(!slug.contains("s3cr3t") && !slug.contains('@'));
+        // GitHub Enterprise keeps the host prefix so `gh -R` targets the right host.
+        assert_eq!(
+            gh_repo_slug("https://ghe.example.com/org/repo.git").as_deref(),
+            Some("ghe.example.com/org/repo")
+        );
+        // A GitHub Enterprise CUSTOM PORT is preserved in the host (splitting
+        // the authority on the first `:` would drop it and reconcile against
+        // the wrong `GH_HOST`).
+        assert_eq!(
+            gh_repo_slug("https://ghe.example:8443/org/repo.git").as_deref(),
+            Some("ghe.example:8443/org/repo")
+        );
+        // A bracketed IPv6 literal (optionally with a port) is preserved whole —
+        // a naive `:` split would truncate it at the first colon.
+        assert_eq!(
+            gh_repo_slug("https://[2001:db8::1]:8443/org/repo.git").as_deref(),
+            Some("[2001:db8::1]:8443/org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://[2001:db8::1]/org/repo.git").as_deref(),
+            Some("[2001:db8::1]/org/repo")
+        );
+        // A non-http(s) remote (the finalize tests' file:// origins, ssh, local
+        // paths) is NOT a GitHub http remote → None, so gh is never spawned for it.
+        assert!(gh_repo_slug("file:///tmp/origin.git").is_none());
+        assert!(gh_repo_slug("ssh://git@github.com/org/repo.git").is_none());
+        assert!(gh_repo_slug("/tmp/local/repo").is_none());
+        // A URL with no repo path segment yields nothing to act on.
+        assert!(gh_repo_slug("https://github.com/org").is_none());
+    }
+
+    #[test]
+    fn gh_repo_slug_decodes_and_validates_encoded_paths() {
+        // A percent-encoded path component identifies the DECODED name, and
+        // `gh -R` keeps its argument literal — so the slug must decode it (not
+        // pass `org/%72epo` through, which would miss the PR).
+        assert_eq!(
+            gh_repo_slug("https://github.com/org/%72epo.git").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://github.com/%6Frg/repo").as_deref(),
+            Some("org/repo")
+        );
+        // Enterprise host keeps its prefix while the path is still decoded.
+        assert_eq!(
+            gh_repo_slug("https://ghe.example.com/%6Frg/%72epo.git").as_deref(),
+            Some("ghe.example.com/org/repo")
+        );
+        // Fail CLOSED on an encoded separator (`%2F` → `/`): decoding it would
+        // widen/inject the slug (`-R org/bad/evil`), so fall back to cwd
+        // inference instead.
+        assert!(gh_repo_slug("https://github.com/org/bad%2Fevil").is_none());
+        assert!(gh_repo_slug("https://github.com/org/..%2F..%2Fother").is_none());
+        // A malformed `%XX` escape, an encoded control byte, or an encoded
+        // space is not a real name — reject rather than guess.
+        assert!(gh_repo_slug("https://github.com/org/re%zzpo").is_none());
+        assert!(gh_repo_slug("https://github.com/org/re%00po").is_none());
+        assert!(gh_repo_slug("https://github.com/org/re%20po").is_none());
+        // A decoded `.`/`..` component is not a real repository and would make
+        // a degenerate `org/..` slug — reject it too.
+        assert!(gh_repo_slug("https://github.com/org/%2E%2E").is_none());
+        assert!(gh_repo_slug("https://github.com/%2E/repo").is_none());
+    }
+
+    #[test]
+    fn gh_repo_slug_normalizes_github_com_aliases() {
+        // `gh` normalizes every github.com alias/default-port form to the single
+        // host `github.com` (where it reads `GH_TOKEN`). Each MUST therefore emit
+        // the bare `owner/repo` slug — NOT a 3-segment Enterprise slug that would
+        // route the lookup to `GH_ENTERPRISE_TOKEN` + a GHES endpoint and run
+        // unauthenticated.
+        for url in [
+            "https://www.github.com/org/repo.git",
+            "https://WWW.GitHub.COM/org/repo.git",
+            "https://api.github.com/org/repo",
+            "https://github.com:443/org/repo.git",
+            "https://www.github.com:443/org/repo.git",
+            "http://github.com:443/org/repo",
+        ] {
+            assert_eq!(
+                gh_repo_slug(url).as_deref(),
+                Some("org/repo"),
+                "github.com alias must collapse to a bare slug: {url}"
+            );
+        }
+        // A NON-default port is a distinct endpoint even on a github.com alias:
+        // keep the full authority so `GH_HOST` pins it (never silently drop the
+        // port and authenticate against the wrong endpoint).
+        assert_eq!(
+            gh_repo_slug("https://github.com:8443/org/repo.git").as_deref(),
+            Some("github.com:8443/org/repo")
+        );
+        // A host that merely ENDS WITH `github.com` but is a different domain
+        // (no dot boundary) is NOT an alias — it stays an Enterprise slug.
+        assert_eq!(
+            gh_repo_slug("https://notgithub.com/org/repo.git").as_deref(),
+            Some("notgithub.com/org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://evilgithub.com/org/repo.git").as_deref(),
+            Some("evilgithub.com/org/repo")
+        );
+    }
+
+    #[test]
+    fn gh_repo_slug_strips_default_port_from_managed_cloud_hosts() {
+        // GitHub's managed Enterprise cloud (`*.ghe.com`) is a tenancy host gh
+        // routes to `api.tenant.ghe.com`, but gh does NOT strip a default `:443`
+        // — so `tenant.ghe.com:443` would be misrouted to a self-hosted
+        // `tenant.ghe.com:443/api/graphql` endpoint AND select
+        // `GH_ENTERPRISE_TOKEN`. The default port MUST be dropped so both forms
+        // resolve to the same tenancy slug.
+        assert_eq!(
+            gh_repo_slug("https://tenant.ghe.com/org/repo.git").as_deref(),
+            Some("tenant.ghe.com/org/repo")
+        );
+        assert_eq!(
+            gh_repo_slug("https://tenant.ghe.com:443/org/repo.git").as_deref(),
+            Some("tenant.ghe.com/org/repo")
+        );
+        // Case-insensitive on the host.
+        assert_eq!(
+            gh_repo_slug("https://Tenant.GHE.com:443/org/repo.git").as_deref(),
+            Some("Tenant.GHE.com/org/repo")
+        );
+        // A NON-default port is a distinct endpoint — keep it verbatim.
+        assert_eq!(
+            gh_repo_slug("https://tenant.ghe.com:8443/org/repo.git").as_deref(),
+            Some("tenant.ghe.com:8443/org/repo")
+        );
+        // The derived GH_HOST + token host must land on the tenancy path, i.e.
+        // the standard `GH_TOKEN` (not `GH_ENTERPRISE_TOKEN`).
+        let host = gh_host_of_slug(
+            gh_repo_slug("https://tenant.ghe.com:443/org/repo.git")
+                .as_deref()
+                .unwrap(),
+        );
+        assert_eq!(host, "tenant.ghe.com");
+        assert!(
+            gh_uses_standard_token(&host),
+            "managed-cloud host must use the standard GH_TOKEN"
+        );
+        // A self-hosted GHES host that merely ends with `.ghe.com`-adjacent text
+        // is NOT managed cloud: a default `:443` on a plain Enterprise host is
+        // left verbatim (only `*.ghe.com` tenancy is normalized).
+        assert_eq!(
+            gh_repo_slug("https://ghe.example.com:443/org/repo.git").as_deref(),
+            Some("ghe.example.com:443/org/repo")
+        );
+        // A bare `ghe.com` (no tenant subdomain) is NOT a tenancy host — its
+        // `:443` is left verbatim too, matching `gh_uses_standard_token`.
+        assert_eq!(
+            gh_repo_slug("https://ghe.com:443/org/repo.git").as_deref(),
+            Some("ghe.com:443/org/repo")
+        );
+    }
+
+    #[test]
+    fn strip_managed_cloud_default_port_only_touches_ghe_tenancy_443() {
+        // Default `:443` dropped only for `*.ghe.com` (case-insensitive).
+        assert_eq!(
+            strip_managed_cloud_default_port("tenant.ghe.com:443"),
+            "tenant.ghe.com"
+        );
+        assert_eq!(
+            strip_managed_cloud_default_port("Tenant.GHE.COM:443"),
+            "Tenant.GHE.COM"
+        );
+        // Preserved verbatim: non-default port, bare tenancy host, non-tenancy
+        // hosts, a bare `ghe.com`, and a bracketed IPv6 literal (its `:443`
+        // suffix is part of the authority, and `::` must never be split).
+        for a in [
+            "tenant.ghe.com:8443",
+            "tenant.ghe.com",
+            "github.com:443",
+            "ghe.example.com:443",
+            "ghe.com:443",
+            "notghe.com:443",
+            "[2001:db8::1]:443",
+            "[2001:db8::1]",
+        ] {
+            assert_eq!(
+                strip_managed_cloud_default_port(a),
+                a,
+                "must be left verbatim: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_github_com_authority_classifies_aliases_and_rejects_enterprise() {
+        // github.com + its aliases, with no port or the default HTTPS port.
+        for a in [
+            "github.com",
+            "GitHub.com",
+            "github.com:443",
+            "www.github.com",
+            "www.github.com:443",
+            "api.github.com",
+            "foo.github.com",
+        ] {
+            assert!(is_github_com_authority(a), "should be github.com: {a}");
+        }
+        // Non-default port, Enterprise hosts, look-alike domains, and IPv6
+        // literals are all rejected so their authority is retained verbatim.
+        for a in [
+            "github.com:8443",
+            "www.github.com:8443",
+            "ghe.example.com",
+            "ghe.example:8443",
+            "notgithub.com",
+            "evilgithub.com",
+            "[2001:db8::1]",
+            "[2001:db8::1]:443",
+            "[2001:db8::1]:8443",
+        ] {
+            assert!(!is_github_com_authority(a), "should NOT be github.com: {a}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_cli_resolves_absolute_and_rejects_relative_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        // A sandbox PATH: a trusted absolute dir holding a fake executable, plus
+        // the exact entries `execvp` would resolve against the child cwd — an
+        // empty entry, `.`, and a relative dir — which MUST be dropped. The pure
+        // `trusted_cli_from` takes the PATH explicitly, so this never mutates the
+        // shared process env that parallel tests spawning real git/gh rely on.
+        let tmp = std::env::temp_dir().join(format!(
+            "trusted-cli-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let exe = tmp.join("fakebin");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let crafted = std::env::join_paths([
+            std::path::PathBuf::from(""),            // empty → cwd
+            std::path::PathBuf::from("."),           // cwd
+            std::path::PathBuf::from("rel-cli-dir"), // relative
+            tmp.clone(),                             // trusted absolute
+        ])
+        .unwrap();
+
+        let (resolved, sanitized) =
+            trusted_cli_from("fakebin", &crafted).expect("resolves on absolute dir");
+        assert_eq!(resolved, exe, "must resolve the trusted absolute binary");
+        // The sanitized PATH keeps ONLY the absolute entry.
+        let kept: Vec<_> = std::env::split_paths(&sanitized).collect();
+        assert_eq!(
+            kept,
+            vec![tmp.clone()],
+            "relative/empty entries must be stripped"
+        );
+
+        // A relative program path is refused outright (would resolve to cwd).
+        assert!(trusted_cli_from("./fakebin", &crafted).is_err());
+        // An absolute program is trusted verbatim.
+        let (abs, _) = trusted_cli_from(exe.to_str().unwrap(), &crafted).unwrap();
+        assert_eq!(abs, exe);
+        // A binary reachable ONLY via stripped relative entries is not found
+        // (fail closed) once no absolute dir provides it.
+        let rel_only =
+            std::env::join_paths([std::path::PathBuf::from(""), std::path::PathBuf::from(".")])
+                .unwrap();
+        assert!(
+            trusted_cli_from("fakebin", &rel_only).is_err(),
+            "no absolute dir → fail closed"
+        );
+
+        // EFFECTIVE-EXECUTE (the F3 finding): an EARLIER dir holds a same-named
+        // file whose execute bit is set only for OTHER (mode 0601) — a file a
+        // non-root daemon cannot actually exec. A mode-bit check would return it
+        // and pre-empt the fallback; the effective `access(X_OK)` check must SKIP
+        // it and resolve the usable binary in the LATER dir, exactly as a real
+        // `PATH` search falls through on EACCES. (As root `access(X_OK)` succeeds
+        // whenever any execute bit is set, so the skip is only observable for a
+        // non-root daemon — guard the skip assertion accordingly.)
+        let dir_a = tmp.join("a");
+        let dir_b = tmp.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let a_bin = dir_a.join("fakebin");
+        std::fs::write(&a_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&a_bin, std::fs::Permissions::from_mode(0o601)).unwrap();
+        let b_bin = dir_b.join("fakebin");
+        std::fs::write(&b_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&b_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let two = std::env::join_paths([dir_a.clone(), dir_b.clone()]).unwrap();
+        let (resolved, _) = trusted_cli_from("fakebin", &two).expect("a usable binary exists");
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(resolved, a_bin, "root can exec any execute-bit file");
+        } else {
+            assert_eq!(
+                resolved, b_bin,
+                "a non-root daemon must skip the other-exec-only file and fall through"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn gh_host_of_slug_derives_the_trusted_host() {
+        // A bare owner/repo slug is github.com; a 3-segment slug names its
+        // GitHub Enterprise host.
+        assert_eq!(gh_host_of_slug("org/repo"), "github.com");
+        assert_eq!(
+            gh_host_of_slug("ghe.example.com/org/repo"),
+            "ghe.example.com"
+        );
+        // The host segment keeps a custom port / bracketed IPv6 so `GH_HOST`
+        // pins the exact Enterprise authority.
+        assert_eq!(
+            gh_host_of_slug("ghe.example:8443/org/repo"),
+            "ghe.example:8443"
+        );
+        assert_eq!(
+            gh_host_of_slug("[2001:db8::1]:8443/org/repo"),
+            "[2001:db8::1]:8443"
+        );
+    }
+
+    #[test]
+    fn gh_pr_list_args_pins_the_trusted_slug_with_dash_r() {
+        // A resolved slug MUST be pinned with `-R owner/repo` so the
+        // token-bearing lookup targets the supervisor-chosen repository, never
+        // the agent-mutable `origin`. The finalize contract test uses a
+        // `file://` origin (no slug), so without this unit assertion a
+        // regression that stopped adding `-R` would go uncaught.
+        let args = gh_pr_list_args(Some("org/repo"), "feat/x");
+        assert_eq!(
+            args,
+            vec![
+                "pr",
+                "list",
+                "-R",
+                "org/repo",
+                "--head",
+                "feat/x",
+                "--state",
+                "all",
+                "--json",
+                "number,url,state,isDraft,title,author",
+                "--limit",
+                "1",
+            ]
+        );
+        // The `-R owner/repo` pair is adjacent and carries the exact slug.
+        let i = args
+            .iter()
+            .position(|a| a == "-R")
+            .expect("-R must be present for a slug");
+        assert_eq!(args[i + 1], "org/repo");
+
+        // A GitHub Enterprise slug keeps its host prefix so `-R` targets the
+        // right host.
+        let ghe = gh_pr_list_args(Some("ghe.example.com/org/repo"), "feat/x");
+        let i = ghe.iter().position(|a| a == "-R").expect("-R for GHE slug");
+        assert_eq!(ghe[i + 1], "ghe.example.com/org/repo");
+
+        // No slug → NO `-R` (cwd-based inference), but the branch is still
+        // pinned with `--head`.
+        let none = gh_pr_list_args(None, "feat/x");
+        assert!(
+            !none.iter().any(|a| a == "-R"),
+            "no -R without a slug: {none:?}"
+        );
+        let h = none
+            .iter()
+            .position(|a| a == "--head")
+            .expect("--head present");
+        assert_eq!(none[h + 1], "feat/x");
+    }
+
+    #[test]
+    fn reconcile_gate_mirrors_node_push_failed() {
+        // Mirrors Node's `workingBranch && allowPr && !pushFailed`: reconcile
+        // runs for an allow-PR run whose publication did not fail.
+        assert!(
+            reconcile_gate(true, false),
+            "allow-PR + !push_failed → reconcile"
+        );
+        assert!(
+            !reconcile_gate(false, false),
+            "a run that was not asked to open a PR never reconciles"
+        );
+        assert!(
+            !reconcile_gate(true, true),
+            "a failed/uncertain publication must NOT claim a PR"
+        );
+        // The crux of this finding: the gate must NOT require a push to have
+        // OCCURRED. A prepared branch with no new commits (or a push-disabled
+        // run) was never published this round yet leaves `push_failed` false,
+        // and an existing provider PR for it must still be looked up. A run with
+        // an UNRELATED `retain` whose push nonetheless succeeded is the same
+        // shape from the gate's view (`push_failed` false).
+        let published = GitResult {
+            branch: Some("feat/x".into()),
+            commits: vec!["deadbeef".into()],
+            pushed: true,
+            pr: None,
+            retain: true,
+            push_failed: false,
+            work_found: false,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        assert!(
+            reconcile_gate(true, published.push_failed),
+            "a published branch (push_failed false) is reconciled even with retain set"
+        );
+        let no_new_commits = GitResult {
+            branch: Some("feat/x".into()),
+            commits: vec![],
+            pushed: false,
+            pr: None,
+            retain: false,
+            push_failed: false,
+            work_found: false,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        assert!(
+            reconcile_gate(true, no_new_commits.push_failed),
+            "an un-attempted / no-new-commit branch must still look up its existing PR"
+        );
+        // The retain-SKIPPED push: the finalize push path REFUSES to publish
+        // when an earlier incomplete/stranded scan set `retain`, and marks that
+        // uncertain publication with the dedicated `push_failed` state. Reporting
+        // a PR for that unpublished branch would attach one that may not carry
+        // this run's commits, so the gate must close.
+        let skipped = GitResult {
+            branch: Some("feat/x".into()),
+            commits: vec!["deadbeef".into()],
+            pushed: false,
+            pr: None,
+            retain: true,
+            push_failed: true,
+            work_found: false,
+            unborn_no_ref: false,
+            scan_incomplete: false,
+        };
+        assert!(
+            !reconcile_gate(true, skipped.push_failed),
+            "a retain-skipped (unpublished) push sets push_failed, so it must NOT report a PR"
+        );
+    }
+
+    #[test]
+    fn gh_auth_env_scrubs_ambient_credentials_on_both_paths() {
+        // Pre-seed a command with ambient operator credentials; the PRODUCTION
+        // `gh_auth_env` must scrub them ALL on both the token and anonymous
+        // paths, and always pin a supervisor-owned GH_CONFIG_DIR outside any
+        // checkout. The test drives the real Tokio command helper and inspects
+        // the resulting env through its underlying `std::process::Command`
+        // (`as_std`), so a regression that diverges from — or removes — the
+        // production scrub turns this test red.
+        let ambient = [
+            ("GH_TOKEN", "ambient-gh"),
+            ("GITHUB_TOKEN", "ambient-github"),
+            ("GH_ENTERPRISE_TOKEN", "ambient-ghe"),
+            ("GITHUB_ENTERPRISE_TOKEN", "ambient-ghe2"),
+        ];
+
+        // Token path, github.com: the job token lands on GH_TOKEN; every other
+        // credential source is scrubbed; GH_CONFIG_DIR is a private dir
+        // OUTSIDE the checkout.
+        let mut cmd = Command::new("gh");
+        for (k, v) in ambient {
+            cmd.env(k, v);
+        }
+        // Seed an ambient GH_HOST/GH_REPO too: a bare owner/repo (github.com)
+        // lookup resolves the omitted host through gh's default and GH_REPO
+        // overrides the repository target, so both must be scrubbed or they
+        // could redirect the lookup off the trusted repo/host.
+        cmd.env("GH_HOST", "evil.example.com");
+        cmd.env("GH_REPO", "evil/repo");
+        let _guard =
+            gh_auth_env(&mut cmd, Some("job-token"), "github.com").expect("github.com token env");
+        let env = env_of(cmd.as_std());
+        assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some("job-token"));
+        assert!(
+            !env.contains_key("GH_ENTERPRISE_TOKEN"),
+            "enterprise token must not be set for github.com: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_HOST"),
+            "GH_HOST must not be set for github.com: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_REPO"),
+            "an inherited GH_REPO must be scrubbed for github.com: {env:?}"
+        );
+        let cfg = env.get("GH_CONFIG_DIR").expect("GH_CONFIG_DIR must be set");
+        assert!(std::path::Path::new(cfg).is_absolute());
+
+        // Token path, GitHub Enterprise: the job token lands on
+        // GH_ENTERPRISE_TOKEN with GH_HOST pinned; GH_TOKEN is NOT set.
+        let mut ghe_cmd = Command::new("gh");
+        for (k, v) in ambient {
+            ghe_cmd.env(k, v);
+        }
+        // An ambient GH_HOST must be OVERRIDDEN to the trusted Enterprise host,
+        // not left as whatever was inherited.
+        ghe_cmd.env("GH_HOST", "evil.example.com");
+        let _ghe_guard =
+            gh_auth_env(&mut ghe_cmd, Some("job-token"), "ghe.example.com").expect("ghe token env");
+        let env = env_of(ghe_cmd.as_std());
+        assert_eq!(
+            env.get("GH_ENTERPRISE_TOKEN").map(String::as_str),
+            Some("job-token")
+        );
+        assert_eq!(
+            env.get("GH_HOST").map(String::as_str),
+            Some("ghe.example.com")
+        );
+        assert!(
+            !env.contains_key("GH_TOKEN"),
+            "GH_TOKEN must not be set for a GHE host: {env:?}"
+        );
+
+        // Token path, GitHub MANAGED Enterprise cloud (`*.ghe.com`): gh treats a
+        // tenancy host as github.com for auth, so the token lands on GH_TOKEN
+        // (NOT GH_ENTERPRISE_TOKEN), with GH_HOST still pinned to the trusted
+        // host so the lookup targets the configured repo.url host.
+        let mut ghe_cloud = Command::new("gh");
+        for (k, v) in ambient {
+            ghe_cloud.env(k, v);
+        }
+        let _ghe_cloud_guard = gh_auth_env(&mut ghe_cloud, Some("job-token"), "tenant.ghe.com")
+            .expect("ghe-cloud token env");
+        let env = env_of(ghe_cloud.as_std());
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("job-token"),
+            "*.ghe.com must use GH_TOKEN: {env:?}"
+        );
+        assert_eq!(
+            env.get("GH_HOST").map(String::as_str),
+            Some("tenant.ghe.com"),
+            "GH_HOST must stay pinned to the trusted host: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_ENTERPRISE_TOKEN"),
+            "GH_ENTERPRISE_TOKEN must not be set for *.ghe.com: {env:?}"
+        );
+
+        // Anonymous path: NO token var survives; GH_CONFIG_DIR is still set.
+        let mut anon_cmd = Command::new("gh");
+        for (k, v) in ambient {
+            anon_cmd.env(k, v);
+        }
+        anon_cmd.env("GH_HOST", "evil.example.com");
+        anon_cmd.env("GH_REPO", "evil/repo");
+        let _anon_guard = gh_auth_env(&mut anon_cmd, None, "github.com").expect("anonymous env");
+        let env = env_of(anon_cmd.as_std());
+        for k in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            assert!(
+                !env.contains_key(k),
+                "{k} must be scrubbed anonymously: {env:?}"
+            );
+        }
+        assert!(
+            !env.contains_key("GH_HOST"),
+            "an inherited GH_HOST must be scrubbed anonymously: {env:?}"
+        );
+        assert!(
+            !env.contains_key("GH_REPO"),
+            "an inherited GH_REPO must be scrubbed anonymously: {env:?}"
+        );
+        assert!(env.contains_key("GH_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn redact_token_scrubs_the_literal_token_and_userinfo() {
+        let token = "s3cr3tPAT";
+        let text = format!("gh error using {token} at https://{token}@github.com/o/r");
+        let red = redact_token(&text, Some(token));
+        assert!(
+            !red.contains(token),
+            "the literal token must be scrubbed: {red}"
+        );
+        assert!(!red.contains('@'), "http userinfo must be scrubbed: {red}");
+        assert!(red.contains("***"));
+        // No token → userinfo is still scrubbed (the regex arm runs unconditionally).
+        let red = redact_token("see https://u:p@host/x", None);
+        assert_eq!(red, "see https://host/x");
+    }
+
+    #[test]
+    fn parse_pr_list_maps_first_pr_or_reports_not_found() {
+        // The first PR maps author.login → openedBy and carries the PR fields.
+        let json = r#"[{"number":42,"url":"https://github.com/o/r/pull/42","state":"OPEN","isDraft":true,"title":"Slice","author":{"login":"octocat"}}]"#;
+        let pr = parse_pr_list(json);
+        assert_eq!(pr["found"], true);
+        assert_eq!(pr["number"], 42);
+        assert_eq!(pr["url"], "https://github.com/o/r/pull/42");
+        assert_eq!(pr["state"], "OPEN");
+        assert_eq!(pr["isDraft"], true);
+        assert_eq!(pr["title"], "Slice");
+        assert_eq!(pr["openedBy"], "octocat");
+        // An empty array (no PR) → found:false, openedBy:null, no error key.
+        let none = parse_pr_list("[]");
+        assert_eq!(none["found"], false);
+        assert_eq!(none["openedBy"], serde_json::Value::Null);
+        assert!(none.get("error").is_none());
+        // Empty stdout is treated as an empty array, not an error.
+        assert_eq!(parse_pr_list("")["found"], false);
+        // A PR missing an author resolves openedBy to null but still found:true.
+        let no_author = parse_pr_list(r#"[{"number":7,"title":"x"}]"#);
+        assert_eq!(no_author["found"], true);
+        assert_eq!(no_author["openedBy"], serde_json::Value::Null);
+        assert_eq!(no_author["isDraft"], false);
+    }
+
+    #[test]
+    fn parse_pr_list_reports_malformed_output_as_an_error() {
+        // Non-empty stdout that fails to parse is NOT "no PR" — it is
+        // truncated/corrupt gh output and must surface as {found:false,error}
+        // (the PR's stated best-effort contract), not be silently
+        // indistinguishable from "this branch has no PR".
+        let bad = parse_pr_list("[{\"number\":1");
+        assert_eq!(bad["found"], false);
+        assert_eq!(bad["openedBy"], serde_json::Value::Null);
+        assert!(
+            bad["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("malformed JSON"),
+            "a parse failure must carry an error: {bad:#?}"
+        );
+        // A parsed-but-non-array payload (a JSON object) is likewise malformed,
+        // not "no PR".
+        let obj = parse_pr_list(r#"{"number":1}"#);
+        assert_eq!(obj["found"], false);
+        assert!(
+            obj["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("non-array"),
+            "a non-array payload must carry an error: {obj:#?}"
+        );
+        // The empty array and empty stdout stay error-free "no PR" results.
+        assert!(parse_pr_list("[]").get("error").is_none());
+        assert!(parse_pr_list("").get("error").is_none());
+        assert!(parse_pr_list("   \n").get("error").is_none());
+        // A parsed array whose first element is a non-object (null, number,
+        // string, nested array) is corrupt output, not a found PR: mapping it
+        // would falsely report found:true with all-null fields. Fail closed.
+        for bad in [r#"[null]"#, r#"[1]"#, r#"["x"]"#, r#"[[]]"#, r#"[true]"#] {
+            let r = parse_pr_list(bad);
+            assert_eq!(
+                r["found"], false,
+                "non-object entry must not be found: {bad}"
+            );
+            assert_eq!(r["openedBy"], serde_json::Value::Null);
+            assert!(
+                r["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("non-object"),
+                "a non-object array entry must carry an error: {r:#?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_agent_pr_rejects_non_github_provider() {
+        let dir = git_workspace("reconcile-provider").await;
+        let pr = reconcile_agent_pr(
+            &dir,
+            "gitlab",
+            "https://gitlab.com/o/r.git",
+            "feat/x",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(pr["found"], false);
+        assert_eq!(
+            pr["error"],
+            "PR reconcile unsupported for provider \"gitlab\""
+        );
+    }
+
+    #[test]
+    fn reconcile_token_falls_back_to_username_for_token_as_username_urls() {
+        // The token handed to `gh` is the userinfo PASSWORD for `user:pass@`,
+        // but the USERNAME for the token-as-username `https://<pat>@host` form
+        // (where `split_url_credential` leaves the password empty). Reading only
+        // the password would hand `gh` an empty token and clear every auth
+        // source. Mirror the production selection and assert BOTH forms.
+        let select = |c: &GitCredential| -> String {
+            if c.password.is_empty() {
+                c.username.clone()
+            } else {
+                c.password.clone()
+            }
+        };
+        // `user:pass@` → the password.
+        let (_u, cred) = trusted_fetch_source("https://oauth2:secretpat@github.com/o/r.git");
+        let cred = cred.expect("user:pass credential");
+        assert_eq!(select(&cred), "secretpat");
+        // `<pat>@` (token-as-username) → the username, password empty.
+        let (_u, cred) = trusted_fetch_source("https://secretpat@github.com/o/r.git");
+        let cred = cred.expect("token-as-username credential");
+        assert!(cred.password.is_empty(), "password must be empty");
+        assert_eq!(select(&cred), "secretpat");
+    }
+
+    #[tokio::test]
+    async fn reconcile_agent_pr_never_fails_without_gh_slug() {
+        // A github provider but a non-GitHub-http URL (a file:// origin) has no
+        // trusted slug to pin with `-R`. Reconciliation does NOT skip `gh` —
+        // it still invokes `gh pr list` with cwd-based repository inference
+        // (the checkout's own remotes), which in a checkout with no GitHub
+        // remote (and no `gh` auth) returns found:false rather than ever
+        // failing the job.
+        let dir = git_workspace("reconcile-skip").await;
+        let pr = reconcile_agent_pr(
+            &dir,
+            "github",
+            "file:///tmp/origin.git",
+            "feat/x",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(pr["found"], false, "{pr:#?}");
     }
 
     #[test]
@@ -4602,7 +6318,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.commits.iter().any(|c| c == &sha),
             "finalize must enumerate the work-branch commit even when HEAD moved, got {:?}",
@@ -4653,7 +6369,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             !res.pushed,
             "side-branch work must not be reported as pushed (run dir must be retained)"
@@ -4708,7 +6424,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "a stranded detached-HEAD commit must set retain (the reflog scan finds it)"
@@ -4807,7 +6523,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "a commit the agent made atop a pre-existing DIVERGENT branch must set retain — the \
@@ -4872,7 +6588,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "an expired reflog no longer reaches provisioning, so the detached-commit scan is \
@@ -4900,7 +6616,7 @@ mod tests {
         assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
         commit(&dir, "real work").await;
         let (repo, bare) = repo_with_reachable_remote(&dir).await;
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert_eq!(res.commits.len(), 1, "the work-branch commit is enumerated");
         assert!(
             res.pushed,
@@ -4960,7 +6676,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             res.retain,
             "stashed WIP is stranded agent work; finalize must retain"
@@ -5021,7 +6737,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             res.retain,
             "a tag pinning an abandoned commit is its only copy; finalize must retain"
@@ -5047,7 +6763,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             !res.retain,
             "a tag on a commit already on the work branch must not retain"
@@ -5221,7 +6937,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(
             res.pushed,
             "the push must succeed against the trusted URL despite the planted hook and rewritten origin"
@@ -5282,7 +6998,7 @@ mod tests {
         // Agent commits on the fallback work branch; the local `main` is left
         // behind (and would be "ahead" of the fallback under a naive count).
         commit(&dir, "real work").await;
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert_eq!(
             res.commits.len(),
             1,
@@ -5380,7 +7096,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(
             res.pushed,
             "the push must succeed against the trusted URL despite the planted insteadOf rewrites"
@@ -5714,7 +7430,7 @@ mod tests {
         .await
         .unwrap();
 
-        let res = finalize_git(&dir, &prep, &repo, t).await;
+        let res = finalize_git(&dir, &prep, &repo, false, t).await;
         assert!(
             res.pushed,
             "the work branch push must succeed; checked-out remote branch must not block it"
@@ -5829,7 +7545,7 @@ mod tests {
         .await
         .unwrap();
 
-        let res = finalize_git(&dir, &prep, &repo, t).await;
+        let res = finalize_git(&dir, &prep, &repo, false, t).await;
         assert!(
             res.retain,
             "a commit parked only on an agent-advanced remote-tracking ref must be retained, \
@@ -5949,7 +7665,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "side-branch work on an empty base must flag retain (nets must not be skipped when \
@@ -6008,7 +7724,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "a stranded detached-HEAD commit on an empty base must flag retain via the reflog net"
@@ -6032,7 +7748,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.unborn_no_ref,
             "a no-op run on an unborn base must be marked unborn_no_ref (retain={}, work_found={}, commits={:?})",
@@ -6079,7 +7795,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             !res.unborn_no_ref,
             "a committing run on an unborn base must NOT be marked unborn_no_ref"
@@ -6137,7 +7853,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain && res.work_found,
             "stranded side-branch work flags retain+work_found (retain={}, work_found={})",
@@ -6197,7 +7913,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             !res.unborn_no_ref,
             "an orphaned commit on an unborn base must NOT be marked unborn_no_ref \
@@ -6277,7 +7993,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             !res.unborn_no_ref,
             "an overflowing non-head-ref scan is inconclusive, so the run must NOT be marked \
@@ -6347,7 +8063,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             !res.unborn_no_ref,
             "an over-cap non-head-ref candidate set is inconclusive, so the run must NOT be \
@@ -6403,7 +8119,7 @@ mod tests {
             )])),
             provision_shas: Some(std::collections::BTreeSet::from([start])),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(60)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(60)).await;
         assert!(
             res.retain,
             "a HEAD reflog past the distinct-position cap must fail closed as unbounded"
@@ -6451,7 +8167,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "a side-branch commit with push disabled must flag retain (the sweep must run even \
@@ -6514,12 +8230,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(res.retain, "stranded side-branch work must flag retain");
         assert!(
             !res.pushed,
             "retain (incomplete/stranded scan) must REFUSE the push — never publish a partial \
              account as pushed"
+        );
+        assert!(
+            res.push_failed,
+            "a retain-skipped (refused) publication must set push_failed so the PR reconcile gate \
+             (!push_failed, mirroring Node) does not claim a PR for a branch this run never \
+             published — the gate test alone can't catch a regression of this assignment"
         );
         assert!(
             res.work_found,
@@ -6568,7 +8290,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "a stranded detached-HEAD commit must flag retain"
@@ -6703,7 +8425,7 @@ mod tests {
         // Clean work on the work branch only.
         commit(&dir, "clean work").await;
         let (repo, bare) = repo_with_reachable_remote(&dir).await;
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(
             !res.retain,
             "a complete branch listing with no stranded work must not be retained (the \
@@ -6875,7 +8597,7 @@ mod tests {
         .unwrap();
         assert_eq!(on.trim(), branch);
         commit(&dir, "first work").await;
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert_eq!(
             res.commits.len(),
             1,
@@ -6923,7 +8645,7 @@ mod tests {
         // untouched (its tip equals the provision-time snapshot).
         commit(&dir, "real work").await;
         let (repo, bare) = repo_with_reachable_remote(&dir).await;
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         // The pre-existing branch must NOT be mistaken for stranded agent work:
         // `commits` stays populated (not cleared by the stranded-work path) and
         // `retain` is not set by a misclassification. (The push lands on the
@@ -6987,7 +8709,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "an agent-created side branch with unpublished commits must retain the run dir"
@@ -7179,7 +8901,7 @@ mod tests {
         // GIT_CONFIG_GLOBAL to /dev/null regardless of HOME or the inherited
         // environment, so the planted rewrite is inert and the push reaches
         // the trusted URL.
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(
             res.pushed,
             "the push must ignore the global insteadOf rewrite and reach the trusted URL"
@@ -7401,7 +9123,7 @@ mod tests {
             "control: the trusted bare must still be untouched before the isolated push"
         );
         // GREEN: finalize isolates the system tier, so the push reaches trusted.
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(res.pushed, "the isolated push must reach the trusted URL");
         assert!(
             bare_has_work(&bare).await,
@@ -7445,7 +9167,7 @@ mod tests {
         );
         // GREEN: the core runner scrubs GIT_CONFIG_COUNT/KEY/VALUE, so finalize
         // reaches the trusted URL.
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(res.pushed, "the scrubbed push must reach the trusted URL");
         assert!(
             bare_has_work(&bare).await,
@@ -7501,7 +9223,7 @@ mod tests {
                 .unwrap();
             f.write_all(blob.as_bytes()).unwrap();
         }
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             res.retain,
             "an overflowing side-branch listing must fail closed and retain the run dir"
@@ -7544,7 +9266,7 @@ mod tests {
             .unwrap();
         }
         commit(&dir, "work to push").await;
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "an over-cap side-branch set must fail closed and retain the run dir"
@@ -7627,7 +9349,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), t).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
         assert!(
             res.scan_incomplete,
             "an overflowing side-branch listing is inconclusive, so it must flag scan_incomplete \
@@ -7700,7 +9422,7 @@ mod tests {
             "control: the trusted bare must still be untouched before the scrubbed push"
         );
         // GREEN: finalize scrubs the worktree scope, so the push reaches trusted.
-        let res = finalize_git(&dir, &prep, &repo, Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &repo, false, Duration::from_secs(30)).await;
         assert!(res.pushed, "the scrubbed push must reach the trusted URL");
         assert!(
             bare_has_work(&bare).await,
@@ -7736,7 +9458,7 @@ mod tests {
             "the checked-out branch must be preserved as the work branch even when push is disabled"
         );
         commit(&dir, "work on own checkout").await;
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert_eq!(
             res.branch.as_deref(),
             Some("main"),
@@ -7799,7 +9521,7 @@ mod tests {
             provision_tips: None,
             provision_shas: None,
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_secs(30)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_secs(30)).await;
         assert!(
             res.retain,
             "an absent provision snapshot must fail closed and retain the run dir"
@@ -7890,6 +9612,7 @@ mod tests {
             &dir,
             &prep,
             &test_repo(),
+            false,
             Duration::from_secs(300),
             expired,
         )
@@ -7941,7 +9664,7 @@ mod tests {
             provision_tips: Some(std::collections::BTreeMap::new()),
             provision_shas: Some(std::collections::BTreeSet::new()),
         };
-        let res = finalize_git(&dir, &prep, &test_repo(), Duration::from_nanos(1)).await;
+        let res = finalize_git(&dir, &prep, &test_repo(), false, Duration::from_nanos(1)).await;
         assert!(
             res.retain,
             "a per-command timeout that expires every probe must fail closed and retain"
@@ -8223,5 +9946,138 @@ mod tests {
             !dir.exists(),
             "the secret directory must be removed once the guard is dropped"
         );
+    }
+
+    /// Env var set on the re-exec'd child (never on the parent harness) so the
+    /// relative-`TMPDIR` regression below runs in its own process. Mutating the
+    /// process-wide `TMPDIR`/cwd in-process would race any sibling test that
+    /// reads `std::env::temp_dir()`, so we isolate it in a subprocess instead.
+    #[cfg(unix)]
+    const RELTMP_CHILD_ENV: &str = "NANO_RELTMP_CHILD";
+
+    /// Regression: a RELATIVE `TMPDIR` (e.g. `reltmp`) must not yield a relative
+    /// private directory. `std::env::temp_dir()` honours a relative `TMPDIR`
+    /// verbatim, and the children we hand these paths to (`gh` via
+    /// `GH_CONFIG_DIR`, git's credential helper via `NANO_GIT_CRED_FILE`) run
+    /// with a DIFFERENT cwd (the agent workspace) — so a relative path would
+    /// resolve against agent-controlled locations. Both the `gh` config guard
+    /// and the credential-secret file must produce ABSOLUTE paths, and those
+    /// paths must still resolve to the real private directory from a child whose
+    /// cwd differs from the daemon's.
+    ///
+    /// The relative `TMPDIR` and sandbox cwd are process-wide globals, so the
+    /// checks run in a re-exec'd subprocess (set via `Command`, not on this
+    /// harness process). That keeps the parent's `TMPDIR`/cwd untouched, so no
+    /// parallel test observing `temp_dir()` can flake on our mutation.
+    #[cfg(unix)]
+    #[test]
+    fn relative_tmpdir_yields_absolute_child_resolvable_paths() {
+        // Child role: the parent re-exec'd us with cwd=<base> and a RELATIVE
+        // `TMPDIR=reltmp` set on THIS process only. Run the assertions, drop a
+        // sentinel proving the body actually ran (so a zero-match test filter
+        // can't masquerade as success), and exit 0; any failed assertion panics
+        // and the harness exits non-zero for the parent to catch.
+        if std::env::var_os(RELTMP_CHILD_ENV).is_some() {
+            // cwd is the absolute sandbox `base`; TMPDIR is the relative name.
+            let base = std::env::current_dir().expect("child cwd (sandbox base)");
+            let other = base.join("other-cwd");
+            std::fs::create_dir_all(&other).expect("create alternate child cwd");
+
+            // The helper itself must absolutize a relative TMPDIR.
+            let resolved =
+                absolute_temp_root().expect("absolute_temp_root resolves relative TMPDIR");
+            assert!(
+                resolved.is_absolute(),
+                "absolute_temp_root must return an absolute path, got {resolved:?}"
+            );
+
+            // gh config guard: path must be absolute, not resolved against a child cwd.
+            let gh = GhConfigGuard::create().expect("create gh config dir under relative TMPDIR");
+            let gh_path = gh.path().to_path_buf();
+            assert!(
+                gh_path.is_absolute(),
+                "GH_CONFIG_DIR must be absolute even under a relative TMPDIR, got {gh_path:?}"
+            );
+            assert!(
+                gh_path.exists(),
+                "the private gh config dir must actually exist at its absolute path"
+            );
+
+            // Credential secret file: path must be absolute and child-resolvable.
+            let (cred, cred_file) =
+                cred_secret_file(b"reltmp-secret").expect("create cred file under relative TMPDIR");
+            assert!(
+                cred_file.is_absolute(),
+                "NANO_GIT_CRED_FILE must be absolute even under a relative TMPDIR, got {cred_file:?}"
+            );
+
+            // Resolve both paths from a grandchild whose cwd is `other` (NOT the
+            // daemon cwd `base`). An absolute path resolves identically
+            // regardless of cwd; the pre-fix relative path would have been looked
+            // up under `other` and missed the real private directory.
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(r#"test -d "$GH_CONFIG_DIR" && test "reltmp-secret" = "$(cat "$NANO_GIT_CRED_FILE")""#)
+                .current_dir(&other)
+                .env("GH_CONFIG_DIR", &gh_path)
+                .env("NANO_GIT_CRED_FILE", &cred_file)
+                .status()
+                .expect("spawn child to resolve paths from a different cwd");
+            assert!(
+                ok.success(),
+                "absolute GH_CONFIG_DIR and NANO_GIT_CRED_FILE must resolve from a child with a \
+                 different cwd than the daemon"
+            );
+
+            drop(cred);
+            drop(gh);
+            // Sentinel: prove this body ran (guards against a filter matching
+            // zero tests, which would otherwise exit 0 and fake a pass).
+            std::fs::write(base.join(".reltmp-ran"), b"1").expect("write ran sentinel");
+            return;
+        }
+
+        // Parent role: build an absolute sandbox, then run the body in a child
+        // process whose cwd is `base` and whose `TMPDIR` is the RELATIVE name
+        // `reltmp`. Setting those globals only on the child keeps this harness
+        // process's `TMPDIR`/cwd untouched, so no parallel test can race them.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base = std::path::absolute(std::env::temp_dir())
+            .expect("absolute temp root for test base")
+            .join(format!("nano-reltmp-base-{uniq}"));
+        let reltmp = base.join("reltmp");
+        std::fs::create_dir_all(&reltmp).expect("create relative TMPDIR target");
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "provision::tests::relative_tmpdir_yields_absolute_child_resolvable_paths",
+            ])
+            .env(RELTMP_CHILD_ENV, "1")
+            // RELATIVE TMPDIR + sandbox cwd, applied to the child ONLY.
+            .env("TMPDIR", "reltmp")
+            .current_dir(&base)
+            .status()
+            .expect("spawn relative-TMPDIR regression child");
+        assert!(
+            status.success(),
+            "relative-TMPDIR regression failed in child (exit {:?}): temp-derived paths must be \
+             absolutized before being handed to children with a different cwd",
+            status.code()
+        );
+        assert!(
+            base.join(".reltmp-ran").exists(),
+            "regression child did not run its body (test filter matched zero tests?)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
