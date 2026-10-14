@@ -418,6 +418,21 @@ impl Agent {
                             continue;
                         }
                     };
+                    // Byte-bound the injected frame BEFORE admission: `out` is
+                    // only count-bounded (`OUT_CHANNEL_CAP`), so without this a
+                    // hub could queue `OUT_CHANNEL_CAP` prompts of up to 1 MiB
+                    // each (~1 GiB/slot) while a wedged agent keeps emitting
+                    // updates that hold off the idle timeout. Drop (and log) an
+                    // over-large frame rather than queue it; the steer loop
+                    // continues so a single abusive prompt does not end steering.
+                    if !inject_frame_within_budget(&frame) {
+                        crate::runtime::log(&format!(
+                            "agentic hub: dropping oversized injected steer frame ({} bytes > {} cap)",
+                            frame.to_string().len(),
+                            MAX_ACP_INJECT
+                        ));
+                        continue;
+                    }
                     // Race the send against the turn's stop signal, exactly as
                     // the receive path above does: `out` is bounded
                     // (`OUT_CHANNEL_CAP`), so when the agent stops reading stdin
@@ -560,6 +575,25 @@ const OUT_CHANNEL_CAP: usize = 1024;
 /// (see [`handle_message`]), capping queued outbound memory at
 /// `OUT_CHANNEL_CAP * MAX_ACP_REPLY`.
 const MAX_ACP_REPLY: usize = 64 * 1024; // 64 KiB
+
+/// Per-frame byte budget for an injected steer frame (a hub-delivered
+/// `session/prompt` / `session/cancel`) queued into `out`. The steer channel is
+/// byte-bounded upstream (`hub::client::MAX_STEER_CHUNK_BYTES`), but `out` is only
+/// COUNT-bounded ([`OUT_CHANNEL_CAP`]): once a steer prompt is injected it sits in
+/// `out` until `write_loop` drains it, so `OUT_CHANNEL_CAP` prompts of up to 1 MiB
+/// each could retain ~1 GiB per slot while a wedged agent keeps emitting updates
+/// (which holds off the idle timeout). A steering prompt is short operator text —
+/// far under this budget — so a frame exceeding it is an abusive/amplifying
+/// payload: it is dropped (and logged) rather than queued, capping queued injected
+/// memory at `OUT_CHANNEL_CAP * MAX_ACP_INJECT`. Mirrors [`MAX_ACP_REPLY`].
+const MAX_ACP_INJECT: usize = 64 * 1024; // 64 KiB
+
+/// True when a serialized steer frame fits within [`MAX_ACP_INJECT`]. The steer
+/// task drops (rather than queues) an over-large frame so a hub cannot amplify a
+/// wedged agent into unbounded per-slot memory through repeated injected prompts.
+fn inject_frame_within_budget(frame: &Value) -> bool {
+    frame.to_string().len() <= MAX_ACP_INJECT
+}
 
 async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
     mut reader: BufReader<R>,
@@ -1045,6 +1079,31 @@ mod tests {
         assert!(handle_message(&line, &shared, &out));
         let reply = rx.try_recv().expect("a normal reply must be enqueued");
         assert_eq!(reply["id"], 7);
+    }
+
+    #[test]
+    fn oversized_injected_steer_frame_is_rejected() {
+        // A hub steer prompt whose serialized frame exceeds MAX_ACP_INJECT must
+        // NOT be admitted into `out`: the channel is only count-bounded, so
+        // OUT_CHANNEL_CAP such frames (~1 MiB each) would retain ~1 GiB per slot
+        // while a wedged agent keeps emitting updates. The budget check is the
+        // admission gate the steer task applies before `out.send`.
+        let mut frame = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64 << 32,
+            "method": "session/prompt",
+            "params": { "sessionId": "s", "prompt": [{ "type": "text", "text": "x".repeat(MAX_ACP_INJECT) }] }
+        });
+        assert!(
+            !inject_frame_within_budget(&frame),
+            "an over-large injected prompt frame must be rejected"
+        );
+        // A normal-sized steer prompt is admitted.
+        frame["params"]["prompt"][0]["text"] = json!("do the thing");
+        assert!(
+            inject_frame_within_budget(&frame),
+            "a normal injected prompt frame must be admitted"
+        );
     }
 
     #[test]
