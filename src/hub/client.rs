@@ -569,31 +569,65 @@ impl LaneBuffer {
     /// and the `RELEASE` without the prerequisite ownership frame, desyncing the
     /// hub (a `RELEASE`/transcript for a job it never saw claimed). Preserving
     /// the `CLAIM` keeps the whole `CLAIM → tail → RELEASE` sequence intact.
-    /// Other control families (`RELEASE`/`DEREGISTER`/`HEARTBEAT`) are preserved.
-    fn drop_control_presence(&mut self) {
-        // Streams with a buffered RELEASE: their CLAIM is for a completed job
-        // the snapshot cannot rebuild, so it must survive this prune.
+    /// Other control families (`DEREGISTER`/`HEARTBEAT`) are preserved.
+    ///
+    /// A buffered `RELEASE` WHOSE STREAM IS CURRENTLY IN-FLIGHT is a SUPERSEDED
+    /// earlier generation and is DROPPED (its drain barrier disarmed via the
+    /// returned `seq`). This is the retry-during-outage hazard: a prior
+    /// `(instance, jobKey)` completes during the outage (its `RELEASE` buffered,
+    /// its slot removed from `in_flight`), then an identical-keyed retry
+    /// re-claims the SAME stream and is live again. The resync snapshot prepends
+    /// an authoritative `CLAIM` for that live retry, but the stale `RELEASE`
+    /// drains AFTER it and would clear the retry's ownership — the hub then has
+    /// no claim for a job that is still running. Barriers key on the `RELEASE`
+    /// `seq` and the tail flushes by stream id, so neither can tell the two
+    /// generations apart; collapsing the superseded `RELEASE`/`CLAIM` here (the
+    /// snapshot rebuilds the live `CLAIM`) is the fence. A `RELEASE` for a stream
+    /// that is NOT in-flight is a genuinely completed job with no live retry and
+    /// is preserved. Returns the `seq` of every dropped `RELEASE` so the caller
+    /// can disarm its drain barrier.
+    fn drop_control_presence(&mut self, in_flight_streams: &HashSet<String>) -> Vec<u32> {
+        // Streams with a buffered RELEASE whose job is NOT currently in-flight:
+        // a job that started and finished during the outage with no live retry.
+        // Its CLAIM is for a completed job the snapshot cannot rebuild, so it
+        // must survive this prune (keeping CLAIM → tail → RELEASE intact). A
+        // RELEASE whose stream IS in-flight is excluded here — that CLAIM is
+        // rebuilt by the snapshot and the stale RELEASE is dropped below.
         let pending_release: HashSet<String> = self
             .control
             .iter()
             .filter(|bf| bf.frame.family == Family::Release)
             .filter_map(|bf| presence_stream_id(&bf.frame.payload))
+            .filter(|s| !in_flight_streams.contains(s))
             .collect();
         let mut freed = 0;
+        let mut disarmed: Vec<u32> = Vec::new();
         self.control.retain(|bf| {
+            let stream = presence_stream_id(&bf.frame.payload);
             let drop_it = match bf.frame.family {
                 Family::Register => true,
-                Family::Claim => presence_stream_id(&bf.frame.payload)
-                    .map(|s| !pending_release.contains(&s))
+                Family::Claim => stream
+                    .as_ref()
+                    .map(|s| !pending_release.contains(s))
                     .unwrap_or(true),
+                // Superseded RELEASE for a re-claimed (live) stream: drop it so
+                // it cannot clear the retry's snapshot-asserted ownership.
+                Family::Release => stream
+                    .as_ref()
+                    .map(|s| in_flight_streams.contains(s))
+                    .unwrap_or(false),
                 _ => false,
             };
             if drop_it {
                 freed += bf.bytes;
+                if bf.frame.family == Family::Release {
+                    disarmed.push(bf.frame.seq);
+                }
             }
             !drop_it
         });
         self.bytes = self.bytes.saturating_sub(freed);
+        disarmed
     }
 
     /// Test-only: iterate every buffered frame (across all lanes) so a test can
@@ -1316,10 +1350,12 @@ impl HubClient {
         // Per-job CLAIMs: the `{instance, jobKey}` ownership frames the hub's
         // pinned per-job validator accepts (one per live job). Kept for normal
         // claim/release semantics AND re-asserted here.
-        {
+        let in_flight_streams: HashSet<String> = {
             let in_flight = self.in_flight.lock().unwrap();
+            let mut streams: HashSet<String> = HashSet::new();
             for (inst, jobs) in in_flight.iter() {
                 for job_key in jobs {
+                    streams.insert(compose_stream_id(inst, job_key));
                     snapshot.push(self.make_frame(
                         Lane::Control,
                         Family::Claim,
@@ -1351,7 +1387,8 @@ impl HubClient {
                     json!({ "instance": inst, "jobKeys": job_keys }),
                 ));
             }
-        }
+            streams
+        };
         // Drop the superseded REGISTER/CLAIM frames first so the snapshot
         // re-admits them deduplicated. Prepending in REVERSE via
         // `push_front_control_bounded` lands the snapshot at the front in
@@ -1363,11 +1400,18 @@ impl HubClient {
         // fragmented, because it is already bounded by live instances+jobs and
         // hiding a worker from the hub is worse than transiently exceeding the
         // bulk-traffic memory budget by a few small control frames.
-        buf.drop_control_presence();
+        let disarmed = buf.drop_control_presence(&in_flight_streams);
         for frame in snapshot.into_iter().rev() {
             buf.push_front_control_bounded(frame);
         }
         drop(buf);
+        // Disarm the drain barriers of any superseded RELEASE dropped above (a
+        // completed earlier generation whose stream a live retry re-claimed), so
+        // orphaned armed barriers do not accumulate. Done after releasing the
+        // outbound lock, preserving the outbound → release_barriers order.
+        for seq in disarmed {
+            self.disarm_release_barrier(seq);
+        }
         self.outbound_notify.notify_one();
     }
 
@@ -1933,16 +1977,22 @@ fn percent_encode_query(value: &str) -> String {
     out
 }
 
-/// Whether connecting with `config` would transmit a real identity credential
-/// over an UNENCRYPTED, non-local WebSocket. `tokio-tungstenite` carries the
-/// identity as a `?token=` query param on the upgrade URL (see
-/// [`authenticated_url`]); over a plaintext `ws://` scheme that whole URL —
-/// credential included — crosses the network in the clear, so a real secret or
-/// token sent to a remote host is exposed to anyone on-path. Returns `true`
-/// (meaning "refuse") only when ALL of these hold:
-///   * a real identity is configured — `identity_token` resolves to something
-///     that is NOT the sentinel [`LOCAL_AGENTIC_TOKEN`] (the local, no-auth dev
-///     token carries no secret worth protecting, so local-mode is exempt), AND
+/// Whether connecting with `config` would transmit a sensitive credential over
+/// an UNENCRYPTED, non-local WebSocket. `tokio-tungstenite` carries BOTH the
+/// identity (`?token=`) AND the capability credential (`?capability=`) as query
+/// params on the upgrade URL (see [`authenticated_url`]); over a plaintext
+/// `ws://` scheme that whole URL — every credential included — crosses the
+/// network in the clear, so anything secret sent to a remote host is exposed to
+/// anyone on-path. Returns `true` (meaning "refuse") only when ALL of these hold:
+///   * a SENSITIVE credential is configured — either a real identity
+///     (`identity_token` resolves to something that is NOT the sentinel
+///     [`LOCAL_AGENTIC_TOKEN`]) OR a non-empty capability `credential`. The
+///     capability credential is checked independently of the identity because
+///     the sentinel identity (`NANO_AGENTIC_TOKEN=nano-local`) keeps
+///     `config.credential` populated (it only forces `secure=true`), so a
+///     capability secret would otherwise ride plaintext under the local-token
+///     exemption. A bare local token with no capability credential carries
+///     nothing worth protecting, so it stays exempt, AND
 ///   * the URL scheme is plaintext `ws://` (a `wss://` URL is encrypted — the
 ///     `rustls-tls-native-roots` feature gives tungstenite a TLS backend so it
 ///     can actually complete that handshake), AND
@@ -1950,11 +2000,13 @@ fn percent_encode_query(value: &str) -> String {
 ///     the same machine never leaves it, so local plaintext is fine and keeps
 ///     the default dev experience working).
 fn insecure_credential_exposure(config: &HubConfig) -> bool {
-    let Some(identity) = identity_token(config) else {
-        return false; // no credential to expose
-    };
-    if identity == LOCAL_AGENTIC_TOKEN {
-        return false; // local no-auth dev token — nothing secret to protect
+    // "Sensitive" = a real (non-sentinel) identity OR any non-empty capability
+    // credential. Both ride the plaintext upgrade URL, so either one leaking is
+    // enough to refuse.
+    let real_identity = identity_token(config).is_some_and(|id| id != LOCAL_AGENTIC_TOKEN);
+    let has_capability = config.credential.as_deref().is_some_and(|c| !c.is_empty());
+    if !real_identity && !has_capability {
+        return false; // nothing secret to protect
     }
     let url = config.url.trim();
     // `wss://` is TLS-encrypted; only bare `ws://` is in the clear. Any other
@@ -4524,7 +4576,7 @@ mod tests {
             4,
             json!({ "instance": "w", "jobKey": "done" }),
         ));
-        buf.drop_control_presence();
+        buf.drop_control_presence(&HashSet::new());
         let claims: Vec<&Value> = buf
             .control
             .iter()
@@ -4551,6 +4603,90 @@ mod tests {
                 .iter()
                 .any(|bf| bf.frame.family == Family::Register),
             "every REGISTER is pruned — the resync snapshot rebuilds it"
+        );
+    }
+
+    // Finding 1 (round 22): retry-during-outage. A prior generation of
+    // `(instance, jobKey)` completes during an outage — its CLAIM + RELEASE are
+    // buffered — and an identical-keyed retry re-claims the SAME stream and is
+    // live again (its stream is in `in_flight`). `drop_control_presence` must
+    // treat that buffered RELEASE (and its paired CLAIM) as a SUPERSEDED
+    // generation and DROP both, returning the RELEASE seq to disarm: the resync
+    // snapshot rebuilds the live retry's CLAIM, and draining the stale RELEASE
+    // after it would clear the active retry's ownership on the hub.
+    #[test]
+    fn drop_control_presence_drops_superseded_release_for_a_live_retry() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        // Prior generation that completed during the outage: CLAIM + RELEASE.
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            1,
+            json!({ "instance": "w", "jobKey": "retried" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            2,
+            json!({ "instance": "w", "jobKey": "retried" }),
+        ));
+        // The retry is live again on the same stream.
+        let mut in_flight = HashSet::new();
+        in_flight.insert(compose_stream_id("w", "retried"));
+        let disarmed = buf.drop_control_presence(&in_flight);
+        assert_eq!(
+            disarmed,
+            vec![2],
+            "the superseded RELEASE's seq is returned so its drain barrier is disarmed"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the stale RELEASE is dropped so it cannot clear the live retry's ownership"
+        );
+        assert!(
+            !buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "its paired CLAIM is dropped too — the resync snapshot rebuilds the live CLAIM"
+        );
+    }
+
+    // A buffered RELEASE whose stream is NOT in-flight is a genuinely completed
+    // job with no live retry, so it (and its CLAIM) must still be preserved —
+    // the superseded-generation collapse must not regress the normal case.
+    #[test]
+    fn drop_control_presence_keeps_release_when_no_live_retry() {
+        let mut buf = LaneBuffer::with_limits(16, 0);
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Claim,
+            1,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        buf.push(Frame::new(
+            Lane::Control,
+            Family::Release,
+            2,
+            json!({ "instance": "w", "jobKey": "done" }),
+        ));
+        let disarmed = buf.drop_control_presence(&HashSet::new());
+        assert!(
+            disarmed.is_empty(),
+            "no RELEASE is dropped when its stream is not in-flight"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Release),
+            "the completed job's RELEASE is preserved"
+        );
+        assert!(
+            buf.control
+                .iter()
+                .any(|bf| bf.frame.family == Family::Claim),
+            "its CLAIM→tail→RELEASE sequence stays intact"
         );
     }
 
@@ -5359,6 +5495,61 @@ mod tests {
             !with("ws://hub.example.com/na", Some(LOCAL_AGENTIC_TOKEN), None),
             "the local no-auth dev token carries no secret worth protecting"
         );
+    }
+
+    // Finding 2 (round 22): a non-empty capability `credential` is ALSO
+    // sensitive — it rides the same plaintext upgrade URL as `?capability=`.
+    // The gap: `NANO_AGENTIC_TOKEN=nano-local` is the sentinel, so the identity
+    // check exempts it, yet `from_env` keeps `config.credential` populated (the
+    // sentinel only forces `secure=true`). The guard must refuse remote ws://
+    // whenever a capability credential is present, independent of the identity.
+    #[test]
+    fn insecure_credential_exposure_fires_for_remote_plaintext_capability_credential() {
+        let with_cred = |url: &str, token: Option<&str>, credential: Option<&str>| {
+            let mut cfg = test_config();
+            cfg.url = url.into();
+            cfg.secret = None;
+            cfg.token = token.map(Into::into);
+            cfg.credential = credential.map(Into::into);
+            insecure_credential_exposure(&cfg)
+        };
+
+        // The exact bypass: sentinel identity + capability credential + remote
+        // plaintext. The sentinel exempts the identity, but the capability
+        // credential must still force a refusal.
+        assert!(
+            with_cred(
+                "ws://hub.example.com/na",
+                Some(LOCAL_AGENTIC_TOKEN),
+                Some("cap-secret")
+            ),
+            "a capability credential over remote plaintext must be refused even with the local token"
+        );
+        // A capability credential with no identity at all is still sensitive.
+        assert!(with_cred(
+            "ws://hub.example.com/na",
+            None,
+            Some("cap-secret")
+        ));
+
+        // Encrypted transport is fine even with a capability credential.
+        assert!(!with_cred(
+            "wss://hub.example.com/na",
+            Some(LOCAL_AGENTIC_TOKEN),
+            Some("cap-secret")
+        ));
+        // Loopback is fine — the credential never leaves the machine.
+        assert!(!with_cred(
+            "ws://127.0.0.1/na",
+            Some(LOCAL_AGENTIC_TOKEN),
+            Some("cap-secret")
+        ));
+        // An empty credential is not a secret worth protecting.
+        assert!(!with_cred(
+            "ws://hub.example.com/na",
+            Some(LOCAL_AGENTIC_TOKEN),
+            Some("")
+        ));
     }
 
     #[test]

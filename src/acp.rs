@@ -404,8 +404,16 @@ impl Agent {
                             // under `yolo`, so no hub outcome can re-decide an
                             // outstanding request. Log loudly and drop — never
                             // silently swallow an unsupported steer.
+                            // `request_id` is arbitrary hub-controlled text
+                            // (newlines, escapes, up to ~1 MiB), so logging it
+                            // verbatim would enable log injection/amplification;
+                            // log only its byte length, mirroring the inbound
+                            // size-only logging in `route_inbound`. `outcome` is
+                            // validated to the closed `{granted,denied}` set in
+                            // `control::validate_envelope`, so it is safe to log.
                             crate::runtime::log(&format!(
-                                "agentic hub: dropping inbound permission steer {request_id} → {outcome}: permission is not in the supported steer contract (ACP permissions are auto-answered under yolo)"
+                                "agentic hub: dropping inbound permission steer (request_id {} bytes) → {outcome}: permission is not in the supported steer contract (ACP permissions are auto-answered under yolo)",
+                                request_id.len()
                             ));
                             continue;
                         }
