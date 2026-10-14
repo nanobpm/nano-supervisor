@@ -2722,6 +2722,12 @@ mod tests {
     /// deterministic `wf-<name>-` worker ids and the on-disk filename.
     #[test]
     fn manifest_path_enforces_name_charset() {
+        // The accepted names below resolve the state home (`home_dir`), so this
+        // test must hold the env lock like every other state-home reader: a
+        // sibling test (`lock_base_is_invariant_to_environment`) removes `HOME`
+        // while it holds the lock, and without a deterministic `C8CTL_NANO_HOME`
+        // here a concurrent run would see neither var and reject a valid name.
+        let _cfg = TempCfg::new();
         for bad in [
             "my fleet",   // interior space
             "my\tfleet",  // control char
