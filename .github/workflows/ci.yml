@@ -118,12 +118,20 @@ jobs:
       - name: start local nano engine
         run: .github/scripts/start-nano-engine.sh "$PLUGIN_VERSION" 8080
       - name: contract tests (Node target)
-        env:
-          # The parity guard (issue #59) calls `gh api` to assert each PARITY_GAPS
-          # issue is still open; without a token `gh` cannot authenticate. Scoped
-          # to THIS step only — not the npm/plugin lifecycle steps above.
-          GH_TOKEN: ${{ github.token }}
+        # No GH_TOKEN here: this runs the whole suite, which spawns `c8 nano`
+        # worker/agent processes that would INHERIT a step token (the harness only
+        # strips fleet-prefixed vars). The parity guard runs here too but tokenless,
+        # so it takes its documented local-skip path; it is re-run with a token in
+        # the dedicated, worker-free step below (least privilege).
         run: cargo test -p contract-tests --locked --no-fail-fast
+      - name: parity guard (Node target)
+        env:
+          # Only the parity guard (issue #59) needs `gh` (it calls `gh api` to
+          # assert each PARITY_GAPS issue is still open). Scope the token to this
+          # one step, which spawns NO worker/agent processes — so the token cannot
+          # leak into the plugin or any spawned agent.
+          GH_TOKEN: ${{ github.token }}
+        run: cargo test -p contract-tests --locked --test parity -- --nocapture
 
   # Worker contract tests against the Rust `nano-supervisor work <hire>` (issue
   # #4), end to end on the same engine as the Node job — one suite, both targets. The fleet CLI surface (#3: hire, assign,
@@ -157,17 +165,23 @@ jobs:
       - name: start local nano engine
         run: .github/scripts/start-nano-engine.sh "$PLUGIN_VERSION" 8080
       - name: worker contract tests (Rust target)
-        env:
-          # The parity guard (issue #59) calls `gh api` to assert each PARITY_GAPS
-          # issue is still open. Scoped to THIS step (which runs `--test parity`)
-          # only — not the whole job.
-          GH_TOKEN: ${{ github.token }}
+        # No GH_TOKEN here: these suites spawn worker/agent processes that would
+        # INHERIT a step token (the harness only strips fleet-prefixed vars). The
+        # parity guard is the only consumer of `gh`, so it is scoped to its own
+        # worker-free, token-bearing step below (least privilege).
         run: |
           export NS_BIN="$PWD/target/debug/nano-supervisor"
           cargo test -p contract-tests --locked \
             --test worker_prompt --test worker_env --test worker_result \
             --test worker_lease --test worker_finalize --test worker_selection \
-            --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard --test daemon_leak --test parity -- --nocapture
+            --test worker_resume --test worker_sweeps --test pin --test nested_supervisor --test worker_offline --test pdeath_guard --test daemon_leak -- --nocapture
+      - name: parity guard (Rust target)
+        env:
+          # Only the parity guard (issue #59) needs `gh` (it calls `gh api` to
+          # assert each PARITY_GAPS issue is still open). Scope the token to this
+          # one step, which spawns NO worker/agent processes.
+          GH_TOKEN: ${{ github.token }}
+        run: cargo test -p contract-tests --locked --test parity -- --nocapture
       - name: fleet CLI contract tests (Rust target)
         # live_status_round_trip stays skipped (needs NS_ALLOW_LIVE_SUPERVISOR=1): CI must not start a real daemon (#40).
         run: |

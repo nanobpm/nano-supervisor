@@ -1194,8 +1194,12 @@ pub fn assert_parity(verdict: Parity, why: impl FnOnce() -> String) {
     }
     if verdict == Parity::Xpass {
         panic!(
-            "XPASS: the parity gap is fixed, so its marker is stale — drop the \
-             `expect_parity` marker and its PARITY_GAPS row ({})",
+            "XPASS: the parity gap is fixed, so this marker is stale — remove \
+             THIS `expect_parity` marker now. Several markers may cite one \
+             PARITY_GAPS row (e.g. the Rust #59 row is shared), so delete the \
+             row only once its LAST marker is gone; removing it while other \
+             markers still cite it turns their expected failures into \
+             unregistered `Fail`s ({})",
             why()
         );
     }
