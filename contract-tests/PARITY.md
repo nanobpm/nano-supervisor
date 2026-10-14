@@ -14,10 +14,13 @@ Every row carries exactly one disposition:
 - **`n/a: <reason>`** — the change does not apply to the Rust worker (e.g. a
   JS-language-specific bug), with the reason.
 
-The live, CI-enforced counterpart of the `rust-issue` rows is
-[`PARITY_GAPS`](src/lib.rs) (asserted by [`tests/parity.rs`](tests/parity.rs)),
-which fails when a cited issue closes. The `contract-test` rows mirror the
-README fixes table.
+The CI-enforced guard is [`PARITY_GAPS`](src/lib.rs) (asserted by
+[`tests/parity.rs`](tests/parity.rs)), which fails when a cited issue closes.
+That guard checks only the separately registered typed parity gaps (today Rust
+#59 and plugin #274 / #289); it does **not** read this Markdown file, so a
+`rust-issue` row here (e.g. #78) is **not** enforced by it — closing #78 would
+not fail the guard. CI enforcement of these ledger rows remains deferred to
+#57. The `contract-test` rows mirror the README fixes table.
 
 | Plugin change | Behaviour | Disposition |
 | --- | --- | --- |
@@ -43,17 +46,35 @@ The plugin fix has two parts; both are already satisfied in the Rust worker:
 
 2. **The class fix (settlement-path throw fails the job, not a forever loop)**
    is how [`slot::run`](../src/slot.rs) already settles: `execute` returns
-   `Result<Settle>`, a panic is captured by `reconcile_exec_join` into
-   `Some(Err(e))`, and the settlement `match` turns any error into
+   `Result<Settle>` and the settlement `match` turns any `Err` into
    `jobs.fail(&key, retries - 1, …)` — the job **fails** (retries preserved,
    surfaced as an incident when exhausted) instead of escaping to a `run failed`
-   log and re-activating forever. An **aborted** run (lost activation /
-   force-stop) takes the `outcome.is_none()` branch and returns *without*
-   settling ("job NOT settled (the engine will redeliver it)"), so the
-   force-stop yield wins; and a `fail` request that itself rejects is **logged**
-   (`fail failed: … (original error: …)`), not propagated as a second masking
-   failure. These mirror the plugin's wrapped-settlement, aborted-returns, and
-   fail-settle-rejection branches exactly.
+   log and re-activating forever. Two qualifications keep this from overstating
+   parity with #285:
+
+   - **Scope of the panic capture.** `reconcile_exec_join` captures a panic of
+     the *execution* task into `Some(Err(e))`, so an execution panic fails the
+     job. It does **not** wrap the subsequent settlement code (`jobs.complete` /
+     `jobs.fail`) — a throw there is not recovered into a fallback settle (see
+     the next point).
+   - **Daemon vs standalone panic policy.** The execution-panic downgrade holds
+     in **daemon** mode (`propagate_job_panic: false`). In **standalone**
+     `work` mode (`propagate_job_panic: true`) an execution panic is instead
+     **re-raised** to crash the worker with a non-zero exit (so a swallowed
+     crash cannot exit 0); it is not downgraded to a `jobs.fail`.
+   - **A rejected settle request is logged, not recovered.** A `complete` or
+     `fail` request that itself rejects is only **logged** (`complete failed: …`
+     / `fail failed: … (original error: …)`); the worker does **not** fall back
+     to the other settle command. So a settlement-path failure is surfaced but
+     not retried/failed-over — a narrower guarantee than the plugin's
+     wrapped-settlement branch.
+
+   An **aborted** run (lost activation / force-stop) takes the
+   `outcome.is_none()` branch and returns *without* settling ("job NOT settled
+   (the engine will redeliver it)"), so the force-stop yield wins. The
+   execution-error and aborted-returns branches mirror the plugin; the
+   settlement-rejection branch is logged-and-surfaced rather than
+   recovered.
 
 ### jwulf/c8ctl-plugin-nano#262 — ACP plan carry-over
 
