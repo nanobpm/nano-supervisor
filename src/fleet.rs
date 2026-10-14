@@ -1455,7 +1455,26 @@ pub fn supervisor(op: SupervisorOp) -> Result<()> {
 
 /// `supervisor status`: print "not running" when no daemon is bound, else query
 /// the control socket and render the live daemon descriptor and worker roster.
+///
+/// The fleet-hygiene overlay (nanobpm/nano-supervisor#42) must render on EVERY
+/// path — including the error paths — so operators see the other/phantom
+/// supervisors on the host exactly when the current fleet is unhealthy and the
+/// hygiene view matters most. Rather than sprinkle `print_other_supervisors`
+/// before each return (and risk a future early-return skipping it, as the
+/// protocol-error and live-but-unhealthy transport paths once did), this thin
+/// wrapper runs the current-supervisor probe and then ALWAYS renders the overlay
+/// before propagating the probe's result (preserving the primary error).
 fn supervisor_status(home: &std::path::Path) -> Result<()> {
+    let current = supervisor_status_current(home);
+    print_other_supervisors(home);
+    current
+}
+
+/// Probe and render the *current* supervisor's state. Returns the result the
+/// command should exit with; the fleet-hygiene overlay is rendered by the
+/// `supervisor_status` wrapper on every path, so this function must never call
+/// `print_other_supervisors` itself.
+fn supervisor_status_current(home: &std::path::Path) -> Result<()> {
     if !supervisor_running(home) {
         println!("Supervisor not running");
         return Ok(());
@@ -1507,6 +1526,17 @@ fn supervisor_status(home: &std::path::Path) -> Result<()> {
             Ok(())
         }
         Err(e) => Err(e).context("querying the supervisor control socket"),
+    }
+}
+
+/// Fleet-hygiene overlay for `supervisor status` (nanobpm/nano-supervisor#42):
+/// list the *other* supervisors running on the host and flag the phantoms a
+/// torn-down agent run can leave behind (cwd a deleted run dir, or home under
+/// `/tmp`). Best-effort — a discovery hiccup prints nothing rather than failing
+/// the status command.
+fn print_other_supervisors(home: &std::path::Path) {
+    for line in crate::phantom::render(&crate::phantom::discover_other_supervisors(home)) {
+        println!("{line}");
     }
 }
 

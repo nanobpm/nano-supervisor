@@ -14,6 +14,10 @@ mod envelope;
 mod fleet;
 mod jobs;
 mod pdeath;
+// Host-wide supervisor discovery + phantom flagging for `supervisor status`
+// (nanobpm/nano-supervisor#42): surface stray fleets a torn-down agent run left
+// behind — those whose cwd is a deleted run dir or whose home is under `/tmp`.
+mod phantom;
 mod pin;
 mod pipe;
 mod profile;
