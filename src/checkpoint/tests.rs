@@ -587,6 +587,81 @@ async fn restore_refuses_off_branch_snapshot() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A clean worktree that returns to its base AFTER a prior interval snapshot a
+/// WIP file must still publish a fresh (clean) snapshot to supersede the stale
+/// one — otherwise the remote checkpoint keeps the discarded file and an
+/// interrupted run restores it. A later still-clean interval then no-ops.
+#[tokio::test]
+async fn clean_snapshot_supersedes_a_stale_prior_checkpoint() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("cleansupersede").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    // Interval 1: a WIP file is present -> a dirty snapshot is committed.
+    std::fs::write(work.join("WIP.txt"), "in progress\n").unwrap();
+    let snap1 = snapshot_worktree(
+        &git, &base_sha, "main", "run-c", None, 5 * 1024 * 1024, &[], "m1",
+    )
+    .await;
+    let (tree1, head1) = match snap1 {
+        Snapshot::Committed { tree, head, .. } => (tree, head),
+        Snapshot::Skipped { reason } => panic!("interval 1 skipped: {reason}"),
+    };
+
+    // The agent deletes the WIP file -> the worktree is clean again (== base).
+    std::fs::remove_file(work.join("WIP.txt")).unwrap();
+
+    // Interval 2: clean, but a DIFFERENT checkpoint was already pushed this
+    // session, so a fresh (clean) snapshot MUST be produced to supersede it.
+    let snap2 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-c",
+        Some((tree1.as_str(), head1.as_str())),
+        5 * 1024 * 1024,
+        &[],
+        "m2",
+    )
+    .await;
+    let (tree2, head2) = match snap2 {
+        Snapshot::Committed { sha, tree, head, .. } => {
+            // The superseding snapshot drops the discarded file.
+            let ls = git.run(&["ls-tree", "-r", "--name-only", &sha]).await.out();
+            assert!(!ls.contains("WIP.txt"), "stale WIP.txt still present: {ls}");
+            (tree, head)
+        }
+        Snapshot::Skipped { reason } => {
+            panic!("clean interval wrongly skipped a stale checkpoint: {reason}")
+        }
+    };
+
+    // Interval 3: still clean and the last push already matches -> genuine no-op.
+    let snap3 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-c",
+        Some((tree2.as_str(), head2.as_str())),
+        5 * 1024 * 1024,
+        &[],
+        "m3",
+    )
+    .await;
+    match snap3 {
+        Snapshot::Skipped { reason } => assert_eq!(reason, "unchanged"),
+        Snapshot::Committed { .. } => panic!("idle clean interval should no-op"),
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 struct FakeProbe {
     orphan: bool,
 }

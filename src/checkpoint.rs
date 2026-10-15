@@ -40,7 +40,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::safecwd::CwdHandle;
@@ -738,7 +738,23 @@ pub struct GitRunner {
     /// ops, mirroring `provision::git_isolated`: the agent shares the daemon's
     /// `HOME`, so its global config (`insteadOf`, proxies) is untrusted.
     isolate_config: bool,
+    /// Hard cap on retained stdout bytes per invocation. Every pipe is still
+    /// drained to EOF (so git never blocks on a full buffer), but a
+    /// job-controlled remote/helper flooding stdout — or a pathological ref
+    /// listing — can never grow unbounded and exhaust the long-lived daemon's
+    /// memory. On overflow the invocation FAILS CLOSED (`status = None`) so a
+    /// caller never parses a silently truncated ref listing / blob / patch.
+    /// Must exceed the largest legitimate stdout (a `cat-file blob` of a file up
+    /// to `max_file_bytes`); `run_in` callers that read blobs size it from the
+    /// config (see `with_max_stdout`).
+    max_stdout: usize,
 }
+
+/// Default retained-stdout cap: comfortably over the 5 MiB default
+/// `max_file_bytes` blob read plus `cat-file` headers, while still bounding a
+/// flooded pipe far below daemon-exhausting sizes. Authenticated runners raise
+/// it from config via [`GitRunner::with_max_stdout`].
+const DEFAULT_MAX_STDOUT: usize = 16 * 1024 * 1024;
 
 impl GitRunner {
     pub fn new(cwd: CwdHandle, timeout: Duration) -> Self {
@@ -747,7 +763,20 @@ impl GitRunner {
             timeout,
             cred: None,
             isolate_config: false,
+            max_stdout: DEFAULT_MAX_STDOUT,
         }
+    }
+
+    /// Raise the retained-stdout cap so a legitimate `cat-file blob` of a file up
+    /// to `max_file_bytes` is never truncated/rejected, while still bounding a
+    /// flooded pipe. Floors at [`DEFAULT_MAX_STDOUT`] so a tiny configured file
+    /// cap can never shrink the bound below normal ref-listing output.
+    pub fn with_max_stdout(mut self, max_file_bytes: u64) -> Self {
+        let want = usize::try_from(max_file_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(8 * 1024 * 1024);
+        self.max_stdout = want.max(DEFAULT_MAX_STDOUT);
+        self
     }
 
     /// Attach an out-of-band push credential and isolate untrusted config for
@@ -895,26 +924,34 @@ impl GitRunner {
         }
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
+        let max_stdout = self.max_stdout;
         let wait = async {
+            // Drain BOTH pipes to EOF so git never blocks on a full buffer, but
+            // retain only a bounded amount: unbounded `read_to_end` here let a
+            // large restore diff or a noisy remote/helper grow the buffer without
+            // limit and exhaust the long-lived daemon's memory. stdout fails
+            // closed on overflow (its caller parses ref listings / blobs / patches
+            // and must never act on a silently truncated capture); stderr keeps
+            // only a short diagnostic tail.
             let read_out = async {
-                let mut buf = Vec::new();
-                if let Some(o) = stdout_pipe.as_mut() {
-                    let _ = o.read_to_end(&mut buf).await;
+                match stdout_pipe.as_mut() {
+                    Some(o) => crate::provision::drain_capped(o, max_stdout).await,
+                    None => (Vec::new(), false),
                 }
-                buf
             };
             let read_err = async {
-                let mut buf = Vec::new();
-                if let Some(e) = stderr_pipe.as_mut() {
-                    let _ = e.read_to_end(&mut buf).await;
+                match stderr_pipe.as_mut() {
+                    Some(e) => crate::provision::drain_capped(e, crate::provision::GIT_STDERR_TAIL)
+                        .await
+                        .0,
+                    None => Vec::new(),
                 }
-                buf
             };
             let (status, out, err) = tokio::join!(child.wait(), read_out, read_err);
             (status, out, err)
         };
         match tokio::time::timeout(self.timeout, wait).await {
-            Ok((status, out, err)) => {
+            Ok((status, (out, out_overflow), err)) => {
                 // git finished within the timeout, but a helper it spawned can
                 // outlive the leader while sharing its group. Tear the whole group
                 // down before disarming, mirroring the provisioning path.
@@ -927,6 +964,20 @@ impl GitRunner {
                     )
                     .await;
                     group_guard.disarm();
+                }
+                // stdout exceeded its cap: leading bytes were DROPPED, so the
+                // capture is a partial tail. Fail closed rather than let the
+                // caller parse an incomplete ref listing / blob / patch as if it
+                // were the whole stream.
+                if out_overflow {
+                    return GitOut {
+                        status: None,
+                        stdout: String::new(),
+                        stderr: format!(
+                            "git stdout exceeded the {max_stdout}-byte capture cap; \
+                             refusing to act on a truncated result"
+                        ),
+                    };
                 }
                 let (code, stderr) = match status {
                     Ok(s) => (s.code(), String::from_utf8_lossy(&err).into_owned()),
@@ -1123,9 +1174,20 @@ pub async fn snapshot_worktree(
             unborn
         };
     if clean {
-        return Snapshot::Skipped {
-            reason: "clean".into(),
-        };
+        // A clean worktree still needs a fresh snapshot when we ALREADY pushed a
+        // DIFFERENT checkpoint this session: an earlier interval may have snapshot
+        // a WIP file the agent has since deleted, and simply skipping here leaves
+        // the remote WIP ref holding that superseded content — which an
+        // interrupted run would then wrongly restore. Publish the clean snapshot
+        // (just the base tree) to supersede it. Only truly skip when nothing stale
+        // needs replacing: no prior push this session, or the last push already
+        // matches this clean tree (the common idle-interval no-op).
+        let supersedes_prior = matches!(last_tree, Some((lt, _)) if lt != tree_sha);
+        if !supersedes_prior {
+            return Snapshot::Skipped {
+                reason: "clean".into(),
+            };
+        }
     }
 
     let mut trailers: Vec<String> = Vec::new();

@@ -54,7 +54,11 @@ fn now_ms() -> u64 {
 fn runner_for(agent_cwd: &CwdHandle, repo_url: &str, cfg: &CheckpointConfig) -> Option<GitRunner> {
     let cwd = agent_cwd.try_clone().ok()?;
     let (_, cred) = crate::provision::split_url_credential(repo_url);
-    Some(GitRunner::new(cwd, cfg.git_timeout()).with_credential(cred, true))
+    Some(
+        GitRunner::new(cwd, cfg.git_timeout())
+            .with_credential(cred, true)
+            .with_max_stdout(cfg.max_file_bytes),
+    )
 }
 
 /// What [`start`] hands back to `execute`.

@@ -3657,7 +3657,7 @@ const MAX_REFLOG_SCAN: usize = 512;
 
 /// Bytes of a child stream's *tail* retained for diagnostics. The stream is
 /// still drained fully; only the last `GIT_STDERR_TAIL` bytes are kept.
-const GIT_STDERR_TAIL: usize = 8 * 1024;
+pub(crate) const GIT_STDERR_TAIL: usize = 8 * 1024;
 
 /// Read `reader` to EOF, retaining only its last `cap` bytes. Always consumes the
 /// whole stream (so the writer never blocks on a full pipe) while bounding memory
@@ -3667,7 +3667,7 @@ const GIT_STDERR_TAIL: usize = 8 * 1024;
 /// short (a partial buffer we must not trust as the whole stream). A security
 /// scrub that must see the COMPLETE listing uses it to fail closed rather than
 /// act on a silently truncated — or silently short-read — tail.
-async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
+pub(crate) async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
