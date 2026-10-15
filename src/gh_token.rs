@@ -777,36 +777,28 @@ fn run_capped(
     let out_r = bounded_join(out_t, join_deadline);
     let err_r = bounded_join(err_t, join_deadline);
     let output_failed = out_r.is_none() || err_r.is_none();
-    // A drain that could not be collected means a descendant is still holding a
-    // pipe open after the wrapper exited (on the timeout path the group was
-    // already killed in the loop above, so this is a no-op there). Tear the
-    // whole group down now — identity-gated via the spawn-time guard, so a
-    // recycled pgid is never signalled, and `still_ours()` fails OPEN for a
-    // reaped leader whose descendants keep the pgid reserved (exactly our case)
-    // — so the descendant and its blocked threads can't accumulate across ticks.
+    // Tear the whole group down now, UNCONDITIONALLY — on BOTH the failed-drain
+    // and the successful-collection path. Successful output collection does NOT
+    // mean the group has exited: a wrapper such as `printf gho_x; sleep 30
+    // >/dev/null 2>&1 & exit 0` finishes both drains (the descendant's
+    // redirected output does not hold our pipes), so `output_failed` is false —
+    // yet the descendant is still alive and would otherwise survive,
+    // accumulating one process (plus its watchdog/reaper resources) per refresh
+    // tick. `kill_group_if_ours()` is itself a no-op when the group holds
+    // nothing live, so calling it on the success path costs only a gated,
+    // harmless SIGKILL to the pgid.
+    //
+    // Do NOT gate this kill on a `group_has_live_member()` scan: that scan is
+    // best-effort and explicitly fails open (a descendant that forks mid-scan
+    // can be missed — see `pdeath::group_has_live_member`'s contract). A false
+    // negative would skip the kill AND the unconditional `disarm()` below would
+    // then disable the guard's Drop fallback, leaking exactly the descendant the
+    // scan missed. Signalling first and disarming second keeps the kill
+    // unconditional while retaining the identity check (`still_ours()`), so a
+    // recycled pgid is never signalled, yet nothing survives a false-negative
+    // scan.
     #[cfg(unix)]
-    if output_failed {
-        group_guard.kill_group_if_ours();
-    } else {
-        // Successful output collection does NOT mean the group has exited: a
-        // wrapper such as `printf gho_x; sleep 30 >/dev/null 2>&1 & exit 0`
-        // finishes both drains (the descendant's redirected output does not
-        // hold our pipes), so `output_failed` is false — yet the descendant is
-        // still alive and would otherwise survive, accumulating one process
-        // (plus its watchdog/reaper resources) per refresh tick. Clean up
-        // remaining group members on success too: enumerate the group and, if
-        // anything live remains, SIGKILL it — identity-gated via the same
-        // spawn-time guard, so a recycled pgid is never signalled. The
-        // enumeration is best-effort and fails open (a mid-scan fork can be
-        // missed); a missed member is then caught by the guard's Drop below
-        // (which signals whenever the group is still verifiably ours), so a
-        // false negative here is not a leak.
-        if let Some(guard) = group_guard.guard() {
-            if crate::pdeath::group_has_live_member(guard.pgid()) {
-                group_guard.kill_group_if_ours();
-            }
-        }
-    }
+    group_guard.kill_group_if_ours();
     // The child is reaped and any surviving descendant has now been signalled;
     // disarm so the guard's Drop never signals a recycled pgid.
     #[cfg(unix)]
@@ -1754,9 +1746,12 @@ mod tests {
     /// 0 and the descendant's redirected output never holds our pipes, so BOTH
     /// drains finish and `output_failed` is false — yet the descendant is still
     /// alive and, before the fix, was disarmed and leaked (one process plus its
-    /// watchdog/reaper resources per refresh tick). `run_capped` now enumerates
-    /// the group after successful collection and SIGKILLs any live member
-    /// (identity-gated by the spawn-time guard). We assert the recorded
+    /// watchdog/reaper resources per refresh tick). `run_capped` now issues an
+    /// UNCONDITIONAL identity-gated group SIGKILL after successful collection —
+    /// no longer gated on a best-effort `group_has_live_member()` scan, whose
+    /// fail-open false negative would skip the kill and then be defeated by the
+    /// unconditional `disarm()` (the "Unconditional disarm" advisory). We assert
+    /// the recorded
     /// descendant pid is dead afterwards — with the same ESRCH/zombie-aware
     /// handling as the round-5 test: once the wrapper exits, the killed
     /// descendant is reparented and reaped by its NEW parent, so a prompt
