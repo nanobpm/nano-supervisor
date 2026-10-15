@@ -36,8 +36,8 @@
 //! - [`is_git_auth_failure`] classifies the (already-redacted) git/gh failure
 //!   detail so only a real auth/OAuth-scope failure triggers that recovery.
 
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 
@@ -45,13 +45,29 @@ use sha1::{Digest, Sha1};
 /// served without re-spawning `gh`.
 const DEFAULT_TTL_MS: u64 = 5 * 60_000;
 
-/// Monotonic clock in milliseconds since the UNIX epoch — the production clock
-/// for the cache. Tests inject their own.
+/// Monotonic clock in milliseconds, anchored to the UNIX epoch — the production
+/// clock for the cache. Tests inject their own.
+///
+/// The clock MUST be monotonic: TTL expiry, the busy-defer bound, and the
+/// credential age are all computed as `now.saturating_sub(earlier)`, so a clock
+/// that can move backward would clamp those deltas to zero and indefinitely
+/// stall a refresh (or freeze the reported age) for the whole duration of a
+/// backward wall-clock adjustment. `SystemTime` is a wall clock and can jump
+/// backward (NTP step, manual set, leap-second smear), so it must NOT drive
+/// these deltas directly. Instead we anchor the UNIX wall-clock reading ONCE at
+/// first use and advance it with a monotonic [`Instant`]: later wall-clock
+/// changes can't rewind the cache's sense of elapsed time, while the values
+/// stay in the existing "millis since the UNIX epoch" representation.
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static ANCHOR: OnceLock<(Instant, u64)> = OnceLock::new();
+    let (mono0, unix0) = *ANCHOR.get_or_init(|| {
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        (Instant::now(), unix)
+    });
+    unix0.saturating_add(mono0.elapsed().as_millis() as u64)
 }
 
 fn coerce_env_ms(name: &str, default: u64) -> u64 {
@@ -262,14 +278,12 @@ impl GhTokenCache {
 
     /// Fold a read result into the cache. The read has already happened (outside
     /// the lock); `scopes` probes are run here only when needed, also outside the
-    /// lock, then the record is committed under a generation fence.
-    fn adopt(&self, read: GhAuthRead) -> AdoptOutcome {
-        // Snapshot prev + generation under the lock, then release it for the
-        // (possibly slow) scopes probe.
-        let (prev, start_gen) = {
-            let g = self.inner.lock().unwrap();
-            (g.cache.clone(), g.generation)
-        };
+    /// lock, then the record is committed under a generation fence. `prev` and
+    /// `start_gen` are the record and generation the CALLER snapshotted **before
+    /// invoking the reader** — the fence must bracket the token read, so the
+    /// generation cannot be captured here (after the read) without reopening the
+    /// overlapping-read race this guards against.
+    fn adopt(&self, read: GhAuthRead, prev: Option<Record>, start_gen: u64) -> AdoptOutcome {
         let now = (self.clock)();
 
         // Transient read failure: never discard a usable cached credential.
@@ -375,7 +389,15 @@ impl GhTokenCache {
     /// job path (the startup prime, the auth-failure recovery where the caller is
     /// already blocked on git, and the background maintenance tick).
     pub fn refresh(&self, force: bool) -> AdoptOutcome {
-        {
+        // Snapshot the previous record AND the generation BEFORE spawning the
+        // (slow) reader, so the generation fence brackets the token READ, not
+        // only the later scopes probe. Capturing the generation after the read
+        // (as `adopt` used to) let a stale read that STARTED before a newer
+        // committed write still snapshot the post-write generation, pass the
+        // fence, and silently overwrite the newer token without reporting
+        // `superseded`. Snapshotting here makes that stale read observe the
+        // bumped generation at commit and report `superseded` instead.
+        let (prev, start_gen) = {
             let g = self.inner.lock().unwrap();
             if !force {
                 if let Some(p) = g.cache.as_ref() {
@@ -390,9 +412,10 @@ impl GhTokenCache {
                     }
                 }
             }
-        }
+            (g.cache.clone(), g.generation)
+        };
         let read = (self.reader)();
-        self.adopt(read)
+        self.adopt(read, prev, start_gen)
     }
 
     /// The per-job hot path. Serve the PRIMED cache verbatim — NEVER a blocking
@@ -580,30 +603,95 @@ fn gh_noninteractive_env() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Production `gh auth token` reader (synchronous spawn). Bounded by a 10s wait.
+/// Spawn `cmd`, capture its stdout/stderr, and enforce `timeout`. Returns
+/// `Some((exit_code, stdout, stderr))` when the child exits within the deadline,
+/// or `None` when it could not be spawned OR exceeded the deadline (in which
+/// case the child is **killed and reaped** so it can't linger as a zombie or
+/// keep running past our wait). Both pipes are drained on their own threads so a
+/// child that fills a pipe buffer can never wedge the wait, and so whatever it
+/// wrote before a kill is still collected. This is the shared, bounded spawn for
+/// every `gh` child here — neither the token read nor the scopes probe may block
+/// `prime()` / the maintenance refresh indefinitely.
+fn run_capped(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Option<(Option<i32>, String, String)> {
+    use std::io::Read;
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let out_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = out.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = err.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap so it can't become a zombie
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    // Join the drain threads regardless: the pipes are closed once the child is
+    // gone, so these return promptly, and joining reaps them.
+    let stdout = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
+    status.map(|st| (st.code(), stdout, stderr))
+}
+
+/// Production `gh auth token` reader (synchronous spawn), bounded by a 10s wait.
+/// A timeout (or any spawn failure) is a transient [`GhAuthRead::ReadFailed`] so
+/// the caller PRESERVES any prior cached credential rather than dropping to
+/// anonymous on a stalled keychain/token read.
 fn read_gh_auth_token_default() -> GhAuthRead {
+    read_gh_auth_token(Duration::from_secs(10))
+}
+
+fn read_gh_auth_token(timeout: Duration) -> GhAuthRead {
     use std::process::Command;
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "token"]);
     for (k, v) in gh_noninteractive_env() {
         cmd.env(k, v);
     }
-    match cmd.output() {
-        Ok(out) => classify_gh_auth_read(
-            false,
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-        ),
-        Err(_) => GhAuthRead::ReadFailed,
+    match run_capped(cmd, timeout) {
+        Some((code, stdout, stderr)) => classify_gh_auth_read(false, code, &stdout, &stderr),
+        None => GhAuthRead::ReadFailed,
     }
 }
 
 /// Read the token's OAuth scopes from the live `X-OAuth-Scopes` response header.
-/// Best-effort: failure -> `None` (scopes simply go unreported). The token rides
-/// the child env (`GH_TOKEN`), NEVER argv, so it can't leak via `ps` — the same
+/// Best-effort and BOUNDED by `timeout`: a spawn failure, a timeout, or a missing
+/// header all yield `None` (scopes simply go unreported) so a stalled or slow API
+/// probe never blocks adoption of a rotated token. The token rides the child env
+/// (`GH_TOKEN`), NEVER argv, so it can't leak via `ps` — the same
 /// no-env-leak-to-argv guarantee as the credential delivery in [`crate::provision`].
-fn gh_token_scopes(token: &str, _timeout: Duration) -> Option<String> {
+fn gh_token_scopes(token: &str, timeout: Duration) -> Option<String> {
     if token.is_empty() {
         return None;
     }
@@ -614,10 +702,10 @@ fn gh_token_scopes(token: &str, _timeout: Duration) -> Option<String> {
         cmd.env(k, v);
     }
     cmd.env("GH_TOKEN", token);
-    let out = cmd.output().ok()?;
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (_code, stdout, stderr) = run_capped(cmd, timeout)?;
+    let mut combined = stdout;
     combined.push('\n');
-    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    combined.push_str(&stderr);
     for line in combined.lines() {
         if let Some(rest) = line.to_ascii_lowercase().strip_prefix("x-oauth-scopes:") {
             let _ = rest;
@@ -1143,5 +1231,108 @@ mod tests {
         // The next hot-path lookup re-reads the CLI.
         assert_eq!(cache.token_for_cli().as_deref(), Some("gho_x"));
         assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// Finding-1 regression (the generation fence must bracket the token READ,
+    /// not only the scopes probe). A reads the OLD token; while A's read is in
+    /// flight, B commits a NEWER token. A must observe the bumped generation and
+    /// report `superseded` rather than overwrite B's newer credential.
+    #[test]
+    fn overlapping_read_does_not_overwrite_a_newer_committed_token() {
+        use std::sync::mpsc;
+        let clock = FakeClock::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let (a_reading_tx, a_reading_rx) = mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
+        // mpsc endpoints are Send but not Sync; a `Reader` must be Send + Sync,
+        // so wrap the ones the reader closure uses in a Mutex.
+        let a_reading_tx = Mutex::new(a_reading_tx);
+        let b_done_rx = Mutex::new(b_done_rx);
+        let c = calls.clone();
+        let reader: Reader = Box::new(move || {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // A: announce it is mid-read, then block until B has committed.
+                a_reading_tx.lock().unwrap().send(()).unwrap();
+                b_done_rx.lock().unwrap().recv().unwrap();
+                GhAuthRead::Token("gho_old".into())
+            } else {
+                // B: commit immediately with the newer token.
+                GhAuthRead::Token("gho_new".into())
+            }
+        });
+        let cache = Arc::new(GhTokenCache::with_seams(
+            60_000,
+            240_000,
+            reader,
+            Box::new(|_| Some("repo".into())),
+            clock.clock(),
+        ));
+        let ca = cache.clone();
+        let a = std::thread::spawn(move || ca.refresh(true));
+        a_reading_rx.recv().unwrap(); // A has snapshotted gen and is mid-read
+        let b_out = cache.refresh(true); // B reads + commits gho_new (gen bumps)
+        assert_eq!(b_out.token.as_deref(), Some("gho_new"));
+        assert!(b_out.changed);
+        b_done_tx.send(()).unwrap(); // release A to finish its stale read
+        let a_out = a.join().unwrap();
+        assert!(
+            a_out.superseded,
+            "A's stale read must not clobber B's newer commit"
+        );
+        assert!(!a_out.changed);
+        assert_eq!(
+            cache.token_for_cli().as_deref(),
+            Some("gho_new"),
+            "the newer token survives the overlapping stale read"
+        );
+    }
+
+    /// Finding-4 regression: the production clock never moves backward and stays
+    /// anchored to UNIX-epoch millis (so a wall-clock step can't stall refreshes
+    /// by clamping `now.saturating_sub(last_check)` to zero).
+    #[test]
+    fn production_clock_is_monotonic_and_epoch_anchored() {
+        let a = now_ms();
+        let b = now_ms();
+        assert!(b >= a, "the production clock never goes backward");
+        assert!(
+            a > 1_600_000_000_000,
+            "anchored to UNIX-epoch millis, not a monotonic-only base"
+        );
+    }
+
+    /// Finding-2 regression: a child that outlives the deadline is killed, reaped,
+    /// and reported as a failure promptly — not after its own runtime.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_kills_a_child_that_exceeds_the_timeout() {
+        use std::process::Command;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let out = run_capped(cmd, Duration::from_millis(150));
+        assert!(
+            out.is_none(),
+            "a child past the deadline is killed and reported as a failure"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "returns promptly on timeout, not after the child's full runtime"
+        );
+    }
+
+    /// Finding-2 companion: a prompt command still returns its captured output
+    /// and exit code through the bounded spawn.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_returns_output_for_a_prompt_command() {
+        use std::process::Command;
+        let mut cmd = Command::new("printf");
+        cmd.arg("hello");
+        let (code, stdout, _stderr) =
+            run_capped(cmd, Duration::from_secs(5)).expect("a fast command completes in time");
+        assert_eq!(code, Some(0));
+        assert_eq!(stdout, "hello");
     }
 }
