@@ -1290,6 +1290,17 @@ fn active_runs() -> &'static Mutex<HashMap<PathBuf, usize>> {
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether this worker currently has NO run in flight — the idle signal the
+/// gh-auth-token maintenance refresh ([`crate::gh_token`]) consults so it can
+/// DEFER a `gh auth token` re-read while a job is active (keeping the read off
+/// the job path), bounded by `NANO_GH_TOKEN_MAX_DEFER_MS`. Reuses the same
+/// refcounted in-flight-run registry the sweep guard maintains, so "a job is
+/// running" is one source of truth. A poisoned lock is treated as idle (the
+/// refresh is best-effort and must never wedge on a lock error).
+pub(crate) fn worker_is_idle() -> bool {
+    active_runs().lock().map(|m| m.is_empty()).unwrap_or(true)
+}
+
 /// RAII registration of an in-flight run directory in [`active_runs`]. The dir
 /// is protected from the sweep from construction until this guard drops, which
 /// covers every exit path of [`execute`] — normal return, an early `?` bail, or

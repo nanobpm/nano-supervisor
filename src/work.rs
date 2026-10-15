@@ -397,6 +397,43 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         protocol_override: std::env::var("NANO_AGENTIC_PROTOCOL").ok(),
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(slot::Shutdown::Running);
+    // nanobpm/nano-supervisor#67 (porting jwulf/c8ctl-plugin-nano#294/#293):
+    // keep this worker's `gh auth token` fresh for its whole lifetime. Prime the
+    // cache once at startup (off the job path — this `work::run` setup runs before
+    // the slot's first `activate`) so the worker's GH AUTH identity is logged, then
+    // run a background maintenance refresh that re-reads `gh auth token` on a TTL
+    // cadence. The refresh DEFERS while a job is active (reusing `slot::worker_is_idle`)
+    // so a read never lands on the job path, but that defer is bounded
+    // (`NANO_GH_TOKEN_MAX_DEFER_MS`) so a saturated worker still adopts a rotated
+    // login within a few intervals. The thread is detached (never joined) so, like
+    // the plugin's unref'd timer, it cannot keep a dead worker's process alive.
+    {
+        let gh_cache = std::sync::Arc::new(crate::gh_token::GhTokenCache::production());
+        gh_cache.prime(log);
+        let interval = Duration::from_millis(crate::gh_token::ttl_ms().max(1_000));
+        let refresh_cache = gh_cache.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("gh-auth-refresh".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                if let Some(true) = refresh_cache.maintenance_tick(slot::worker_is_idle()) {
+                    log(&crate::gh_token::describe_gh_auth_token(
+                        refresh_cache.info().as_ref(),
+                    ));
+                }
+            })
+        {
+            // A spawn failure (e.g. a process/thread-limit cap) must NOT be
+            // swallowed: without this thread the token is never refreshed for
+            // the worker's lifetime and the cache is dropped when this block
+            // ends, so the worker silently degrades to whatever credential it
+            // started with. Warn so operators know lifetime refresh is off.
+            log(&format!(
+                "⚠ gh auth token refresh disabled: could not start the refresh thread: {e}"
+            ));
+        }
+    }
+
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));
     // The slot's `JoinHandle` resolves to `Result<(), JoinError>`: `Ok(())` on a
     // clean return, `Err` on a PANIC/abort. That error must NOT be discarded —
