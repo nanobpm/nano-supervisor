@@ -412,7 +412,7 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
         gh_cache.prime(log);
         let interval = Duration::from_millis(crate::gh_token::ttl_ms().max(1_000));
         let refresh_cache = gh_cache.clone();
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("gh-auth-refresh".to_string())
             .spawn(move || loop {
                 std::thread::sleep(interval);
@@ -422,7 +422,16 @@ pub async fn run(opts: WorkOptions) -> Result<()> {
                     ));
                 }
             })
-            .ok();
+        {
+            // A spawn failure (e.g. a process/thread-limit cap) must NOT be
+            // swallowed: without this thread the token is never refreshed for
+            // the worker's lifetime and the cache is dropped when this block
+            // ends, so the worker silently degrades to whatever credential it
+            // started with. Warn so operators know lifetime refresh is off.
+            log(&format!(
+                "⚠ gh auth token refresh disabled: could not start the refresh thread: {e}"
+            ));
+        }
     }
 
     let mut slot_task = tokio::spawn(slot::run(jobs, cfg, shutdown_rx, shutdown_tx.clone()));

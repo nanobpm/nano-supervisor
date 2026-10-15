@@ -714,10 +714,15 @@ fn run_capped(
             }
         }
     };
-    // The child is reaped by here on every path; disarm so the guard's Drop
-    // never signals a recycled pgid.
-    #[cfg(unix)]
-    group_guard.disarm();
+    // The direct child is reaped by here on every path, but do NOT disarm yet.
+    // On the normal-exit path (the child exited 0, so the timeout branch above
+    // never fired and nothing tore the group down) a descendant can have
+    // inherited our pipes and outlived the wrapper — the `printf gho_x; sleep
+    // 30 & exit 0` case. Keep the spawn-time guard armed THROUGH output
+    // collection so that, if a drain cannot complete, we can still tear that
+    // descendant down below instead of leaking it (and its blocked
+    // reader/joiner threads) across every refresh tick.
+    //
     // Join the drain threads, but BOUNDED: once the child (and, on unix, its
     // whole group) is gone the pipes close and these return promptly — yet a
     // descendant that survived (non-unix, or a re-parented escapee) would keep
@@ -729,6 +734,21 @@ fn run_capped(
     let out_r = bounded_join(out_t, join_deadline);
     let err_r = bounded_join(err_t, join_deadline);
     let output_failed = out_r.is_none() || err_r.is_none();
+    // A drain that could not be collected means a descendant is still holding a
+    // pipe open after the wrapper exited (on the timeout path the group was
+    // already killed in the loop above, so this is a no-op there). Tear the
+    // whole group down now — identity-gated via the spawn-time guard, so a
+    // recycled pgid is never signalled, and `still_ours()` fails OPEN for a
+    // reaped leader whose descendants keep the pgid reserved (exactly our case)
+    // — so the descendant and its blocked threads can't accumulate across ticks.
+    #[cfg(unix)]
+    if output_failed {
+        group_guard.kill_group_if_ours();
+    }
+    // The child is reaped and any surviving descendant has now been signalled;
+    // disarm so the guard's Drop never signals a recycled pgid.
+    #[cfg(unix)]
+    group_guard.disarm();
     let stdout = String::from_utf8_lossy(&out_r.unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&err_r.unwrap_or_default()).into_owned();
     status.map(|st| (st.code(), stdout, stderr, output_failed))
@@ -794,12 +814,30 @@ fn read_gh_auth_token(timeout: Duration) -> GhAuthRead {
     }
 }
 
+/// Deliver `token` to a spawned `gh` child so the API validates EXACTLY the
+/// token we just read — never gh's stored credentials for some other login.
+/// `gh` honours `GH_TOKEN` on github.com but IGNORES it on a self-hosted
+/// GitHub Enterprise host, where it reads `GH_ENTERPRISE_TOKEN` (or falls back
+/// to stored credentials) instead — see `src/provision.rs`, which selects the
+/// variable by host. We do not resolve the active host here, so set BOTH to the
+/// same value: whichever variable the configured host honours, it is OUR token,
+/// so the probe can never pair this token's fingerprint with a DIFFERENT (e.g.
+/// a stored-login rotation's) token's scopes. The unused variable is harmless —
+/// gh ignores `GH_ENTERPRISE_TOKEN` on github.com and `GH_TOKEN` on Enterprise.
+/// The token rides the child env, NEVER argv, so it can't leak via `ps` — the
+/// same no-env-leak-to-argv guarantee as [`crate::provision`].
+fn apply_probe_token(cmd: &mut std::process::Command, token: &str) {
+    cmd.env("GH_TOKEN", token);
+    cmd.env("GH_ENTERPRISE_TOKEN", token);
+}
+
 /// Read the token's OAuth scopes from the live `X-OAuth-Scopes` response header.
 /// Best-effort and BOUNDED by `timeout`: a spawn failure, a timeout, or a missing
 /// header all yield `None` (scopes simply go unreported) so a stalled or slow API
 /// probe never blocks adoption of a rotated token. The token rides the child env
-/// (`GH_TOKEN`), NEVER argv, so it can't leak via `ps` — the same
-/// no-env-leak-to-argv guarantee as the credential delivery in [`crate::provision`].
+/// (`GH_TOKEN` / `GH_ENTERPRISE_TOKEN`, see [`apply_probe_token`]), NEVER argv,
+/// so it can't leak via `ps` — the same no-env-leak-to-argv guarantee as the
+/// credential delivery in [`crate::provision`].
 fn gh_token_scopes(token: &str, timeout: Duration) -> Option<String> {
     if token.is_empty() {
         return None;
@@ -810,8 +848,10 @@ fn gh_token_scopes(token: &str, timeout: Duration) -> Option<String> {
     for (k, v) in gh_noninteractive_env() {
         cmd.env(k, v);
     }
-    cmd.env("GH_TOKEN", token);
+    // Scrub BEFORE delivering the token: the strip removes the daemon's
+    // engine secrets but must not clear the `GH_*` token vars we set next.
     scrub_sensitive_env(&mut cmd);
+    apply_probe_token(&mut cmd, token);
     let (_code, stdout, stderr, _output_failed) = run_capped(cmd, timeout)?;
     let mut combined = stdout;
     combined.push('\n');
@@ -1540,6 +1580,109 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "returns promptly: killing the direct child alone would leave the \
              descendant holding the pipes and the drain joins blocked"
+        );
+    }
+
+    /// Round-5 regression (advisory: *preserve cleanup guard until descendant
+    /// output collection completes*). The round-4 test above proved the read is
+    /// reported as `output_failed`; this proves the surviving descendant is also
+    /// KILLED, not merely reported. A wrapper exits 0 while a backgrounded
+    /// descendant records its own pid and then holds stdout open. Because the
+    /// direct child exited cleanly, the timeout branch never fired, so the ONLY
+    /// thing that tears the descendant down is the post-collection group kill
+    /// `run_capped` now performs when a drain can't complete. Without it the
+    /// descendant (and its blocked reader/joiner threads) would accumulate on
+    /// every refresh tick. We assert the recorded pid is dead afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_kills_a_descendant_that_outlives_a_successful_wrapper() {
+        use std::process::Command;
+        let pidfile = std::env::temp_dir().join(format!(
+            "nano_gh_desc_{}_{}.pid",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        // Background `sleep` (it inherits stdout and holds the pipe open), record
+        // ITS pid via `$!` — not `$$`, which in a subshell is the parent sh's pid
+        // and would make this pass trivially once sh is reaped — then exit 0.
+        let script = format!(
+            "printf gho_x; sleep 30 & echo $! > '{p}'; exit 0",
+            p = pidfile.display()
+        );
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script.as_str()]);
+        let (code, _stdout, _stderr, output_failed) =
+            run_capped(cmd, Duration::from_millis(150)).expect("the wrapper exits promptly");
+        assert_eq!(code, Some(0), "the wrapper itself exits 0");
+        assert!(
+            output_failed,
+            "a descendant holding the pipe fails output collection"
+        );
+        // Read the pid the backgrounded sleep recorded.
+        let mut pid: Option<i32> = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    pid = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("the descendant recorded its pid before sleeping");
+        // `kill(pid, 0)` returns Err(ESRCH) once the descendant is gone (the
+        // group kill reaped it / its reparent did). Poll briefly for the signal
+        // + reap to land.
+        let mut alive = true;
+        for _ in 0..200 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive,
+            "the surviving descendant must be killed by the post-collection group \
+             cleanup, not leaked across refresh ticks (pid {pid})"
+        );
+    }
+
+    /// Round-5 regression (advisory: *pin Enterprise host and token source*).
+    /// The scopes probe must deliver OUR exact token in whichever variable the
+    /// active host honours — `GH_TOKEN` on github.com, `GH_ENTERPRISE_TOKEN` on
+    /// a self-hosted Enterprise host, where `gh` IGNORES `GH_TOKEN` and would
+    /// otherwise fall back to stored credentials (pairing this token's
+    /// fingerprint with a different login's scopes). Setting BOTH to the same
+    /// value makes the probe host-agnostic: whichever var the host uses, it is
+    /// our token.
+    #[test]
+    fn apply_probe_token_feeds_both_github_and_enterprise_token_vars() {
+        let mut cmd = std::process::Command::new("gh");
+        apply_probe_token(&mut cmd, "gho_secret");
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GH_TOKEN" && v == "gho_secret"),
+            "the github.com token var must carry our exact token"
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "GH_ENTERPRISE_TOKEN" && v == "gho_secret"),
+            "the Enterprise token var must carry the SAME token so the probe never \
+             falls back to stored creds on a self-hosted host"
         );
     }
 }
