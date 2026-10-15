@@ -745,13 +745,36 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(mut child) => {
+        Ok(child) => {
             // Reap the watchdog when it exits so it never lingers as a zombie of
             // the daemon (the same fix issue #52 applied to the agent watchdog).
+            // Spawn that reaper FALLIBLY (see `spawn_watchdog`): a panicking
+            // `thread::spawn` would unwind the caller on a thread-creation
+            // refusal. On failure, kill + reap the watchdog inline so nothing
+            // leaks, and report the watchdog as unavailable. The child is shared
+            // with the reaper closure behind an Arc<Mutex>: a failed
+            // `Builder::spawn` drops the closure (and its captures), so without
+            // sharing, the error path could no longer reach the child.
             let pid = child.id();
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+            let reaper_child = std::sync::Arc::clone(&child);
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    if let Ok(mut c) = reaper_child.lock() {
+                        let _ = c.wait();
+                    }
+                })
+                .is_err()
+            {
+                if let Ok(mut c) = child.lock() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                crate::runtime::log(&format!(
+                    "warning: owner watchdog reaper thread failed to spawn for owner {owner}"
+                ));
+                return None;
+            }
             Some(pid)
         }
         Err(e) => {
@@ -1552,16 +1575,42 @@ fn spawn_watchdog(agent_pid: u32) -> Option<u32> {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(mut child) => {
+        Ok(child) => {
             // The watchdog is our child: reap it when it exits, or it lingers
             // as a zombie of the daemon (one leaked process slot per watched
             // spawn until `fork` hits EAGAIN — issue #52). It can live as long
             // as the watched group, so wait on a detached thread rather than
-            // block the caller.
+            // block the caller. Spawn that reaper FALLIBLY: under a
+            // process/thread limit the OS can refuse to create it, and a
+            // panicking `thread::spawn` here would unwind the caller (startup
+            // priming, or the detached maintenance thread — killing every
+            // future refresh) before its cleanup guard is installed. On
+            // failure, kill + reap the watchdog inline so nothing leaks, and
+            // report the watchdog as unavailable (best-effort, exactly like a
+            // fork/exec failure below). The child is shared with the reaper
+            // closure behind an Arc<Mutex>: a failed `Builder::spawn` drops the
+            // closure (and its captures), so without sharing, the error path
+            // could no longer reach the child to kill + reap it.
             let pid = child.id();
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+            let reaper_child = std::sync::Arc::clone(&child);
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    if let Ok(mut c) = reaper_child.lock() {
+                        let _ = c.wait();
+                    }
+                })
+                .is_err()
+            {
+                if let Ok(mut c) = child.lock() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                crate::runtime::log(&format!(
+                    "warning: parent-death watchdog reaper thread failed to spawn for pid {agent_pid}"
+                ));
+                return None;
+            }
             Some(pid)
         }
         Err(e) => {

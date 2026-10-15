@@ -664,11 +664,16 @@ fn run_capped(
         crate::pdeath::arm_std(&mut cmd);
     }
     let mut child = cmd.spawn().ok()?;
+    // Install the child's cleanup guard BEFORE `watch()`: the watchdog spawn is
+    // best-effort and its reaper thread is created fallibly, but if that
+    // fallible path (or any later one) ever unwinds, the guard must already be
+    // armed so the child group is torn down rather than orphaned.
     #[cfg(unix)]
     let mut group_guard = {
         let pid = child.id();
+        let guard = crate::pdeath::GroupGuard::new(Some(pid));
         crate::pdeath::watch(pid);
-        crate::pdeath::GroupGuard::new(Some(pid))
+        guard
     };
     let mut out = child.stdout.take();
     let mut err = child.stderr.take();
@@ -707,12 +712,18 @@ fn run_capped(
         Err(_) => {
             // The stdout drain already started: kill + reap the child (closing
             // its pipes so that drain sees EOF), join the started drain so its
-            // thread does not leak, then report the read as failed.
+            // thread does not leak, then report the read as failed. The join is
+            // BOUNDED (`bounded_join`, not a bare `join`): a descendant that
+            // escaped the killed group and still holds stdout would otherwise
+            // keep the drain blocked indefinitely, hanging `prime()` / the
+            // refresh loop — thread-creation failure must not bypass bounded
+            // output collection. A give-up detaches the stuck drain to finish
+            // (or leak) on its own, exactly like the normal path below.
             #[cfg(unix)]
             group_guard.kill_group_if_ours();
             let _ = child.kill();
             let _ = child.wait();
-            let _ = out_t.join();
+            let _ = bounded_join(out_t, Instant::now() + Duration::from_secs(2));
             #[cfg(unix)]
             group_guard.disarm();
             return None;
@@ -1682,8 +1693,24 @@ mod tests {
         // the wrapper's process group (pgid == the wrapper's pid, since the
         // wrapper leads the group), so `group_has_live_member` reports `false`
         // once no LIVE member remains, ignoring a held zombie anchor.
+        //
+        // `getpgid` itself can also legitimately fail with ESRCH here: if the
+        // descendant's new parent reaps it PROMPTLY, the pid is already gone —
+        // which IS successful cleanup, so accept ESRCH as done. Any other lookup
+        // error is a real failure; when the pid still exists, retain the
+        // zombie-aware group-liveness check.
         let pgid = unsafe { libc::getpgid(pid) };
-        assert!(pgid >= 0, "getpgid(descendant) must succeed (pid {pid})");
+        if pgid < 0 {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ESRCH),
+                "getpgid(descendant pid {pid}) failed with an error other than ESRCH: {err}"
+            );
+            let _ = std::fs::remove_file(&pidfile);
+            // ESRCH: the descendant is already reaped — cleanup succeeded.
+            return;
+        }
         let mut live = true;
         for _ in 0..200 {
             if !crate::pdeath::group_has_live_member(pgid as u32) {
