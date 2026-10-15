@@ -111,14 +111,19 @@ pub enum GhAuthRead {
 }
 
 /// Map one completed (or failed) `gh auth token` invocation to a [`GhAuthRead`].
-/// `status` is the process exit code (`None` = killed/no code).
+/// `status` is the process exit code (`None` = killed/no code). `output_failed`
+/// marks an invocation whose captured output could NOT be fully collected (a
+/// descendant held a pipe open past the drain bound): the output is then
+/// incomplete, so an empty buffer must NOT be read as a definitive logout —
+/// treat the read as a transient failure and preserve any cached credential.
 pub fn classify_gh_auth_read(
     spawn_errored: bool,
     status: Option<i32>,
     stdout: &str,
     stderr: &str,
+    output_failed: bool,
 ) -> GhAuthRead {
-    if spawn_errored {
+    if spawn_errored || output_failed {
         return GhAuthRead::ReadFailed;
     }
     if status == Some(0) {
@@ -603,10 +608,26 @@ fn gh_noninteractive_env() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Scrub the daemon's engine-connection secrets from a `gh` child before it is
+/// spawned — the same strip every other `gh` launch applies
+/// (`src/provision.rs`). This worker's own environment carries
+/// `CAMUNDA_CLIENT_SECRET` / `NANO_AGENTIC_TOKEN` / the ZEEBE client secrets,
+/// and a spawned `gh` inherits them; on Linux a same-UID agent on the host can
+/// then read them out of the child's `/proc/<pid>/environ`. `gh` needs none of
+/// them to read a token or probe scopes, so remove the whole
+/// [`crate::slot::SENSITIVE_DAEMON_ENV`] set while retaining the GitHub auth
+/// variables (`GH_TOKEN` and friends) the reader relies on.
+fn scrub_sensitive_env(cmd: &mut std::process::Command) {
+    for k in crate::slot::SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+}
+
 /// Spawn `cmd`, capture its stdout/stderr, and enforce `timeout`. Returns
-/// `Some((exit_code, stdout, stderr))` when the child exits within the deadline,
-/// or `None` when it could not be spawned OR exceeded the deadline. On expiry the
-/// child is killed and reaped — on unix the WHOLE process group is signalled
+/// `Some((exit_code, stdout, stderr, output_failed))` when the child exits
+/// within the deadline, or `None` when it could not be spawned OR exceeded the
+/// deadline. On expiry the child is killed and reaped — on unix the WHOLE
+/// process group is signalled
 /// (the child is spawned as its own group leader, so a `gh` wrapper or helper
 /// that backgrounded a descendant holding our pipes cannot keep those pipes
 /// open past the deadline), and the drain-thread joins are themselves bounded
@@ -616,13 +637,16 @@ fn gh_noninteractive_env() -> Vec<(&'static str, String)> {
 /// finish (or leak) on its own, and its buffer is reaped by a detached thread.
 /// Both pipes are drained on their own threads so a child that fills a pipe
 /// buffer can never wedge the wait, and so whatever it wrote before a kill is
-/// still collected. This is the shared, bounded spawn for every `gh` child
-/// here — neither the token read nor the scopes probe may block `prime()` / the
-/// maintenance refresh indefinitely.
+/// still collected. `output_failed` is `true` when a drain could not be
+/// collected within its bound (a descendant held the pipe open) — the captured
+/// output is then INCOMPLETE, so a caller must treat the read as failed rather
+/// than trust an empty/partial buffer. This is the shared, bounded spawn for
+/// every `gh` child here — neither the token read nor the scopes probe may
+/// block `prime()` / the maintenance refresh indefinitely.
 fn run_capped(
     mut cmd: std::process::Command,
     timeout: Duration,
-) -> Option<(Option<i32>, String, String)> {
+) -> Option<(Option<i32>, String, String, bool)> {
     use std::io::Read;
     use std::process::Stdio;
     cmd.stdin(Stdio::null());
@@ -698,20 +722,27 @@ fn run_capped(
     // whole group) is gone the pipes close and these return promptly — yet a
     // descendant that survived (non-unix, or a re-parented escapee) would keep
     // a pipe open forever, so never let that hang the caller. On a stuck drain
-    // the buffer is dropped for THIS result and reaped by a detached thread.
+    // the buffer is dropped for THIS result and reaped by a detached thread,
+    // and `output_failed` is set so the caller treats the read as failed
+    // (incomplete output) rather than trusting an empty/partial buffer.
     let join_deadline = deadline + Duration::from_secs(2);
-    let stdout = String::from_utf8_lossy(&bounded_join(out_t, join_deadline)).into_owned();
-    let stderr = String::from_utf8_lossy(&bounded_join(err_t, join_deadline)).into_owned();
-    status.map(|st| (st.code(), stdout, stderr))
+    let out_r = bounded_join(out_t, join_deadline);
+    let err_r = bounded_join(err_t, join_deadline);
+    let output_failed = out_r.is_none() || err_r.is_none();
+    let stdout = String::from_utf8_lossy(&out_r.unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_r.unwrap_or_default()).into_owned();
+    status.map(|st| (st.code(), stdout, stderr, output_failed))
 }
 
 /// Join a drain thread, bounded by `deadline`. A finished thread is joined and
-/// its buffer returned. A thread still blocked at the deadline (its pipe is
-/// held open by a surviving descendant) is NOT awaited: it is handed to a
-/// detached reaper that joins it whenever it eventually finishes, so no thread
-/// or buffer leaks — and an empty buffer is returned now. This is what keeps a
-/// descendant-held pipe from hanging the caller past the deadline.
-fn bounded_join(t: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+/// its buffer returned as `Some`. A thread still blocked at the deadline (its
+/// pipe is held open by a surviving descendant) is NOT awaited: it is handed to
+/// a detached reaper that joins it whenever it eventually finishes, so no
+/// thread or buffer leaks — and `None` is returned now so the caller knows the
+/// output was NOT collected (rather than mistaking an empty buffer for a
+/// completed, empty read). This is what keeps a descendant-held pipe from
+/// hanging the caller past the deadline while still surfacing the failure.
+fn bounded_join(t: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -725,16 +756,16 @@ fn bounded_join(t: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Vec<u
     // deadline instead of blocking the caller.
     loop {
         match rx.try_recv() {
-            Ok(Ok(v)) => return v,
+            Ok(Ok(v)) => return Some(v),
             // The drain thread panicked: there is no output for this result.
-            Ok(Err(_)) => return Vec::new(),
+            Ok(Err(_)) => return None,
             Err(mpsc::TryRecvError::Empty) => {
                 if Instant::now() >= deadline {
-                    return Vec::new();
+                    return None;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(mpsc::TryRecvError::Disconnected) => return Vec::new(),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
         }
     }
 }
@@ -754,8 +785,11 @@ fn read_gh_auth_token(timeout: Duration) -> GhAuthRead {
     for (k, v) in gh_noninteractive_env() {
         cmd.env(k, v);
     }
+    scrub_sensitive_env(&mut cmd);
     match run_capped(cmd, timeout) {
-        Some((code, stdout, stderr)) => classify_gh_auth_read(false, code, &stdout, &stderr),
+        Some((code, stdout, stderr, output_failed)) => {
+            classify_gh_auth_read(false, code, &stdout, &stderr, output_failed)
+        }
         None => GhAuthRead::ReadFailed,
     }
 }
@@ -777,7 +811,8 @@ fn gh_token_scopes(token: &str, timeout: Duration) -> Option<String> {
         cmd.env(k, v);
     }
     cmd.env("GH_TOKEN", token);
-    let (_code, stdout, stderr) = run_capped(cmd, timeout)?;
+    scrub_sensitive_env(&mut cmd);
+    let (_code, stdout, stderr, _output_failed) = run_capped(cmd, timeout)?;
     let mut combined = stdout;
     combined.push('\n');
     combined.push_str(&stderr);
@@ -1007,23 +1042,56 @@ mod tests {
     #[test]
     fn classify_distinguishes_token_logout_and_transient() {
         assert_eq!(
-            classify_gh_auth_read(false, Some(0), "gho_abc\n", ""),
+            classify_gh_auth_read(false, Some(0), "gho_abc\n", "", false),
             GhAuthRead::Token("gho_abc".into())
         );
         assert_eq!(
-            classify_gh_auth_read(false, Some(0), "   \n", ""),
+            classify_gh_auth_read(false, Some(0), "   \n", "", false),
             GhAuthRead::LoggedOut
         );
         assert_eq!(
-            classify_gh_auth_read(false, Some(1), "", "no oauth token found for github.com"),
+            classify_gh_auth_read(
+                false,
+                Some(1),
+                "",
+                "no oauth token found for github.com",
+                false
+            ),
             GhAuthRead::LoggedOut
         );
         assert_eq!(
-            classify_gh_auth_read(false, Some(1), "", "keychain error"),
+            classify_gh_auth_read(false, Some(1), "", "keychain error", false),
             GhAuthRead::ReadFailed
         );
         assert_eq!(
-            classify_gh_auth_read(true, None, "", ""),
+            classify_gh_auth_read(true, None, "", "", false),
+            GhAuthRead::ReadFailed
+        );
+    }
+
+    /// Round-4 regression: a clean exit-0 whose captured output could NOT be
+    /// fully collected (a descendant held the pipe open past the drain bound)
+    /// is a transient failure, NOT a definitive logout — an incomplete/empty
+    /// buffer must never clear a valid cached credential.
+    #[test]
+    fn classify_treads_uncollected_output_as_transient_not_logout() {
+        // exit 0 + empty stdout would normally read as LoggedOut …
+        assert_eq!(
+            classify_gh_auth_read(false, Some(0), "", "", false),
+            GhAuthRead::LoggedOut
+        );
+        // … but with output_failed set it is a transient ReadFailed.
+        assert_eq!(
+            classify_gh_auth_read(false, Some(0), "", "", true),
+            GhAuthRead::ReadFailed
+        );
+        // output_failed dominates even a would-be token and a logged-out stderr.
+        assert_eq!(
+            classify_gh_auth_read(false, Some(0), "gho_abc\n", "", true),
+            GhAuthRead::ReadFailed
+        );
+        assert_eq!(
+            classify_gh_auth_read(false, Some(1), "", "no oauth token", true),
             GhAuthRead::ReadFailed
         );
     }
@@ -1405,10 +1473,49 @@ mod tests {
         use std::process::Command;
         let mut cmd = Command::new("printf");
         cmd.arg("hello");
-        let (code, stdout, _stderr) =
+        let (code, stdout, _stderr, output_failed) =
             run_capped(cmd, Duration::from_secs(5)).expect("a fast command completes in time");
         assert_eq!(code, Some(0));
         assert_eq!(stdout, "hello");
+        assert!(
+            !output_failed,
+            "a prompt command's output is fully collected"
+        );
+    }
+
+    /// Round-4 regression (a descendant-held pipe must fail the read, not fake a
+    /// logout): a wrapper that prints its token, exits 0 immediately, and leaves
+    /// a background descendant holding stdout open. The wrapper's own output is
+    /// collected, but the drain thread stays blocked on the descendant's
+    /// inherited pipe past the join bound, so `run_capped` reports
+    /// `output_failed` — which `classify_gh_auth_read` maps to a transient
+    /// `ReadFailed`, never a `LoggedOut` that would clear a valid cached token.
+    /// (The round-3 test's `wait` keeps the wrapper alive until the deadline;
+    /// here the wrapper exits at once so the exit code is real and only the
+    /// OUTPUT collection fails.)
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_flags_output_failed_when_a_descendant_outlives_the_wrapper() {
+        use std::process::Command;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf gho_x; sleep 30 & exit 0"]);
+        let start = Instant::now();
+        let (code, _stdout, _stderr, output_failed) =
+            run_capped(cmd, Duration::from_millis(150)).expect("the wrapper exits promptly");
+        assert_eq!(code, Some(0), "the wrapper itself exits 0");
+        assert!(
+            output_failed,
+            "a descendant holding the pipe past the join bound fails output collection"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "bounded by deadline + join bound, not the descendant's runtime"
+        );
+        // The classification contract: never a false logout on uncollected output.
+        assert_eq!(
+            classify_gh_auth_read(false, code, "", "", output_failed),
+            GhAuthRead::ReadFailed
+        );
     }
 
     /// Round-3 regression (descendant-held pipes must not outlive the deadline):
