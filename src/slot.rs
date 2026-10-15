@@ -501,7 +501,12 @@ async fn handle(
     // task too — never detach it (see `run`). Returning here (rather than
     // aborting) leaves the task running so the slot can settle the job; only a
     // drain/loss aborts it.
-    let mut exec = AbortOnDrop(tokio::spawn(execute(cfg.clone(), key.clone(), job.clone())));
+    let mut exec = AbortOnDrop(tokio::spawn(execute(
+        cfg.clone(),
+        key.clone(),
+        job.clone(),
+        jobs.clone(),
+    )));
     let raced = tokio::select! {
         r = &mut exec.0 => Some(reconcile_exec_join(&key, r, cfg.propagate_job_panic)),
         // Drop the watch guard immediately; the abort/await happens below.
@@ -2169,7 +2174,12 @@ fn may_reap_completed_run(
     !(provisioned && has_commits && !pushed)
 }
 
-async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
+async fn execute(
+    cfg: Arc<SlotConfig>,
+    key: String,
+    job: ActivatedJobResult,
+    jobs: Jobs,
+) -> Result<Settle> {
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
     let env = envelope::assemble(&custom_headers, &variables);
@@ -2335,6 +2345,34 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Err(_) => None,
     };
 
+    // WIP checkpointing (#66): restore any prior interrupted workspace, launch
+    // the throttled orphan sweep, and start the periodic background checkpointer
+    // so this attempt's work survives an abrupt interruption (crash / SLA cancel)
+    // even when the job future is aborted before settlement. Best-effort: a
+    // failure degrades to transcript-only resume and never fails the job. The
+    // guard is held until settlement (`finish` below), and its `Drop` stops the
+    // loop if the future is aborted first.
+    let mut checkpoint_guard: Option<crate::checkpoint::integration::CheckpointGuard> = None;
+    let mut checkpoint_note: Option<String> = None;
+    if let (Some(repo), Some(prep)) = (env.repository.as_ref(), git_prep.as_ref()) {
+        let started = crate::checkpoint::integration::start(
+            &agent_cwd,
+            &repo.url,
+            branch_push,
+            prep.working_branch.as_deref(),
+            branch_base.as_deref(),
+            job.element_instance_key.value(),
+            job.element_id.value(),
+            &key,
+            start_head.as_deref(),
+            &Value::Object(variables.clone()),
+            jobs.clone(),
+        )
+        .await;
+        checkpoint_guard = started.guard;
+        checkpoint_note = started.restore_note;
+    }
+
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(
         &cfg,
@@ -2344,7 +2382,16 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         &run_dir,
         Some(prepared.agent_cwd()),
     )?;
-    let payload = build_agent_payload(&cfg, &job, &env);
+    let mut payload = build_agent_payload(&cfg, &job, &env);
+    // Fold the restored-checkpoint note into the agent prompt so a resumed run is
+    // told its workspace already carries interrupted WIP (append after redaction,
+    // which `build_agent_payload` already applied).
+    if let Some(note) = &checkpoint_note {
+        if let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) {
+            let combined = format!("{prompt}{note}");
+            payload["prompt"] = Value::String(combined);
+        }
+    }
     // Use the EFFECTIVE protocol (the hub's `NANO_AGENTIC_PROTOCOL` override, if
     // any), resolved in one place, so this `acp` flag — which selects the
     // result-nudge encoding below — never diverges from how `run_agent` actually
@@ -2655,6 +2702,15 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         }
         Settle::Complete(vars)
     };
+
+    // Finalize checkpointing (#66): on success the work is now published, so the
+    // periodic loop is stopped and the WIP + recovery refs are deleted; on
+    // failure the loop is stopped but the last checkpoint is LEFT on the remote
+    // for a resumed run to adopt. Must run while the checkout still exists (the
+    // reap below may delete the run dir).
+    if let Some(guard) = checkpoint_guard.take() {
+        guard.finish(matches!(settle, Settle::Complete(_))).await;
+    }
 
     // Reap the run directory unless `--keep-runs`. Only successful runs are
     // reaped here; a failed run is left for post-mortem and aged out by

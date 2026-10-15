@@ -598,12 +598,12 @@ fn is_hex_sha(s: &str) -> bool {
 /// it unread. Permit the fields to go unread there so the non-Unix build stays
 /// warning-clean (`-D warnings`).
 #[cfg_attr(not(unix), allow(dead_code))]
-struct GitCredential {
+pub(crate) struct GitCredential {
     /// Host (without port) the credential is scoped to, so the helper never
     /// hands the token to a differently-hosted submodule remote.
-    host: String,
-    username: String,
-    password: String,
+    pub(crate) host: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
 }
 
 /// Re-anchor a *relative local* clone source against the supervisor's working
@@ -674,7 +674,7 @@ fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
 /// username with an empty password, mirroring how git itself would interpret
 /// the original URL. A credential-free URL yields `(url, None)` and is returned
 /// byte-for-byte unchanged.
-fn split_url_credential(url: &str) -> (String, Option<GitCredential>) {
+pub(crate) fn split_url_credential(url: &str) -> (String, Option<GitCredential>) {
     let sanitized = scrub_url_credentials(url);
     // Only the `scheme://[userinfo@]authority…` form carries an embeddable
     // credential; anything else (or a URL the scrub left untouched) has none.
@@ -3043,7 +3043,7 @@ async fn git(
 /// the agent's injection surface is on-disk config (handled by the global/system
 /// isolation and `insteadOf` stripping on the finalize push) and `.git/hooks`
 /// (handled by `core.hooksPath=/dev/null`), not the environment.
-const GIT_CONFIG_INJECTION_ENV: &[&str] =
+pub(crate) const GIT_CONFIG_INJECTION_ENV: &[&str] =
     &["GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
 
 async fn git_untruncated(
@@ -3158,7 +3158,7 @@ const GIT_CRED_HELPER: &str = "!f() { \
 /// Unix-only: the secret-file mechanism is built on `std::os::unix` / `libc`,
 /// which do not exist on other targets.
 #[cfg(unix)]
-struct CredFile {
+pub(crate) struct CredFile {
     dir: std::path::PathBuf,
 }
 
@@ -3179,7 +3179,7 @@ impl Drop for CredFile {
 /// instead — out-of-band credential delivery is not implemented off Unix), so
 /// this carries no state.
 #[cfg(not(unix))]
-struct CredFile;
+pub(crate) struct CredFile;
 
 /// Write the credential secret to a `0600` file inside a freshly-created,
 /// private `0700` per-command directory, and return the guard that removes that
@@ -3295,7 +3295,7 @@ fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
 /// `std::process::Command` (tests) so both receive the identical `-c` args and
 /// credential environment. Mirrors the `UnixCommandExt` pattern in `safecwd`.
 #[cfg(unix)]
-trait CredCommand {
+pub(crate) trait CredCommand {
     fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>);
     fn env(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>);
 }
@@ -3348,7 +3348,10 @@ impl CredCommand for std::process::Command {
 /// the `CredCommand` bound exists only under `#[cfg(unix)]`. The
 /// `#[cfg(not(unix))]` stub below keeps non-Unix targets compiling.
 #[cfg(unix)]
-fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Result<CredFile> {
+pub(crate) fn apply_git_credential<C: CredCommand>(
+    cmd: &mut C,
+    c: &GitCredential,
+) -> Result<CredFile> {
     let (guard, file) = cred_secret_file(c.password.as_bytes())?;
 
     cmd.arg("-c");
@@ -3373,7 +3376,7 @@ fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Resul
 /// caller, in [`git_with_env_capture`]): the `CredCommand` abstraction exists
 /// only under `#[cfg(unix)]`, so the generic form cannot be named here.
 #[cfg(not(unix))]
-fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredFile> {
+pub(crate) fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredFile> {
     let _ = c;
     Err(anyhow::anyhow!(
         "out-of-band git credential delivery is not supported on this \
@@ -3654,7 +3657,7 @@ const MAX_REFLOG_SCAN: usize = 512;
 
 /// Bytes of a child stream's *tail* retained for diagnostics. The stream is
 /// still drained fully; only the last `GIT_STDERR_TAIL` bytes are kept.
-const GIT_STDERR_TAIL: usize = 8 * 1024;
+pub(crate) const GIT_STDERR_TAIL: usize = 8 * 1024;
 
 /// Read `reader` to EOF, retaining only its last `cap` bytes. Always consumes the
 /// whole stream (so the writer never blocks on a full pipe) while bounding memory
@@ -3664,7 +3667,7 @@ const GIT_STDERR_TAIL: usize = 8 * 1024;
 /// short (a partial buffer we must not trust as the whole stream). A security
 /// scrub that must see the COMPLETE listing uses it to fail closed rather than
 /// act on a silently truncated — or silently short-read — tail.
-async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
+pub(crate) async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -4136,7 +4139,7 @@ fn gh_pr_list_args(slug: Option<&str>, branch: &str) -> Vec<String> {
 /// same `fchdir`) resolves only against trusted absolute directories too. Fails
 /// closed: a program not found on an absolute `PATH` is an error, never a
 /// fallback to the vulnerable bare-name search.
-fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+pub(crate) fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
     let raw = std::env::var_os("PATH").unwrap_or_default();
     trusted_cli_from(program, &raw)
 }
