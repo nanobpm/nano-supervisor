@@ -149,6 +149,72 @@ fn secret_content_detection() {
 }
 
 #[test]
+fn rotating_batch_bounds_and_rotates() {
+    let mk = |n: usize| -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("refs/nano/wip/{i:03}"), format!("sha{i}")))
+            .collect()
+    };
+    // Fits within the batch: returned unchanged (same length).
+    assert_eq!(rotating_batch(mk(10), 25, 0).len(), 10);
+    // Oversized: bounded to the batch size.
+    let b = rotating_batch(mk(100), 25, 0);
+    assert_eq!(b.len(), 25);
+    // Rotating: different `now_ms` offsets select different windows, so refs
+    // starved by one window are eventually covered by another.
+    let w0: Vec<String> = rotating_batch(mk(100), 25, 0).into_iter().map(|e| e.0).collect();
+    let w1: Vec<String> = rotating_batch(mk(100), 25, 40).into_iter().map(|e| e.0).collect();
+    assert_ne!(w0, w1);
+    // A zero batch still makes progress (never selects nothing).
+    assert_eq!(rotating_batch(mk(5), 0, 0).len(), 1);
+}
+
+#[test]
+fn pem_private_key_after_benign_block() {
+    // A benign CERTIFICATE / PUBLIC KEY block FIRST, then a private key: the
+    // filter must scan every BEGIN marker, not just the first, or the private
+    // key would be published.
+    let cert_then_key = "-----BEGIN CERTIFICATE-----\nMIIBhTCC\n-----END CERTIFICATE-----\n\
+         -----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\n-----END RSA PRIVATE KEY-----";
+    assert!(contains_secret(cert_then_key, &[]));
+    let pub_then_key = "-----BEGIN PUBLIC KEY-----\nMFkwEwYH\n-----END PUBLIC KEY-----\n\
+         -----BEGIN PRIVATE KEY-----\nMC4CAQAw\n-----END PRIVATE KEY-----";
+    assert!(contains_secret(pub_then_key, &[]));
+    // Benign blocks with NO private key must not false-positive.
+    assert!(!contains_secret(
+        "-----BEGIN CERTIFICATE-----\nMIIBhTCC\n-----END CERTIFICATE-----\n\
+         -----BEGIN PUBLIC KEY-----\nMFkwEwYH\n-----END PUBLIC KEY-----",
+        &[]
+    ));
+}
+
+#[test]
+fn err_text_truncation_is_utf8_safe() {
+    // A git diagnostic whose byte-400 cut falls inside a multi-byte char must
+    // NOT panic (String::truncate would); the cut backs up to a char boundary.
+    let mut s = "a".repeat(399);
+    s.push('é'); // 2 bytes at offset 399..401 — byte 400 is mid-character.
+    s.push_str(&"b".repeat(50));
+    let out = GitOut {
+        status: Some(1),
+        stdout: String::new(),
+        stderr: s,
+    }
+    .err_text();
+    assert!(out.len() <= 400);
+    assert!(out.is_char_boundary(out.len()));
+
+    // Direct helper coverage for a few boundary positions.
+    let mut t = "x".repeat(10);
+    t.push('界'); // 3 bytes at 10..13.
+    truncate_on_char_boundary(&mut t, 12);
+    assert_eq!(t, "x".repeat(10)); // backed up past the split char.
+    let mut u = "short".to_string();
+    truncate_on_char_boundary(&mut u, 400);
+    assert_eq!(u, "short"); // under the cap: unchanged.
+}
+
+#[test]
 fn normalize_and_url_credentials() {
     let n = normalize_secret_values(&["  a ".into(), "".into(), "a".into(), "b".into()]);
     assert_eq!(n, vec!["a".to_string(), "b".to_string()]);

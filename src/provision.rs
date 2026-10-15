@@ -3043,7 +3043,7 @@ async fn git(
 /// the agent's injection surface is on-disk config (handled by the global/system
 /// isolation and `insteadOf` stripping on the finalize push) and `.git/hooks`
 /// (handled by `core.hooksPath=/dev/null`), not the environment.
-const GIT_CONFIG_INJECTION_ENV: &[&str] =
+pub(crate) const GIT_CONFIG_INJECTION_ENV: &[&str] =
     &["GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
 
 async fn git_untruncated(
@@ -4139,7 +4139,7 @@ fn gh_pr_list_args(slug: Option<&str>, branch: &str) -> Vec<String> {
 /// same `fchdir`) resolves only against trusted absolute directories too. Fails
 /// closed: a program not found on an absolute `PATH` is an error, never a
 /// fallback to the vulnerable bare-name search.
-fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+pub(crate) fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
     let raw = std::env::var_os("PATH").unwrap_or_default();
     trusted_cli_from(program, &raw)
 }

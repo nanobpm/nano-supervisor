@@ -40,7 +40,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::safecwd::CwdHandle;
@@ -438,9 +438,12 @@ pub fn contains_secret(text: &str, secret_values: &[String]) -> bool {
     {
         return true;
     }
-    // PEM private key block.
-    if let Some(i) = text.find("-----BEGIN ") {
-        let tail = &text[i + "-----BEGIN ".len()..];
+    // PEM private key block. Scan EVERY `-----BEGIN ` marker, not just the first:
+    // a file whose first block is a certificate or public key followed by a
+    // private-key block would otherwise slip through and publish the private key.
+    let mut search = text;
+    while let Some(i) = search.find("-----BEGIN ") {
+        let tail = &search[i + "-----BEGIN ".len()..];
         if let Some(j) = tail.find("-----") {
             let label = &tail[..j];
             if label.ends_with("PRIVATE KEY")
@@ -448,6 +451,11 @@ pub fn contains_secret(text: &str, secret_values: &[String]) -> bool {
             {
                 return true;
             }
+            // Advance past this marker's closing dashes so the next iteration
+            // inspects subsequent blocks.
+            search = &tail[j + "-----".len()..];
+        } else {
+            search = tail;
         }
     }
     // Token prefixes with a minimum run of allowed characters.
@@ -663,11 +671,25 @@ impl GitOut {
         let tail: Vec<&str> = t.lines().rev().take(3).collect();
         let joined: Vec<&str> = tail.into_iter().rev().collect();
         let mut s = joined.join(" | ");
-        if s.len() > 400 {
-            s.truncate(400);
-        }
+        truncate_on_char_boundary(&mut s, 400);
         redact_url_userinfo(&s)
     }
+}
+
+/// Truncate `s` in place to at most `max` bytes WITHOUT splitting a UTF-8
+/// character. `String::truncate` panics when `max` falls inside a multi-byte
+/// char (e.g. 399 ASCII bytes followed by `é`); a job-controlled git diagnostic
+/// must never panic the checkpointer, so back the cut up to the nearest char
+/// boundary at or below `max`.
+fn truncate_on_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut boundary = max;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    s.truncate(boundary);
 }
 
 /// Redact `scheme://user:pass@` userinfo from a diagnostic string.
@@ -753,7 +775,24 @@ impl GitRunner {
         env: &[(&str, &str)],
         input: Option<&[u8]>,
     ) -> GitOut {
-        let mut cmd = Command::new("git");
+        // Resolve `git` to a trusted ABSOLUTE path on a sanitized PATH, exactly as
+        // the provisioning launcher does (provision.rs): the child `fchdir`s into
+        // the agent-controlled checkout, so a bare `git` lookup (empty/`.`/relative
+        // PATH entry) could otherwise resolve an agent-planted binary that then
+        // receives this run's credential-file location. The sanitized PATH also
+        // constrains git's own transport/credential-helper subprocesses.
+        let (git_exe, safe_path) = match crate::provision::trusted_cli("git") {
+            Ok(v) => v,
+            Err(e) => {
+                return GitOut {
+                    status: None,
+                    stdout: String::new(),
+                    stderr: format!("git resolution failed: {e}"),
+                }
+            }
+        };
+        let mut cmd = Command::new(git_exe);
+        cmd.env("PATH", &safe_path);
         cmd.arg("-c").arg("credential.helper=");
         // Out-of-band credential (if any) must be configured with its `-c` flags
         // BEFORE the git subcommand args. The returned guard owns the 0600 secret
@@ -784,10 +823,40 @@ impl GitRunner {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        // Strip the daemon's engine-connection secrets (CAMUNDA_*/ZEEBE_*) from
+        // every git child, matching provision.rs: git runs job-controlled remote
+        // URLs plus remote/credential helpers, so a hostile repo config or helper
+        // could otherwise read those secrets straight out of the inherited env.
+        for k in crate::slot::SENSITIVE_DAEMON_ENV {
+            cmd.env_remove(k);
+        }
+        // Strip git's environment-based config-injection channels
+        // (GIT_CONFIG_COUNT/KEY_<n>/VALUE_<n>, …): git applies them ABOVE every
+        // on-disk file, bypassing the GIT_CONFIG_GLOBAL/SYSTEM=/dev/null isolation,
+        // so a tainted daemon environment could inject `url.*.insteadOf` config for
+        // an authenticated checkpoint push/fetch.
+        for k in crate::provision::GIT_CONFIG_INJECTION_ENV {
+            cmd.env_remove(k);
+        }
+        for (k, _) in std::env::vars_os() {
+            if k.to_str().is_some_and(|s| {
+                s.starts_with("GIT_CONFIG_KEY_") || s.starts_with("GIT_CONFIG_VALUE_")
+            }) {
+                cmd.env_remove(&k);
+            }
+        }
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Give the git child its own process group + parent-death signal so a hard
+        // daemon crash (kill -9, which never runs `kill_on_drop`) tears the whole
+        // git tree — transports, remote/credential helpers — down with the daemon
+        // instead of leaving it mutating the checkout.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(unix)]
+        crate::pdeath::arm(&mut cmd);
         if let Err(e) = self.cwd.apply(&mut cmd) {
             return GitOut {
                 status: None,
@@ -805,28 +874,86 @@ impl GitRunner {
                 }
             }
         };
+        // Capture the spawn-time process-group identity so a timeout/cancel can
+        // SIGKILL the WHOLE git tree (not just the leader `kill_on_drop` reaps):
+        // SSH transports, remote helpers and filters git spawned share its group
+        // and would otherwise keep running after teardown. The guard verifies the
+        // group's identity, so it never signals a recycled pgid (issue #27).
+        #[cfg(unix)]
+        let gpid = child.id();
+        #[cfg(unix)]
+        if let Some(pid) = gpid {
+            crate::pdeath::watch(pid);
+        }
+        #[cfg(unix)]
+        let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
         if let Some(mut si) = child.stdin.take() {
             if let Some(data) = input {
                 let _ = si.write_all(data).await;
             }
             let _ = si.shutdown().await;
         }
-        match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(Ok(o)) => GitOut {
-                status: o.status.code(),
-                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-            },
-            Ok(Err(e)) => GitOut {
-                status: None,
-                stdout: String::new(),
-                stderr: format!("wait failed: {e}"),
-            },
-            Err(_) => GitOut {
-                status: None,
-                stdout: String::new(),
-                stderr: "git timed out".to_string(),
-            },
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let wait = async {
+            let read_out = async {
+                let mut buf = Vec::new();
+                if let Some(o) = stdout_pipe.as_mut() {
+                    let _ = o.read_to_end(&mut buf).await;
+                }
+                buf
+            };
+            let read_err = async {
+                let mut buf = Vec::new();
+                if let Some(e) = stderr_pipe.as_mut() {
+                    let _ = e.read_to_end(&mut buf).await;
+                }
+                buf
+            };
+            let (status, out, err) = tokio::join!(child.wait(), read_out, read_err);
+            (status, out, err)
+        };
+        match tokio::time::timeout(self.timeout, wait).await {
+            Ok((status, out, err)) => {
+                // git finished within the timeout, but a helper it spawned can
+                // outlive the leader while sharing its group. Tear the whole group
+                // down before disarming, mirroring the provisioning path.
+                #[cfg(unix)]
+                {
+                    crate::pdeath::terminate_group_and_reap(
+                        &mut child,
+                        group_guard.guard(),
+                        Duration::from_secs(3),
+                    )
+                    .await;
+                    group_guard.disarm();
+                }
+                let (code, stderr) = match status {
+                    Ok(s) => (s.code(), String::from_utf8_lossy(&err).into_owned()),
+                    Err(e) => (None, format!("wait failed: {e}")),
+                };
+                GitOut {
+                    status: code,
+                    stdout: String::from_utf8_lossy(&out).into_owned(),
+                    stderr,
+                }
+            }
+            Err(_) => {
+                // Timed out: SIGKILL the whole group (not just the leader) using
+                // the spawn-time identity, then reap the leader (bounded) so the
+                // long-lived daemon never accumulates zombie git leaders.
+                #[cfg(unix)]
+                {
+                    group_guard.kill_group_if_ours();
+                    group_guard.disarm();
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+                GitOut {
+                    status: None,
+                    stdout: String::new(),
+                    stderr: "git timed out".to_string(),
+                }
+            }
         }
     }
 }
@@ -1557,6 +1684,29 @@ pub struct SweepResult {
     pub error: Option<String>,
 }
 
+/// Select a bounded, ROTATING window of at most `batch` entries from `entries`,
+/// keyed off `now_ms` so successive sweeps cover different refs. Entries are
+/// sorted by ref name for a deterministic order, then a `batch`-sized window
+/// starting at `now_ms % len` is taken (wrapping), so every ref is eventually
+/// considered instead of being starved behind a stable prefix. Returns all
+/// entries unchanged when the set already fits in `batch`.
+fn rotating_batch(
+    mut entries: Vec<(String, String)>,
+    batch: usize,
+    now_ms: u64,
+) -> Vec<(String, String)> {
+    let batch = batch.max(1);
+    if entries.len() <= batch {
+        return entries;
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let total = entries.len();
+    let offset = (now_ms as usize) % total;
+    (0..batch)
+        .map(|k| entries[(offset + k) % total].clone())
+        .collect()
+}
+
 /// Reclaim stale / orphaned nano refs across both swept namespaces. A ref is
 /// reclaimed when it ages past the TTL, OR — past a grace window — when the
 /// `probe` reports it an orphan (its element terminal AND its process finished).
@@ -1606,6 +1756,16 @@ pub async fn sweep_stale_checkpoints(
     if entries.is_empty() {
         return SweepResult::default();
     }
+
+    // Bound the EXPENSIVE part of the sweep. Every selected ref is fetched (one
+    // refspec apiece) and then has its history/timestamp read and possibly
+    // cleaned up, so an unbounded `entries` would grow fetch argv and cleanup
+    // work with the TOTAL accumulated ref count — eventually exceeding the
+    // command-line argument limit and consuming ever more disk/time. Select a
+    // bounded, ROTATING batch here, BEFORE building the fetch refspecs, so each
+    // sweep does O(batch) work and the rotating window ensures later refs are
+    // eventually considered rather than being starved behind a stable prefix.
+    entries = rotating_batch(entries, max_lookups.max(max_deletes), now_ms);
 
     let local = |r: &str| -> String {
         let suffix = r
