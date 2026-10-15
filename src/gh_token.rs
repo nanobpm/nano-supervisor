@@ -672,20 +672,52 @@ fn run_capped(
     };
     let mut out = child.stdout.take();
     let mut err = child.stderr.take();
-    let out_t = std::thread::spawn(move || {
+    // Spawn the two drain threads FALLIBLY (`Builder::spawn`, not the panicking
+    // `thread::spawn`): under a process/thread limit the OS can refuse to create
+    // a thread, and a panic here would abort `prime()` / the refresh loop instead
+    // of reporting a best-effort read failure. On a spawn failure, kill + reap
+    // the child (and its group) and join any drain already started so nothing
+    // leaks, then return `None` so the read is reported as failed.
+    let out_t = match std::thread::Builder::new().spawn(move || {
         let mut b = Vec::new();
         if let Some(s) = out.as_mut() {
             let _ = s.read_to_end(&mut b);
         }
         b
-    });
-    let err_t = std::thread::spawn(move || {
+    }) {
+        Ok(t) => t,
+        Err(_) => {
+            #[cfg(unix)]
+            group_guard.kill_group_if_ours();
+            let _ = child.kill();
+            let _ = child.wait();
+            #[cfg(unix)]
+            group_guard.disarm();
+            return None;
+        }
+    };
+    let err_t = match std::thread::Builder::new().spawn(move || {
         let mut b = Vec::new();
         if let Some(s) = err.as_mut() {
             let _ = s.read_to_end(&mut b);
         }
         b
-    });
+    }) {
+        Ok(t) => t,
+        Err(_) => {
+            // The stdout drain already started: kill + reap the child (closing
+            // its pipes so that drain sees EOF), join the started drain so its
+            // thread does not leak, then report the read as failed.
+            #[cfg(unix)]
+            group_guard.kill_group_if_ours();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_t.join();
+            #[cfg(unix)]
+            group_guard.disarm();
+            return None;
+        }
+    };
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -765,12 +797,23 @@ fn run_capped(
 fn bounded_join(t: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let out = t.join();
-        // If the caller already timed out and walked away, `send` fails — the
-        // buffer is then dropped here, which is the intended give-up path.
-        let _ = tx.send(out);
-    });
+    // Spawn the joiner FALLIBLY: under a process/thread limit the OS can refuse
+    // to create it, and a panicking `thread::spawn` would abort the caller
+    // instead of reporting the output as not collected. On failure, return
+    // `None` (output collection incomplete) — the drain thread `t` is dropped
+    // here, detaching it to finish (or leak) on its own exactly like the
+    // stuck-drain give-up path below.
+    if std::thread::Builder::new()
+        .spawn(move || {
+            let out = t.join();
+            // If the caller already timed out and walked away, `send` fails — the
+            // buffer is then dropped here, which is the intended give-up path.
+            let _ = tx.send(out);
+        })
+        .is_err()
+    {
+        return None;
+    }
     // Poll rather than `recv_deadline` (which is still unstable): a finished
     // drain is observed within one poll tick, and a stuck one gives up at the
     // deadline instead of blocking the caller.
@@ -1631,22 +1674,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let pid = pid.expect("the descendant recorded its pid before sleeping");
-        // `kill(pid, 0)` returns Err(ESRCH) once the descendant is gone (the
-        // group kill reaped it / its reparent did). Poll briefly for the signal
-        // + reap to land.
-        let mut alive = true;
+        // `kill(pid, 0)` succeeds for a ZOMBIE too: once the wrapper exits, its
+        // killed descendant is reparented and must be reaped by its NEW parent,
+        // not by `run_capped` — so in a container without prompt orphan reaping
+        // the pid can linger as a zombie even though cleanup succeeded. Assert on
+        // the zombie-aware group-liveness check instead: the descendant shares
+        // the wrapper's process group (pgid == the wrapper's pid, since the
+        // wrapper leads the group), so `group_has_live_member` reports `false`
+        // once no LIVE member remains, ignoring a held zombie anchor.
+        let pgid = unsafe { libc::getpgid(pid) };
+        assert!(pgid >= 0, "getpgid(descendant) must succeed (pid {pid})");
+        let mut live = true;
         for _ in 0..200 {
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                alive = false;
+            if !crate::pdeath::group_has_live_member(pgid as u32) {
+                live = false;
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = std::fs::remove_file(&pidfile);
         assert!(
-            !alive,
+            !live,
             "the surviving descendant must be killed by the post-collection group \
-             cleanup, not leaked across refresh ticks (pid {pid})"
+             cleanup, not leaked across refresh ticks (pid {pid}, pgid {pgid})"
         );
     }
 
