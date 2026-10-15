@@ -787,6 +787,25 @@ fn run_capped(
     #[cfg(unix)]
     if output_failed {
         group_guard.kill_group_if_ours();
+    } else {
+        // Successful output collection does NOT mean the group has exited: a
+        // wrapper such as `printf gho_x; sleep 30 >/dev/null 2>&1 & exit 0`
+        // finishes both drains (the descendant's redirected output does not
+        // hold our pipes), so `output_failed` is false — yet the descendant is
+        // still alive and would otherwise survive, accumulating one process
+        // (plus its watchdog/reaper resources) per refresh tick. Clean up
+        // remaining group members on success too: enumerate the group and, if
+        // anything live remains, SIGKILL it — identity-gated via the same
+        // spawn-time guard, so a recycled pgid is never signalled. The
+        // enumeration is best-effort and fails open (a mid-scan fork can be
+        // missed); a missed member is then caught by the guard's Drop below
+        // (which signals whenever the group is still verifiably ours), so a
+        // false negative here is not a leak.
+        if let Some(guard) = group_guard.guard() {
+            if crate::pdeath::group_has_live_member(guard.pgid()) {
+                group_guard.kill_group_if_ours();
+            }
+        }
     }
     // The child is reaped and any surviving descendant has now been signalled;
     // disarm so the guard's Drop never signals a recycled pgid.
@@ -1724,6 +1743,94 @@ mod tests {
             !live,
             "the surviving descendant must be killed by the post-collection group \
              cleanup, not leaked across refresh ticks (pid {pid}, pgid {pgid})"
+        );
+    }
+
+    /// Round-8 regression ("Previously missed" advisory: *clean up surviving
+    /// descendants after successful output collection*). The round-5 test above
+    /// proves the descendant is killed when its inherited pipe keeps a drain
+    /// blocked (`output_failed`). This proves the OTHER hole is closed too: a
+    /// wrapper such as `printf gho_x; sleep 30 >/dev/null 2>&1 & exit 0` exits
+    /// 0 and the descendant's redirected output never holds our pipes, so BOTH
+    /// drains finish and `output_failed` is false — yet the descendant is still
+    /// alive and, before the fix, was disarmed and leaked (one process plus its
+    /// watchdog/reaper resources per refresh tick). `run_capped` now enumerates
+    /// the group after successful collection and SIGKILLs any live member
+    /// (identity-gated by the spawn-time guard). We assert the recorded
+    /// descendant pid is dead afterwards — with the same ESRCH/zombie-aware
+    /// handling as the round-5 test: once the wrapper exits, the killed
+    /// descendant is reparented and reaped by its NEW parent, so a prompt
+    /// reaper makes `getpgid` fail with ESRCH (successful cleanup), and a
+    /// lingering zombie is not a live member.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_kills_a_descendant_after_successful_output_collection() {
+        use std::process::Command;
+        let pidfile = std::env::temp_dir().join(format!(
+            "nano_gh_desc_ok_{}_{}.pid",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        // Background `sleep` with its output REDIRECTED (so it never holds our
+        // pipes and both drains complete), record ITS pid via `$!` — not `$$`,
+        // which in a subshell is the parent sh's pid and would make this pass
+        // trivially once sh is reaped — then exit 0.
+        let script = format!(
+            "printf gho_x; sleep 30 >/dev/null 2>&1 & echo $! > '{p}'; exit 0",
+            p = pidfile.display()
+        );
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script.as_str()]);
+        let (code, stdout, _stderr, output_failed) =
+            run_capped(cmd, Duration::from_millis(150)).expect("the wrapper exits promptly");
+        assert_eq!(code, Some(0), "the wrapper itself exits 0");
+        assert_eq!(stdout, "gho_x", "the wrapper's own output is collected");
+        assert!(
+            !output_failed,
+            "the descendant's redirected output never holds our pipes, so collection succeeds"
+        );
+        // Read the pid the backgrounded sleep recorded.
+        let mut pid: Option<i32> = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    pid = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("the descendant recorded its pid before sleeping");
+        // Same liveness contract as the round-5 test: accept ESRCH (already
+        // reaped by its new parent) as successful cleanup; reject other lookup
+        // errors; when the pid still exists, assert the group has no LIVE
+        // member (a held zombie anchor is not one).
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid < 0 {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ESRCH),
+                "getpgid(descendant pid {pid}) failed with an error other than ESRCH: {err}"
+            );
+            let _ = std::fs::remove_file(&pidfile);
+            // ESRCH: the descendant is already reaped — cleanup succeeded.
+            return;
+        }
+        let mut live = true;
+        for _ in 0..200 {
+            if !crate::pdeath::group_has_live_member(pgid as u32) {
+                live = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !live,
+            "the surviving descendant must be killed after successful output \
+             collection, not leaked across refresh ticks (pid {pid}, pgid {pgid})"
         );
     }
 
