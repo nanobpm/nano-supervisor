@@ -605,13 +605,20 @@ fn gh_noninteractive_env() -> Vec<(&'static str, String)> {
 
 /// Spawn `cmd`, capture its stdout/stderr, and enforce `timeout`. Returns
 /// `Some((exit_code, stdout, stderr))` when the child exits within the deadline,
-/// or `None` when it could not be spawned OR exceeded the deadline (in which
-/// case the child is **killed and reaped** so it can't linger as a zombie or
-/// keep running past our wait). Both pipes are drained on their own threads so a
-/// child that fills a pipe buffer can never wedge the wait, and so whatever it
-/// wrote before a kill is still collected. This is the shared, bounded spawn for
-/// every `gh` child here — neither the token read nor the scopes probe may block
-/// `prime()` / the maintenance refresh indefinitely.
+/// or `None` when it could not be spawned OR exceeded the deadline. On expiry the
+/// child is killed and reaped — on unix the WHOLE process group is signalled
+/// (the child is spawned as its own group leader, so a `gh` wrapper or helper
+/// that backgrounded a descendant holding our pipes cannot keep those pipes
+/// open past the deadline), and the drain-thread joins are themselves bounded
+/// ([`bounded_join`]) so even a surviving descendant (e.g. one that escaped the
+/// group on a platform without group signalling) can never hang `prime()` or a
+/// maintenance refresh: the join gives up, the stuck reader thread is left to
+/// finish (or leak) on its own, and its buffer is reaped by a detached thread.
+/// Both pipes are drained on their own threads so a child that fills a pipe
+/// buffer can never wedge the wait, and so whatever it wrote before a kill is
+/// still collected. This is the shared, bounded spawn for every `gh` child
+/// here — neither the token read nor the scopes probe may block `prime()` / the
+/// maintenance refresh indefinitely.
 fn run_capped(
     mut cmd: std::process::Command,
     timeout: Duration,
@@ -621,7 +628,24 @@ fn run_capped(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Own process group (unix) so a timed-out child cannot leave a descendant
+    // holding stdout/stderr open: killing only the direct child would not close
+    // those pipes, and the drain threads below would block past the deadline.
+    // `arm` (Linux) + `watch` (macOS/Linux) are the same parent-death backstops
+    // the other spawn sites use, so a daemon death cannot orphan the child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+        crate::pdeath::arm_std(&mut cmd);
+    }
     let mut child = cmd.spawn().ok()?;
+    #[cfg(unix)]
+    let mut group_guard = {
+        let pid = child.id();
+        crate::pdeath::watch(pid);
+        crate::pdeath::GroupGuard::new(Some(pid))
+    };
     let mut out = child.stdout.take();
     let mut err = child.stderr.take();
     let out_t = std::thread::spawn(move || {
@@ -644,24 +668,75 @@ fn run_capped(
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // Kill the WHOLE group first (identity-gated, so a recycled
+                    // pgid is never signalled): a descendant still holding our
+                    // pipes dies too, which is what lets the drain threads see
+                    // EOF. Then kill + reap the direct child (a no-op if the
+                    // group kill already got it) so it can't become a zombie.
+                    #[cfg(unix)]
+                    group_guard.kill_group_if_ours();
                     let _ = child.kill();
-                    let _ = child.wait(); // reap so it can't become a zombie
+                    let _ = child.wait();
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(_) => {
+                #[cfg(unix)]
+                group_guard.kill_group_if_ours();
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
             }
         }
     };
-    // Join the drain threads regardless: the pipes are closed once the child is
-    // gone, so these return promptly, and joining reaps them.
-    let stdout = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
+    // The child is reaped by here on every path; disarm so the guard's Drop
+    // never signals a recycled pgid.
+    #[cfg(unix)]
+    group_guard.disarm();
+    // Join the drain threads, but BOUNDED: once the child (and, on unix, its
+    // whole group) is gone the pipes close and these return promptly — yet a
+    // descendant that survived (non-unix, or a re-parented escapee) would keep
+    // a pipe open forever, so never let that hang the caller. On a stuck drain
+    // the buffer is dropped for THIS result and reaped by a detached thread.
+    let join_deadline = deadline + Duration::from_secs(2);
+    let stdout = String::from_utf8_lossy(&bounded_join(out_t, join_deadline)).into_owned();
+    let stderr = String::from_utf8_lossy(&bounded_join(err_t, join_deadline)).into_owned();
     status.map(|st| (st.code(), stdout, stderr))
+}
+
+/// Join a drain thread, bounded by `deadline`. A finished thread is joined and
+/// its buffer returned. A thread still blocked at the deadline (its pipe is
+/// held open by a surviving descendant) is NOT awaited: it is handed to a
+/// detached reaper that joins it whenever it eventually finishes, so no thread
+/// or buffer leaks — and an empty buffer is returned now. This is what keeps a
+/// descendant-held pipe from hanging the caller past the deadline.
+fn bounded_join(t: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let out = t.join();
+        // If the caller already timed out and walked away, `send` fails — the
+        // buffer is then dropped here, which is the intended give-up path.
+        let _ = tx.send(out);
+    });
+    // Poll rather than `recv_deadline` (which is still unstable): a finished
+    // drain is observed within one poll tick, and a stuck one gives up at the
+    // deadline instead of blocking the caller.
+    loop {
+        match rx.try_recv() {
+            Ok(Ok(v)) => return v,
+            // The drain thread panicked: there is no output for this result.
+            Ok(Err(_)) => return Vec::new(),
+            Err(mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    return Vec::new();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return Vec::new(),
+        }
+    }
 }
 
 /// Production `gh auth token` reader (synchronous spawn), bounded by a 10s wait.
@@ -1334,5 +1409,30 @@ mod tests {
             run_capped(cmd, Duration::from_secs(5)).expect("a fast command completes in time");
         assert_eq!(code, Some(0));
         assert_eq!(stdout, "hello");
+    }
+
+    /// Round-3 regression (descendant-held pipes must not outlive the deadline):
+    /// a shell that backgrounds a long-lived child and waits on it inherits our
+    /// stdout/stderr into that child, so killing only the direct shell would
+    /// leave the pipes open and the drain threads blocked. The whole process
+    /// group must be killed so the pipes close, and the call must return
+    /// promptly — not after the descendant's own runtime.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_kills_descendants_holding_the_pipes() {
+        use std::process::Command;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & wait"]);
+        let start = Instant::now();
+        let out = run_capped(cmd, Duration::from_millis(150));
+        assert!(
+            out.is_none(),
+            "a child whose descendant holds the pipes is still a timeout"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "returns promptly: killing the direct child alone would leave the \
+             descendant holding the pipes and the drain joins blocked"
+        );
     }
 }

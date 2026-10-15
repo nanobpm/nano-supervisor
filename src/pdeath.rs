@@ -53,6 +53,41 @@ pub fn arm(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn arm(_cmd: &mut Command) {}
 
+/// [`arm`] for a **std** command (pdeath.rs otherwise works in tokio types).
+/// gh_token's bounded spawn is synchronous `std::process`, so it needs the same
+/// Linux parent-death hook on a `std::process::Command`; a no-op elsewhere.
+#[cfg(all(target_os = "linux", unix))]
+pub fn arm_std(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id();
+    // SAFETY: pre_exec runs in the forked child before exec; we only call
+    // async-signal-safe libc functions (prctl, getppid, raise) and touch no
+    // Rust allocator state.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the race: if the daemon already died between fork and here,
+            // PR_SET_PDEATHSIG will never fire, so self-terminate now.
+            if libc::getppid() as u32 != parent {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(all(target_os = "linux", unix)))]
+pub fn arm_std(_cmd: &mut std::process::Command) {}
+
 /// Bind the CURRENT process to die when its parent does. Used when a supervisor
 /// is allowed to run *attached* inside an agent run (#40): arming
 /// `PR_SET_PDEATHSIG` on ourselves means that if the invoking agent dies — or the
