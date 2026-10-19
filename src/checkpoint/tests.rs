@@ -160,7 +160,7 @@ fn rotating_batch_bounds_and_rotates() {
     // Oversized: bounded to the batch size.
     let b = rotating_batch(mk(100), 25, 0);
     assert_eq!(b.len(), 25);
-    // Rotating: different `now_ms` offsets select different windows, so refs
+    // Rotating: different `cursor` offsets select different windows, so refs
     // starved by one window are eventually covered by another.
     let w0: Vec<String> = rotating_batch(mk(100), 25, 0)
         .into_iter()
@@ -171,8 +171,46 @@ fn rotating_batch_bounds_and_rotates() {
         .map(|e| e.0)
         .collect();
     assert_ne!(w0, w1);
+    // Fix E: a monotonic cursor advanced by the batch size tiles CONSECUTIVE,
+    // non-overlapping windows that cover every ref — unlike a wall-clock
+    // remainder, which can pin one window forever when the sweep cadence is a
+    // multiple of the ref count (e.g. `3_600_000 % 100 == 0`). Advancing the
+    // cursor by `batch` each sweep walks offsets 0,25,50,75 and so visits all
+    // 100 refs across four sweeps.
+    let mut seen = std::collections::BTreeSet::new();
+    for step in 0..4u64 {
+        for e in rotating_batch(mk(100), 25, step * 25) {
+            seen.insert(e.0);
+        }
+    }
+    assert_eq!(seen.len(), 100, "cursor tiling left refs uncovered");
+    // A cadence that is a multiple of the ref count aliases back to the SAME
+    // window under a bare remainder (`100 % 100 == 0`, identical to cursor 0);
+    // this is exactly the wall-clock starvation Fix E avoids by advancing the
+    // cursor monotonically by `batch` at the call site rather than feeding it a
+    // wall-clock remainder.
+    let aliased: Vec<String> = rotating_batch(mk(100), 25, 100)
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    assert_eq!(aliased, w0, "remainder aliasing baseline changed");
     // A zero batch still makes progress (never selects nothing).
     assert_eq!(rotating_batch(mk(5), 0, 0).len(), 1);
+}
+
+#[test]
+fn make_temp_index_dir_is_absolute() {
+    // Fix B: Git resolves `GIT_INDEX_FILE` relative to the checkout it runs in,
+    // so the snapshot's temp index dir MUST be absolute — a relative `TMPDIR`
+    // would otherwise make `read-tree` address a different path and silently skip
+    // the snapshot. The returned path is always absolute regardless of `TMPDIR`.
+    let dir = make_temp_index_dir().expect("temp index dir");
+    assert!(
+        dir.is_absolute(),
+        "temp index dir not absolute: {}",
+        dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

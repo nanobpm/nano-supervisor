@@ -1291,7 +1291,13 @@ pub async fn snapshot_worktree(
 }
 
 fn make_temp_index_dir() -> Option<PathBuf> {
-    let base = std::env::temp_dir();
+    // Resolve the temp root to an ABSOLUTE path first. Git resolves
+    // `GIT_INDEX_FILE` relative to the checkout it runs in, but this directory is
+    // created relative to the SUPERVISOR's cwd; with a relative `TMPDIR` (e.g.
+    // `TMPDIR=tmp`) the two disagree and `read-tree` addresses a different path,
+    // silently skipping the snapshot. Anchoring to an absolute path makes both
+    // sides name the same directory regardless of cwd.
+    let base = std::path::absolute(std::env::temp_dir()).ok()?;
     let unique = format!(
         "nano-ckpt-{}-{}",
         std::process::id(),
@@ -1794,15 +1800,22 @@ pub struct SweepResult {
 }
 
 /// Select a bounded, ROTATING window of at most `batch` entries from `entries`,
-/// keyed off `now_ms` so successive sweeps cover different refs. Entries are
-/// sorted by ref name for a deterministic order, then a `batch`-sized window
-/// starting at `now_ms % len` is taken (wrapping), so every ref is eventually
-/// considered instead of being starved behind a stable prefix. Returns all
-/// entries unchanged when the set already fits in `batch`.
+/// keyed off the monotonic `cursor` so successive sweeps cover different refs.
+/// Entries are sorted by ref name for a deterministic order, then a `batch`-sized
+/// window starting at `cursor % len` is taken (wrapping), so every ref is
+/// eventually considered instead of being starved behind a stable prefix.
+///
+/// The offset is driven by a caller-advanced monotonic cursor rather than a
+/// wall-clock timestamp: a wall-clock remainder (`now_ms % len`) can repeat
+/// indefinitely when the sweep cadence is a multiple of the ref count (e.g. an
+/// hourly sweep over 100 refs: `3_600_000 % 100 == 0`), pinning the same window
+/// forever and starving the rest. A cursor that advances by `batch` each sweep
+/// tiles consecutive windows regardless of timing. Returns all entries unchanged
+/// when the set already fits in `batch`.
 fn rotating_batch(
     mut entries: Vec<(String, String)>,
     batch: usize,
-    now_ms: u64,
+    cursor: u64,
 ) -> Vec<(String, String)> {
     let batch = batch.max(1);
     if entries.len() <= batch {
@@ -1810,11 +1823,18 @@ fn rotating_batch(
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let total = entries.len();
-    let offset = (now_ms as usize) % total;
+    let offset = (cursor % total as u64) as usize;
     (0..batch)
         .map(|k| entries[(offset + k) % total].clone())
         .collect()
 }
+
+/// Process-local rotation cursor for [`rotating_batch`]. Advanced by the window
+/// size on every sweep so successive sweeps tile consecutive ref windows,
+/// independent of the wall clock (see [`rotating_batch`]). Best-effort: it
+/// resets on restart, which is acceptable for an opportunistic GC backstopped by
+/// the TTL.
+static SWEEP_ROTATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Reclaim stale / orphaned nano refs across both swept namespaces. A ref is
 /// reclaimed when it ages past the TTL, OR — past a grace window — when the
@@ -1874,7 +1894,13 @@ pub async fn sweep_stale_checkpoints(
     // bounded, ROTATING batch here, BEFORE building the fetch refspecs, so each
     // sweep does O(batch) work and the rotating window ensures later refs are
     // eventually considered rather than being starved behind a stable prefix.
-    entries = rotating_batch(entries, max_lookups.max(max_deletes), now_ms);
+    // The window advances by a process-local monotonic cursor (NOT a wall-clock
+    // remainder), so consecutive sweeps tile consecutive windows even when the
+    // sweep cadence is a multiple of the ref count.
+    let batch = max_lookups.max(max_deletes);
+    let cursor =
+        SWEEP_ROTATION.fetch_add(batch.max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+    entries = rotating_batch(entries, batch, cursor);
 
     let local = |r: &str| -> String {
         let suffix = r
@@ -1916,8 +1942,14 @@ pub async fn sweep_stale_checkpoints(
         if doomed.len() >= max_deletes {
             break;
         }
-        let lr = local(reference);
-        let ct = git.run(&["log", "-1", "--format=%ct", &lr]).await.out();
+        // Read the commit time from the IMMUTABLE object SHA captured by
+        // `ls-remote`, not from the shared local `refs/nano-gc/*` ref. The scratch
+        // repo is shared per-UID across repositories, so two supervisors sweeping
+        // different repos whose checkpoint refs share a name can overwrite the same
+        // local ref between this fetch and the timestamp read; reading the pinned
+        // SHA makes the timestamp decision independent of that shared mutable ref.
+        // The fetch above brought this object into the scratch repo, so it resolves.
+        let ct = git.run(&["log", "-1", "--format=%ct", sha]).await.out();
         let at_ms = ct.parse::<u64>().map(|s| s * 1000).unwrap_or(0);
         if at_ms == 0 {
             continue;

@@ -652,7 +652,7 @@ fn resolve_local_source(url: &str, supervisor_cwd: &Path) -> String {
 /// Re-apply the same re-anchor here, then lift any embedded credential out of
 /// argv exactly as the clone did. Remote URLs and absolute paths pass through
 /// unchanged, so this is a no-op for the common case.
-fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
+pub(crate) fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
     let supervisor_cwd = std::env::current_dir();
     let resolved = match &supervisor_cwd {
         Ok(cwd) => resolve_local_source(url, cwd),

@@ -418,10 +418,24 @@ async fn restore(
 /// sweep itself cleans up, so it stays tiny, and deleting it on drop would race a
 /// concurrent sweep that resolved the same path. Returns the `--git-dir` path, or
 /// `None` when the repo cannot be prepared (the sweep then skips, best-effort).
+///
+/// The scratch root is created PRIVATE (mode 0700) under an ABSOLUTE temp root:
+///   * Absolute — Git resolves a relative `--git-dir` against the runner's cwd
+///     (the job checkout), so a relative `TMPDIR` (e.g. `TMPDIR=tmp`) would place
+///     the scratch repo INSIDE the disposable checkout rather than the intended
+///     persistent location. `std::path::absolute` pins it regardless of cwd.
+///   * Private + validated — the root lives in a world-writable temp dir and
+///     holds fetched private repository history. A default 0755 directory would
+///     leave that history world-readable, and a predictable path invites a
+///     pre-created directory or symlink planted by another user. We create the
+///     root 0700 and, on reuse, require it to be a real directory we own and not
+///     a symlink before trusting it.
 async fn sweep_scratch_repo(runner: &GitRunner) -> Option<std::path::PathBuf> {
-    let git_dir = std::env::temp_dir()
-        .join(format!("nano-gc-scratch-{}", current_uid()))
-        .join("repo.git");
+    let root = std::path::absolute(std::env::temp_dir())
+        .ok()?
+        .join(format!("nano-gc-scratch-{}", current_uid()));
+    create_private_dir(&root)?;
+    let git_dir = root.join("repo.git");
     // `git init --bare` is idempotent for an existing repo, so this both creates
     // the scratch repo on first use and validates it on reuse.
     std::fs::create_dir_all(&git_dir).ok()?;
@@ -432,6 +446,40 @@ async fn sweep_scratch_repo(runner: &GitRunner) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(git_dir)
+}
+
+/// Create `dir` as a PRIVATE (0700) directory we own, or validate an existing one
+/// is a real directory we own and not a symlink. Returns `None` (so the caller
+/// skips, best-effort) when the path exists but fails that check — e.g. a symlink
+/// or a directory planted by another user in the shared temp root.
+fn create_private_dir(dir: &std::path::Path) -> Option<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // `create` fails if the path already exists; a pre-existing entry is then
+        // validated below rather than blindly reused.
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+        // `symlink_metadata` does NOT follow a final symlink, so a planted symlink
+        // is rejected here instead of being silently dereferenced.
+        let meta = std::fs::symlink_metadata(dir).ok()?;
+        if !meta.file_type().is_dir() {
+            return None;
+        }
+        if meta.uid() != current_uid() {
+            return None;
+        }
+        // Tighten perms in case the directory pre-existed with looser modes.
+        if meta.mode() & 0o077 != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+        Some(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).ok()?;
+        Some(())
+    }
 }
 
 /// The uid for the scratch-repo name (isolates one user's daemon from another's
@@ -453,39 +501,19 @@ fn current_uid() -> u32 {
 /// repository by URL/path rather than the `"origin"` alias that only exists in
 /// the job checkout's config.
 ///
-/// The URL is credential-sanitized (the runner re-attaches auth out of band via
-/// the credential helper, so an embedded userinfo secret must never reach the
-/// sweep's argv). A relative LOCAL path is anchored to the job checkout
-/// (`agent_cwd`) so it resolves to the same repository irrespective of the
-/// scratch git-dir's own location; remote URLs (`scheme://…`) and scp-like SSH
-/// targets (`host:path`) are passed through untouched.
-fn sweep_remote_target(repo_url: &str, agent_cwd: &CwdHandle) -> String {
-    let (sanitized, _cred) = crate::provision::split_url_credential(repo_url);
-    if !is_local_path(&sanitized) {
-        return sanitized;
-    }
-    let p = std::path::Path::new(&sanitized);
-    if p.is_relative() {
-        if let Ok(anchor) = agent_cwd.path() {
-            return anchor.join(p).to_string_lossy().into_owned();
-        }
-    }
-    sanitized
-}
-
-/// Whether a git remote string names a LOCAL filesystem path (as opposed to a
-/// `scheme://…` URL or an scp-like `host:path` SSH target). Mirrors git's own
-/// rule: a colon appearing before the first slash marks an scp-like remote.
-fn is_local_path(remote: &str) -> bool {
-    if remote.contains("://") {
-        return false;
-    }
-    match (remote.find(':'), remote.find('/')) {
-        // Colon before any slash ⇒ scp-like `host:path`, i.e. a remote.
-        (Some(colon), Some(slash)) => colon > slash,
-        (Some(_), None) => false,
-        (None, _) => true,
-    }
+/// This MUST resolve to the SAME destination `provision()` cloned from, so it
+/// delegates to [`crate::provision::trusted_fetch_source`] — the exact resolver
+/// provisioning used. In particular a relative LOCAL path (e.g. `./origin.git`)
+/// is re-anchored against the SUPERVISOR's cwd, not the job checkout: that is
+/// where `provision()` resolved it, so anchoring anywhere else (such as the
+/// checkout) would target a different — or nonexistent — repository. Remote
+/// URLs (`scheme://…`) and scp-like SSH targets (`host:path`) pass through
+/// unchanged. The URL is credential-sanitized (the runner re-attaches auth out
+/// of band via the credential helper from the same raw `repo_url`, so an
+/// embedded userinfo secret must never reach the sweep's argv).
+fn sweep_remote_target(repo_url: &str) -> String {
+    let (resolved, _cred) = crate::provision::trusted_fetch_source(repo_url);
+    resolved
 }
 
 /// Run the orphan GC sweep opportunistically, throttled to `gc_every_ms` across
@@ -517,9 +545,10 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
     // nor orphan reclamation ever runs. Resolve the sweep's remote to the trusted
     // repository URL itself — credential-sanitized (auth rides the runner's
     // out-of-band credential helper, exactly as for "origin"), with relative local
-    // paths anchored to the job checkout so they resolve the same regardless of the
-    // scratch git-dir.
-    let sweep_remote = sweep_remote_target(repo_url, agent_cwd);
+    // paths re-anchored against the SUPERVISOR's cwd exactly as `provision()`
+    // resolved them when cloning, so the sweep targets the very repository the job
+    // was provisioned from regardless of the scratch git-dir or checkout cwd.
+    let sweep_remote = sweep_remote_target(repo_url);
     let plan = plan.clone();
     tokio::spawn(async move {
         // Run the sweep against a dedicated scratch repo (`--git-dir`) that
@@ -830,47 +859,73 @@ mod tests {
     const PRED: &str = "refs/nano/wip/pred-elem";
 
     #[test]
-    fn local_path_detection_matches_git_remote_rules() {
-        // Remote URLs and scp-like SSH targets are NOT local paths.
-        assert!(!is_local_path("https://github.com/o/r.git"));
-        assert!(!is_local_path("ssh://git@host/r.git"));
-        assert!(!is_local_path("git@github.com:org/repo.git"));
-        assert!(!is_local_path("file://localhost/srv/r.git"));
-        // Filesystem paths (absolute, relative, with a colon AFTER a slash) are.
-        assert!(is_local_path("/srv/remote.git"));
-        assert!(is_local_path("./remote.git"));
-        assert!(is_local_path("../a/remote.git"));
-        assert!(is_local_path("remote.git"));
-        assert!(is_local_path("dir/a:b.git"));
-    }
-
-    #[test]
-    fn sweep_remote_target_sanitizes_and_anchors() {
-        let tmp = std::env::temp_dir().join(format!("nano-anchor-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let tmp = std::fs::canonicalize(&tmp).unwrap();
-        let cwd = crate::safecwd::CwdHandle::open(&tmp).expect("open anchor");
-
-        // An embedded HTTPS credential is scrubbed from the sweep's remote argv.
-        let url = sweep_remote_target("https://user:tok@github.com/o/r.git", &cwd);
+    fn sweep_remote_target_resolves_like_provisioning() {
+        // An embedded HTTPS credential is scrubbed from the sweep's remote argv,
+        // and the scheme/host are preserved (remote URLs pass through unchanged).
+        let url = sweep_remote_target("https://sekret123@github.com/o/r.git");
         assert!(
-            !url.contains("tok"),
+            !url.contains("sekret123"),
             "credential leaked into sweep remote: {url}"
         );
-        assert!(url.starts_with("https://"));
+        assert_eq!(url, "https://github.com/o/r.git");
 
-        // A relative local path is anchored to the trusted checkout so it resolves
-        // the same regardless of the scratch git-dir.
-        let anchor = cwd.path().expect("anchor path");
-        let rel = sweep_remote_target("remote.git", &cwd);
-        assert_eq!(rel, anchor.join("remote.git").to_string_lossy());
+        // scp-like SSH targets pass through untouched (not treated as a path).
+        assert_eq!(
+            sweep_remote_target("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
 
         // An absolute local path is passed through unchanged.
-        let abs = anchor.join("other.git");
+        let abs = std::env::temp_dir().join("sweep-abs.git");
         let abs_s = abs.to_string_lossy().into_owned();
-        assert_eq!(sweep_remote_target(&abs_s, &cwd), abs_s);
+        assert_eq!(sweep_remote_target(&abs_s), abs_s);
 
-        let _ = std::fs::remove_dir_all(&tmp);
+        // A relative local path is re-anchored against the SUPERVISOR's cwd —
+        // exactly where `provision()`/`trusted_fetch_source` resolve it — so the
+        // sweep and the clone target the same repository. Delegating to the same
+        // resolver guarantees this.
+        let (provisioned, _) = crate::provision::trusted_fetch_source("remote.git");
+        assert_eq!(sweep_remote_target("remote.git"), provisioned);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            sweep_remote_target("remote.git"),
+            cwd.join("remote.git").to_string_lossy()
+        );
+    }
+
+    /// Regression: the scratch-repo root is created PRIVATE (0700) we own, and a
+    /// pre-existing entry is validated — a symlink (symlink-reuse attack) is
+    /// rejected, and a reused directory with looser modes is tightened to 0700.
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_is_0700_and_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("nano-privdir-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+
+        // Fresh create: directory exists with exactly 0700.
+        let fresh = base.join("fresh");
+        assert!(create_private_dir(&fresh).is_some());
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "fresh dir not private: {mode:o}");
+
+        // Reuse with loose perms: tightened back to 0700.
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_private_dir(&fresh).is_some());
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "reused dir not tightened: {mode:o}");
+
+        // A planted symlink at the path is rejected, not dereferenced.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert!(
+            create_private_dir(&link).is_none(),
+            "symlink accepted as private dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Regression: when `branch.base` is OMITTED, provisioning's resolved effective
