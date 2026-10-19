@@ -154,13 +154,30 @@ if ! strict_json="$(gh api "repos/$repo/issues?labels=$label&state=all&per_page=
   exit 0
 fi
 
+# Decode into a checked assignment BEFORE the loop. A `jq` failure inside a
+# `while ... done < <(jq …)` process substitution is invisible: `set -o pipefail`
+# does not propagate the substitution's exit status to the parent loop, so a
+# malformed/partial response would silently yield zero rows, leave `missing`
+# empty, and let the STRICT gate report OK without checking any candidate — a
+# fail-open. A command-substitution assignment is covered by `set -e`/pipefail,
+# so a decode error here fails the gate (where a token is configured) instead.
+if ! strict_rows="$(printf '%s' "$strict_json" \
+      | jq -r '.[] | "\(.number)\t\(if .pull_request then "PR" else "issue" end)\t\(.state)\t\(.title)"')"; then
+  if [ "$have_token" -eq 1 ]; then
+    note "parity-ledger: could not decode '$label' issues/PRs for $repo (token configured — failing rather than waiving the gate)"
+    exit 1
+  fi
+  note "SKIP parity-ledger: could not decode $repo response (no token)"
+  exit 0
+fi
+
 missing=()
 while IFS=$'\t' read -r num kind state title; do
   [ -n "$num" ] || continue
   if ! has_row "$num"; then
     missing+=("$repo#$num ($kind, $state) — $title")
   fi
-done < <(printf '%s' "$strict_json" | jq -r '.[] | "\(.number)\t\(if .pull_request then "PR" else "issue" end)\t\(.state)\t\(.title)"')
+done <<< "$strict_rows"
 
 # --- INFORMATIONAL: issues closed since the pinned plugin version -------------
 warn_closed=()
@@ -184,14 +201,23 @@ if [ -n "$pin_date" ]; then
     # pin but commented on / relabelled AFTER it is returned here and would
     # produce a false "closed since" backfill warning. Keep only items actually
     # closed at/after the pin.
-    while IFS=$'\t' read -r num title labels; do
-      [ -n "$num" ] || continue
-      has_row "$num" && continue
-      printf '%s' "$labels" | grep -q "$label" && continue  # counted by STRICT
-      warn_closed+=("$repo#$num — $title")
-    done < <(printf '%s' "$closed_json" \
-      | jq -r --arg since "${since}T00:00:00Z" \
-          '.[] | select(.closed_at != null and .closed_at >= $since) | "\(.number)\t\(.title)\t\(.labels | map(.name) | join(","))"')
+    #
+    # Decode into a checked assignment first (same reasoning as STRICT above): a
+    # `jq` failure in a `done < <(jq …)` process substitution is masked, which
+    # here would silently drop every backfill candidate. This scan is only
+    # informational, so a decode error warns and skips rather than failing.
+    if closed_rows="$(printf '%s' "$closed_json" \
+        | jq -r --arg since "${since}T00:00:00Z" \
+            '.[] | select(.closed_at != null and .closed_at >= $since) | "\(.number)\t\(.title)\t\(.labels | map(.name) | join(","))"')"; then
+      while IFS=$'\t' read -r num title labels; do
+        [ -n "$num" ] || continue
+        has_row "$num" && continue
+        printf '%s' "$labels" | grep -q "$label" && continue  # counted by STRICT
+        warn_closed+=("$repo#$num — $title")
+      done <<< "$closed_rows"
+    else
+      note "parity-ledger: WARN — could not decode closed-since issues for $repo; skipping backfill scan"
+    fi
   fi
 fi
 
