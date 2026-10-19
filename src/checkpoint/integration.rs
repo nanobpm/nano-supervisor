@@ -266,7 +266,7 @@ pub async fn start(
     });
 
     // --- restore a prior checkpoint ---------------------------------------
-    let outcome = restore(&runner, &plan, variables, base_ref, element_id).await;
+    let outcome = restore(&runner, &plan, variables, element_id).await;
     let restore_note = outcome.note;
 
     // --- opportunistic orphan sweep (throttled, backgrounded) -------------
@@ -296,7 +296,6 @@ async fn restore(
     runner: &GitRunner,
     plan: &Plan,
     variables: &Value,
-    base_ref: Option<&str>,
     element_id: &str,
 ) -> RestoreOutcome {
     let none = || RestoreOutcome {
@@ -323,8 +322,13 @@ async fn restore(
             _ => continue,
         };
         fetched_refs.push(reference.clone());
+        // Validate the restore against the RESOLVED effective base (configured
+        // `branch.base`, else provisioning's fallback base), not the raw
+        // `branch.base`: when that field is omitted the snapshot records the
+        // effective base, so passing an empty expected base here would reject the
+        // generated fallback-branch rename on an otherwise valid self-restore.
         let result =
-            restore_checkpoint(runner, &fetched, branch, true, base_ref.unwrap_or("")).await;
+            restore_checkpoint(runner, &fetched, branch, true, plan.base_ref.as_str()).await;
         if result.restored {
             crate::runtime::log(&format!(
                 "checkpoint: restored prior workspace from {reference} (mode {})",
@@ -444,6 +448,46 @@ fn current_uid() -> u32 {
     }
 }
 
+/// Resolve the remote the orphan-GC sweep targets. The sweep runs against a
+/// fresh scratch `--git-dir` with no named remotes, so it must reference the
+/// repository by URL/path rather than the `"origin"` alias that only exists in
+/// the job checkout's config.
+///
+/// The URL is credential-sanitized (the runner re-attaches auth out of band via
+/// the credential helper, so an embedded userinfo secret must never reach the
+/// sweep's argv). A relative LOCAL path is anchored to the job checkout
+/// (`agent_cwd`) so it resolves to the same repository irrespective of the
+/// scratch git-dir's own location; remote URLs (`scheme://…`) and scp-like SSH
+/// targets (`host:path`) are passed through untouched.
+fn sweep_remote_target(repo_url: &str, agent_cwd: &CwdHandle) -> String {
+    let (sanitized, _cred) = crate::provision::split_url_credential(repo_url);
+    if !is_local_path(&sanitized) {
+        return sanitized;
+    }
+    let p = std::path::Path::new(&sanitized);
+    if p.is_relative() {
+        if let Ok(anchor) = agent_cwd.path() {
+            return anchor.join(p).to_string_lossy().into_owned();
+        }
+    }
+    sanitized
+}
+
+/// Whether a git remote string names a LOCAL filesystem path (as opposed to a
+/// `scheme://…` URL or an scp-like `host:path` SSH target). Mirrors git's own
+/// rule: a colon appearing before the first slash marks an scp-like remote.
+fn is_local_path(remote: &str) -> bool {
+    if remote.contains("://") {
+        return false;
+    }
+    match (remote.find(':'), remote.find('/')) {
+        // Colon before any slash ⇒ scp-like `host:path`, i.e. a remote.
+        (Some(colon), Some(slash)) => colon > slash,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 /// Run the orphan GC sweep opportunistically, throttled to `gc_every_ms` across
 /// the whole process. Spawned detached so it never adds latency to the job.
 fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jobs) {
@@ -466,6 +510,16 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
         Some(r) => r,
         None => return,
     };
+    // The sweep runs against a dedicated scratch `--git-dir` (see below), which is
+    // a FRESH bare repo with no `origin`. `plan.remote` ("origin") only resolves
+    // inside the job checkout's `.git/config`; against the scratch git-dir it
+    // resolves to nothing, so the sweep's first `ls-remote` fails and neither TTL
+    // nor orphan reclamation ever runs. Resolve the sweep's remote to the trusted
+    // repository URL itself — credential-sanitized (auth rides the runner's
+    // out-of-band credential helper, exactly as for "origin"), with relative local
+    // paths anchored to the job checkout so they resolve the same regardless of the
+    // scratch git-dir.
+    let sweep_remote = sweep_remote_target(repo_url, agent_cwd);
     let plan = plan.clone();
     tokio::spawn(async move {
         // Run the sweep against a dedicated scratch repo (`--git-dir`) that
@@ -490,7 +544,7 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
             now_ms(),
             SWEEP_MAX_DELETES,
             SWEEP_MAX_LOOKUPS,
-            &plan.remote,
+            &sweep_remote,
         )
         .await;
         if !r.deleted.is_empty() || r.error.is_some() {
@@ -774,6 +828,161 @@ mod tests {
 
     const OWN: &str = "refs/nano/wip/own-elem";
     const PRED: &str = "refs/nano/wip/pred-elem";
+
+    #[test]
+    fn local_path_detection_matches_git_remote_rules() {
+        // Remote URLs and scp-like SSH targets are NOT local paths.
+        assert!(!is_local_path("https://github.com/o/r.git"));
+        assert!(!is_local_path("ssh://git@host/r.git"));
+        assert!(!is_local_path("git@github.com:org/repo.git"));
+        assert!(!is_local_path("file://localhost/srv/r.git"));
+        // Filesystem paths (absolute, relative, with a colon AFTER a slash) are.
+        assert!(is_local_path("/srv/remote.git"));
+        assert!(is_local_path("./remote.git"));
+        assert!(is_local_path("../a/remote.git"));
+        assert!(is_local_path("remote.git"));
+        assert!(is_local_path("dir/a:b.git"));
+    }
+
+    #[test]
+    fn sweep_remote_target_sanitizes_and_anchors() {
+        let tmp = std::env::temp_dir().join(format!("nano-anchor-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = std::fs::canonicalize(&tmp).unwrap();
+        let cwd = crate::safecwd::CwdHandle::open(&tmp).expect("open anchor");
+
+        // An embedded HTTPS credential is scrubbed from the sweep's remote argv.
+        let url = sweep_remote_target("https://user:tok@github.com/o/r.git", &cwd);
+        assert!(
+            !url.contains("tok"),
+            "credential leaked into sweep remote: {url}"
+        );
+        assert!(url.starts_with("https://"));
+
+        // A relative local path is anchored to the trusted checkout so it resolves
+        // the same regardless of the scratch git-dir.
+        let anchor = cwd.path().expect("anchor path");
+        let rel = sweep_remote_target("remote.git", &cwd);
+        assert_eq!(rel, anchor.join("remote.git").to_string_lossy());
+
+        // An absolute local path is passed through unchanged.
+        let abs = anchor.join("other.git");
+        let abs_s = abs.to_string_lossy().into_owned();
+        assert_eq!(sweep_remote_target(&abs_s, &cwd), abs_s);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Regression: when `branch.base` is OMITTED, provisioning's resolved effective
+    /// base still reaches `Plan.base_ref`, and `restore` must validate against THAT
+    /// — not the empty `branch.base`. Otherwise a self-resume onto a per-activation
+    /// fallback branch is rejected as a branch mismatch even though the snapshot
+    /// recorded the effective base. (The direct-`restore_checkpoint` tests supply
+    /// `"main"` explicitly; this exercises the `start`→`restore` wiring.)
+    #[tokio::test]
+    async fn restore_uses_resolved_effective_base_when_branch_base_omitted() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let runner_at = |p: &std::path::Path| GitRunner::new(CwdHandle::open(p).unwrap(), dur);
+        let root = std::env::temp_dir().join(format!(
+            "nano-restore-base-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let root_git = runner_at(&root);
+        assert!(root_git.run(&["init", "--bare", "remote.git"]).await.ok());
+        assert!(root_git.run(&["clone", "remote.git", "seed"]).await.ok());
+        let seed = runner_at(&root.join("seed"));
+        assert!(seed
+            .run(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .await
+            .ok());
+        std::fs::write(root.join("seed/README.md"), "base\n").unwrap();
+        assert!(seed.run(&["add", "-A"]).await.ok());
+        assert!(seed
+            .run(&[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-m",
+                "init"
+            ])
+            .await
+            .ok());
+        assert!(seed.run(&["push", "origin", "main"]).await.ok());
+
+        // Activation A: a generated fallback branch cut from main, snapshots WIP
+        // recording `main` as the base ref.
+        let elem = "elem-base-omitted";
+        let own = checkpoint_ref(elem).unwrap();
+        let branch_a = "nano/agent-work/main-aaaaaaaaaaaaaaaa-100-200-0";
+        let branch_b = "nano/agent-work/main-bbbbbbbbbbbbbbbb-101-201-1";
+        assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+        let git_a = runner_at(&root.join("a"));
+        assert!(git_a.run(&["checkout", "-b", branch_a]).await.ok());
+        let base_sha = git_a.run(&["rev-parse", "HEAD"]).await.out();
+        std::fs::write(root.join("a/WIP.txt"), "in progress\n").unwrap();
+        let snap = snapshot_worktree(
+            &git_a,
+            &base_sha,
+            "main",
+            "run-A",
+            None,
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await;
+        let sha = match snap {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_eq!(
+            push_checkpoint(&git_a, &own, &sha, "", "origin").await,
+            PushResult::Ok
+        );
+
+        // Activation B: same element key (same own ref), a FRESH fallback branch,
+        // and `branch.base` omitted. Provisioning resolved the effective base to
+        // `main`, carried in `Plan.base_ref`; `restore` must use it.
+        assert!(root_git.run(&["clone", "remote.git", "b"]).await.ok());
+        let git_b = runner_at(&root.join("b"));
+        assert!(git_b.run(&["checkout", "-b", branch_b]).await.ok());
+        let plan = Plan {
+            config: CheckpointConfig::from_env(),
+            own_ref: own.clone(),
+            recovered_ref: recovered_checkpoint_ref(elem).unwrap(),
+            working_branch: branch_b.to_string(),
+            base_sha: String::new(),
+            // effective_base.or(branch.base=None) == "main"
+            base_ref: "main".to_string(),
+            run_id: "run-B".to_string(),
+            remote: "origin".to_string(),
+            secret_values: Vec::new(),
+        };
+        let outcome = restore(&git_b, &plan, &serde_json::json!({}), elem).await;
+        assert!(
+            outcome.note.is_some(),
+            "fallback-rename self-resume was rejected despite a resolved effective base"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b/WIP.txt")).unwrap(),
+            "in progress\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn non_explicit_resume_refuses_sibling_predecessor() {

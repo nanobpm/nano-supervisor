@@ -772,6 +772,118 @@ async fn seeded_supersession_state_replaces_a_discarded_restored_checkpoint() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Supersession must compare HEAD, not only the tree. A checkpoint can capture a
+/// commit/revert pair whose tree equals the provisioned base; if the agent then
+/// resets HEAD back to that base, every later tick sees a tree identical to the
+/// last push. A tree-only supersession check would read that as "already pushed
+/// this tree" and skip forever, leaving the discarded commits alive in the stale
+/// remote checkpoint's ancestry (a same-branch restore would then recover them).
+/// Including the last snapshotted HEAD forces a superseding clean snapshot.
+#[tokio::test]
+async fn supersession_detects_discarded_history_with_an_unchanged_tree() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("discardhistory").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    // The agent commits a change and then reverts it: HEAD advances by two
+    // commits but the worktree tree returns to the base tree.
+    std::fs::write(work.join("scratch.txt"), "work in flight\n").unwrap();
+    assert!(git.run(&["add", "-A"]).await.ok());
+    assert!(git
+        .run(&[
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-m",
+            "c1"
+        ])
+        .await
+        .ok());
+    std::fs::remove_file(work.join("scratch.txt")).unwrap();
+    assert!(git.run(&["add", "-A"]).await.ok());
+    assert!(git
+        .run(&[
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-m",
+            "c2"
+        ])
+        .await
+        .ok());
+    let advanced_head = git.run(&["rev-parse", "HEAD"]).await.out();
+    assert_ne!(advanced_head, base_sha, "HEAD should have advanced");
+
+    // Interval 1: the worktree tree equals base, but HEAD is ahead, so a dirty
+    // snapshot capturing the (soon-to-be-discarded) history is committed.
+    let snap1 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-h",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "m1",
+    )
+    .await;
+    let (tree1, head1) = match snap1 {
+        Snapshot::Committed { tree, head, .. } => (tree, head),
+        Snapshot::Skipped { reason } => panic!("interval 1 skipped: {reason}"),
+    };
+    assert_eq!(
+        head1, advanced_head,
+        "snapshot should record the advanced HEAD"
+    );
+
+    // The agent DISCARDS the history, resetting HEAD back to base. The tree is
+    // unchanged from interval 1 (both equal the base tree), so a tree-only check
+    // would skip here and strand the discarded commits in the remote checkpoint.
+    assert!(git.run(&["reset", "--hard", &base_sha]).await.ok());
+    let reset_tree = git.run(&["rev-parse", "HEAD^{tree}"]).await.out();
+    assert_eq!(
+        reset_tree, tree1,
+        "the reset tree must equal interval 1's tree"
+    );
+
+    // Interval 2: clean and tree-unchanged, but HEAD moved, so a superseding
+    // clean snapshot (parented on base) MUST be committed — not skipped.
+    let snap2 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-h",
+        Some((tree1.as_str(), head1.as_str())),
+        5 * 1024 * 1024,
+        &[],
+        "m2",
+    )
+    .await;
+    match snap2 {
+        Snapshot::Committed { head, .. } => {
+            assert_eq!(
+                head, base_sha,
+                "superseding snapshot must re-parent on base"
+            );
+        }
+        Snapshot::Skipped { reason } => {
+            panic!("discarded history was wrongly skipped as {reason}")
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 struct FakeProbe {
     orphan: bool,
 }
@@ -852,6 +964,78 @@ async fn sweep_spares_active_escalation_but_reclaims_orphans_and_ttl() {
     let res = sweep_stale_checkpoints(&git, None, 1, 0, None, now, 50, 20, "origin").await;
     assert_eq!(res.deleted.len(), 1);
     assert_eq!(res.deleted[0].why, "ttl");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The orphan sweep runs against a dedicated scratch `--git-dir` that has no
+/// `origin` remote. Driven through that scratch runner, the sweep must target the
+/// repository by URL/path (as `maybe_sweep` now resolves it) rather than the
+/// `"origin"` alias: with the scratch git-dir, `"origin"` resolves to nothing and
+/// the first `ls-remote` fails, so neither TTL nor orphan reclamation runs.
+#[tokio::test]
+async fn sweep_reclaims_through_a_scratch_git_dir_runner() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("sweepscratch").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    // Push a WIP checkpoint to the shared remote.
+    std::fs::write(work.join("w.txt"), "a\n").unwrap();
+    let snap = snapshot_worktree(&git, &base_sha, "main", "r1", None, 5_000_000, &[], "m").await;
+    let sha = match snap {
+        Snapshot::Committed { sha, .. } => sha,
+        Snapshot::Skipped { reason } => panic!("{reason}"),
+    };
+    let ref_ttl = checkpoint_ref("scratchttl").unwrap();
+    assert_eq!(
+        push_checkpoint(&git, &ref_ttl, &sha, "", "origin").await,
+        PushResult::Ok
+    );
+
+    // A fresh daemon-owned scratch bare repo, exactly as `sweep_scratch_repo`
+    // prepares — no named remotes.
+    let scratch = root.join("scratch.git");
+    assert!(root_git
+        .run(&["init", "--bare", "--quiet", &scratch.to_string_lossy()])
+        .await
+        .ok());
+    let scratch_runner = runner_at(&work).with_git_dir(scratch.clone());
+    let remote_url = root.join("remote.git").to_string_lossy().into_owned();
+    let now = 10_u64.pow(15);
+
+    // Through the scratch git-dir, "origin" is undefined -> the sweep errors and
+    // reclaims nothing (this is the bug the fix guards against).
+    let via_origin =
+        sweep_stale_checkpoints(&scratch_runner, None, 1, 0, None, now, 50, 20, "origin").await;
+    assert!(
+        via_origin.error.is_some() && via_origin.deleted.is_empty(),
+        "origin must not resolve against the scratch git-dir: {via_origin:?}"
+    );
+
+    // Targeting the repository by path works through the scratch git-dir: the
+    // TTL-expired orphan is reclaimed.
+    let via_url =
+        sweep_stale_checkpoints(&scratch_runner, None, 1, 0, None, now, 50, 20, &remote_url).await;
+    assert!(
+        via_url.error.is_none(),
+        "scratch-path sweep errored: {via_url:?}"
+    );
+    assert_eq!(
+        via_url.deleted.len(),
+        1,
+        "orphan not reclaimed: {via_url:?}"
+    );
+    assert_eq!(via_url.deleted[0].why, "ttl");
+    assert!(fetch_checkpoint(&git, &ref_ttl, "origin")
+        .await
+        .unwrap()
+        .is_none());
 
     let _ = std::fs::remove_dir_all(&root);
 }

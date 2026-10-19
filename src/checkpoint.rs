@@ -1225,7 +1225,17 @@ pub async fn snapshot_worktree(
         // (just the base tree) to supersede it. Only truly skip when nothing stale
         // needs replacing: no prior push this session, or the last push already
         // matches this clean tree (the common idle-interval no-op).
-        let supersedes_prior = matches!(last_tree, Some((lt, _)) if lt != tree_sha);
+        //
+        // Supersession must compare HEAD as well as the tree: an agent can push a
+        // checkpoint capturing commits, then DISCARD that history (e.g. revert or
+        // `reset --hard` back to the provisioned base) so the worktree tree again
+        // equals the base — a tree-only check would read `lt == tree_sha` and skip
+        // forever, leaving the discarded commits alive in the stale remote
+        // checkpoint's ancestry, which a same-branch restore would then recover.
+        // Including the last snapshotted HEAD forces a fresh clean snapshot that
+        // supersedes the stale history whenever either the tree OR the head moved.
+        let supersedes_prior =
+            matches!(last_tree, Some((lt, lh)) if lt != tree_sha || lh != head_sha);
         if !supersedes_prior {
             return Snapshot::Skipped {
                 reason: "clean".into(),
