@@ -710,13 +710,36 @@ fn spawn_owner_watchdog(owner: u32, home: std::path::PathBuf) -> Option<u32> {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(mut child) => {
+        Ok(child) => {
             // Reap the watchdog when it exits so it never lingers as a zombie of
             // the daemon (the same fix issue #52 applied to the agent watchdog).
+            // Spawn that reaper FALLIBLY (see `spawn_watchdog`): a panicking
+            // `thread::spawn` would unwind the caller on a thread-creation
+            // refusal. On failure, kill + reap the watchdog inline so nothing
+            // leaks, and report the watchdog as unavailable. The child is shared
+            // with the reaper closure behind an Arc<Mutex>: a failed
+            // `Builder::spawn` drops the closure (and its captures), so without
+            // sharing, the error path could no longer reach the child.
             let pid = child.id();
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+            let reaper_child = std::sync::Arc::clone(&child);
+            if std::thread::Builder::new()
+                .spawn(move || {
+                    if let Ok(mut c) = reaper_child.lock() {
+                        let _ = c.wait();
+                    }
+                })
+                .is_err()
+            {
+                if let Ok(mut c) = child.lock() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                crate::runtime::log(&format!(
+                    "warning: owner watchdog reaper thread failed to spawn for owner {owner}"
+                ));
+                return None;
+            }
             Some(pid)
         }
         Err(e) => {
@@ -1440,23 +1463,110 @@ impl Drop for GroupGuard {
 }
 
 /// Start a watchdog that kills the agent's whole process group when the daemon
-/// dies. `agent_pid` is the agent's pid, which is also its process-group id (the
-/// agent is spawned with `process_group(0)`).
+/// dies, and return an owned [`WatchdogHandle`] for it. `agent_pid` is the
+/// agent's pid, which is also its process-group id (the agent is spawned with
+/// `process_group(0)`).
 ///
 /// This runs on **both** macOS and Linux. On Linux `PR_SET_PDEATHSIG` ([`arm`])
 /// only signals the direct agent process, not the descendants it spawns; those
 /// share the agent's process group but receive no signal on parent death, so a
 /// `kill -9` of the daemon would orphan them. The watchdog closes that gap by
 /// signalling the entire process group once the daemon exits.
+///
+/// The caller should [`WatchdogHandle::stop`] the returned handle once it has
+/// finished the guarded work AND torn down the child's process group itself:
+/// that stops and reaps the watchdog deterministically, which is what closes the
+/// zombies-only-group leak (issue #67 / #84) WITHOUT weakening the shared
+/// retirement predicate. Dropping the handle instead detaches the watchdog
+/// fire-and-forget — it keeps back-stopping and self-retires once its target
+/// group is numerically gone, reaped on a detached thread so it never zombies.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn watch(agent_pid: u32) {
-    let _ = spawn_watchdog(agent_pid);
+#[must_use = "dropping the handle detaches the watchdog fire-and-forget; call \
+              `stop()` after the caller's own group cleanup to stop and reap it"]
+pub fn watch(agent_pid: u32) -> WatchdogHandle {
+    WatchdogHandle {
+        child: spawn_watchdog(agent_pid),
+    }
+}
+
+/// An owned handle to a running parent-death watchdog (see [`watch`]).
+///
+/// Holding it lets the caller STOP and reap the watchdog deterministically —
+/// [`WatchdogHandle::stop`] — once the guarded work is done and the caller has
+/// torn down the child's process group itself. Dropping it without `stop`
+/// instead detaches the watchdog fire-and-forget (the pre-#84 behaviour): it
+/// keeps running as the parent-death backstop and is reaped on a detached thread
+/// when it self-retires, so it never lingers as a zombie (issue #52).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub struct WatchdogHandle {
+    /// `None` when the watchdog could not be spawned (best-effort backstop) or
+    /// after `stop`/`drop` has taken ownership of the child to reap it.
+    child: Option<std::process::Child>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl WatchdogHandle {
+    /// Stop the watchdog NOW and reap it. Call this only AFTER the caller has
+    /// torn down the child's process group itself (so there is nothing left for
+    /// the watchdog to back-stop): it SIGKILLs the watchdog, then `wait`s to
+    /// reap it. This is what deterministically closes the zombies-only watchdog
+    /// leak (issue #67 / #84) without weakening the shared retirement predicate
+    /// — the watchdog no longer has to *observe* its group drain in order to
+    /// exit. It cannot race the daemon-death kill: the caller runs inside the
+    /// daemon, so if it is alive to call `stop`, the daemon is alive and no
+    /// parent-death backstop is needed. `wait` returns promptly because the
+    /// watchdog is our own direct child and was just SIGKILLed.
+    pub fn stop(mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for WatchdogHandle {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return; // already stopped/reaped
+        };
+        // The watchdog is our child: it must be reaped when it exits, or it
+        // lingers as a zombie of the daemon (one leaked slot per watched spawn
+        // until `fork` hits EAGAIN — issue #52). It can live as long as the
+        // watched group, so wait on a DETACHED thread rather than block the
+        // dropping caller. Spawn that reaper FALLIBLY: under a process/thread
+        // limit the OS can refuse to create it, and a panicking `thread::spawn`
+        // inside a `Drop` would abort the process. On failure, kill + reap the
+        // watchdog inline so nothing leaks — dropping the backstop early is
+        // strictly better than leaking a zombie plus its reaper. The child is
+        // shared with the reaper closure behind an `Arc<Mutex>` so the error path
+        // can still reach it to kill + reap after a failed `Builder::spawn`.
+        let pid = child.id();
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        let reaper_child = std::sync::Arc::clone(&child);
+        if std::thread::Builder::new()
+            .spawn(move || {
+                if let Ok(mut c) = reaper_child.lock() {
+                    let _ = c.wait();
+                }
+            })
+            .is_err()
+        {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            crate::runtime::log(&format!(
+                "warning: parent-death watchdog reaper thread failed to spawn for pid {pid}"
+            ));
+        }
+    }
 }
 
 /// Spawn the parent-death watchdog for `agent_pid` (see [`watch`]) and return
-/// its pid, or `None` if it could not be spawned.
+/// its [`Child`](std::process::Child), or `None` if it could not be spawned.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_watchdog(agent_pid: u32) -> Option<u32> {
+fn spawn_watchdog(agent_pid: u32) -> Option<std::process::Child> {
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
@@ -1517,17 +1627,12 @@ fn spawn_watchdog(agent_pid: u32) -> Option<u32> {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(mut child) => {
-            // The watchdog is our child: reap it when it exits, or it lingers
-            // as a zombie of the daemon (one leaked process slot per watched
-            // spawn until `fork` hits EAGAIN — issue #52). It can live as long
-            // as the watched group, so wait on a detached thread rather than
-            // block the caller.
-            let pid = child.id();
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            Some(pid)
+        Ok(child) => {
+            // Reaping is now the owner's responsibility via the returned
+            // `WatchdogHandle` (its `stop` or `Drop`), so just hand the child
+            // back. This keeps the no-zombie guarantee (issue #52) while letting
+            // the caller close the group deterministically (issue #67 / #84).
+            Some(child)
         }
         Err(e) => {
             crate::runtime::log(&format!(
@@ -1539,7 +1644,21 @@ fn spawn_watchdog(agent_pid: u32) -> Option<u32> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn watch(_agent_pid: u32) {}
+#[must_use]
+pub fn watch(_agent_pid: u32) -> WatchdogHandle {
+    WatchdogHandle
+}
+
+/// Non-unix stub of the owned watchdog handle (see the unix [`WatchdogHandle`]).
+/// No watchdog runs on these platforms, so `stop` is a no-op; the type exists
+/// only so call sites and the structs that store it stay platform-neutral.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub struct WatchdogHandle;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+impl WatchdogHandle {
+    pub fn stop(self) {}
+}
 
 /// The macOS watchdog loop: block on the parent pid via kqueue `NOTE_EXIT`,
 /// then `SIGKILL` the agent's process group. Returns when the parent is gone
@@ -1602,8 +1721,21 @@ pub fn reap_watchdog(
                 {
                     break true; // parent gone -> reap the group
                 }
-                if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
-                    break false; // group already gone -> nothing to do
+                // Numeric group-gone check: retire only when the group is
+                // NUMERICALLY gone (`kill(-pgid, 0)` fails). This retirement
+                // predicate is deliberately the bare numeric probe, NOT the
+                // advisory `group_has_live_member` scan (issue #67 review / #84):
+                // that scan can under-report a still-live member — a `fork()`
+                // racing the enumeration, or a Linux thread-group leader shown
+                // `Z` while its sibling threads still run — and on this SHARED
+                // parent-death backstop a false "gone" would retire the watchdog
+                // PREMATURELY and drop the daemon-death SIGKILL cleanup for a tree
+                // that is still alive. The zombies-only-group leak that first
+                // motivated the scan is instead closed deterministically by the
+                // caller stopping this watchdog after its own group cleanup
+                // (`WatchdogHandle::stop`), so retirement never has to weaken.
+                if !group_alive(pgid) {
+                    break false; // group numerically gone -> nothing to do
                 }
             }
         };
@@ -1778,8 +1910,20 @@ fn parent_is_dead_or_zombie(pid: u32) -> bool {
 }
 
 /// Poll until either the parent (daemon) exits or the agent's process group has
-/// already gone away. Returns `true` when the parent died (the caller should
-/// reap the group), `false` when the group vanished on its own (nothing to do).
+/// already drained of every member. Returns `true` when the parent died (the
+/// caller should reap the group), `false` when the group is numerically gone
+/// (`kill(-pgid, 0)` fails — nothing to do).
+///
+/// The group-gone test is the **bare numeric** probe ([`group_alive`]), NOT the
+/// advisory [`group_has_live_member`] scan. The scan is zombie-aware but can
+/// under-report a live member — a `fork()` racing its enumeration, or a Linux
+/// thread-group leader shown `Z` while its sibling threads run — so on this
+/// SHARED parent-death backstop a false "gone" would retire the watchdog
+/// PREMATURELY and drop the daemon-death SIGKILL cleanup for a tree that is still
+/// alive (issue #67 review / #84). The zombies-only-group leak that once pushed
+/// this predicate toward the scan is instead closed deterministically by the
+/// caller stopping the watchdog after its own group cleanup
+/// ([`WatchdogHandle::stop`]), so retirement keeps the safe numeric test.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 unsafe fn wait_parent_or_group_gone(
     parent_pid: u32,
@@ -1814,8 +1958,18 @@ unsafe fn wait_parent_or_group_gone(
         if parent_is_dead_or_zombie(parent_pid) {
             return true;
         }
-        if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
-            return false; // process group already gone -> nothing to reap
+        // Numeric group-gone check: retire only when the group is NUMERICALLY
+        // gone (`kill(-pgid, 0)` fails). Deliberately NOT the advisory
+        // `group_has_live_member` scan — on this SHARED retirement predicate the
+        // scan's under-reporting (a `fork()` racing the enumeration, or a Linux
+        // `Z` thread-group leader with live sibling threads) would retire the
+        // watchdog PREMATURELY and lose the daemon-death cleanup backstop for a
+        // still-live tree, at EVERY call site (issue
+        // #84). The zombies-only-group leak that first pushed this
+        // toward the scan is closed instead by the caller stopping the watchdog
+        // explicitly after verified group cleanup (`WatchdogHandle::stop`).
+        if !group_alive(pgid) {
+            return false; // group numerically gone -> nothing to reap
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -1848,10 +2002,22 @@ mod tests {
     /// `fork` fails with EAGAIN. Under `cargo test` the "watchdog" is the test
     /// binary, which exits at once on the unknown `__reap-watchdog` argument,
     /// so it must disappear from the process table rather than linger as `Z`.
+    /// Regression (issue #52 / #84): the watchdog is our child, so when it
+    /// exits it must be reaped — an unreaped watchdog stays a zombie of the
+    /// daemon for its whole lifetime (one leaked slot per agent/git spawn until
+    /// `fork` fails with EAGAIN). Under #84 the owning [`WatchdogHandle`] reaps
+    /// it: here the handle is DROPPED (the cancellation / fire-and-forget path),
+    /// so a detached thread must `wait` it. Under `cargo test` the "watchdog" is
+    /// the test binary, which exits at once on the unknown `__reap-watchdog`
+    /// argument, so it must disappear from the process table rather than linger
+    /// as `Z`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn exited_watchdog_is_reaped_not_left_a_zombie() {
-        let pid = spawn_watchdog(std::process::id()).expect("watchdog spawns");
+    fn dropped_watchdog_handle_reaps_its_child() {
+        let child = spawn_watchdog(std::process::id()).expect("watchdog spawns");
+        let pid = child.id();
+        // Dropping the handle must reap the child on a detached thread.
+        drop(WatchdogHandle { child: Some(child) });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut last = String::new();
         while std::time::Instant::now() < deadline {
@@ -1865,7 +2031,238 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        panic!("watchdog pid {pid} was never reaped (ps stat {last:?})");
+        panic!("dropped watchdog pid {pid} was never reaped (ps stat {last:?})");
+    }
+
+    /// Regression (issue #67 / #84): [`WatchdogHandle::stop`] must stop AND reap
+    /// the watchdog deterministically — this is the mechanism that replaces the
+    /// retirement-predicate weakening and closes the zombies-only leak. After
+    /// `stop` returns, the child must already be gone from the process table
+    /// (not merely signalled): `stop` SIGKILLs then `wait`s, so there is no
+    /// detached-thread delay to poll for.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn stopped_watchdog_handle_reaps_synchronously() {
+        let child = spawn_watchdog(std::process::id()).expect("watchdog spawns");
+        let pid = child.id();
+        WatchdogHandle { child: Some(child) }.stop();
+        // `stop` reaped inline, so the pid is already gone — assert without a
+        // polling grace window (a lingering `Z` here would be a real regression).
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            stat.is_empty(),
+            "stop() must reap the watchdog synchronously, but pid {pid} is still \
+             present (ps stat {stat:?})"
+        );
+    }
+
+    /// Regression (issue #67 / #84 — the Option (a) redesign): the SHARED
+    /// retirement predicate must use the bare NUMERIC liveness probe, never the
+    /// advisory `group_has_live_member` scan. A zombies-only group still answers
+    /// `kill(-pgid, 0)` (the zombie leader is held), so the watchdog must KEEP
+    /// monitoring it — it must NOT prematurely retire — and only conclude "group
+    /// gone" once the zombie is reaped and the group is numerically gone.
+    ///
+    /// This replaces the round-11 `watchdog_treats_a_zombies_only_group_as_gone`
+    /// test, whose premise (retire on the zombie-aware scan) was reverted:
+    /// retiring on the advisory scan can drop the daemon-death SIGKILL cleanup
+    /// for a still-live tree (a `fork` racing enumeration, or a `Z` thread-group
+    /// leader with live sibling threads). The leak the scan once addressed is
+    /// now closed by the owner calling [`WatchdogHandle::stop`] instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watchdog_keeps_monitoring_a_zombies_only_group_until_numerically_gone() {
+        // SAFETY: a bare `fork`; the child only makes async-signal-safe libc
+        // calls (`setpgid`, `_exit`) and the parent reaps it with `waitpid`.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: lead a brand-new process group, then exit at once so the
+            // group is left with a single ZOMBIE leader — the state a SIGKILLed
+            // descendant held unreaped by a non-reaping init leaves behind.
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        let child = pid as u32;
+        let mut is_zombie = false;
+        for _ in 0..1000 {
+            if parent_is_dead_or_zombie(child) {
+                is_zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            is_zombie,
+            "the child must become a zombie leader of its own group"
+        );
+        // The group is numerically alive (the zombie is held) even though it has
+        // no LIVE member. The reverted predicate keys on the numeric probe, so
+        // the watchdog must NOT retire yet.
+        assert!(
+            group_alive(child),
+            "the numeric probe must still see the held zombie leader"
+        );
+        assert!(
+            !group_has_live_member(child),
+            "sanity: the zombies-only group has no live member"
+        );
+        let me = std::process::id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: `wait_parent_or_group_gone` only makes libc liveness probes.
+            let parent_died = unsafe { wait_parent_or_group_gone(me, child, None) };
+            let _ = tx.send(parent_died);
+        });
+        // It must NOT retire while the group is numerically alive (parent alive,
+        // zombie still held): a premature return here is the regression.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "the watchdog retired on a numerically-alive (zombies-only) group — \
+             the reverted predicate must keep monitoring until the group is gone"
+        );
+        // Reap the zombie: the group is now NUMERICALLY gone, so the next poll
+        // must return `false` (nothing to reap).
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(parent_died) => assert!(
+                !parent_died,
+                "once the group is numerically gone the watchdog must return \
+                 `false` (nothing to reap), not report parent death"
+            ),
+            Err(_) => panic!(
+                "wait_parent_or_group_gone never returned after the group became \
+                 numerically gone while the parent stayed alive"
+            ),
+        }
+    }
+
+    /// Regression (issue #67 / #84): the retirement predicate must not retire
+    /// while the group still has a genuinely LIVE member. This is the fork /
+    /// live-thread concern the reviewer raised — the advisory scan could
+    /// under-report a live member and retire early; the numeric probe cannot.
+    /// A live child in its own group keeps the watchdog monitoring; only once it
+    /// is killed AND reaped (group numerically gone) does the watchdog retire.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn watchdog_does_not_retire_while_a_live_member_remains() {
+        // SAFETY: a bare `fork`; the child only makes async-signal-safe libc
+        // calls (`setpgid`, `pause`/`_exit`) and the parent kills + reaps it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: lead its own group and block indefinitely so it stays a
+            // genuinely LIVE member until the parent kills it.
+            unsafe {
+                libc::setpgid(0, 0);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let child = pid as u32;
+        // Wait until the child has entered its own group and is live.
+        let mut ready = false;
+        for _ in 0..1000 {
+            if group_alive(child) && !parent_is_dead_or_zombie_portable(child) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ready, "the live child must enter its own group");
+        let me = std::process::id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: `wait_parent_or_group_gone` only makes libc liveness probes.
+            let parent_died = unsafe { wait_parent_or_group_gone(me, child, None) };
+            let _ = tx.send(parent_died);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "the watchdog retired while a live member remained — premature \
+             retirement would drop the daemon-death cleanup for a live tree"
+        );
+        // Kill the whole group and reap the leader: now numerically gone.
+        unsafe {
+            libc::kill(-(pid), libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(parent_died) => assert!(
+                !parent_died,
+                "once the member is killed + reaped the watchdog must return \
+                 `false` (group numerically gone), not report parent death"
+            ),
+            Err(_) => panic!(
+                "wait_parent_or_group_gone never returned after the live member \
+                 was killed and reaped while the parent stayed alive"
+            ),
+        }
+    }
+
+    /// Regression (issue #67 / #84): exercise the REAL production `reap_watchdog`
+    /// loop (not just its `wait_parent_or_group_gone` helper). With the parent
+    /// alive but the target group already numerically gone, the loop must retire
+    /// PROMPTLY and WITHOUT signalling — a watchdog whose job finished must not
+    /// poll until the daemon itself dies. Run it off-thread with a deadline so a
+    /// regression (polling forever) fails the test instead of hanging it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn production_reap_watchdog_retires_when_parent_alive_and_group_gone() {
+        // Create a definitely-dead pgid: fork a child into its own group, let it
+        // exit, and reap it — its pgid is then numerically gone (`kill(-pgid, 0)`
+        // fails). SAFETY: the child only makes async-signal-safe libc calls.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let dead_pgid = pid as u32;
+        // Guard against the (unlikely) pid-reuse of our just-reaped child.
+        if group_alive(dead_pgid) {
+            return;
+        }
+        let me = std::process::id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Parent (`me`) is alive, group is gone -> must return promptly.
+            reap_watchdog(me, dead_pgid, None, None, None);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "reap_watchdog did not retire for an alive parent + numerically-gone \
+             group: it would poll until the daemon's own death"
+        );
+    }
+
+    /// Portable "is this pid dead or a zombie" probe for the cross-platform
+    /// tests above. On Linux it uses the real `/proc` classifier; on macOS,
+    /// which has no equivalent here, it approximates with the numeric probe
+    /// (a live member answers `kill(pid, 0)`), which is all these tests need.
+    #[cfg(target_os = "linux")]
+    fn parent_is_dead_or_zombie_portable(pid: u32) -> bool {
+        parent_is_dead_or_zombie(pid)
+    }
+    #[cfg(target_os = "macos")]
+    fn parent_is_dead_or_zombie_portable(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) != 0 }
     }
 
     #[cfg(target_os = "linux")]
