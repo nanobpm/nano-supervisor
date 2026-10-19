@@ -81,9 +81,7 @@ pub async fn run(
     // `kill_tree` has torn the group down on the normal path.
     let mut group_guard = crate::pdeath::GroupGuard::new(pgid);
     #[cfg(unix)]
-    if let Some(pid) = pgid {
-        crate::pdeath::watch(pid);
-    }
+    let watchdog = pgid.map(crate::pdeath::watch);
 
     // Deliver the whole payload, then close stdin so the agent sees EOF.
     if let Some(mut stdin) = child.stdin.take() {
@@ -148,6 +146,12 @@ pub async fn run(
     // The group is now torn down and the child reaped, so its pid must not be
     // signalled again (it may be recycled by the OS): disarm the guard.
     group_guard.disarm();
+    // Group cleanup is complete, so stop and reap the parent-death watchdog
+    // deterministically (issue #67 / #84) instead of leaving it to self-retire.
+    #[cfg(unix)]
+    if let Some(watchdog) = watchdog {
+        watchdog.stop();
+    }
 
     Ok(PipeOutcome {
         stdout: collected,

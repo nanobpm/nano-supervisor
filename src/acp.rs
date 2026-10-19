@@ -87,6 +87,11 @@ pub struct Agent {
     /// `execute` on lease loss instead of calling `shutdown`), so descendants the
     /// agent started cannot survive and overlap the job's redelivery.
     group_guard: crate::pdeath::GroupGuard,
+    /// Owned parent-death watchdog (issue #67 / #84). `shutdown` stops and reaps
+    /// it deterministically after the group is torn down; a cancellation drop
+    /// (no `shutdown`) detaches it fire-and-forget so it still back-stops a
+    /// daemon death and is reaped when it self-retires. `None` on non-unix.
+    watchdog: Option<crate::pdeath::WatchdogHandle>,
     /// Optional inbound-steer receiver (issue #10): typed hub-delivered controls
     /// applied to the running ACP turn. SUPPORTED CONTRACT: `prompt` and `cancel`
     /// ONLY — a `prompt` is injected as additional `session/prompt` input and a
@@ -141,9 +146,9 @@ impl Agent {
         // Preserve the pgid (== leader pid) before anything can reap the leader.
         let pgid = child.id();
         #[cfg(unix)]
-        if let Some(pid) = pgid {
-            crate::pdeath::watch(pid);
-        }
+        let watchdog = pgid.map(crate::pdeath::watch);
+        #[cfg(not(unix))]
+        let watchdog: Option<crate::pdeath::WatchdogHandle> = None;
         let stdin = child.stdin.take().context("agent stdin")?;
         let stdout = child.stdout.take().context("agent stdout")?;
         let group_guard = crate::pdeath::GroupGuard::new(pgid);
@@ -167,6 +172,7 @@ impl Agent {
             shared,
             next_id: 1,
             group_guard,
+            watchdog,
             steer: None,
         })
     }
@@ -521,6 +527,11 @@ impl Agent {
         )
         .await;
         self.group_guard.disarm();
+        // Group fully torn down: stop and reap the watchdog deterministically
+        // (issue #67 / #84) instead of leaving it to self-retire.
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.stop();
+        }
     }
 }
 
