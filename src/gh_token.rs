@@ -642,40 +642,50 @@ fn scrub_sensitive_env(cmd: &mut std::process::Command) {
 const MAX_CAPTURED_OUTPUT: usize = 1024 * 1024;
 
 /// Drain `reader` to EOF while retaining at most `cap` bytes, returning the
-/// retained bytes and whether the stream was TRUNCATED (produced more than
-/// `cap`). Reading deliberately continues past the cap — into a throwaway
+/// retained bytes and whether the capture is INCOMPLETE — i.e. it was either
+/// TRUNCATED (the stream produced more than `cap`) OR aborted by a read error
+/// before EOF. Reading deliberately continues past the cap — into a throwaway
 /// buffer — so the child never blocks on a full pipe and the kill/EOF teardown
 /// in [`run_capped`] still works; only the memory we HOLD is bounded. This
 /// replaces `read_to_end`'s unbounded growth so a noisy `gh` child cannot
-/// exhaust worker memory. A truncated capture is INCOMPLETE, so the caller must
-/// treat the read as failed (token read → `ReadFailed`, scopes probe → `None`)
-/// rather than trust a partial buffer — exactly like a drain that could not be
-/// collected within its join bound.
+/// exhaust worker memory. A read error is NOT a clean EOF: swallowing it would
+/// let an empty buffer read as `LoggedOut` (clearing a valid cached token) or a
+/// partial buffer be accepted as a token/parsed for scopes, so it is reported as
+/// incomplete exactly like truncation. An incomplete capture means the caller
+/// must treat the read as failed (token read → `ReadFailed`, scopes probe →
+/// `None`) rather than trust a partial buffer — the same as a drain that could
+/// not be collected within its join bound.
 fn drain_capped<R: std::io::Read>(reader: &mut R, cap: usize) -> (Vec<u8>, bool) {
     let mut kept = Vec::new();
     let mut scratch = [0u8; 8192];
-    let mut truncated = false;
+    let mut incomplete = false;
     loop {
         match reader.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => {
                 if kept.len() >= cap {
                     // Already full: keep draining to EOF but discard the bytes.
-                    truncated = true;
+                    incomplete = true;
                     continue;
                 }
                 let room = cap - kept.len();
                 let take = room.min(n);
                 kept.extend_from_slice(&scratch[..take]);
                 if take < n {
-                    truncated = true;
+                    incomplete = true;
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            // A real read error (broken pipe, I/O failure, …) is NOT EOF: the
+            // bytes we have are partial/absent, so flag the capture incomplete
+            // rather than returning it as a clean, complete read.
+            Err(_) => {
+                incomplete = true;
+                break;
+            }
         }
     }
-    (kept, truncated)
+    (kept, incomplete)
 }
 
 /// Spawn `cmd`, capture its stdout/stderr, and enforce `timeout`. Returns
@@ -693,9 +703,10 @@ fn drain_capped<R: std::io::Read>(reader: &mut R, cap: usize) -> (Vec<u8>, bool)
 /// Both pipes are drained on their own threads so a child that fills a pipe
 /// buffer can never wedge the wait, and so whatever it wrote before a kill is
 /// still collected. `output_failed` is `true` when a drain could not be
-/// collected within its bound (a descendant held the pipe open) OR the child
+/// collected within its bound (a descendant held the pipe open), the child
 /// produced more than [`MAX_CAPTURED_OUTPUT`] bytes on a pipe (the capture was
-/// truncated to bound memory) — the captured
+/// truncated to bound memory), OR a pipe read failed before EOF (an I/O error
+/// mid-capture) — the captured
 /// output is then INCOMPLETE, so a caller must treat the read as failed rather
 /// than trust an empty/partial buffer. This is the shared, bounded spawn for
 /// every `gh` child here — neither the token read nor the scopes probe may
@@ -833,11 +844,12 @@ fn run_capped(
     let join_deadline = deadline + Duration::from_secs(2);
     let out_r = bounded_join(out_t, join_deadline);
     let err_r = bounded_join(err_t, join_deadline);
-    // A pipe fails collection if its drain could not be joined (`None`) OR it was
-    // truncated at the cap (`Some((_, true))`).
+    // A pipe fails collection if its drain could not be joined (`None`) OR the
+    // capture was incomplete — truncated at the cap or aborted by a read error
+    // before EOF (`Some((_, true))`).
     let drain_failed = |r: &Option<(Vec<u8>, bool)>| match r {
         None => true,
-        Some((_, truncated)) => *truncated,
+        Some((_, incomplete)) => *incomplete,
     };
     let output_failed = drain_failed(&out_r) || drain_failed(&err_r);
     // Tear the whole group down now, UNCONDITIONALLY — on BOTH the failed-drain
@@ -877,7 +889,7 @@ fn run_capped(
 }
 
 /// Join a drain thread, bounded by `deadline`. A finished thread is joined and
-/// its `(buffer, truncated)` result returned as `Some`. A thread still blocked
+/// its `(buffer, incomplete)` result returned as `Some`. A thread still blocked
 /// at the deadline (its pipe is held open by a surviving descendant) is NOT
 /// awaited: it is handed to a detached reaper that joins it whenever it
 /// eventually finishes, so no thread or buffer leaks — and `None` is returned
@@ -1771,7 +1783,91 @@ mod tests {
         assert!(truncated);
     }
 
-    /// a shell that backgrounds a long-lived child and waits on it inherits our
+    /// Read-error regression: a non-`Interrupted` read error is NOT a clean EOF.
+    /// `drain_capped` must flag the capture INCOMPLETE whether the error strikes
+    /// before any bytes (an empty failed read that must not become a `LoggedOut`
+    /// clearing a valid token) or after some (a partial buffer that must not be
+    /// accepted as a token / parsed for scopes). `Interrupted` is retried, not a
+    /// failure.
+    #[test]
+    fn drain_capped_flags_read_errors_as_incomplete() {
+        use std::io::{Error, ErrorKind, Read};
+
+        // A reader that yields `before` bytes, then fails with `kind`.
+        struct FailingReader {
+            before: usize,
+            emitted: usize,
+            kind: ErrorKind,
+        }
+        impl Read for FailingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.emitted < self.before {
+                    let n = (self.before - self.emitted).min(buf.len());
+                    for b in &mut buf[..n] {
+                        *b = b'x';
+                    }
+                    self.emitted += n;
+                    return Ok(n);
+                }
+                Err(Error::new(self.kind, "boom"))
+            }
+        }
+
+        // Error before any bytes: empty, incomplete.
+        let mut r = FailingReader {
+            before: 0,
+            emitted: 0,
+            kind: ErrorKind::BrokenPipe,
+        };
+        let (kept, incomplete) = drain_capped(&mut r, 1024);
+        assert_eq!(kept.len(), 0);
+        assert!(
+            incomplete,
+            "a read error before any bytes fails the capture"
+        );
+
+        // Error after some bytes: partial retained, still incomplete.
+        let mut r = FailingReader {
+            before: 10,
+            emitted: 0,
+            kind: ErrorKind::Other,
+        };
+        let (kept, incomplete) = drain_capped(&mut r, 1024);
+        assert_eq!(kept.len(), 10);
+        assert!(
+            incomplete,
+            "a read error after partial bytes fails the capture"
+        );
+
+        // `Interrupted` is retried: the reader recovers and reaches EOF cleanly,
+        // so the capture is complete.
+        struct InterruptOnceReader {
+            interrupted: bool,
+            emitted: bool,
+        }
+        impl Read for InterruptOnceReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(Error::new(ErrorKind::Interrupted, "retry"));
+                }
+                if !self.emitted {
+                    self.emitted = true;
+                    buf[0] = b'y';
+                    return Ok(1);
+                }
+                Ok(0)
+            }
+        }
+        let mut r = InterruptOnceReader {
+            interrupted: false,
+            emitted: false,
+        };
+        let (kept, incomplete) = drain_capped(&mut r, 1024);
+        assert_eq!(kept.len(), 1);
+        assert!(!incomplete, "`Interrupted` is retried, not a failure");
+    }
+
     /// stdout/stderr into that child, so killing only the direct shell would
     /// leave the pipes open and the drain threads blocked. The whole process
     /// group must be killed so the pipes close, and the call must return
