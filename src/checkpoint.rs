@@ -651,8 +651,15 @@ pub trait OrphanProbe: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct GitOut {
     pub status: Option<i32>,
+    /// Lossy-decoded stdout for TEXTUAL consumers (ref listings, shas,
+    /// diagnostics). Binary payloads must use [`GitOut::stdout_bytes`].
     pub stdout: String,
     pub stderr: String,
+    /// Raw stdout bytes, BEFORE the lossy UTF-8 decode. A `git diff --binary`
+    /// restore patch can carry non-UTF-8 hunk content (e.g. Latin-1 without NUL
+    /// bytes); the lossy decode would replace those bytes and corrupt the patch
+    /// handed to `git apply`, so patch transport reads this field instead.
+    pub stdout_bytes: Vec<u8>,
 }
 
 impl GitOut {
@@ -661,6 +668,11 @@ impl GitOut {
     }
     fn out(&self) -> String {
         self.stdout.trim().to_string()
+    }
+    /// Raw stdout bytes for binary-safe transport (e.g. a patch piped to
+    /// `git apply`). Never lossy-decoded.
+    fn stdout_bytes(&self) -> &[u8] {
+        &self.stdout_bytes
     }
     fn err_text(&self) -> String {
         let t = if !self.stderr.trim().is_empty() {
@@ -748,6 +760,12 @@ pub struct GitRunner {
     /// to `max_file_bytes`); `run_in` callers that read blobs size it from the
     /// config (see `with_max_stdout`).
     max_stdout: usize,
+    /// When set, every git invocation runs against THIS repository directory
+    /// (`--git-dir`) instead of the checkout the runner's cwd is pinned to. The
+    /// orphan-GC sweep uses it to operate on a dedicated scratch repo that
+    /// outlives any single job's checkout, so reaping a job's `.git` mid-sweep
+    /// cannot fail the sweep's git operations.
+    git_dir: Option<std::path::PathBuf>,
 }
 
 /// Default retained-stdout cap: comfortably over the 5 MiB default
@@ -764,7 +782,17 @@ impl GitRunner {
             cred: None,
             isolate_config: false,
             max_stdout: DEFAULT_MAX_STDOUT,
+            git_dir: None,
         }
+    }
+
+    /// Point every git invocation at a SPECIFIC repository directory
+    /// (`--git-dir`), decoupling the operation from the checkout the runner's cwd
+    /// is pinned to. Used by the orphan-GC sweep so it runs against a dedicated
+    /// scratch repo that survives the job checkout's teardown.
+    pub fn with_git_dir(mut self, git_dir: std::path::PathBuf) -> Self {
+        self.git_dir = Some(git_dir);
+        self
     }
 
     /// Raise the retained-stdout cap so a legitimate `cat-file blob` of a file up
@@ -816,12 +844,19 @@ impl GitRunner {
                 return GitOut {
                     status: None,
                     stdout: String::new(),
+                    stdout_bytes: Vec::new(),
                     stderr: format!("git resolution failed: {e}"),
                 }
             }
         };
         let mut cmd = Command::new(git_exe);
         cmd.env("PATH", &safe_path);
+        // A dedicated `--git-dir` (the orphan-GC scratch repo) redirects every
+        // operation away from the pinned checkout, so reaping that checkout
+        // mid-sweep cannot fail the sweep. It must precede the subcommand args.
+        if let Some(gd) = &self.git_dir {
+            cmd.arg("--git-dir").arg(gd);
+        }
         cmd.arg("-c").arg("credential.helper=");
         // Out-of-band credential (if any) must be configured with its `-c` flags
         // BEFORE the git subcommand args. The returned guard owns the 0600 secret
@@ -834,6 +869,7 @@ impl GitRunner {
                     return GitOut {
                         status: None,
                         stdout: String::new(),
+                        stdout_bytes: Vec::new(),
                         stderr: format!("credential setup failed: {e}"),
                     }
                 }
@@ -890,6 +926,7 @@ impl GitRunner {
             return GitOut {
                 status: None,
                 stdout: String::new(),
+                stdout_bytes: Vec::new(),
                 stderr: format!("cwd bind failed: {e}"),
             };
         }
@@ -899,6 +936,7 @@ impl GitRunner {
                 return GitOut {
                     status: None,
                     stdout: String::new(),
+                    stdout_bytes: Vec::new(),
                     stderr: format!("spawn failed: {e}"),
                 }
             }
@@ -975,6 +1013,7 @@ impl GitRunner {
                     return GitOut {
                         status: None,
                         stdout: String::new(),
+                        stdout_bytes: Vec::new(),
                         stderr: format!(
                             "git stdout exceeded the {max_stdout}-byte capture cap; \
                              refusing to act on a truncated result"
@@ -988,6 +1027,7 @@ impl GitRunner {
                 GitOut {
                     status: code,
                     stdout: String::from_utf8_lossy(&out).into_owned(),
+                    stdout_bytes: out,
                     stderr,
                 }
             }
@@ -1004,6 +1044,7 @@ impl GitRunner {
                 GitOut {
                     status: None,
                     stdout: String::new(),
+                    stdout_bytes: Vec::new(),
                     stderr: "git timed out".to_string(),
                 }
             }
@@ -1684,17 +1725,25 @@ pub async fn restore_checkpoint(
     if !diff.ok() {
         return refuse(&format!("diff failed: {}", diff.err_text()), false);
     }
-    if diff.stdout.trim().is_empty() {
+    if diff.stdout_bytes().is_empty() {
         return refuse("empty diff", false);
     }
+    // Feed git apply the RAW diff bytes, not the lossy UTF-8 decode: a
+    // `--binary` diff can carry non-UTF-8 hunk content (e.g. Latin-1 without NUL
+    // bytes), and the lossy decode would replace those bytes and corrupt the
+    // patch before it ever reaches the worktree.
     let apply = git
         .run_in(
             &["apply", "--3way", "--whitespace=nowarn"],
             &[],
-            Some(diff.stdout.as_bytes()),
+            Some(diff.stdout_bytes()),
         )
         .await;
-    if !apply.ok() || apply.stderr.to_ascii_lowercase().contains("conflict") {
+    // Detect apply failure by EXIT STATUS, never by diagnostic text: a clean
+    // `--3way` apply prints `Applied patch to 'conflict.rs' cleanly.` — a
+    // substring match on "conflict" would misread that filename as a conflict
+    // and reset away work that applied cleanly.
+    if !apply.ok() {
         let _ = git.run(&["reset", "-q", "--hard", &head]).await;
         let _ = git.run(&["clean", "-fdq"]).await;
         return refuse(

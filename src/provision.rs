@@ -802,6 +802,13 @@ pub struct GitPrep {
     /// (a detached HEAD, or a failed branch cut), not that `branch.push = false`;
     /// finalize then has no branch to enumerate or push.
     pub working_branch: Option<String>,
+    /// The EFFECTIVE base identity the work branch was cut from: the configured
+    /// base (`branch.base`/`repository.base_ref`), else the remote default branch,
+    /// else the checked-out branch a fallback was composed from. Checkpointing
+    /// records THIS as the snapshot's BaseRef trailer so a retry on a generated
+    /// fallback branch can recognise its own checkpoint; `branch.base` alone is
+    /// empty whenever the envelope omits it. `None` only when no base is known.
+    pub effective_base: Option<String>,
     /// Whether the envelope asked for a push (`branch.push`, default true).
     pub want_push: bool,
     /// HEAD at provision time, so finalize can enumerate the agent's new commits
@@ -1292,8 +1299,19 @@ pub async fn prepare_work_branch(
         }
     }
 
+    // The base identity a checkpoint snapshot must record so a retry on a
+    // generated fallback branch recognises it: the configured base when known,
+    // else the remote default, else the checked-out branch a fallback was cut
+    // from. This is what `create_names_base`/`cut_fallback` actually used, so it
+    // stays correct even when `branch.base` is omitted.
+    let effective_base = configured_base
+        .clone()
+        .or_else(|| remote_default.clone())
+        .or_else(|| checked_out.clone());
+
     GitPrep {
         working_branch,
+        effective_base,
         want_push,
         start_sha,
         provision_tips,
@@ -5858,6 +5876,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_base_is_populated_when_branch_base_is_omitted() {
+        // With no explicit `branch.base`, checkpointing must still record the
+        // EFFECTIVE base (the checked-out default branch the fallback is cut
+        // from), or a retry on the generated fallback branch rejects its own
+        // checkpoint for want of a matching BaseRef.
+        let dir = git_workspace("effbase").await;
+        let prep = prepare_work_branch(
+            &dir,
+            &test_repo(),
+            None, // branch.base omitted
+            None,
+            true,
+            "u-eb",
+            Duration::from_secs(30),
+        )
+        .await;
+        // The workspace checks out `main`; with push on and no explicit base, the
+        // effective base resolves to the checked-out default branch.
+        assert_eq!(
+            prep.effective_base.as_deref(),
+            Some("main"),
+            "effective base must be populated even without branch.base"
+        );
+        // An explicit branch.base still wins over the fallback.
+        let dir2 = git_workspace("effbase2").await;
+        let prep2 = prepare_work_branch(
+            &dir2,
+            &test_repo(),
+            Some("release"),
+            None,
+            true,
+            "u-eb2",
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(prep2.effective_base.as_deref(), Some("release"));
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+        let _ = std::fs::remove_dir_all(dir_path(&dir2));
+    }
+
+    #[tokio::test]
     async fn branch_cut_rejects_invalid_explicit_create() {
         // A job-controlled `branch.create` that is not a valid branch name must
         // not be honoured: the checkout stays on the base and no working branch
@@ -7756,6 +7815,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7815,6 +7875,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7839,6 +7900,7 @@ mod tests {
         let dir = empty_base_workspace("unborn-noop").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7886,6 +7948,7 @@ mod tests {
         commit(&dir, "first work").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7944,6 +8007,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -8004,6 +8068,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -8084,6 +8149,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -8154,6 +8220,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -8207,6 +8274,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("main".into()),
+            effective_base: None,
             want_push: false,
             start_sha: Some(start.clone()),
             provision_tips: Some(std::collections::BTreeMap::from([(
@@ -8258,6 +8326,7 @@ mod tests {
         // No prepared work branch and push disabled: the read-only path.
         let prep = GitPrep {
             working_branch: None,
+            effective_base: None,
             want_push: false,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -9440,6 +9509,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -9612,6 +9682,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: None,
+            effective_base: None,
             want_push: false,
             start_sha: Some(start),
             provision_tips: None,
@@ -9691,6 +9762,7 @@ mod tests {
         commit(&dir, "work commit").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -9755,6 +9827,7 @@ mod tests {
         commit(&dir, "work commit").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),

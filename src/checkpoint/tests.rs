@@ -204,6 +204,7 @@ fn err_text_truncation_is_utf8_safe() {
     let out = GitOut {
         status: Some(1),
         stdout: String::new(),
+        stdout_bytes: Vec::new(),
         stderr: s,
     }
     .err_text();
@@ -676,6 +677,101 @@ async fn clean_snapshot_supersedes_a_stale_prior_checkpoint() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A RESUMED run seeds its supersession state from the restored checkpoint. If
+/// the agent then discards the restored work (back to the base) before the first
+/// tick, the seeded `last_tree` (the restored checkpoint's tree) differs from the
+/// now-clean tree, so the tick must publish a clean snapshot that supersedes the
+/// stale remote checkpoint — not skip as `clean` and leave the discarded work to
+/// be restored again after the next interruption.
+#[tokio::test]
+async fn seeded_supersession_state_replaces_a_discarded_restored_checkpoint() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("resumesupersede").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    // Attempt 1: snapshot a WIP file (this is the checkpoint a retry restores).
+    std::fs::write(work.join("WIP.txt"), "in progress\n").unwrap();
+    let snap1 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-r",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "m1",
+    )
+    .await;
+    let (sha1, tree1, head1) = match snap1 {
+        Snapshot::Committed {
+            sha, tree, head, ..
+        } => (sha, tree, head),
+        Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+    };
+
+    // Resume: the supersession seed is the restored checkpoint's (tree, head) —
+    // exactly what `restore()` reads from `FetchedCheckpoint` (`sha^{tree}` +
+    // parent). The agent then DISCARDS the restored file, returning to the base.
+    let seed_tree = git
+        .run(&["rev-parse", "--verify", "-q", &format!("{sha1}^{{tree}}")])
+        .await
+        .out();
+    assert_eq!(seed_tree, tree1, "seed must be the checkpoint's tree");
+    std::fs::remove_file(work.join("WIP.txt")).unwrap();
+
+    // First tick of the resumed run: with the seed, the clean tree differs from
+    // the seeded (stale) tree, so a clean superseding snapshot is produced.
+    let snap2 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-r",
+        Some((seed_tree.as_str(), head1.as_str())),
+        5 * 1024 * 1024,
+        &[],
+        "m2",
+    )
+    .await;
+    match snap2 {
+        Snapshot::Committed { sha, .. } => {
+            let ls = git.run(&["ls-tree", "-r", "--name-only", &sha]).await.out();
+            assert!(
+                !ls.contains("WIP.txt"),
+                "discarded WIP.txt still present: {ls}"
+            );
+        }
+        Snapshot::Skipped { reason } => {
+            panic!("a seeded clean tick must supersede the stale checkpoint, not skip: {reason}")
+        }
+    }
+
+    // Contrast: WITHOUT the seed (the old behaviour) the same clean tick wrongly
+    // reports `clean` and leaves the stale checkpoint in place.
+    let snap3 = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-r",
+        None, // no seed — the bug F5 fixes
+        5 * 1024 * 1024,
+        &[],
+        "m3",
+    )
+    .await;
+    match snap3 {
+        Snapshot::Skipped { reason } => assert_eq!(reason, "clean"),
+        Snapshot::Committed { .. } => {}
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 struct FakeProbe {
     orphan: bool,
 }
@@ -882,6 +978,148 @@ async fn restore_recognises_a_per_activation_fallback_rename() {
     let refused = restore_checkpoint(&git_c, &fetched, Some(branch_b), true, "release").await;
     assert!(!refused.restored);
     assert!(refused.branch_mismatch, "reason: {}", refused.reason);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A diverged restore replays the base→snapshot diff through `git apply`. The
+/// patch must be transported as RAW bytes: a non-UTF-8 hunk (Latin-1 without NUL
+/// bytes) must survive intact, or the apply corrupts/fails the restored content.
+#[tokio::test]
+async fn diverged_restore_preserves_non_utf8_patch_bytes() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("latin1").await;
+    let root_git = runner_at(&root);
+
+    // Worker A commits a Latin-1 (non-UTF-8, no NUL) file on a fallback branch and
+    // snapshots it. `snapshot_worktree` records the configured base ref.
+    let branch_a = "nano/agent-work/main-aaaaaaaaaaaaaaaa-100-200-0";
+    let work_a = root.join("a");
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git_a = runner_at(&work_a);
+    assert!(git_a.run(&["checkout", "-b", branch_a]).await.ok());
+    let base_sha = git_a.run(&["rev-parse", "HEAD"]).await.out();
+    // 0xE9 = 'é' in Latin-1: a lone continuation-invalid byte, no NUL.
+    std::fs::write(
+        work_a.join("latin1.txt"),
+        [b"caf".as_slice(), &[0xE9u8], b"\n"].concat(),
+    )
+    .unwrap();
+    let snap = snapshot_worktree(
+        &git_a,
+        &base_sha,
+        "main",
+        "run-l1",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "nano: WIP checkpoint",
+    )
+    .await;
+    let sha = match snap {
+        Snapshot::Committed { sha, .. } => sha,
+        Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+    };
+    let reference = checkpoint_ref("elem-l1").unwrap();
+    assert_eq!(
+        push_checkpoint(&git_a, &reference, &sha, "", "origin").await,
+        PushResult::Ok
+    );
+
+    // Worker B: a DIFFERENT activation whose HEAD has advanced past the snapshot's
+    // parent (diverged), forcing the 3-way patch path. Its fallback branch shares
+    // the base segment but has a fresh uniq.
+    let branch_b = "nano/agent-work/main-bbbbbbbbbbbbbbbb-101-201-1";
+    let work_b = root.join("b");
+    assert!(root_git.run(&["clone", "remote.git", "b"]).await.ok());
+    let git_b = runner_at(&work_b);
+    assert!(git_b.run(&["checkout", "-b", branch_b]).await.ok());
+    // Advance HEAD so the restore is genuinely diverged (not a fast-forward).
+    std::fs::write(work_b.join("other.txt"), "unrelated\n").unwrap();
+    commit_all(&git_b, "advance head").await;
+
+    let fetched = fetch_checkpoint(&git_b, &reference, "origin")
+        .await
+        .unwrap()
+        .expect("checkpoint present");
+    let ok = restore_checkpoint(&git_b, &fetched, Some(branch_b), true, "main").await;
+    assert!(ok.restored, "diverged restore refused: {}", ok.reason);
+    // The non-UTF-8 byte must survive the patch round-trip byte-for-byte.
+    let restored = std::fs::read(work_b.join("latin1.txt")).unwrap();
+    assert_eq!(
+        restored,
+        [b"caf".as_slice(), &[0xE9u8], b"\n"].concat(),
+        "non-UTF-8 content corrupted by lossy patch decoding"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A clean `git apply --3way` prints `Applied patch to 'conflict.rs' cleanly.`
+/// for a file named `conflict.rs`. Apply-failure detection must use the EXIT
+/// STATUS, not a "conflict" substring match, or that filename is misread as a
+/// conflict and the cleanly-restored work is reset away.
+#[tokio::test]
+async fn diverged_restore_does_not_mistake_a_conflict_named_file_for_a_conflict() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("conflictname").await;
+    let root_git = runner_at(&root);
+
+    let branch_a = "nano/agent-work/main-aaaaaaaaaaaaaaaa-100-200-0";
+    let work_a = root.join("a");
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git_a = runner_at(&work_a);
+    assert!(git_a.run(&["checkout", "-b", branch_a]).await.ok());
+    let base_sha = git_a.run(&["rev-parse", "HEAD"]).await.out();
+    // A file literally named `conflict.rs`, with content that applies cleanly.
+    std::fs::write(work_a.join("conflict.rs"), "fn conflict() {}\n").unwrap();
+    let snap = snapshot_worktree(
+        &git_a,
+        &base_sha,
+        "main",
+        "run-cf",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "nano: WIP checkpoint",
+    )
+    .await;
+    let sha = match snap {
+        Snapshot::Committed { sha, .. } => sha,
+        Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+    };
+    let reference = checkpoint_ref("elem-cf").unwrap();
+    assert_eq!(
+        push_checkpoint(&git_a, &reference, &sha, "", "origin").await,
+        PushResult::Ok
+    );
+
+    let branch_b = "nano/agent-work/main-bbbbbbbbbbbbbbbb-101-201-1";
+    let work_b = root.join("b");
+    assert!(root_git.run(&["clone", "remote.git", "b"]).await.ok());
+    let git_b = runner_at(&work_b);
+    assert!(git_b.run(&["checkout", "-b", branch_b]).await.ok());
+    std::fs::write(work_b.join("other.txt"), "unrelated\n").unwrap();
+    commit_all(&git_b, "advance head").await;
+
+    let fetched = fetch_checkpoint(&git_b, &reference, "origin")
+        .await
+        .unwrap()
+        .expect("checkpoint present");
+    let ok = restore_checkpoint(&git_b, &fetched, Some(branch_b), true, "main").await;
+    assert!(
+        ok.restored,
+        "a file named conflict.rs must not be misread as a merge conflict: {}",
+        ok.reason
+    );
+    assert_eq!(
+        std::fs::read_to_string(work_b.join("conflict.rs")).unwrap(),
+        "fn conflict() {}\n"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

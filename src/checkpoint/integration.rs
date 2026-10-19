@@ -94,11 +94,21 @@ struct Plan {
 /// doing so (the previous behaviour) laundered a concurrent sibling's write into
 /// our lease and let us clobber it. If a push is rejected for a stale lease, a
 /// sibling holds the ref — we drop ownership and stop publishing to it.
+#[derive(Clone)]
 struct RefLease {
     reference: String,
     /// The sha our lease is currently pinned to (`""` demands absence).
     expect: String,
     owned: bool,
+}
+
+/// The periodic loop's per-ref leases, shared with the finalize path so
+/// [`CheckpointGuard::finish`] deletes ONLY against the shas THIS attempt last
+/// wrote — never a freshly re-observed remote value, which could name a
+/// replacement attempt's ref that we no longer own.
+struct LeaseState {
+    own: std::sync::Mutex<RefLease>,
+    recovered: std::sync::Mutex<RefLease>,
 }
 
 impl RefLease {
@@ -160,11 +170,24 @@ struct RestoreOutcome {
     seed_own: Option<String>,
     /// Lease seed for our recovery ref (only when it is genuinely ours already).
     seed_rec: Option<String>,
+    /// Supersession seed for the periodic loop's `last_tree`: the restored
+    /// checkpoint's `(tree, head)`. Without it a resumed run that the agent
+    /// reverts to the provisioned base before the first tick keeps reporting
+    /// `clean` (no prior push this session), so the stale remote checkpoint is
+    /// never superseded and the discarded work returns on the next interruption.
+    seed_tree: Option<(String, String)>,
 }
 
 /// Begin checkpointing for a provisioned job. Restores a prior checkpoint (own or
 /// an explicitly adopted predecessor), launches the throttled orphan sweep, and
 /// starts the periodic background checkpointer. Best-effort throughout.
+///
+/// `effective_base` is provisioning's EFFECTIVE base identity
+/// (`GitPrep::effective_base`): the configured base, else the remote default /
+/// checked-out branch the fallback was cut from. This is what the snapshot's
+/// BaseRef trailer must record so a retry on a generated fallback branch
+/// recognises its own checkpoint; `base_ref` alone is empty whenever
+/// `branch.base` is omitted.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
     agent_cwd: &CwdHandle,
@@ -172,6 +195,7 @@ pub async fn start(
     branch_push: bool,
     working_branch: Option<&str>,
     base_ref: Option<&str>,
+    effective_base: Option<&str>,
     element_instance_key: &str,
     element_id: &str,
     run_id: &str,
@@ -233,7 +257,9 @@ pub async fn start(
         recovered_ref,
         working_branch: working_branch.unwrap_or("").to_string(),
         base_sha: base_sha.unwrap_or("").to_string(),
-        base_ref: base_ref.unwrap_or("").to_string(),
+        // Record provisioning's EFFECTIVE base (falling back to the configured
+        // `branch.base`), never an empty string when only the former is known.
+        base_ref: effective_base.or(base_ref).unwrap_or("").to_string(),
         run_id: run_id.to_string(),
         remote: "origin".to_string(),
         secret_values: normalize_secret_values(&credentials_from_url(repo_url)),
@@ -254,6 +280,7 @@ pub async fn start(
         runner,
         outcome.seed_own,
         outcome.seed_rec,
+        outcome.seed_tree,
     );
 
     StartResult {
@@ -276,6 +303,7 @@ async fn restore(
         note: None,
         seed_own: None,
         seed_rec: None,
+        seed_tree: None,
     };
     let self_ref = plan.own_ref.as_str();
     let predecessor = predecessor_checkpoint_ref(variables, Some(self_ref), Some(element_id));
@@ -304,12 +332,38 @@ async fn restore(
             ));
             let note = checkpoint_restored_note(&result);
             outcome.note = (!note.is_empty()).then_some(note);
+            // Seed the periodic loop's supersession state from the checkpoint we
+            // just restored. Otherwise `last_tree` starts empty, so an agent that
+            // reverts the restored work back to the provisioned base before the
+            // first tick keeps producing a `clean` snapshot (no prior push this
+            // session) and the stale remote checkpoint is never superseded — the
+            // discarded work would then return after the next interruption.
+            let tree = runner
+                .run(&[
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("{}^{{tree}}", fetched.sha),
+                ])
+                .await
+                .out();
+            if !tree.is_empty() {
+                outcome.seed_tree = Some((tree, fetched.parent.clone()));
+            }
             if reference == self_ref {
-                // Self-resume: both of our refs already hold this sha; lease
-                // against it so our first periodic push advances rather than
-                // (re)creating.
+                // Self-resume: our WIP ref already holds this sha; lease against
+                // it so our first periodic push advances rather than (re)creating.
                 outcome.seed_own = Some(fetched.sha.clone());
-                outcome.seed_rec = Some(fetched.sha.clone());
+                // The RECOVERY ref is leased independently: each tick pushes WIP
+                // first, so an interruption (or a failed recovery push) can leave
+                // recovery absent or at an OLDER sha than the WIP we just read.
+                // Seeding its lease from the WIP sha would then be rejected as a
+                // stale lease and disable recovery updates for the whole run.
+                // Observe the recovery ref ONCE to establish its own baseline —
+                // create-only when absent — and thereafter advance it only on our
+                // own successful writes.
+                let rec = observe_remote_ref_sha(runner, &plan.recovered_ref, &plan.remote).await;
+                outcome.seed_rec = (!rec.is_empty()).then_some(rec);
             } else {
                 // Adopted an explicit predecessor: copy its snapshot onto OUR WIP
                 // ref NOW (create-only), BEFORE the orphan sweep can reclaim the
@@ -347,6 +401,49 @@ async fn restore(
     outcome
 }
 
+/// A daemon-owned scratch repository the orphan-GC sweep runs against. The sweep
+/// fetches candidate refs into local `refs/nano-gc/*` and reads their commit
+/// times; doing that in the JOB's checkout ties the sweep's lifetime to a
+/// checkout that settlement may reap mid-sweep (removing its `.git`), failing
+/// every subsequent git op while the hourly throttle suppresses a retry. A
+/// dedicated, persistent repo under the daemon's temp dir outlives any single
+/// job, so reaping never interrupts a sweep.
+///
+/// The repo is PERSISTENT (one per uid, reused across sweeps) and is never
+/// removed by the sweep: it holds only transient `refs/nano-gc/*` temp refs the
+/// sweep itself cleans up, so it stays tiny, and deleting it on drop would race a
+/// concurrent sweep that resolved the same path. Returns the `--git-dir` path, or
+/// `None` when the repo cannot be prepared (the sweep then skips, best-effort).
+async fn sweep_scratch_repo(runner: &GitRunner) -> Option<std::path::PathBuf> {
+    let git_dir = std::env::temp_dir()
+        .join(format!("nano-gc-scratch-{}", current_uid()))
+        .join("repo.git");
+    // `git init --bare` is idempotent for an existing repo, so this both creates
+    // the scratch repo on first use and validates it on reuse.
+    std::fs::create_dir_all(&git_dir).ok()?;
+    let init = runner
+        .run(&["init", "--bare", "--quiet", &git_dir.to_string_lossy()])
+        .await;
+    if !init.ok() {
+        return None;
+    }
+    Some(git_dir)
+}
+
+/// The uid for the scratch-repo name (isolates one user's daemon from another's
+/// in the world-writable temp dir). `libc` is already a daemon dependency.
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` is async-signal-safe and always succeeds.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::id()
+    }
+}
+
 /// Run the orphan GC sweep opportunistically, throttled to `gc_every_ms` across
 /// the whole process. Spawned detached so it never adds latency to the job.
 fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jobs) {
@@ -371,6 +468,18 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
     };
     let plan = plan.clone();
     tokio::spawn(async move {
+        // Run the sweep against a dedicated scratch repo (`--git-dir`) that
+        // outlives this job's checkout. Otherwise the sweep fetches/reads
+        // `refs/nano-gc/*` inside the job's `.git`, which settlement may reap
+        // mid-sweep — failing every later git op while the hourly throttle
+        // suppresses a retry (so repeated short jobs starve reclamation).
+        let Some(git_dir) = sweep_scratch_repo(&runner).await else {
+            crate::runtime::log(
+                "checkpoint: orphan sweep skipped — could not prepare a scratch repo",
+            );
+            return;
+        };
+        let runner = runner.with_git_dir(git_dir);
         let probe = SdkOrphanProbe { jobs };
         let r = sweep_stale_checkpoints(
             &runner,
@@ -407,19 +516,28 @@ fn spawn_periodic(
     finalize_runner: GitRunner,
     seed_own: Option<String>,
     seed_rec: Option<String>,
+    seed_tree: Option<(String, String)>,
 ) -> Option<CheckpointGuard> {
     let loop_runner = runner_for(agent_cwd, repo_url, &plan.config)?;
     let stop = Arc::new(Notify::new());
     let stop_loop = stop.clone();
     let loop_plan = plan.clone();
+    // The leases live in a shared state so finalize (`CheckpointGuard::finish`)
+    // deletes against the shas THIS attempt last owned, not a fresh observation.
+    let leases = Arc::new(LeaseState {
+        own: std::sync::Mutex::new(RefLease::new(plan.own_ref.clone(), seed_own)),
+        recovered: std::sync::Mutex::new(RefLease::new(plan.recovered_ref.clone(), seed_rec)),
+    });
+    let loop_leases = leases.clone();
     let handle = tokio::spawn(async move {
-        periodic_loop(loop_runner, loop_plan, stop_loop, seed_own, seed_rec).await;
+        periodic_loop(loop_runner, loop_plan, stop_loop, loop_leases, seed_tree).await;
     });
     Some(CheckpointGuard {
         handle,
         stop,
         plan,
         runner: finalize_runner,
+        leases,
         finished: false,
     })
 }
@@ -428,14 +546,15 @@ async fn periodic_loop(
     runner: GitRunner,
     plan: Arc<Plan>,
     stop: Arc<Notify>,
-    seed_own: Option<String>,
-    seed_rec: Option<String>,
+    leases: Arc<LeaseState>,
+    seed_tree: Option<(String, String)>,
 ) {
     let first = Duration::from_millis(plan.config.min_interval_ms);
     let interval = Duration::from_millis(plan.config.interval_ms.max(plan.config.min_interval_ms));
-    let mut own_lease = RefLease::new(plan.own_ref.clone(), seed_own);
-    let mut rec_lease = RefLease::new(plan.recovered_ref.clone(), seed_rec);
-    let mut last_tree: Option<(String, String)> = None;
+    // Supersession state is seeded from a restored checkpoint so a resume →
+    // discard → first-tick still publishes the clean snapshot that replaces the
+    // stale remote one (rather than reporting `clean` and leaving it in place).
+    let mut last_tree: Option<(String, String)> = seed_tree;
     let mut delay = first;
     loop {
         tokio::select! {
@@ -447,8 +566,7 @@ async fn periodic_loop(
             &runner,
             &plan,
             last_tree.as_ref().map(|(t, h)| (t.as_str(), h.as_str())),
-            &mut own_lease,
-            &mut rec_lease,
+            &leases,
         )
         .await
         {
@@ -466,33 +584,38 @@ async fn periodic_loop(
     }
 }
 
-/// Push `sha` to `lease.reference`, leased against the sha WE last held (never a
-/// freshly re-observed remote value). Advances the lease only on our own
-/// successful write; drops ownership on a stale-lease rejection.
-async fn lease_push(
+/// Two-phase lease push against a SHARED (mutexed) lease, so no lock guard is
+/// held across the `.await` (which would make the future `!Send`). We snapshot
+/// `(owned, expect, reference)` under the lock, push outside it, then re-lock to
+/// fold the result in. The periodic loop is the sole writer and `finish` only
+/// reads, so the lease cannot change between the two locks.
+async fn lease_push_shared(
     runner: &GitRunner,
     remote: &str,
-    lease: &mut RefLease,
+    lock: &std::sync::Mutex<RefLease>,
     sha: &str,
 ) -> PushResult {
-    if !lease.owned {
+    let (owned, expect, reference) = {
+        let l = lock.lock().unwrap();
+        (l.owned, l.expect.clone(), l.reference.clone())
+    };
+    if !owned {
         return PushResult::StaleLease {
             error: "ownership already lost".into(),
         };
     }
-    let res = push_checkpoint(runner, &lease.reference, sha, &lease.expect, remote).await;
-    lease.apply(&res, sha);
+    let res = push_checkpoint(runner, &reference, sha, &expect, remote).await;
+    lock.lock().unwrap().apply(&res, sha);
     res
 }
 
 /// Snapshot the worktree and push it to the WIP ref (and promote the GC-proof
-/// recovery ref), each under its own ownership lease.
+/// recovery ref), each under its own ownership lease held in the shared state.
 async fn push_snapshot(
     runner: &GitRunner,
     plan: &Plan,
     last_tree: Option<(&str, &str)>,
-    own_lease: &mut RefLease,
-    rec_lease: &mut RefLease,
+    leases: &LeaseState,
 ) -> TickOutcome {
     let snap = snapshot_worktree(
         runner,
@@ -529,7 +652,7 @@ async fn push_snapshot(
             return TickOutcome::Idle;
         }
     };
-    match lease_push(runner, &plan.remote, own_lease, &sha).await {
+    match lease_push_shared(runner, &plan.remote, &leases.own, &sha).await {
         PushResult::Ok => {}
         PushResult::StaleLease { .. } => return TickOutcome::OwnershipLost,
         PushResult::Error { error } => {
@@ -543,7 +666,7 @@ async fn push_snapshot(
     // Promote a GC-proof recovery copy so a human escalation can still be resumed
     // even if the per-checkpoint WIP ref is later reclaimed (#295). A lost recovery
     // lease (a sibling holds it) is non-fatal: our WIP ref still carries the work.
-    let _ = lease_push(runner, &plan.remote, rec_lease, &sha).await;
+    let _ = lease_push_shared(runner, &plan.remote, &leases.recovered, &sha).await;
     TickOutcome::Pushed(tree, head)
 }
 
@@ -553,6 +676,7 @@ pub struct CheckpointGuard {
     stop: Arc<Notify>,
     plan: Arc<Plan>,
     runner: GitRunner,
+    leases: Arc<LeaseState>,
     finished: bool,
 }
 
@@ -560,31 +684,42 @@ impl CheckpointGuard {
     /// Stop the periodic loop and finalize. On success the WIP and recovery refs
     /// are deleted (the work is now published); on failure the last checkpoint is
     /// left in place for a resumed run.
+    ///
+    /// Deletion is leased against the shas THIS attempt last wrote (the shared
+    /// lease state), never a freshly re-observed remote value: after a concurrent
+    /// replacement attempt advances the refs, a fresh observation would name ITS
+    /// sha as deletion authority and let a successful finalize delete the
+    /// replacement's in-progress WIP/recovery refs. A ref whose lease we lost (or
+    /// never wrote) is left for the orphan sweep instead.
     pub async fn finish(mut self, success: bool) {
         self.finished = true;
         self.stop.notify_waiters();
         self.handle.abort();
         let _ = (&mut self.handle).await;
         if success {
-            let expect =
-                observe_remote_ref_sha(&self.runner, &self.plan.own_ref, &self.plan.remote).await;
-            let _ = delete_checkpoint_ref(
-                &self.runner,
-                &self.plan.own_ref,
-                &self.plan.remote,
-                Some(&expect),
-            )
-            .await;
-            let expect_rec =
-                observe_remote_ref_sha(&self.runner, &self.plan.recovered_ref, &self.plan.remote)
-                    .await;
-            let _ = delete_checkpoint_ref(
-                &self.runner,
-                &self.plan.recovered_ref,
-                &self.plan.remote,
-                Some(&expect_rec),
-            )
-            .await;
+            // Snapshot each lease under its lock, then delete only the sha we
+            // last owned. `expect == ""` means we never wrote the ref (create-only
+            // baseline): there is nothing of ours to delete, so skip it.
+            let own = self.leases.own.lock().unwrap().clone();
+            if own.owned && !own.expect.is_empty() {
+                let _ = delete_checkpoint_ref(
+                    &self.runner,
+                    &self.plan.own_ref,
+                    &self.plan.remote,
+                    Some(&own.expect),
+                )
+                .await;
+            }
+            let rec = self.leases.recovered.lock().unwrap().clone();
+            if rec.owned && !rec.expect.is_empty() {
+                let _ = delete_checkpoint_ref(
+                    &self.runner,
+                    &self.plan.recovered_ref,
+                    &self.plan.remote,
+                    Some(&rec.expect),
+                )
+                .await;
+            }
         }
     }
 }
@@ -714,5 +849,56 @@ mod tests {
         let lease = RefLease::new(OWN.to_string(), None);
         assert_eq!(lease.expect, "");
         assert!(lease.owned);
+    }
+
+    #[test]
+    fn recovery_lease_is_seeded_independently_of_the_wip_ref() {
+        // The recovery ref can be ABSENT or at an OLDER sha than the WIP ref (each
+        // tick pushes WIP first, so an interruption can leave them apart). Seeding
+        // the recovery lease from the WIP sha would be rejected as a stale lease.
+        // A `None` seed (absent recovery) must stay create-only, and an observed
+        // recovery sha must seed only the recovery lease — never the WIP sha.
+        let rec_absent = RefLease::new("refs/nano/recovered/e".to_string(), None);
+        assert_eq!(rec_absent.expect, "", "absent recovery ref => create-only");
+        let rec_observed = RefLease::new(
+            "refs/nano/recovered/e".to_string(),
+            Some("older-rec-sha".to_string()),
+        );
+        assert_eq!(rec_observed.expect, "older-rec-sha");
+        assert_ne!(
+            rec_observed.expect, "wip-sha",
+            "must not borrow the WIP sha"
+        );
+    }
+
+    #[test]
+    fn finish_deletes_only_refs_this_attempt_still_owns() {
+        // The finalize path must delete ONLY against the sha THIS attempt last
+        // wrote, and skip a ref whose lease was lost (a sibling holds it) or never
+        // written (create-only baseline). Model the guard's per-ref decision.
+        fn may_delete(lease: &RefLease) -> Option<&str> {
+            if lease.owned && !lease.expect.is_empty() {
+                Some(lease.expect.as_str())
+            } else {
+                None
+            }
+        }
+        // Owned with a real last-written sha => delete against it.
+        let mut owned = RefLease::new(OWN.to_string(), Some("aaa".into()));
+        owned.apply(&PushResult::Ok, "bbb");
+        assert_eq!(may_delete(&owned), Some("bbb"));
+        // Ownership lost (stale lease) => do NOT delete the replacement's ref.
+        let mut lost = RefLease::new(OWN.to_string(), Some("aaa".into()));
+        lost.apply(
+            &PushResult::StaleLease {
+                error: "rejected".into(),
+            },
+            "bbb",
+        );
+        assert_eq!(may_delete(&lost), None);
+        // Never wrote (create-only baseline, no successful push) => nothing of
+        // ours to delete.
+        let unwritten = RefLease::new(OWN.to_string(), None);
+        assert_eq!(may_delete(&unwritten), None);
     }
 }

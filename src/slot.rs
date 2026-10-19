@@ -2377,6 +2377,11 @@ async fn execute(
             branch_push,
             prep.working_branch.as_deref(),
             branch_base.as_deref(),
+            // Provisioning's effective base (configured base, else remote default,
+            // else the checked-out branch the fallback was cut from) — recorded as
+            // the snapshot BaseRef so a retry on a generated fallback branch
+            // recognises its checkpoint even when `branch.base` is omitted.
+            prep.effective_base.as_deref(),
             job.element_instance_key.value(),
             job.element_id.value(),
             &key,
