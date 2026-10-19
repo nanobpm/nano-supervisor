@@ -188,11 +188,31 @@ jobs:
           export NS_BIN="$PWD/target/debug/nano-supervisor"
           cargo test -p contract-tests --locked --test cli --test state --test socket --test phantom_status -- --nocapture
 
+  # Parity-ledger coverage gate (issue #57): every behaviour-changing plugin
+  # issue (those labelled `behaviour-change`, open or closed) must have a row in
+  # `contract-tests/PARITY.md`. This is the Rust-side counterpart of the JS PR
+  # template's parity checkbox — it fails when a JS behaviour change lands without
+  # a disposition. `scripts/parity-ledger` resolves the plugin repo with `gh`, so
+  # it needs a token; it is a tiny, worker-free job, so the token cannot leak into
+  # any spawned plugin/agent process (the same least-privilege split the parity
+  # guard uses).
+  parity-ledger:
+    name: parity ledger
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: parity-ledger coverage gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/parity-ledger
+
   # Single required status for branch protection: add jobs above, not to the ruleset.
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [lint, test, contract-tests-node, contract-tests-rust]
+    needs: [lint, test, contract-tests-node, contract-tests-rust, parity-ledger]
     runs-on: ubuntu-latest
     steps:
       - name: all jobs passed
@@ -202,3 +222,4 @@ jobs:
           test "${{ needs.test.result }}" = success
           test "${{ needs.contract-tests-node.result }}" = success
           test "${{ needs.contract-tests-rust.result }}" = success
+          test "${{ needs.parity-ledger.result }}" = success
