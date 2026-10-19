@@ -10,12 +10,20 @@
 //! with a TTL and re-read on a worker-lifetime cadence **off the job path**, so
 //! a rotated login is adopted within an interval without ever blocking a job.
 //!
-//! The cache keeps the **FD / no-env-leak** guarantees of the credential
-//! delivery from #24/#62: the token value never rides argv (the scopes probe
-//! passes it to `gh` via `GH_TOKEN` in the child env, exactly like
-//! [`crate::provision`]'s delivery) and is never logged — only its
+//! The cache keeps the credential-handling guarantees of the delivery from
+//! #24/#62: the token value never rides argv and is never logged — only its
 //! non-reversible **fingerprint** and OAuth **scopes** appear in logs and the
-//! supervisor activity marker.
+//! supervisor activity marker. The scopes probe passes the token to `gh` via
+//! `GH_TOKEN` in the child env, exactly like [`crate::provision`]'s delivery —
+//! and, like that path, this **accepts** the sanctioned same-UID
+//! `/proc/<pid>/environ` exposure rather than claiming full environment
+//! isolation: `gh` has no file/FD secret-input channel short of a `hosts.yml`
+//! under `GH_CONFIG_DIR`, so the env delivery re-creates, for `gh`, the
+//! `/proc/<pid>/environ` exposure #24 removed for `git`. This is an explicitly
+//! accepted exception (see `provision.rs`'s `gh_auth_env` note and the #24/#49
+//! decision): a same-UID attacker can already read the operator's
+//! `~/.config/gh` credentials directly, so hardening only this path buys
+//! nothing.
 //!
 //! The design mirrors the plugin so the parity ledger (#57) can cite it:
 //!
