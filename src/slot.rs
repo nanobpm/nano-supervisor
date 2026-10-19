@@ -2174,6 +2174,22 @@ fn may_reap_completed_run(
     !(provisioned && has_commits && !pushed)
 }
 
+/// Whether the WIP/recovery checkpoint refs may be DELETED on finalize. The
+/// checkpoint is a safety net for UNPUBLISHED work, so a bare `Settle::Complete`
+/// is not enough: the work must be durably published — its commits reached the
+/// real branch (`pushed`), or there was nothing to publish (`!has_commits`) — and
+/// the checkout must not be flagged for retention (`!retained`). Otherwise the
+/// commits may live ONLY in the soon-reaped run dir, so the checkpoint must be
+/// preserved for a resumed run to adopt.
+fn checkpoint_deletion_durable(
+    complete: bool,
+    retained: bool,
+    pushed: bool,
+    has_commits: bool,
+) -> bool {
+    complete && !retained && (pushed || !has_commits)
+}
+
 async fn execute(
     cfg: Arc<SlotConfig>,
     key: String,
@@ -2703,13 +2719,24 @@ async fn execute(
         Settle::Complete(vars)
     };
 
-    // Finalize checkpointing (#66): on success the work is now published, so the
-    // periodic loop is stopped and the WIP + recovery refs are deleted; on
-    // failure the loop is stopped but the last checkpoint is LEFT on the remote
-    // for a resumed run to adopt. Must run while the checkout still exists (the
-    // reap below may delete the run dir).
+    // Finalize checkpointing (#66): the WIP + recovery refs are a safety net for
+    // UNPUBLISHED work, so they may be deleted ONLY once the work is durably
+    // published — i.e. the run settled successfully AND its commits reached the
+    // real branch (`pushed`), or there was nothing to publish (`!has_commits`),
+    // AND finalize did not flag the checkout for retention (`!retain`). A
+    // `Settle::Complete` is NOT by itself proof of durable success: a completed
+    // round can still leave commits only in this (soon-reaped) run dir. When the
+    // work is not durably published, STOP the loop but LEAVE the last checkpoint
+    // on the remote for a resumed run to adopt. Must run while the checkout still
+    // exists (the reap below may delete the run dir).
     if let Some(guard) = checkpoint_guard.take() {
-        guard.finish(matches!(settle, Settle::Complete(_))).await;
+        let durable = checkpoint_deletion_durable(
+            matches!(settle, Settle::Complete(_)),
+            retain,
+            pushed,
+            has_commits,
+        );
+        guard.finish(durable).await;
     }
 
     // Reap the run directory unless `--keep-runs`. Only successful runs are
@@ -6515,6 +6542,26 @@ mod tests {
         // A non-repository run never holds commits, so it is always reapable.
         assert!(may_reap_completed_run(false, false, false, false));
         assert!(may_reap_completed_run(false, true, false, false));
+    }
+
+    #[test]
+    fn checkpoint_refs_deleted_only_when_work_is_durable() {
+        // The WIP/recovery checkpoint refs guard UNPUBLISHED work, so a bare
+        // successful settle does NOT license deleting them. Delete only when the
+        // run completed AND the work is durable (pushed, or nothing to publish)
+        // AND the checkout was not retained.
+        // Completed + pushed commits -> durable, safe to delete.
+        assert!(checkpoint_deletion_durable(true, false, true, true));
+        // Completed + commits but NOT pushed -> the commits live only in the
+        // soon-reaped run dir; PRESERVE the checkpoint.
+        assert!(!checkpoint_deletion_durable(true, false, false, true));
+        // Completed with nothing to publish -> no work at risk, safe to delete.
+        assert!(checkpoint_deletion_durable(true, false, false, false));
+        // Retained checkout (stranded work / inconclusive scan) -> PRESERVE even
+        // though commits were pushed.
+        assert!(!checkpoint_deletion_durable(true, true, true, true));
+        // Not a successful settle -> never delete.
+        assert!(!checkpoint_deletion_durable(false, false, true, false));
     }
 
     #[cfg(unix)]

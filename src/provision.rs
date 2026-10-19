@@ -2110,6 +2110,15 @@ async fn finalize_git_with_deadline(
                     if refname.starts_with("refs/heads/") {
                         continue;
                     }
+                    // Nano's own checkpoint machinery (#66) materialises local
+                    // refs under `refs/nano/` (fetched WIP/recovery snapshots) and
+                    // `refs/nano-gc/` (sweep bookkeeping). Their commits are WIP
+                    // SNAPSHOTS, not stranded agent work — counting them would make
+                    // finalize treat every checkpoint-enabled run as having unpushed
+                    // work and refuse to push. Skip them exactly like local heads.
+                    if refname.starts_with("refs/nano/") || refname.starts_with("refs/nano-gc/") {
+                        continue;
+                    }
                     // `%(*objectname)` is the peeled commit for an annotated tag
                     // and empty otherwise; prefer it, else the direct object.
                     let direct = parts.next().unwrap_or("");
@@ -6431,6 +6440,90 @@ mod tests {
         assert!(
             res.retain,
             "a stranded detached-HEAD commit must set retain (the reflog scan finds it)"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_ignores_parked_nano_checkpoint_refs() {
+        // nano's checkpoint machinery (#66) materialises LOCAL refs under
+        // `refs/nano/...` (fetched WIP/recovery snapshots) and `refs/nano-gc/...`
+        // (sweep bookkeeping). Their commits are checkpoint SNAPSHOTS, not
+        // stranded agent work — the stranded-work scan must SKIP them (like
+        // `refs/heads/`), or every checkpoint-enabled run would be wrongly
+        // retained and refuse to push. Without the skip, the parked commit below
+        // is enumerated as stranded work and this test goes red (retain=true).
+        let dir = git_workspace("fin-nano-ref").await;
+        let t = Duration::from_secs(30);
+        let prep = prepare_work_branch(
+            &dir,
+            &test_repo(),
+            None,
+            Some("feat/work"),
+            true,
+            "u-nano",
+            t,
+        )
+        .await;
+        assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
+        // Park a snapshot commit under nano refs WITHOUT moving HEAD (exactly as
+        // `fetch_checkpoint` leaves a local WIP ref behind), so the HEAD-reflog
+        // net cannot independently catch it — this isolates the `refs/nano*` skip.
+        let head = git(&["rev-parse".into(), "HEAD".into()], Some(&dir), t, None)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = git(
+            &["rev-parse".into(), "HEAD^{tree}".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        let parked = git(
+            &[
+                "-c".into(),
+                "user.email=t@t".into(),
+                "-c".into(),
+                "user.name=t".into(),
+                "commit-tree".into(),
+                tree,
+                "-p".into(),
+                head,
+                "-m".into(),
+                "nano: WIP checkpoint".into(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        for reference in ["refs/nano/wip/elem-x", "refs/nano-gc/elem-x"] {
+            git(
+                &["update-ref".into(), reference.into(), parked.clone()],
+                Some(&dir),
+                t,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
+        assert!(
+            !res.retain,
+            "nano checkpoint refs are snapshots, not stranded work, and must not force retain"
+        );
+        assert!(
+            !res.scan_incomplete,
+            "the stranded-work scan must complete, not bail, in the presence of nano refs"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }

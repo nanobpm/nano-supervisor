@@ -162,8 +162,14 @@ fn rotating_batch_bounds_and_rotates() {
     assert_eq!(b.len(), 25);
     // Rotating: different `now_ms` offsets select different windows, so refs
     // starved by one window are eventually covered by another.
-    let w0: Vec<String> = rotating_batch(mk(100), 25, 0).into_iter().map(|e| e.0).collect();
-    let w1: Vec<String> = rotating_batch(mk(100), 25, 40).into_iter().map(|e| e.0).collect();
+    let w0: Vec<String> = rotating_batch(mk(100), 25, 0)
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    let w1: Vec<String> = rotating_batch(mk(100), 25, 40)
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
     assert_ne!(w0, w1);
     // A zero batch still makes progress (never selects nothing).
     assert_eq!(rotating_batch(mk(5), 0, 0).len(), 1);
@@ -577,7 +583,6 @@ async fn restore_refuses_off_branch_snapshot() {
         parent: head,
         base: String::new(),
         base_ref: String::new(),
-        run_id: String::new(),
         branch: "some-other-branch".to_string(),
     };
     let r = restore_checkpoint(&git, &fetched, Some(&branch), false, "").await;
@@ -606,7 +611,14 @@ async fn clean_snapshot_supersedes_a_stale_prior_checkpoint() {
     // Interval 1: a WIP file is present -> a dirty snapshot is committed.
     std::fs::write(work.join("WIP.txt"), "in progress\n").unwrap();
     let snap1 = snapshot_worktree(
-        &git, &base_sha, "main", "run-c", None, 5 * 1024 * 1024, &[], "m1",
+        &git,
+        &base_sha,
+        "main",
+        "run-c",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "m1",
     )
     .await;
     let (tree1, head1) = match snap1 {
@@ -631,7 +643,9 @@ async fn clean_snapshot_supersedes_a_stale_prior_checkpoint() {
     )
     .await;
     let (tree2, head2) = match snap2 {
-        Snapshot::Committed { sha, tree, head, .. } => {
+        Snapshot::Committed {
+            sha, tree, head, ..
+        } => {
             // The superseding snapshot drops the discarded file.
             let ls = git.run(&["ls-tree", "-r", "--name-only", &sha]).await.out();
             assert!(!ls.contains("WIP.txt"), "stale WIP.txt still present: {ls}");
@@ -753,4 +767,121 @@ fn which_git() -> Option<()> {
         .ok()
         .filter(|o| o.status.success())
         .map(|_| ())
+}
+
+#[test]
+fn fallback_branch_parts_peels_the_full_per_activation_uniq() {
+    // `<uniq>` is EXACTLY `<rand(16hex)>-<pid>-<nanos>-<seq>`; the base is
+    // everything before it, even when the base itself contains dashes.
+    assert_eq!(
+        fallback_branch_parts("nano/agent-work/main-aabbccddeeff0011-1234-99887766-0"),
+        Some((
+            "main".to_string(),
+            "aabbccddeeff0011-1234-99887766-0".to_string()
+        ))
+    );
+    assert_eq!(
+        fallback_branch_parts("nano/agent-work/feat-my-thing-00112233445566ff-7-8-9"),
+        Some((
+            "feat-my-thing".to_string(),
+            "00112233445566ff-7-8-9".to_string()
+        ))
+    );
+    // Two production-shaped activations of the SAME base must compare equal on the
+    // base segment (the bug: the old last-dash split left the pid/nanos glued on).
+    let a = fallback_branch_parts("nano/agent-work/main-aaaaaaaaaaaaaaaa-100-200-0").unwrap();
+    let b = fallback_branch_parts("nano/agent-work/main-bbbbbbbbbbbbbbbb-101-201-1").unwrap();
+    assert_eq!(a.0, b.0);
+    assert_ne!(a.1, b.1);
+}
+
+#[test]
+fn fallback_branch_parts_rejects_malformed_shapes() {
+    // Wrong prefix.
+    assert_eq!(fallback_branch_parts("refs/heads/main"), None);
+    // Too few components (missing seq).
+    assert_eq!(
+        fallback_branch_parts("nano/agent-work/main-aaaaaaaaaaaaaaaa-100-200"),
+        None
+    );
+    // `rand` not hex.
+    assert_eq!(
+        fallback_branch_parts("nano/agent-work/main-zzzz-100-200-0"),
+        None
+    );
+    // `pid` not decimal.
+    assert_eq!(
+        fallback_branch_parts("nano/agent-work/main-aaaaaaaaaaaaaaaa-pid-200-0"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn restore_recognises_a_per_activation_fallback_rename() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("fallback-rename").await;
+    let root_git = runner_at(&root);
+
+    // Worker A runs on a generated fallback branch cut from `main` and snapshots
+    // its WIP (recording `main` as the configured base ref).
+    let branch_a = "nano/agent-work/main-aaaaaaaaaaaaaaaa-100-200-0";
+    let branch_b = "nano/agent-work/main-bbbbbbbbbbbbbbbb-101-201-1";
+    let work_a = root.join("a");
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git_a = runner_at(&work_a);
+    assert!(git_a.run(&["checkout", "-b", branch_a]).await.ok());
+    let base_sha = git_a.run(&["rev-parse", "HEAD"]).await.out();
+    std::fs::write(work_a.join("WIP.txt"), "in progress\n").unwrap();
+    let snap = snapshot_worktree(
+        &git_a,
+        &base_sha,
+        "main",
+        "run-A",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "nano: WIP checkpoint",
+    )
+    .await;
+    let sha = match snap {
+        Snapshot::Committed { sha, .. } => sha,
+        Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+    };
+    let reference = checkpoint_ref("elem-fb").unwrap();
+    assert_eq!(
+        push_checkpoint(&git_a, &reference, &sha, "", "origin").await,
+        PushResult::Ok
+    );
+
+    // Worker B is a DIFFERENT activation of the same base: its fallback branch has
+    // a fresh `<uniq>`. A restore must recognise the rename (same base segment +
+    // same recorded base ref) and apply the predecessor's WIP.
+    let work_b = root.join("b");
+    assert!(root_git.run(&["clone", "remote.git", "b"]).await.ok());
+    let git_b = runner_at(&work_b);
+    let fetched = fetch_checkpoint(&git_b, &reference, "origin")
+        .await
+        .unwrap()
+        .expect("checkpoint present");
+    assert_eq!(fetched.base_ref, "main");
+
+    let ok = restore_checkpoint(&git_b, &fetched, Some(branch_b), true, "main").await;
+    assert!(ok.restored, "rename not recognised: {}", ok.reason);
+    assert_eq!(
+        std::fs::read_to_string(work_b.join("WIP.txt")).unwrap(),
+        "in progress\n"
+    );
+
+    // A DIFFERENT configured base must NOT cross-restore: same base SEGMENT is not
+    // enough when the recorded base ref differs.
+    let work_c = root.join("c");
+    assert!(root_git.run(&["clone", "remote.git", "c"]).await.ok());
+    let git_c = runner_at(&work_c);
+    let refused = restore_checkpoint(&git_c, &fetched, Some(branch_b), true, "release").await;
+    assert!(!refused.restored);
+    assert!(refused.branch_mismatch, "reason: {}", refused.reason);
+
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -941,9 +941,11 @@ impl GitRunner {
             };
             let read_err = async {
                 match stderr_pipe.as_mut() {
-                    Some(e) => crate::provision::drain_capped(e, crate::provision::GIT_STDERR_TAIL)
-                        .await
-                        .0,
+                    Some(e) => {
+                        crate::provision::drain_capped(e, crate::provision::GIT_STDERR_TAIL)
+                            .await
+                            .0
+                    }
                     None => Vec::new(),
                 }
             };
@@ -1303,23 +1305,6 @@ pub async fn push_checkpoint(
     }
 }
 
-/// Push an arbitrary `sha` to `ref` (recovery-ref promotion / predecessor adoption),
-/// leased against `expect_sha` (`""` demands absence — create-only).
-pub async fn push_named_ref(
-    git: &GitRunner,
-    reference: &str,
-    sha: &str,
-    expect_sha: &str,
-    remote: &str,
-) -> PushResult {
-    if reference.is_empty() || sha.is_empty() {
-        return PushResult::Error {
-            error: "missing ref or sha".into(),
-        };
-    }
-    push_checkpoint(git, reference, sha, expect_sha, remote).await
-}
-
 /// Observe the sha `ref` currently holds on `remote` (`""` when absent/unreadable).
 pub async fn observe_remote_ref_sha(git: &GitRunner, reference: &str, remote: &str) -> String {
     let r = git.run(&["ls-remote", "--quiet", remote, reference]).await;
@@ -1375,6 +1360,16 @@ pub async fn delete_checkpoint_ref(
         error: r.err_text(),
     }
 }
+/// Delete a LOCAL ref (`git update-ref -d`), best-effort. Fetching a checkpoint
+/// materialises a local copy of `refs/nano/...`; those local refs must be removed
+/// after restore so finalization's stranded-work scan does not mistake the
+/// snapshot commit they pin for unpublished agent work (and refuse to push).
+pub async fn delete_local_ref(git: &GitRunner, reference: &str) {
+    if reference.is_empty() {
+        return;
+    }
+    let _ = git.run(&["update-ref", "-d", reference]).await;
+}
 
 /// A fetched checkpoint and the metadata read from its trailers.
 #[derive(Clone, Debug, Default)]
@@ -1383,7 +1378,6 @@ pub struct FetchedCheckpoint {
     pub parent: String,
     pub base: String,
     pub base_ref: String,
-    pub run_id: String,
     pub branch: String,
 }
 
@@ -1431,7 +1425,6 @@ pub async fn fetch_checkpoint(
         parent,
         base: if base_ok { base } else { String::new() },
         base_ref: trailer(&msg, CHECKPOINT_BASEREF_TRAILER),
-        run_id: trailer(&msg, CHECKPOINT_RUN_TRAILER),
         branch: trailer(&msg, CHECKPOINT_BRANCH_TRAILER),
     }))
 }
@@ -1466,49 +1459,35 @@ pub struct RestoreResult {
     pub branch_mismatch: bool,
 }
 
-/// Canonical git branch-segment sanitizer (mirrors the provisioning fallback
-/// branch naming so a benign per-run rename can be recognised on restore).
-pub fn sanitize_branch_segment(s: &str) -> String {
-    let mut cleaned = String::new();
-    let mut prev_dash = false;
-    for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
-            cleaned.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            cleaned.push('-');
-            prev_dash = true;
-        }
-    }
-    // collapse doubled dots
-    while cleaned.contains("..") {
-        cleaned = cleaned.replace("..", ".");
-    }
-    let cleaned = cleaned.trim_start_matches(['-', '.']).to_string();
-    let mut cleaned: String = cleaned.chars().take(60).collect();
-    let cleaned_trim = cleaned.trim_end_matches(['-', '.']).to_string();
-    cleaned = cleaned_trim;
-    if let Some(stripped) = cleaned.strip_suffix(".lock") {
-        cleaned = format!("{stripped}lock");
-    }
-    if cleaned.is_empty() {
-        "base".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// Parse a generated per-run fallback branch `nano/agent-work/<base>-<token>`.
+/// Parse a generated per-run fallback branch `nano/agent-work/<base>-<uniq>`,
+/// returning `(base, uniq)`.
+///
+/// Provisioning composes the fallback as `<base>-<uniq>` where the per-activation
+/// `<uniq>` is EXACTLY `<rand>-<pid>-<nanos>-<seq>`: four dash-separated
+/// components, none of which itself contains a dash (`rand` is hex, the rest are
+/// decimal; see `slot::process_rand_token` and the activation suffix). Peel those
+/// four components off the RIGHT; everything before them is the (possibly
+/// dash-bearing) `<base>` segment.
+///
+/// The previous implementation split on only the LAST dash, which left
+/// `<rand>-<pid>-<nanos>` glued onto the returned base. Two production-shaped
+/// activations of the SAME base therefore never compared equal, so every default
+/// fallback retry rejected its own checkpoint (the branch-rename recognition in
+/// `restore_checkpoint` below could never fire).
 fn fallback_branch_parts(name: &str) -> Option<(String, String)> {
     let rest = name.strip_prefix("nano/agent-work/")?;
-    // token is a trailing UUID or `run-<token>` segment after the last '-'.
-    let (base, token) = rest.rsplit_once('-')?;
-    if base.is_empty() || token.is_empty() {
+    let mut it = rest.rsplitn(5, '-');
+    let seq = it.next()?;
+    let nanos = it.next()?;
+    let pid = it.next()?;
+    let rand = it.next()?;
+    let base = it.next()?;
+    let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_dec = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if base.is_empty() || !(is_hex(rand) && is_dec(pid) && is_dec(nanos) && is_dec(seq)) {
         return None;
     }
-    // token must be a run-token shape: uuid-ish or `run-...`. The uuid has its own
-    // dashes, so also accept `<...>-run-<token>` by checking a `run` sub-split.
-    Some((base.to_string(), token.to_string()))
+    Some((base.to_string(), format!("{rand}-{pid}-{nanos}-{seq}")))
 }
 
 /// Lay a fetched checkpoint down onto the fresh clone as UNCOMMITTED changes,
@@ -1546,13 +1525,22 @@ pub async fn restore_checkpoint(
         && Some(branch.as_str()) != expected_branch;
 
     let fallback_rename = branch_mismatch && expected_branch_ephemeral && {
+        // A benign per-activation rename: BOTH the snapshot's branch and this
+        // run's expected branch are generated fallback branches
+        // (`nano/agent-work/<base>-<uniq>`) cut from the SAME base. The `<uniq>`
+        // suffix is minted fresh per activation, so recognition turns on the
+        // shared base SEGMENT plus the shared configured base ref the snapshot
+        // recorded — NOT on the activation-specific suffix (which differs by
+        // design). `expected_base_ref` is the configured base and
+        // `checkpoint.base_ref` is the base ref the snapshot recorded; requiring
+        // a non-empty exact match keeps an unrelated base from cross-restoring.
         let snap = fallback_branch_parts(branch);
         let exp = expected_branch.and_then(fallback_branch_parts);
         match (snap, exp) {
-            (Some((sb, st)), Some((eb, _))) => {
+            (Some((sb, _)), Some((eb, _))) => {
                 sb == eb
+                    && !expected_base_ref.is_empty()
                     && checkpoint.base_ref == expected_base_ref
-                    && st == sanitize_branch_segment(&checkpoint.run_id)
             }
             _ => false,
         }
