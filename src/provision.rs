@@ -2664,9 +2664,7 @@ async fn git_raw_status(
     #[cfg(unix)]
     let gpid = child.id();
     #[cfg(unix)]
-    if let Some(pid) = gpid {
-        crate::pdeath::watch(pid);
-    }
+    let watchdog = gpid.map(crate::pdeath::watch);
     #[cfg(unix)]
     let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
     let stderr = child.stderr.take();
@@ -2698,6 +2696,11 @@ async fn git_raw_status(
                 )
                 .await;
                 group_guard.disarm();
+                // Group torn down: stop and reap the watchdog deterministically
+                // (issue #67 / #84).
+                if let Some(watchdog) = watchdog {
+                    watchdog.stop();
+                }
             }
             res.ok()?.code()
         }
@@ -2708,6 +2711,9 @@ async fn git_raw_status(
             {
                 group_guard.kill_group_if_ours();
                 group_guard.disarm();
+                if let Some(watchdog) = watchdog {
+                    watchdog.stop();
+                }
             }
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             None
@@ -3509,9 +3515,7 @@ async fn git_with_env_capture(
     #[cfg(unix)]
     let gpid = child.id();
     #[cfg(unix)]
-    if let Some(pid) = gpid {
-        crate::pdeath::watch(pid);
-    }
+    let watchdog = gpid.map(crate::pdeath::watch);
     // Cancellation cleanup: if this future is dropped mid-clone/fetch (e.g. the
     // slot aborts `execute` on lease loss), the `wait_with_output` future — and
     // the `child` it owns — is dropped, but `kill_on_drop` reaps only the direct
@@ -3567,6 +3571,9 @@ async fn git_with_env_capture(
                     )
                     .await;
                     group_guard.disarm();
+                    if let Some(watchdog) = watchdog {
+                        watchdog.stop();
+                    }
                 }
                 res
             }
@@ -3586,6 +3593,9 @@ async fn git_with_env_capture(
                 {
                     group_guard.kill_group_if_ours();
                     group_guard.disarm();
+                    if let Some(watchdog) = watchdog {
+                        watchdog.stop();
+                    }
                 }
                 // Reap the just-killed leader (bounded) before returning. The `wait`
                 // future — which owns `child` — was dropped when the timeout fired,
@@ -4265,9 +4275,7 @@ async fn gh_pr_list(
     #[cfg(unix)]
     let gpid = child.id();
     #[cfg(unix)]
-    if let Some(pid) = gpid {
-        crate::pdeath::watch(pid);
-    }
+    let watchdog = gpid.map(crate::pdeath::watch);
     #[cfg(unix)]
     let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
     let stderr = child.stderr.take();
@@ -4299,6 +4307,9 @@ async fn gh_pr_list(
                 )
                 .await;
                 group_guard.disarm();
+                if let Some(watchdog) = watchdog {
+                    watchdog.stop();
+                }
             }
             res
         }
@@ -4307,6 +4318,9 @@ async fn gh_pr_list(
             {
                 group_guard.kill_group_if_ours();
                 group_guard.disarm();
+                if let Some(watchdog) = watchdog {
+                    watchdog.stop();
+                }
             }
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             bail!("gh pr list timed out after {}s", timeout.as_secs());

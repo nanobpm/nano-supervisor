@@ -677,11 +677,11 @@ fn run_capped(
     // fallible path (or any later one) ever unwinds, the guard must already be
     // armed so the child group is torn down rather than orphaned.
     #[cfg(unix)]
-    let mut group_guard = {
+    let (mut group_guard, watchdog) = {
         let pid = child.id();
         let guard = crate::pdeath::GroupGuard::new(Some(pid));
-        crate::pdeath::watch(pid);
-        guard
+        let watchdog = crate::pdeath::watch(pid);
+        (guard, watchdog)
     };
     let mut out = child.stdout.take();
     let mut err = child.stderr.take();
@@ -706,6 +706,8 @@ fn run_capped(
             let _ = child.wait();
             #[cfg(unix)]
             group_guard.disarm();
+            #[cfg(unix)]
+            watchdog.stop();
             return None;
         }
     };
@@ -734,6 +736,8 @@ fn run_capped(
             let _ = bounded_join(out_t, Instant::now() + Duration::from_secs(2));
             #[cfg(unix)]
             group_guard.disarm();
+            #[cfg(unix)]
+            watchdog.stop();
             return None;
         }
     };
@@ -811,6 +815,11 @@ fn run_capped(
     // disarm so the guard's Drop never signals a recycled pgid.
     #[cfg(unix)]
     group_guard.disarm();
+    // The group is fully torn down, so stop and reap the parent-death watchdog
+    // deterministically (issue #67 / #84) rather than leaving it to self-retire
+    // across refresh ticks.
+    #[cfg(unix)]
+    watchdog.stop();
     let stdout = String::from_utf8_lossy(&out_r.unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&err_r.unwrap_or_default()).into_owned();
     status.map(|st| (st.code(), stdout, stderr, output_failed))
