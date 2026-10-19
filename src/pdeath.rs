@@ -1686,8 +1686,15 @@ pub fn reap_watchdog(
                 {
                     break true; // parent gone -> reap the group
                 }
-                if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
-                    break false; // group already gone -> nothing to do
+                // Zombie-aware group-gone check (issue #67 review): see the
+                // matching note in `wait_parent_or_group_gone`. A bare
+                // `kill(-pgid, 0)` succeeds for a zombies-only group (a SIGKILLed
+                // descendant held unreaped by a non-reaping init), so the watchdog
+                // would poll forever and leak one per spawn across refresh ticks.
+                // `group_has_live_member` excludes zombies and fails open on an
+                // inspection failure.
+                if !group_has_live_member(pgid) {
+                    break false; // no live member (zombies-only or gone) -> nothing to do
                 }
             }
         };
@@ -1862,8 +1869,13 @@ fn parent_is_dead_or_zombie(pid: u32) -> bool {
 }
 
 /// Poll until either the parent (daemon) exits or the agent's process group has
-/// already gone away. Returns `true` when the parent died (the caller should
-/// reap the group), `false` when the group vanished on its own (nothing to do).
+/// already drained of every *live* member. Returns `true` when the parent died
+/// (the caller should reap the group), `false` when the group has no live member
+/// left (it vanished, or holds only zombies — nothing to do). The group-gone
+/// test is zombie-aware ([`group_has_live_member`], not a bare `kill(-pgid, 0)`):
+/// a SIGKILLed descendant held unreaped by a non-reaping container init would
+/// otherwise keep this polling forever, leaking one watchdog per spawn across the
+/// refresh ticks that re-arm it (issue #67 review).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 unsafe fn wait_parent_or_group_gone(
     parent_pid: u32,
@@ -1898,8 +1910,21 @@ unsafe fn wait_parent_or_group_gone(
         if parent_is_dead_or_zombie(parent_pid) {
             return true;
         }
-        if libc::kill(-(pgid as libc::pid_t), 0) != 0 {
-            return false; // process group already gone -> nothing to reap
+        // Zombie-aware group-gone check (issue #67 review). A bare
+        // `kill(-pgid, 0)` succeeds for a group whose only remaining members are
+        // *zombies* — a SIGKILLed descendant reparented to a non-reaping
+        // container init (PID 1) lingers unreaped, so the probe would keep the
+        // watchdog polling forever and the process would leak one `__reap-watchdog`
+        // (plus its reaper thread) per spawn, accumulating unboundedly across the
+        // gh-token refresh ticks that re-arm it. `group_has_live_member` excludes
+        // zombies, so once the group has drained to zombies-only (or nothing) it
+        // reads as gone and the watchdog exits — there is nothing live left to
+        // SIGKILL anyway, and the group can only shrink from here. It fails *open*
+        // (degrades to the numeric `group_alive` probe) on any inspection failure,
+        // so an unreadable `/proc` never makes the watchdog exit early on a group
+        // that might still hold a live member.
+        if !group_has_live_member(pgid) {
+            return false; // no live member (zombies-only or gone) -> nothing to reap
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -1950,6 +1975,93 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         panic!("watchdog pid {pid} was never reaped (ps stat {last:?})");
+    }
+
+    /// Regression (issue #67 review): the parent-death watchdog must STOP once
+    /// its target group has drained to zombies only, instead of polling forever.
+    ///
+    /// The leak: on Linux under a non-reaping container init (PID 1 that does not
+    /// reap orphans), a SIGKILLed descendant lingers as a zombie its whole parent
+    /// lifetime. The old group-gone test — a bare `kill(-pgid, 0)` — succeeds for
+    /// a zombie, so the watchdog never concluded "group gone" and never exited,
+    /// leaking one `__reap-watchdog` process (plus its reaper thread) per spawn.
+    /// Because the gh-token maintenance refresh re-arms a watchdog on every tick,
+    /// a one-off leak became an UNBOUNDED one — one leaked pair per refresh tick
+    /// for the worker's whole lifetime.
+    ///
+    /// Build a group whose only member is a zombie leader, keep the parent (this
+    /// test process) alive, and assert `wait_parent_or_group_gone` returns `false`
+    /// (group gone, nothing to reap) promptly. Before the zombie-aware fix it
+    /// would loop until the 10s deadline and fail. Run it off-thread so a
+    /// regression fails the test on the deadline instead of hanging it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watchdog_treats_a_zombies_only_group_as_gone() {
+        // SAFETY: a bare `fork`; the child only makes async-signal-safe libc
+        // calls (`setpgid`, `_exit`) and the parent reaps it with `waitpid`.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: lead a brand-new process group (pgid == our pid), then exit
+            // at once so the group is left with a single ZOMBIE leader and no
+            // live member — the state a SIGKILLed-but-unreaped descendant leaves.
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        let child = pid as u32;
+        // Wait until the child is observably a zombie: a deterministic readiness
+        // signal (not a sleep). `parent_is_dead_or_zombie` reads its /proc state.
+        let mut is_zombie = false;
+        for _ in 0..1000 {
+            if parent_is_dead_or_zombie(child) {
+                is_zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            is_zombie,
+            "the child must become a zombie leader of its own group"
+        );
+        // Sanity: the zombie-only group reports no LIVE member even though the
+        // bare numeric probe (`group_alive` / `kill(-pgid, 0)`) still succeeds for
+        // the held zombie — this is exactly the gap the fix closes.
+        assert!(
+            !group_has_live_member(child),
+            "a zombies-only group must report no live member"
+        );
+        assert!(
+            group_alive(child),
+            "the bare numeric probe still sees the held zombie (the old, leaky check)"
+        );
+        // The parent (this process) stays alive, so ONLY the zombie-aware
+        // group-gone branch can end the wait. A regression polls forever, so run
+        // it off-thread with a deadline rather than hang the suite.
+        let me = std::process::id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: `wait_parent_or_group_gone` only makes libc liveness probes.
+            let parent_died = unsafe { wait_parent_or_group_gone(me, child, None) };
+            let _ = tx.send(parent_died);
+        });
+        let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+        // Reap the zombie child regardless of outcome so the test leaves none.
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        match verdict {
+            Ok(parent_died) => assert!(
+                !parent_died,
+                "the watchdog must return `false` (group drained to zombies -> \
+                 nothing to reap), not report parent death"
+            ),
+            Err(_) => panic!(
+                "wait_parent_or_group_gone never returned for a zombies-only group \
+                 while the parent was alive: the watchdog would poll forever and \
+                 leak one process + reaper thread per gh-token refresh tick (#67)"
+            ),
+        }
     }
 
     #[cfg(target_os = "linux")]
