@@ -631,6 +631,53 @@ fn scrub_sensitive_env(cmd: &mut std::process::Command) {
     }
 }
 
+/// Max bytes RETAINED from each captured pipe (stdout and stderr independently).
+/// `gh auth token` output is a few dozen bytes and a `gh api -i` header block is
+/// a few KB, so 1 MiB is generous for every legitimate child here while bounding
+/// the worst case: a noisy or hostile `gh` wrapper that streams unbounded output
+/// must NOT be buffered without limit (the old `read_to_end` grew the vector
+/// until the worker ran out of memory, and the subprocess deadline capped time,
+/// never bytes). Reading continues past the cap so the pipe still drains to EOF
+/// (see [`drain_capped`]); only the retained bytes are bounded.
+const MAX_CAPTURED_OUTPUT: usize = 1024 * 1024;
+
+/// Drain `reader` to EOF while retaining at most `cap` bytes, returning the
+/// retained bytes and whether the stream was TRUNCATED (produced more than
+/// `cap`). Reading deliberately continues past the cap — into a throwaway
+/// buffer — so the child never blocks on a full pipe and the kill/EOF teardown
+/// in [`run_capped`] still works; only the memory we HOLD is bounded. This
+/// replaces `read_to_end`'s unbounded growth so a noisy `gh` child cannot
+/// exhaust worker memory. A truncated capture is INCOMPLETE, so the caller must
+/// treat the read as failed (token read → `ReadFailed`, scopes probe → `None`)
+/// rather than trust a partial buffer — exactly like a drain that could not be
+/// collected within its join bound.
+fn drain_capped<R: std::io::Read>(reader: &mut R, cap: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut scratch = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(n) => {
+                if kept.len() >= cap {
+                    // Already full: keep draining to EOF but discard the bytes.
+                    truncated = true;
+                    continue;
+                }
+                let room = cap - kept.len();
+                let take = room.min(n);
+                kept.extend_from_slice(&scratch[..take]);
+                if take < n {
+                    truncated = true;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (kept, truncated)
+}
+
 /// Spawn `cmd`, capture its stdout/stderr, and enforce `timeout`. Returns
 /// `Some((exit_code, stdout, stderr, output_failed))` when the child exits
 /// within the deadline, or `None` when it could not be spawned OR exceeded the
@@ -646,7 +693,9 @@ fn scrub_sensitive_env(cmd: &mut std::process::Command) {
 /// Both pipes are drained on their own threads so a child that fills a pipe
 /// buffer can never wedge the wait, and so whatever it wrote before a kill is
 /// still collected. `output_failed` is `true` when a drain could not be
-/// collected within its bound (a descendant held the pipe open) — the captured
+/// collected within its bound (a descendant held the pipe open) OR the child
+/// produced more than [`MAX_CAPTURED_OUTPUT`] bytes on a pipe (the capture was
+/// truncated to bound memory) — the captured
 /// output is then INCOMPLETE, so a caller must treat the read as failed rather
 /// than trust an empty/partial buffer. This is the shared, bounded spawn for
 /// every `gh` child here — neither the token read nor the scopes probe may
@@ -655,7 +704,6 @@ fn run_capped(
     mut cmd: std::process::Command,
     timeout: Duration,
 ) -> Option<(Option<i32>, String, String, bool)> {
-    use std::io::Read;
     use std::process::Stdio;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -691,12 +739,9 @@ fn run_capped(
     // of reporting a best-effort read failure. On a spawn failure, kill + reap
     // the child (and its group) and join any drain already started so nothing
     // leaks, then return `None` so the read is reported as failed.
-    let out_t = match std::thread::Builder::new().spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = out.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
+    let out_t = match std::thread::Builder::new().spawn(move || match out.as_mut() {
+        Some(s) => drain_capped(s, MAX_CAPTURED_OUTPUT),
+        None => (Vec::new(), false),
     }) {
         Ok(t) => t,
         Err(_) => {
@@ -711,12 +756,9 @@ fn run_capped(
             return None;
         }
     };
-    let err_t = match std::thread::Builder::new().spawn(move || {
-        let mut b = Vec::new();
-        if let Some(s) = err.as_mut() {
-            let _ = s.read_to_end(&mut b);
-        }
-        b
+    let err_t = match std::thread::Builder::new().spawn(move || match err.as_mut() {
+        Some(s) => drain_capped(s, MAX_CAPTURED_OUTPUT),
+        None => (Vec::new(), false),
     }) {
         Ok(t) => t,
         Err(_) => {
@@ -784,11 +826,20 @@ fn run_capped(
     // a pipe open forever, so never let that hang the caller. On a stuck drain
     // the buffer is dropped for THIS result and reaped by a detached thread,
     // and `output_failed` is set so the caller treats the read as failed
-    // (incomplete output) rather than trusting an empty/partial buffer.
+    // (incomplete output) rather than trusting an empty/partial buffer. A drain
+    // that completed but had to TRUNCATE (child exceeded `MAX_CAPTURED_OUTPUT`)
+    // likewise fails the read: a capped buffer is incomplete, so it must never
+    // be read as a definitive token/logout or parsed for scopes.
     let join_deadline = deadline + Duration::from_secs(2);
     let out_r = bounded_join(out_t, join_deadline);
     let err_r = bounded_join(err_t, join_deadline);
-    let output_failed = out_r.is_none() || err_r.is_none();
+    // A pipe fails collection if its drain could not be joined (`None`) OR it was
+    // truncated at the cap (`Some((_, true))`).
+    let drain_failed = |r: &Option<(Vec<u8>, bool)>| match r {
+        None => true,
+        Some((_, truncated)) => *truncated,
+    };
+    let output_failed = drain_failed(&out_r) || drain_failed(&err_r);
     // Tear the whole group down now, UNCONDITIONALLY — on BOTH the failed-drain
     // and the successful-collection path. Successful output collection does NOT
     // mean the group has exited: a wrapper such as `printf gho_x; sleep 30
@@ -820,20 +871,24 @@ fn run_capped(
     // across refresh ticks.
     #[cfg(unix)]
     watchdog.stop();
-    let stdout = String::from_utf8_lossy(&out_r.unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_r.unwrap_or_default()).into_owned();
+    let stdout = String::from_utf8_lossy(&out_r.map(|(b, _)| b).unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_r.map(|(b, _)| b).unwrap_or_default()).into_owned();
     status.map(|st| (st.code(), stdout, stderr, output_failed))
 }
 
 /// Join a drain thread, bounded by `deadline`. A finished thread is joined and
-/// its buffer returned as `Some`. A thread still blocked at the deadline (its
-/// pipe is held open by a surviving descendant) is NOT awaited: it is handed to
-/// a detached reaper that joins it whenever it eventually finishes, so no
-/// thread or buffer leaks — and `None` is returned now so the caller knows the
-/// output was NOT collected (rather than mistaking an empty buffer for a
-/// completed, empty read). This is what keeps a descendant-held pipe from
-/// hanging the caller past the deadline while still surfacing the failure.
-fn bounded_join(t: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
+/// its `(buffer, truncated)` result returned as `Some`. A thread still blocked
+/// at the deadline (its pipe is held open by a surviving descendant) is NOT
+/// awaited: it is handed to a detached reaper that joins it whenever it
+/// eventually finishes, so no thread or buffer leaks — and `None` is returned
+/// now so the caller knows the output was NOT collected (rather than mistaking
+/// an empty buffer for a completed, empty read). This is what keeps a
+/// descendant-held pipe from hanging the caller past the deadline while still
+/// surfacing the failure.
+fn bounded_join(
+    t: std::thread::JoinHandle<(Vec<u8>, bool)>,
+    deadline: Instant,
+) -> Option<(Vec<u8>, bool)> {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     // Spawn the joiner FALLIBLY: under a process/thread limit the OS can refuse
@@ -914,9 +969,10 @@ fn apply_probe_token(cmd: &mut std::process::Command, token: &str) {
 }
 
 /// Read the token's OAuth scopes from the live `X-OAuth-Scopes` response header.
-/// Best-effort and BOUNDED by `timeout`: a spawn failure, a timeout, or a missing
-/// header all yield `None` (scopes simply go unreported) so a stalled or slow API
-/// probe never blocks adoption of a rotated token. The token rides the child env
+/// Best-effort and BOUNDED by `timeout`: a spawn failure, a timeout, an
+/// incomplete/truncated capture, or a missing header all yield `None` (scopes
+/// simply go unreported) so a stalled, slow, or noisy API probe never blocks
+/// adoption of a rotated token. The token rides the child env
 /// (`GH_TOKEN` / `GH_ENTERPRISE_TOKEN`, see [`apply_probe_token`]), NEVER argv,
 /// so it can't leak via `ps` — the same no-env-leak-to-argv guarantee as the
 /// credential delivery in [`crate::provision`].
@@ -934,7 +990,14 @@ fn gh_token_scopes(token: &str, timeout: Duration) -> Option<String> {
     // engine secrets but must not clear the `GH_*` token vars we set next.
     scrub_sensitive_env(&mut cmd);
     apply_probe_token(&mut cmd, token);
-    let (_code, stdout, stderr, _output_failed) = run_capped(cmd, timeout)?;
+    let (_code, stdout, stderr, output_failed) = run_capped(cmd, timeout)?;
+    // An incomplete capture (drain gave up, or the response exceeded the capture
+    // cap and was truncated) must NOT be parsed: a truncated header block could
+    // drop or split the `X-OAuth-Scopes` line and report wrong/missing scopes.
+    // Report `None` (scopes unreported) rather than trust a partial buffer.
+    if output_failed {
+        return None;
+    }
     let mut combined = stdout;
     combined.push('\n');
     combined.push_str(&stderr);
@@ -1640,7 +1703,74 @@ mod tests {
         );
     }
 
-    /// Round-3 regression (descendant-held pipes must not outlive the deadline):
+    /// Unbounded-output regression: a child that streams more than
+    /// [`MAX_CAPTURED_OUTPUT`] must NOT grow the capture buffer without limit
+    /// (the old `read_to_end` ran the worker out of memory). The retained output
+    /// is capped, the pipe still drains to EOF so the child exits promptly, and
+    /// the truncation is reported as `output_failed` — which
+    /// `classify_gh_auth_read` maps to a transient `ReadFailed`, never a false
+    /// `LoggedOut`/`Token` read off a partial buffer.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_caps_output_and_flags_truncation() {
+        use std::process::Command;
+        // Emit 2x the cap of NUL bytes to stdout, then exit 0 cleanly.
+        let bytes = MAX_CAPTURED_OUTPUT * 2;
+        let mut cmd = Command::new("dd");
+        cmd.args([
+            "if=/dev/zero",
+            &format!("bs={bytes}"),
+            "count=1",
+            "status=none",
+        ]);
+        let start = Instant::now();
+        let (code, stdout, _stderr, output_failed) =
+            run_capped(cmd, Duration::from_secs(10)).expect("dd exits promptly");
+        assert_eq!(code, Some(0), "the child itself exits 0");
+        assert!(
+            output_failed,
+            "exceeding the capture cap truncates and fails output collection"
+        );
+        assert_eq!(
+            stdout.len(),
+            MAX_CAPTURED_OUTPUT,
+            "retained output is bounded at the cap, not the child's full stream"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(9),
+            "the pipe still drains to EOF so the child exits, not after the deadline"
+        );
+        // The classification contract: a truncated capture is a transient read
+        // failure, never a token or logout parsed from a partial buffer.
+        assert_eq!(
+            classify_gh_auth_read(false, code, &stdout, "", output_failed),
+            GhAuthRead::ReadFailed
+        );
+    }
+
+    /// `drain_capped` retains at most `cap` bytes, keeps reading to EOF, and
+    /// flags truncation only when the stream actually exceeds the cap.
+    #[test]
+    fn drain_capped_bounds_retained_bytes() {
+        // Under the cap: fully retained, not truncated.
+        let data = [b'a'; 100];
+        let (kept, truncated) = drain_capped(&mut &data[..], 1024);
+        assert_eq!(kept.len(), 100);
+        assert!(!truncated);
+
+        // Exactly the cap: fully retained, NOT truncated.
+        let data = [b'b'; 1024];
+        let (kept, truncated) = drain_capped(&mut &data[..], 1024);
+        assert_eq!(kept.len(), 1024);
+        assert!(!truncated, "exactly the cap is not a truncation");
+
+        // Over the cap: retained bytes bounded, truncation flagged.
+        let data = [b'c'; 4096];
+        let (kept, truncated) = drain_capped(&mut &data[..], 1024);
+        assert_eq!(kept.len(), 1024);
+        assert!(truncated);
+    }
+
     /// a shell that backgrounds a long-lived child and waits on it inherits our
     /// stdout/stderr into that child, so killing only the direct shell would
     /// leave the pipes open and the drain threads blocked. The whole process
