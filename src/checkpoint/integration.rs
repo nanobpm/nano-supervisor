@@ -107,6 +107,12 @@ struct RefLease {
     reference: String,
     /// The sha our lease is currently pinned to (`""` demands absence).
     expect: String,
+    /// The sha we last ATTEMPTED to push. An ambiguous push failure (the server
+    /// applied the update but the client lost the response — dropped connection /
+    /// timeout) leaves `expect` behind on the pre-push value while the remote has
+    /// actually moved to this sha; remembering it lets us RECONCILE on the next
+    /// stale-lease rejection instead of concluding a sibling stole the ref.
+    attempted: String,
     owned: bool,
 }
 
@@ -124,6 +130,7 @@ impl RefLease {
         Self {
             reference,
             expect: seed.unwrap_or_default(),
+            attempted: String::new(),
             owned: true,
         }
     }
@@ -131,8 +138,11 @@ impl RefLease {
     /// Fold a push result into the lease. ONLY our own successful write advances
     /// the lease target; a stale-lease rejection means a sibling moved the ref, so
     /// we drop ownership; a transient error keeps the lease so the next tick
-    /// retries against the same target. Returns the result for convenience.
+    /// retries against the same target. Either way we record the sha we just
+    /// attempted so an ambiguous failure can be reconciled next tick. Returns the
+    /// result for convenience.
     fn apply(&mut self, result: &PushResult, sha: &str) {
+        self.attempted = sha.to_string();
         match result {
             PushResult::Ok => self.expect = sha.to_string(),
             PushResult::StaleLease { .. } => self.owned = false,
@@ -162,10 +172,19 @@ fn restore_candidates(explicit: bool, own: &str, predecessor: Option<&str>) -> V
 
 /// Outcome of the push for one periodic tick.
 enum TickOutcome {
-    /// Snapshot pushed to our WIP ref; carries `(tree, head)` to dedupe next tick.
-    Pushed(String, String),
-    /// Nothing to publish (clean/unchanged) or a transient push error.
-    Idle,
+    /// Snapshot pushed to our WIP ref; carries `(tree, head)` to dedupe next tick
+    /// and `recovery_pending` = the just-published sha whose GC-proof recovery
+    /// promotion failed transiently (retried on later ticks), else `None`.
+    Pushed {
+        tree: String,
+        head: String,
+        recovery_pending: Option<String>,
+    },
+    /// Nothing new to publish (clean/unchanged) or a transient WIP push error.
+    /// Still carries forward any recovery promotion left pending from an earlier
+    /// successful WIP push, so a transient recovery failure is retried even while
+    /// snapshotting no-ops.
+    Idle { recovery_pending: Option<String> },
     /// We lost ownership of our WIP ref to a concurrent attempt — stop the loop.
     OwnershipLost,
 }
@@ -665,6 +684,13 @@ async fn periodic_loop(
     // discard → first-tick still publishes the clean snapshot that replaces the
     // stale remote one (rather than reporting `clean` and leaving it in place).
     let mut last_tree: Option<(String, String)> = seed_tree;
+    // The GC-proof recovery ref is promoted AFTER the WIP push each tick. When
+    // that promotion fails transiently we remember the published sha here and
+    // retry it on later ticks — WITHOUT withholding the WIP `last_tree` advance,
+    // which would otherwise let a subsequent discard-to-base reappear on resume
+    // (the stale snapshot never gets superseded) and would also mask the recovery
+    // retry behind the resulting `clean` no-ops (nanobpm/nano-supervisor#66).
+    let mut recovery_pending: Option<String> = None;
     let mut delay = first;
     loop {
         tokio::select! {
@@ -676,12 +702,24 @@ async fn periodic_loop(
             &runner,
             &plan,
             last_tree.as_ref().map(|(t, h)| (t.as_str(), h.as_str())),
+            recovery_pending.as_deref(),
             &leases,
         )
         .await
         {
-            TickOutcome::Pushed(tree, head) => last_tree = Some((tree, head)),
-            TickOutcome::Idle => {}
+            TickOutcome::Pushed {
+                tree,
+                head,
+                recovery_pending: rp,
+            } => {
+                last_tree = Some((tree, head));
+                recovery_pending = rp;
+            }
+            TickOutcome::Idle {
+                recovery_pending: rp,
+            } => {
+                recovery_pending = rp;
+            }
             TickOutcome::OwnershipLost => {
                 crate::runtime::log(&format!(
                     "checkpoint: WIP ref {} is held by a concurrent attempt; \
@@ -714,7 +752,36 @@ async fn lease_push_shared(
             error: "ownership already lost".into(),
         };
     }
+    // Snapshot the sha we previously attempted BEFORE this push, so an ambiguous
+    // failure of that earlier push (server applied it, client lost the response)
+    // can be reconciled if this push is now rejected as stale.
+    let prev_attempt = { lock.lock().unwrap().attempted.clone() };
     let res = push_checkpoint(runner, &reference, sha, &expect, remote).await;
+    if matches!(res, PushResult::StaleLease { .. }) && !prev_attempt.is_empty() {
+        // A stale-lease rejection usually means a sibling moved the ref — but it
+        // can also mean OUR OWN previous push actually LANDED while reporting a
+        // transient error, leaving `expect` behind the remote. Verify the remote
+        // tip: if it holds the sha WE last attempted, that push was ours, so
+        // re-base the lease on it and RETRY this push against the recovered
+        // expectation rather than bowing out. We only ever adopt our OWN attempted
+        // sha — never an arbitrary remote tip — so a genuine sibling write (remote
+        // tip != our attempt) still drops ownership exactly as before.
+        let remote_sha = observe_remote_ref_sha(runner, &reference, remote).await;
+        if remote_sha == prev_attempt {
+            crate::runtime::log(&format!(
+                "checkpoint: {reference} already holds our previously-attempted sha \
+                 (ambiguous push landed); re-leasing and retrying"
+            ));
+            {
+                let mut l = lock.lock().unwrap();
+                l.expect = remote_sha.clone();
+                l.owned = true;
+            }
+            let retry = push_checkpoint(runner, &reference, sha, &remote_sha, remote).await;
+            lock.lock().unwrap().apply(&retry, sha);
+            return retry;
+        }
+    }
     lock.lock().unwrap().apply(&res, sha);
     res
 }
@@ -725,6 +792,7 @@ async fn push_snapshot(
     runner: &GitRunner,
     plan: &Plan,
     last_tree: Option<(&str, &str)>,
+    recovery_pending: Option<&str>,
     leases: &LeaseState,
 ) -> TickOutcome {
     let snap = snapshot_worktree(
@@ -759,7 +827,13 @@ async fn push_snapshot(
             if reason != "unchanged" && reason != "clean" {
                 crate::runtime::log(&format!("checkpoint: snapshot skipped — {reason}"));
             }
-            return TickOutcome::Idle;
+            // Nothing new to publish, but an earlier successful WIP push may have
+            // left its recovery promotion unfinished — retry it so a transient
+            // recovery failure converges rather than stranding the recovery ref.
+            let pending = retry_pending_recovery(runner, plan, leases, recovery_pending).await;
+            return TickOutcome::Idle {
+                recovery_pending: pending,
+            };
         }
     };
     match lease_push_shared(runner, &plan.remote, &leases.own, &sha).await {
@@ -770,27 +844,70 @@ async fn push_snapshot(
                 "checkpoint: push to {} failed — {error}",
                 plan.own_ref
             ));
-            return TickOutcome::Idle;
+            // The WIP push itself failed, so there is no newly-published sha to
+            // promote and nothing to advance; keep retrying whatever recovery
+            // promotion was already pending from an earlier successful push.
+            let pending = retry_pending_recovery(runner, plan, leases, recovery_pending).await;
+            return TickOutcome::Idle {
+                recovery_pending: pending,
+            };
         }
     }
-    // Promote a GC-proof recovery copy so a human escalation can still be resumed
-    // even if the per-checkpoint WIP ref is later reclaimed (#295). A lost recovery
-    // lease (a sibling holds it) is non-fatal and terminal: our WIP ref still
-    // carries the work and we never retry a lost lease. But a TRANSIENT recovery
-    // push error must NOT advance `last_tree`: doing so lets the next tick observe
-    // an unchanged tree, skip snapshotting, and never retry the promotion — leaving
-    // the recovery ref absent/stale while finalize believes both publications
-    // completed. Keep `last_tree` unadvanced (return `Idle`) so the next tick
-    // re-snapshots and re-promotes; this converges as soon as the transient clears.
+    // The WIP push SUCCEEDED, so ALWAYS advance `last_tree`: the published
+    // snapshot is now our dedup baseline AND — crucially — the value a later
+    // discard-to-base compares against to SUPERSEDE this snapshot on the remote.
+    // The GC-proof recovery copy (#295) is promoted SEPARATELY; a transient
+    // failure there is remembered as `recovery_pending` and retried on later
+    // ticks, but it must NOT withhold the WIP advance. The previous code returned
+    // `Idle` (unadvanced `last_tree`) on a transient recovery error even though
+    // the WIP snapshot was already published: a subsequent discard back to base
+    // then read `last_tree` as empty/stale, reported `clean`, and never
+    // superseded the published snapshot — so the discarded work reappeared on
+    // resume, and the recovery promotion was itself never retried.
     let rec = lease_push_shared(runner, &plan.remote, &leases.recovered, &sha).await;
-    if recovery_requires_retry(&rec) {
+    let recovery_pending = if recovery_requires_retry(&rec) {
         crate::runtime::log(&format!(
             "checkpoint: recovery promotion to {} failed transiently; will retry next tick",
             plan.recovered_ref
         ));
-        return TickOutcome::Idle;
+        Some(sha)
+    } else {
+        None
+    };
+    TickOutcome::Pushed {
+        tree,
+        head,
+        recovery_pending,
     }
-    TickOutcome::Pushed(tree, head)
+}
+
+/// Retry a recovery promotion a previous tick could not complete. Pushes the
+/// pending sha to the recovery ref under its shared lease and returns `Some(sha)`
+/// if it still needs retrying, or `None` once it has succeeded or hit a TERMINAL
+/// result (a stale-lease rejection means a sibling owns the recovery ref — we
+/// never reclaim it). A `None` input is a no-op. The recovery ref is a single
+/// moving ref, so retrying the latest published sha is always correct — a stale
+/// pending sha can never be re-promoted because each successful WIP push replaces
+/// `recovery_pending` with its own (newer) sha.
+async fn retry_pending_recovery(
+    runner: &GitRunner,
+    plan: &Plan,
+    leases: &LeaseState,
+    pending: Option<&str>,
+) -> Option<String> {
+    let sha = pending?;
+    let rec = lease_push_shared(runner, &plan.remote, &leases.recovered, sha).await;
+    if recovery_requires_retry(&rec) {
+        Some(sha.to_string())
+    } else {
+        if matches!(rec, PushResult::Ok) {
+            crate::runtime::log(&format!(
+                "checkpoint: deferred recovery promotion to {} succeeded",
+                plan.recovered_ref
+            ));
+        }
+        None
+    }
 }
 
 /// Whether a recovery-promotion push result must be retried on a later tick
@@ -1220,6 +1337,61 @@ mod tests {
         // The lease target advances to the sha WE just wrote.
         assert_eq!(lease.expect, "bbb");
         assert!(lease.owned);
+        // Every apply records the sha we attempted so an ambiguous failure can be
+        // reconciled next tick.
+        assert_eq!(lease.attempted, "bbb");
+    }
+
+    #[test]
+    fn lease_records_attempted_sha_even_on_failure() {
+        // An ambiguous push (server applied it, client lost the response) reports
+        // a transient Error and leaves `expect` behind — but we MUST remember the
+        // sha we attempted so the next stale-lease rejection can be reconciled
+        // against the remote tip instead of blindly dropping ownership.
+        let mut lease = RefLease::new(OWN.to_string(), Some("aaa".into()));
+        lease.apply(
+            &PushResult::Error {
+                error: "timeout".into(),
+            },
+            "bbb",
+        );
+        assert_eq!(
+            lease.expect, "aaa",
+            "transient error must not advance expect"
+        );
+        assert_eq!(lease.attempted, "bbb", "attempted sha must be recorded");
+        assert!(lease.owned);
+    }
+
+    #[tokio::test]
+    async fn retry_pending_recovery_is_a_noop_when_nothing_is_pending() {
+        // With no pending promotion the helper must not touch git at all and must
+        // report nothing pending — the common idle-tick path.
+        let dur = Duration::from_secs(5);
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let runner = GitRunner::new(CwdHandle::open(&tmp).unwrap(), dur);
+        let plan = Plan {
+            config: CheckpointConfig::from_env(),
+            own_ref: OWN.to_string(),
+            recovered_ref: "refs/nano/recovered/x".to_string(),
+            working_branch: String::new(),
+            base_sha: String::new(),
+            base_ref: "main".to_string(),
+            run_id: "r".to_string(),
+            remote: "origin".to_string(),
+            secret_values: Vec::new(),
+        };
+        let leases = LeaseState {
+            own: std::sync::Mutex::new(RefLease::new(OWN.to_string(), None)),
+            recovered: std::sync::Mutex::new(RefLease::new(
+                "refs/nano/recovered/x".to_string(),
+                None,
+            )),
+        };
+        assert_eq!(
+            retry_pending_recovery(&runner, &plan, &leases, None).await,
+            None
+        );
     }
 
     #[test]
@@ -1326,5 +1498,250 @@ mod tests {
         // ours to delete.
         let unwritten = RefLease::new(OWN.to_string(), None);
         assert_eq!(may_delete(&unwritten), None);
+    }
+
+    /// Regression (nanobpm/nano-supervisor#66, review round 9): a transient
+    /// RECOVERY promotion failure must NOT withhold the WIP `last_tree` advance.
+    /// The previous code returned `Idle` (unadvanced) whenever recovery promotion
+    /// failed, even though the WIP snapshot was already published — so a later
+    /// discard-to-base read `last_tree` as empty, reported `clean`, and never
+    /// superseded the published WIP, which then reappeared on resume. Drive a
+    /// recovery failure followed by discarding the work and assert the discard
+    /// supersedes the published snapshot on the remote.
+    #[tokio::test]
+    async fn wip_advance_survives_recovery_failure_so_discard_supersedes() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let runner_at = |p: &std::path::Path| GitRunner::new(CwdHandle::open(p).unwrap(), dur);
+        let root =
+            std::env::temp_dir().join(format!("nano-recov-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let root_git = runner_at(&root);
+        assert!(root_git.run(&["init", "--bare", "remote.git"]).await.ok());
+        assert!(root_git.run(&["clone", "remote.git", "work"]).await.ok());
+        let git = runner_at(&root.join("work"));
+        assert!(git
+            .run(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .await
+            .ok());
+        std::fs::write(root.join("work/README.md"), "base\n").unwrap();
+        assert!(git.run(&["add", "-A"]).await.ok());
+        assert!(git
+            .run(&[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-m",
+                "init"
+            ])
+            .await
+            .ok());
+        assert!(git.run(&["push", "origin", "main"]).await.ok());
+        let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+        let elem = "recov-elem";
+        let own = checkpoint_ref(elem).unwrap();
+        // An INVALID recovery ref (`..` is rejected by git) deterministically
+        // forces the recovery promotion to fail with a transient Error every tick
+        // — the exact condition that used to withhold the WIP advance.
+        let plan = Plan {
+            config: CheckpointConfig::from_env(),
+            own_ref: own.clone(),
+            recovered_ref: "refs/nano/recovered/..bad".to_string(),
+            working_branch: "main".to_string(),
+            base_sha: base_sha.clone(),
+            base_ref: "main".to_string(),
+            run_id: "run-recov".to_string(),
+            remote: "origin".to_string(),
+            secret_values: Vec::new(),
+        };
+        let leases = LeaseState {
+            own: std::sync::Mutex::new(RefLease::new(own.clone(), None)),
+            recovered: std::sync::Mutex::new(RefLease::new(plan.recovered_ref.clone(), None)),
+        };
+
+        // Tick 1: WIP work. Recovery promotion fails (bad ref) but the WIP push
+        // succeeds — the tick MUST still advance dedup state and remember the
+        // pending recovery.
+        std::fs::write(root.join("work/WIP.txt"), "in progress\n").unwrap();
+        let (tree, head, rec_pending) = match push_snapshot(&git, &plan, None, None, &leases).await
+        {
+            TickOutcome::Pushed {
+                tree,
+                head,
+                recovery_pending,
+            } => (tree, head, recovery_pending),
+            TickOutcome::Idle { .. } => {
+                panic!("WIP advance withheld after a recovery failure (the bug)")
+            }
+            TickOutcome::OwnershipLost => panic!("unexpected OwnershipLost"),
+        };
+        assert!(
+            rec_pending.is_some(),
+            "a transient recovery failure must be remembered for retry"
+        );
+        let wip_remote = observe_remote_ref_sha(&git, &own, "origin").await;
+        assert!(!wip_remote.is_empty(), "WIP snapshot must be published");
+
+        // Tick 2: DISCARD the work back to base. Because tick 1 advanced
+        // `last_tree`, the clean snapshot now SUPERSEDES the published WIP.
+        std::fs::remove_file(root.join("work/WIP.txt")).unwrap();
+        let out2 = push_snapshot(
+            &git,
+            &plan,
+            Some((tree.as_str(), head.as_str())),
+            rec_pending.as_deref(),
+            &leases,
+        )
+        .await;
+        assert!(
+            matches!(out2, TickOutcome::Pushed { .. }),
+            "discard must publish a superseding snapshot"
+        );
+        let superseded = observe_remote_ref_sha(&git, &own, "origin").await;
+        assert_ne!(
+            superseded, wip_remote,
+            "the discarded WIP must be superseded on the remote, not left to reappear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression (review round 9): an ambiguous push failure (the server applied
+    /// the update but the client lost the response) leaves the lease pinned to the
+    /// pre-push `expect` while the remote has actually moved to our attempted sha.
+    /// The next push must RECONCILE — observe that the remote holds OUR attempted
+    /// sha and retry against it — rather than treating the stale-lease rejection as
+    /// a sibling takeover and halting checkpointing for the rest of the run.
+    #[tokio::test]
+    async fn ambiguous_push_reconciles_against_our_own_landed_sha() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let runner_at = |p: &std::path::Path| GitRunner::new(CwdHandle::open(p).unwrap(), dur);
+        let root =
+            std::env::temp_dir().join(format!("nano-ambig-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let root_git = runner_at(&root);
+        assert!(root_git.run(&["init", "--bare", "remote.git"]).await.ok());
+        assert!(root_git.run(&["clone", "remote.git", "work"]).await.ok());
+        let git = runner_at(&root.join("work"));
+        assert!(git
+            .run(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .await
+            .ok());
+        std::fs::write(root.join("work/README.md"), "base\n").unwrap();
+        assert!(git.run(&["add", "-A"]).await.ok());
+        assert!(git
+            .run(&[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-m",
+                "init"
+            ])
+            .await
+            .ok());
+        assert!(git.run(&["push", "origin", "main"]).await.ok());
+        let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+        let elem = "ambig-elem";
+        let own = checkpoint_ref(elem).unwrap();
+
+        // S1: our FIRST snapshot. Publish it to the own ref — this models the
+        // ambiguous push that LANDED on the remote.
+        std::fs::write(root.join("work/WIP.txt"), "first\n").unwrap();
+        let s1 = match snapshot_worktree(
+            &git,
+            &base_sha,
+            "main",
+            "run",
+            None,
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_eq!(
+            push_checkpoint(&git, &own, &s1, "", "origin").await,
+            PushResult::Ok
+        );
+
+        // S2: our NEXT snapshot (not yet pushed).
+        std::fs::write(root.join("work/WIP.txt"), "second\n").unwrap();
+        let s2 = match snapshot_worktree(
+            &git,
+            &base_sha,
+            "main",
+            "run",
+            Some((s1.as_str(), base_sha.as_str())),
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_ne!(s1, s2, "second snapshot must differ");
+
+        // The ambiguous state: `expect` is still the pre-S1 create-only baseline
+        // ("" demands absence), but we remember S1 as our last attempt — while the
+        // remote actually holds S1.
+        let mut own_lease = RefLease::new(own.clone(), None);
+        own_lease.attempted = s1.clone();
+        let leases = LeaseState {
+            own: std::sync::Mutex::new(own_lease),
+            recovered: std::sync::Mutex::new(RefLease::new(
+                recovered_checkpoint_ref(elem).unwrap(),
+                None,
+            )),
+        };
+
+        // Pushing S2 first fails the create-only lease (the ref exists at S1), but
+        // reconciliation observes remote == our attempted S1 and retries — landing
+        // S2 and KEEPING ownership instead of halting.
+        let res = lease_push_shared(&git, "origin", &leases.own, &s2).await;
+        assert_eq!(
+            res,
+            PushResult::Ok,
+            "ambiguous push must reconcile, not halt"
+        );
+        assert_eq!(
+            observe_remote_ref_sha(&git, &own, "origin").await,
+            s2,
+            "the remote own ref must advance to our retried sha"
+        );
+        {
+            let l = leases.own.lock().unwrap();
+            assert!(l.owned, "ownership must be retained after reconciliation");
+            assert_eq!(l.expect, s2, "lease must be re-based on the landed sha");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -989,16 +989,30 @@ impl GitRunner {
         }
         #[cfg(unix)]
         let mut group_guard = crate::pdeath::GroupGuard::new(gpid);
-        if let Some(mut si) = child.stdin.take() {
-            if let Some(data) = input {
-                let _ = si.write_all(data).await;
-            }
-            let _ = si.shutdown().await;
-        }
+        let mut stdin_pipe = child.stdin.take();
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
         let max_stdout = self.max_stdout;
         let wait = async {
+            // Feed stdin CONCURRENTLY with draining stdout/stderr and awaiting
+            // exit — all inside the single timeout below. Writing stdin to
+            // completion BEFORE we began draining (the previous shape) deadlocks
+            // on a large input: once the child's stdout pipe fills, git stops
+            // reading its stdin and blocks on its own write, so our `write_all`
+            // blocks forever. Because that happened OUTSIDE the `timeout(wait)`
+            // wrapper, the timeout never armed and the git child hung
+            // indefinitely (e.g. a big `git apply`/`hash-object` restore patch).
+            // Driving the write as just another branch of this `join!` lets the
+            // concurrent drain keep stdout flowing while we write, and the
+            // timeout now bounds the whole exchange.
+            let write_in = async {
+                if let Some(mut si) = stdin_pipe.take() {
+                    if let Some(data) = input {
+                        let _ = si.write_all(data).await;
+                    }
+                    let _ = si.shutdown().await;
+                }
+            };
             // Drain BOTH pipes to EOF so git never blocks on a full buffer, but
             // retain only a bounded amount: unbounded `read_to_end` here let a
             // large restore diff or a noisy remote/helper grow the buffer without
@@ -1022,7 +1036,7 @@ impl GitRunner {
                     None => Vec::new(),
                 }
             };
-            let (status, out, err) = tokio::join!(child.wait(), read_out, read_err);
+            let (status, (), out, err) = tokio::join!(child.wait(), write_in, read_out, read_err);
             (status, out, err)
         };
         match tokio::time::timeout(self.timeout, wait).await {
@@ -1777,7 +1791,23 @@ pub async fn restore_checkpoint(
         return refuse(&format!("diff failed: {}", diff.err_text()), false);
     }
     if diff.stdout_bytes().is_empty() {
-        return refuse("empty diff", false);
+        // An EMPTY base→snapshot diff means the snapshot's tree already equals
+        // the base we have checked out: there is nothing to apply, so this is a
+        // successful NO-OP restore, not a failure. Returning `restored = false`
+        // here (the previous behaviour) made `integration::restore` skip seeding
+        // the WIP ownership lease, so the next NON-empty snapshot pushed
+        // create-only against the already-existing ref, was rejected as a stale
+        // lease, and checkpointing silently stopped for the rest of the run.
+        // Report success so ownership is seeded; the worktree already matches.
+        return RestoreResult {
+            restored: true,
+            mode: if checkpoint.base.is_empty() {
+                "noop-empty-base".into()
+            } else {
+                "noop".into()
+            },
+            ..Default::default()
+        };
     }
     // Feed git apply the RAW diff bytes, not the lossy UTF-8 decode: a
     // `--binary` diff can carry non-UTF-8 hunk content (e.g. Latin-1 without NUL
