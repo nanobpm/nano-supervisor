@@ -1146,7 +1146,14 @@ pub async fn snapshot_worktree(
     let _guard = TempDirGuard(tmp.clone());
     let index_path = tmp.join("index");
     let index_str = index_path.to_string_lossy().into_owned();
-    let env: Vec<(&str, &str)> = vec![("GIT_INDEX_FILE", index_str.as_str())];
+    // GIT_LITERAL_PATHSPECS=1 makes EVERY pathspec in this snapshot literal, so a
+    // tracked file whose name is itself pathspec magic (e.g. `:(literal)leak.txt`,
+    // `:!leak.txt`) can never be reinterpreted by `reset` into selecting a
+    // different path and leaving a secret-bearing blob staged for publication.
+    let env: Vec<(&str, &str)> = vec![
+        ("GIT_INDEX_FILE", index_str.as_str()),
+        ("GIT_LITERAL_PATHSPECS", "1"),
+    ];
 
     let head = git.run(&["rev-parse", "--verify", "-q", "HEAD"]).await;
     let unborn = !head.ok();
@@ -1195,8 +1202,30 @@ pub async fn snapshot_worktree(
             reason: format!("diff failed: {}", changed.err_text()),
         };
     }
+    // Secret/deny/size filtering and the exclusion `reset` both key off decoded
+    // path strings, but Unix Git filenames can carry non-UTF-8 bytes. A lossy
+    // decode collapses distinct names (`leak-\xFF.txt` and `leak-\u{FFFD}.txt`)
+    // into one spelling, so the checks could inspect a benign file while leaving
+    // the other file's secret-bearing blob unfiltered, and an exclusion reset
+    // would target the wrong path. Fail closed: if any listed path is not valid
+    // UTF-8, skip the whole snapshot rather than publish an unfilterable tree.
+    let mut changed_paths: Vec<&str> = Vec::new();
+    for raw in changed
+        .stdout_bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+    {
+        match std::str::from_utf8(raw) {
+            Ok(p) => changed_paths.push(p),
+            Err(_) => {
+                return Snapshot::Skipped {
+                    reason: "non-UTF-8 path in snapshot listing".into(),
+                };
+            }
+        }
+    }
     let mut excluded: Vec<(String, String)> = Vec::new();
-    for path in changed.stdout.split('\0').filter(|s| !s.is_empty()) {
+    for path in changed_paths {
         let mut why: Option<&str> = if is_denied_path(path) {
             Some("denied")
         } else {

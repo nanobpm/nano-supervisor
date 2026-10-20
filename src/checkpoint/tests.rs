@@ -664,6 +664,109 @@ async fn snapshot_excludes_denied_and_secret_paths() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Regression: a secret-bearing file whose NAME is itself Git pathspec magic
+// (e.g. `:(literal)leak.txt`) must still be excluded. Without
+// GIT_LITERAL_PATHSPECS the exclusion `reset` would reinterpret the name as a
+// pathspec, select a different (or no) path, and leave the secret blob staged
+// for publication.
+#[tokio::test]
+async fn snapshot_excludes_pathspec_magic_named_secret() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("pathspec").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    std::fs::write(work.join("keep.txt"), "normal\n").unwrap();
+    // Name is literal pathspec magic AND the content is a token.
+    let magic_name = ":(literal)leak.txt";
+    std::fs::write(work.join(magic_name), format!("ghp_{}", "a".repeat(40))).unwrap();
+
+    let snap = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-magic",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "msg",
+    )
+    .await;
+    let (sha, excluded) = match snap {
+        Snapshot::Committed { sha, excluded, .. } => (sha, excluded),
+        Snapshot::Skipped { reason } => panic!("skipped: {reason}"),
+    };
+    let names: Vec<&str> = excluded.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(names.contains(&magic_name), "excluded: {names:?}");
+
+    // The secret file must NOT appear in the published tree under any spelling.
+    let ls = git.run(&["ls-tree", "-r", "--name-only", &sha]).await.out();
+    assert!(ls.contains("keep.txt"), "tree: {ls}");
+    assert!(!ls.contains("leak.txt"), "secret leaked into tree: {ls}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// Regression: a worktree listing with a non-UTF-8 filename cannot be safely
+// filtered (lossy decoding collapses distinct names into one spelling), so the
+// snapshot must FAIL CLOSED by skipping rather than publishing an unfilterable
+// tree.
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_skips_non_utf8_path() {
+    use std::os::unix::ffi::OsStrExt;
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("nonutf8").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    // Git must list raw bytes verbatim, not quote/escape them, so the snapshot
+    // actually sees the invalid bytes.
+    assert!(git.run(&["config", "core.quotePath", "false"]).await.ok());
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    std::fs::write(work.join("keep.txt"), "normal\n").unwrap();
+    // Filename with a lone 0xFF byte — valid on Linux, invalid UTF-8. Some
+    // filesystems (e.g. macOS APFS) reject non-UTF-8 names outright; skip there,
+    // the fail-closed path still runs on Linux CI where the repo is built.
+    let bad = std::ffi::OsStr::from_bytes(b"leak-\xFF.txt");
+    if std::fs::write(work.join(bad), "SECRET\n").is_err() {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+
+    let snap = snapshot_worktree(
+        &git,
+        &base_sha,
+        "main",
+        "run-bad",
+        None,
+        5 * 1024 * 1024,
+        &[],
+        "msg",
+    )
+    .await;
+    match snap {
+        Snapshot::Skipped { reason } => {
+            assert!(reason.contains("non-UTF-8"), "reason: {reason}");
+        }
+        Snapshot::Committed { sha, .. } => {
+            let ls = git.run(&["ls-tree", "-r", "--name-only", &sha]).await.out();
+            panic!("expected fail-closed skip, got committed tree: {ls}");
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn restore_refuses_off_branch_snapshot() {
     if which_git().is_none() {
