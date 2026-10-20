@@ -2230,8 +2230,17 @@ fn git_index_suppression_present(
     // Untracked (`?`) / ignored (`!`) lines never appear here (no `-o`/`-i`),
     // and an unflagged tracked entry is an uppercase non-`S` letter — neither is
     // treated as suppression. A read error fails closed to `true` ("unknown").
-    let mut out = child.stdout.take();
+    //
+    // Wrap the raw `ChildStdout` in a `BufReader` before the per-byte scan:
+    // `ChildStdout` is unbuffered, so reading a byte at a time off it would
+    // issue one `read(2)` syscall per byte of every tracked filename — on a
+    // large checkout that is a syscall storm that can burn the shared deadline.
+    // `BufReader` serves each byte from a fixed-size in-memory buffer (one
+    // syscall per buffer-fill, not per byte) while keeping memory bounded to
+    // that fixed buffer — it never accumulates the listing.
+    let out = child.stdout.take().map(std::io::BufReader::new);
     let reader = std::thread::spawn(move || {
+        let mut out = out;
         let mut flagged = false;
         let mut byte = [0u8; 1];
         // Whether the next byte read is a line's tag byte (the first byte).
@@ -7007,6 +7016,59 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "the suppression check must stream + share the deadline, not stall ({elapsed:?})"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_clean_tree_streams_long_tracked_filenames() {
+        // The per-byte class Copilot flagged on the suppression check: the tag
+        // scan read a byte at a time off the UNBUFFERED `ChildStdout`, so every
+        // byte of every tracked filename cost a `read(2)` syscall. A clean tree
+        // whose `ls-files` listing is dominated by long filenames (many bytes
+        // per line) therefore paid a syscall storm that could burn the shared
+        // deadline. The scan now reads through a `BufReader`, so a clean tree
+        // with long filenames still reads `Some(false)` well under the deadline.
+        let base = init_dirty_probe_repo("longnames");
+        // Long filenames maximise the bytes the tag scan must consume per line;
+        // combined with many files this is the per-byte path under test.
+        let long = "a".repeat(180);
+        for i in 0..4000 {
+            std::fs::write(base.join(format!("{long}-{i:05}")), "x").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "longnames",
+        ]);
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let started = Instant::now();
+        let verdict = git_worktree_dirty_timeout(&handle, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            verdict,
+            Some(false),
+            "a clean tree with long tracked filenames must read clean, not time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the buffered tag scan must not stall on a long-filename listing ({elapsed:?})"
         );
         std::fs::remove_dir_all(&base).ok();
     }
