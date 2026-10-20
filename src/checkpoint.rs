@@ -1347,17 +1347,44 @@ fn make_temp_index_dir() -> Option<PathBuf> {
     // silently skipping the snapshot. Anchoring to an absolute path makes both
     // sides name the same directory regardless of cwd.
     let base = std::path::absolute(std::env::temp_dir()).ok()?;
-    let unique = format!(
-        "nano-ckpt-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let dir = base.join(unique);
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
+    // Ensure the temp ROOT exists (idempotent) before the atomic child create
+    // below: a nested `TMPDIR` whose parents do not yet exist was previously
+    // materialised by `create_dir_all`, and the switch to the non-recursive
+    // `create_dir` for the unique child must not regress that — otherwise a
+    // first-run nested temp root would fail closed and silently disable
+    // checkpointing. This only creates the shared root, never adopts a unique
+    // snapshot directory.
+    std::fs::create_dir_all(&base).ok()?;
+    // Create the directory ATOMICALLY and EXCLUSIVELY. The name mixes the PID
+    // with a SystemTime tick, but concurrent slots in one daemon share a PID and
+    // can observe the same tick (coarse clocks, or a clock that steps back), so
+    // the name is not guaranteed unique. `create_dir_all` treats an existing
+    // directory as success, so two snapshots would then SHARE one temp index —
+    // and either `TempDirGuard` dropping would `remove_dir_all` the directory out
+    // from under the other snapshot mid-`read-tree`. `create_dir` (not `_all`)
+    // fails with `AlreadyExists` on a collision, so each snapshot owns a distinct
+    // directory; on collision retry with a fresh counter-salted name rather than
+    // adopt the existing one. A bounded retry count fails closed to `None`
+    // ("no snapshot") rather than looping forever on a persistently failing temp
+    // root. The parent temp root already exists, so a non-`AlreadyExists` error
+    // is a real failure (permissions, missing root) and also fails closed.
+    for attempt in 0..16u32 {
+        let unique = format!(
+            "nano-ckpt-{}-{}-{attempt}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = base.join(unique);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Some(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 struct TempDirGuard(PathBuf);
@@ -1941,6 +1968,26 @@ pub async fn sweep_stale_checkpoints(
     let prefixes = swept_ref_prefixes();
     let prefix_of =
         |r: &str| -> Option<&'static str> { prefixes.iter().copied().find(|p| r.starts_with(p)) };
+    // Exempt the element the sweep runs FOR across BOTH swept namespaces, not
+    // just the single `own_ref` string. `own_ref` names only this element's WIP
+    // ref, but self-resume seeds the element's RECOVERY lease before launching
+    // this sweep (restore adopts a prior checkpoint into `refs/nano/recovered/`).
+    // If that recovery snapshot is already past the TTL, exempting only the WIP
+    // ref lets the sweep delete the recovery ref before the periodic loop's
+    // first tick refreshes it — recovery promotion then gets a stale-lease
+    // rejection and PERMANENTLY stops updating the recovery ref for this attempt,
+    // stranding the very checkpoint it was resuming. Key the exemption on the
+    // element instance key (the ref tail after its namespace prefix) so both
+    // `refs/nano/wip/<key>` and `refs/nano/recovered/<key>` are spared. A
+    // malformed `own_ref` with no known prefix falls back to the exact-string
+    // match, preserving prior behaviour.
+    let owned_key: Option<&str> = own_ref.and_then(|r| ref_prefix(r).map(|p| &r[p.len()..]));
+    let is_owned = |reference: &str| -> bool {
+        Some(reference) == own_ref
+            || owned_key.is_some_and(|k| {
+                prefix_of(reference).is_some_and(|p| &reference[p.len()..] == k)
+            })
+    };
 
     let mut ls_args: Vec<String> = vec!["ls-remote".into(), "--refs".into(), remote.into()];
     for p in prefixes {
@@ -1960,7 +2007,7 @@ pub async fn sweep_stale_checkpoints(
         let mut it = line.split_whitespace();
         let sha = it.next().unwrap_or("").to_string();
         let reference = it.next().unwrap_or("").to_string();
-        if reference.is_empty() || Some(reference.as_str()) == own_ref {
+        if reference.is_empty() || is_owned(&reference) {
             continue;
         }
         if prefix_of(&reference).is_some() {

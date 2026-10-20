@@ -1080,6 +1080,89 @@ async fn sweep_spares_active_escalation_but_reclaims_orphans_and_ttl() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Advisory regression: the sweep must exempt the owned element across BOTH
+/// swept namespaces, not just the single `own_ref` (WIP) string. Self-resume
+/// seeds the element's RECOVERY lease before the sweep runs, so a recovery
+/// snapshot already past the TTL would be reaped on the first sweep — stranding
+/// the checkpoint the job is resuming — unless the recovery ref is exempted too.
+#[tokio::test]
+async fn sweep_exempts_owned_element_across_both_namespaces() {
+    if which_git().is_none() {
+        return;
+    }
+    let (root, _bare) = setup_remote_with_main("sweepown").await;
+    let work = root.join("a");
+    let root_git = runner_at(&root);
+    assert!(root_git.run(&["clone", "remote.git", "a"]).await.ok());
+    let git = runner_at(&work);
+    let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+    std::fs::write(work.join("w.txt"), "a\n").unwrap();
+    let snap = snapshot_worktree(&git, &base_sha, "main", "r1", None, 5_000_000, &[], "m").await;
+    let sha = match snap {
+        Snapshot::Committed { sha, .. } => sha,
+        Snapshot::Skipped { reason } => panic!("{reason}"),
+    };
+
+    // The owned element: its WIP ref (passed as `own_ref`) AND its recovery ref
+    // (seeded by self-resume). Plus an UNRELATED element's recovery ref, which
+    // must still be reclaimed past the TTL.
+    let own_wip = checkpoint_ref("self").unwrap();
+    let own_rec = recovered_checkpoint_ref("self").unwrap();
+    let other_rec = recovered_checkpoint_ref("stranger").unwrap();
+    for r in [&own_wip, &own_rec, &other_rec] {
+        assert_eq!(
+            push_checkpoint(&git, r, &sha, "", "origin").await,
+            PushResult::Ok,
+            "seed {r}"
+        );
+    }
+
+    // TTL=1 with now far in the future: every ref is past the TTL. Passing only
+    // the WIP ref as `own_ref` must still spare the owned recovery ref while
+    // reclaiming the unrelated one.
+    let now = 10_u64.pow(15);
+    let res = sweep_stale_checkpoints(
+        &git,
+        Some(&own_wip),
+        1,
+        0,
+        None,
+        now,
+        50,
+        20,
+        "origin",
+        "origin",
+    )
+    .await;
+    assert_eq!(
+        res.deleted.len(),
+        1,
+        "only the unrelated recovery ref must be reclaimed: {res:?}"
+    );
+    assert!(
+        res.deleted.iter().any(|d| d.reference == other_rec),
+        "the unrelated recovery ref must be the one reclaimed: {res:?}"
+    );
+    // Both owned refs survive.
+    assert!(
+        fetch_checkpoint(&git, &own_wip, "origin")
+            .await
+            .unwrap()
+            .is_some(),
+        "owned WIP ref must survive"
+    );
+    assert!(
+        fetch_checkpoint(&git, &own_rec, "origin")
+            .await
+            .unwrap()
+            .is_some(),
+        "owned recovery ref must survive the sweep"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The orphan sweep runs against a dedicated scratch `--git-dir` that has no
 /// `origin` remote. Driven through that scratch runner, the sweep must target the
 /// repository by URL/path (as `maybe_sweep` now resolves it) rather than the

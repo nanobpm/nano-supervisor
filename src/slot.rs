@@ -2080,12 +2080,20 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
     // durable copy (nanobpm/nano-supervisor#82). `-c core.fsmonitor=false`
     // pins the fsmonitor hook OFF: an agent-configured `core.fsmonitor` command
     // would otherwise run during `git status` in this daemon process.
+    // `--ignore-submodules=none` overrides any `submodule.<name>.ignore`
+    // (including one committed in `.gitmodules`): without it a `status`-hiding
+    // `=all`/`=dirty` setting lets an initialized submodule carry uncommitted
+    // work while this probe prints nothing — the same read-dirty-as-clean class
+    // as the untracked and suppression-flag bypasses — so finalize would reap
+    // that submodule's only local copy. Checkpointing's `git add -A` records the
+    // submodule's gitlink, so the probe must not under-report it here.
     cmd.args([
         "-c",
         "core.fsmonitor=false",
         "status",
         "--porcelain",
         "--untracked-files=all",
+        "--ignore-submodules=none",
     ])
     .env("GIT_CONFIG_NOSYSTEM", "1")
     .env("GIT_TERMINAL_PROMPT", "0")
@@ -6934,6 +6942,62 @@ mod tests {
             "a skip-worktree edit must fail closed to None, never read clean"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_detects_ignored_dirty_submodule() {
+        // `submodule.<name>.ignore=all` (settable in `.git/config` or committed
+        // in `.gitmodules`) makes `git status` omit a dirty submodule entirely.
+        // Without `--ignore-submodules=none` the probe would read the
+        // superproject clean while an initialized submodule carries uncommitted
+        // work — the same read-dirty-as-clean class as the untracked and
+        // suppression-flag bypasses — letting finalize reap that work's only
+        // copy. The probe overrides the ignore setting, so a dirty submodule
+        // reads dirty (never `Some(false)`).
+        let base = init_dirty_probe_repo("submod-super");
+        let sub = init_dirty_probe_repo("submod-inner");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        // Embed the second repo as a submodule (local path needs the file
+        // protocol explicitly allowed on modern git), then commit it.
+        git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.to_str().unwrap(),
+            "inner",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "add submodule",
+        ]);
+        // Tell git to ignore the submodule entirely, then dirty a TRACKED file
+        // inside it so only the ignore override can surface the change.
+        git(&["config", "submodule.inner.ignore", "all"]);
+        std::fs::write(base.join("inner").join("tracked"), "dirty-inside-submodule").unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            Some(true),
+            "an ignored dirty submodule must read dirty, not clean"
+        );
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&sub).ok();
     }
 
     #[cfg(unix)]
