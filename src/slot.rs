@@ -2063,16 +2063,64 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut cmd = Command::new("git");
-    cmd.args(["status", "--porcelain"])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    // `--untracked-files=all` (not the config-honouring default): a local or
+    // global `status.showUntrackedFiles=no` must not hide untracked work from
+    // this probe — checkpointing's `git add -A` captures it, so omitting it
+    // here would read a dirty tree as clean and let finalize delete the only
+    // durable copy (nanobpm/nano-supervisor#82). `-c core.fsmonitor=false`
+    // pins the fsmonitor hook OFF: an agent-configured `core.fsmonitor` command
+    // would otherwise run during `git status` in this daemon process.
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    ])
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_OPTIONAL_LOCKS", "0")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    // Strip the daemon's engine-connection secrets before spawning, matching
+    // `GitRunner::run_in` and provision.rs: this probe runs for provisioned
+    // checkouts even when checkpointing is disabled, and a repo-configured
+    // hook/helper reachable from `git status` would otherwise inherit
+    // daemon-only `CAMUNDA_*`/`ZEEBE_*` secrets and basic-auth passwords.
+    for k in SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+    // Strip git's environment-based config-injection channels too, so a tainted
+    // daemon environment cannot re-enable an fsmonitor hook (or inject any
+    // other config) above the `-c` pins.
+    for k in crate::provision::GIT_CONFIG_INJECTION_ENV {
+        cmd.env_remove(k);
+    }
     dir.apply_std(&mut cmd).ok()?;
     let mut child = cmd.spawn().ok()?;
     let deadline = Instant::now() + timeout;
+    // Take stdout and drain it CONCURRENTLY with the wait: the verdict only
+    // needs "did git print anything", so the reader keeps a bounded
+    // first-bytes indicator instead of the whole listing. Without this, a
+    // porcelain listing larger than the pipe capacity makes git block writing
+    // while the wait loop below blocks on exit — a healthy but very dirty
+    // checkout would then always pay the full timeout and be killed.
+    let mut out = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut first = [0u8; 1];
+        let nonempty = match out.as_mut().map(|o| o.read(&mut first)) {
+            Some(Ok(n)) => n > 0,
+            // No pipe or a read error: signal "unknown" (None) to the caller.
+            _ => return None,
+        };
+        if nonempty {
+            // Drain the rest so git never blocks on a full pipe; discard it.
+            let mut sink = Vec::new();
+            let _ = out.as_mut().map(|o| o.read_to_end(&mut sink));
+        }
+        Some(nonempty)
+    });
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -2084,20 +2132,14 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
             Err(_) => break None,
         }
     };
-    let mut buf = Vec::new();
-    // Read the (now-closed) pipe before the final reap: a clean tree produces no
-    // output, a dirty one lists its paths. A read error fails closed (`None`).
-    if let Some(mut out) = child.stdout.take() {
-        if out.read_to_end(&mut buf).is_err() {
-            let _ = child.wait();
-            return None;
-        }
-    }
     let _ = child.wait();
+    // Join the drainer (bounded: the pipe is closed once git exits or is
+    // killed). A read failure fails closed to `None` ("unknown").
+    let nonempty = reader.join().ok().flatten()?;
     if !status.is_some_and(|s| s.success()) {
         return None;
     }
-    Some(!String::from_utf8_lossy(&buf).trim().is_empty())
+    Some(nonempty)
 }
 
 /// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
@@ -6584,6 +6626,123 @@ mod tests {
         // The wedged probe still resolves to "no commits" once its deadline
         // kills the blocked git.
         assert_eq!(probe.await.unwrap(), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Shared setup for the `git_worktree_dirty_timeout` regressions: a real
+    /// git work tree under a canonicalized temp dir (canonicalized so the
+    /// no-follow cwd bind is not refused on a symlinked `/var` ancestor), with
+    /// one committed file so `git status` has a HEAD to diff against.
+    #[cfg(unix)]
+    fn init_dirty_probe_repo(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "nano-git-dirty-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(base.join("tracked"), "v1").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        base
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_honours_untracked_despite_config_no() {
+        // The class Copilot flagged: `git status --porcelain` honours a local
+        // `status.showUntrackedFiles=no`, which would hide untracked work that
+        // checkpointing's `git add -A` WOULD capture — reading a dirty tree as
+        // clean and letting finalize delete the only durable copy. The probe
+        // forces `--untracked-files=all`, so the untracked file is still seen.
+        let base = init_dirty_probe_repo("untracked");
+        // Suppress untracked reporting in the repo's own config.
+        let cfg = std::process::Command::new("git")
+            .args(["config", "status.showUntrackedFiles", "no"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(cfg.status.success());
+        // Untracked work the checkpoint would capture but the naive status
+        // (honouring the config) would omit.
+        std::fs::write(base.join("new-work"), "uncommitted").unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            Some(true),
+            "an untracked file must read dirty even with status.showUntrackedFiles=no"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_clean_tree_reads_clean() {
+        // The complementary leg: a clean tree is `Some(false)` (proven clean),
+        // so a genuinely clean run still deletes its checkpoint and reaps.
+        let base = init_dirty_probe_repo("clean");
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            Some(false),
+            "a clean tree must read Some(false)"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_drains_a_pipe_overflowing_listing() {
+        // The class Copilot flagged: stdout was drained only AFTER git exited,
+        // so a porcelain listing larger than the pipe capacity made git block
+        // writing while the wait loop blocked on exit — a healthy but very
+        // dirty checkout always paid the full timeout and was killed (read as
+        // `None`). The drainer now runs concurrently, so the probe returns
+        // `Some(true)` promptly, well under the deadline.
+        let base = init_dirty_probe_repo("overflow");
+        // Far more untracked files than the ~64KiB pipe buffer holds in
+        // porcelain lines, so git must block on a full pipe if nobody drains.
+        for i in 0..8000 {
+            std::fs::write(base.join(format!("filler-{i:05}")), "x").unwrap();
+        }
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let started = Instant::now();
+        let verdict = git_worktree_dirty_timeout(&handle, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            verdict,
+            Some(true),
+            "a very dirty tree must read dirty, not time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the probe must drain concurrently, not pay the full timeout ({elapsed:?})"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
