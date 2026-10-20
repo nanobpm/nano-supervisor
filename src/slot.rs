@@ -2033,6 +2033,73 @@ pub(crate) async fn git_head_blocking(dir: crate::safecwd::CwdHandle) -> Option<
         .flatten()
 }
 
+/// Post-run working-tree verdict for a provisioned checkout, dispatched to the
+/// blocking pool like [`git_head_blocking`]. `Some(false)` is a PROVEN-clean
+/// tree (no uncommitted edits); `Some(true)` is a dirty tree (edits that were
+/// never committed, so neither `pushed` nor the HEAD compare sees them); `None`
+/// means the check could not run (timeout / wedged checkout / non-git dir).
+/// Callers treat anything other than `Some(false)` as "not provably clean" and
+/// fail closed — preserving the checkpoint and retaining the checkout — because
+/// a dirty tree's only durable copy of that work is the WIP checkpoint and its
+/// only local copy is the run dir (nanobpm/nano-supervisor#82). Best-effort and
+/// bounded for the same reason as the HEAD probe: a wedged agent-controlled
+/// checkout must never stall settlement or starve the runtime.
+pub(crate) async fn git_worktree_dirty_blocking(dir: crate::safecwd::CwdHandle) -> Option<bool> {
+    tokio::task::spawn_blocking(move || git_worktree_dirty_timeout(&dir, GIT_HEAD_TIMEOUT))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Bounded `git status --porcelain` probe. Returns `Some(true)` when the tree
+/// carries any change (porcelain output non-empty), `Some(false)` when it is
+/// clean (git exited 0 with empty output), and `None` when the probe could not
+/// conclude — a non-zero exit (e.g. a non-git dir), a timeout on a wedged
+/// checkout, or a spawn/read error. Mirrors the hardening of
+/// [`git_head_timeout`]: pinned no-follow entry through the capability handle,
+/// null stdin, piped stdout owned by the deadline, and a kill+reap on timeout so
+/// a git wedged on agent-planted blocking metadata cannot hang forever.
+fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<bool> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("git");
+    cmd.args(["status", "--porcelain"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    dir.apply_std(&mut cmd).ok()?;
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_HEAD_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+    let mut buf = Vec::new();
+    // Read the (now-closed) pipe before the final reap: a clean tree produces no
+    // output, a dirty one lists its paths. A read error fails closed (`None`).
+    if let Some(mut out) = child.stdout.take() {
+        if out.read_to_end(&mut buf).is_err() {
+            let _ = child.wait();
+            return None;
+        }
+    }
+    let _ = child.wait();
+    if !status.is_some_and(|s| s.success()) {
+        return None;
+    }
+    Some(!String::from_utf8_lossy(&buf).trim().is_empty())
+}
+
 /// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
 /// checkout. A healthy read is milliseconds; 5s is generous headroom for a
 /// loaded host while still bounding a blocked one well under any activation
@@ -2162,13 +2229,27 @@ fn retained_result_counts_as_commits(
 /// of the HEAD compare: a side-branch/detached commit that is then abandoned
 /// leaves the final HEAD unchanged (so `has_commits` reads false) while the only
 /// copy of that work sits in the run dir — the HEAD compare alone would reap it.
+///
+/// `workspace_clean` is the post-run working-tree verdict for a PROVISIONED
+/// checkout: `false` means the tree still holds UNCOMMITTED edits (or the check
+/// could not prove it clean — fail closed). Such edits were never committed, so
+/// neither `pushed` nor the HEAD compare sees them: their only durable copy is
+/// the WIP checkpoint, and their only LOCAL copy is this run dir. Reaping it
+/// would destroy that local copy (and the checkpoint is a soon-GC'd safety net),
+/// so a provisioned run whose tree is not provably clean is retained like an
+/// unpushed one (nanobpm/nano-supervisor#82). A non-provisioned run has no
+/// checkout to hold edits, so its caller passes `workspace_clean = true`.
 fn may_reap_completed_run(
     provisioned: bool,
     has_commits: bool,
     pushed: bool,
     retained: bool,
+    workspace_clean: bool,
 ) -> bool {
     if retained {
+        return false;
+    }
+    if provisioned && !workspace_clean {
         return false;
     }
     !(provisioned && has_commits && !pushed)
@@ -2177,17 +2258,29 @@ fn may_reap_completed_run(
 /// Whether the WIP/recovery checkpoint refs may be DELETED on finalize. The
 /// checkpoint is a safety net for UNPUBLISHED work, so a bare `Settle::Complete`
 /// is not enough: the work must be durably published — its commits reached the
-/// real branch (`pushed`), or there was nothing to publish (`!has_commits`) — and
-/// the checkout must not be flagged for retention (`!retained`). Otherwise the
-/// commits may live ONLY in the soon-reaped run dir, so the checkpoint must be
-/// preserved for a resumed run to adopt.
+/// real branch (`pushed`), or there was nothing to publish (`!has_commits`) — the
+/// working tree must be provably CLEAN (`workspace_clean`), and the checkout must
+/// not be flagged for retention (`!retained`). Otherwise the work may live ONLY
+/// in the soon-reaped run dir, so the checkpoint must be preserved for a resumed
+/// run to adopt.
+///
+/// `workspace_clean` closes the uncommitted-edits gap: `pushed` confirms
+/// publication of COMMITS, and `!has_commits` only means no commit was made —
+/// NEITHER proves the working tree is free of unpublished edits. A run can
+/// return a valid result (e.g. a blocked ACP outcome) while leaving checkpointed
+/// edits uncommitted; those edits exist only in the WIP checkpoint, so deleting
+/// it — even when commits were pushed — would strand them. We therefore require
+/// a positive clean verdict (dirty, or an inconclusive check, reads `false` and
+/// preserves the checkpoint) before declaring the work durable
+/// (nanobpm/nano-supervisor#82).
 fn checkpoint_deletion_durable(
     complete: bool,
     retained: bool,
     pushed: bool,
     has_commits: bool,
+    workspace_clean: bool,
 ) -> bool {
-    complete && !retained && (pushed || !has_commits)
+    complete && !retained && workspace_clean && (pushed || !has_commits)
 }
 
 async fn execute(
@@ -2635,6 +2728,22 @@ async fn execute(
         Ok(cwd) => git_head_blocking(cwd).await,
         Err(_) => None,
     };
+    // Post-run working-tree verdict for a provisioned checkout: `pushed`/HEAD see
+    // only COMMITS, so a run that left checkpointed edits UNCOMMITTED (e.g. a
+    // blocked ACP outcome) would otherwise look durable while its only copies are
+    // the WIP checkpoint and this soon-reaped run dir. Probe cleanliness so the
+    // checkpoint-deletion and reap decisions below can fail closed on any tree
+    // that is not PROVABLY clean. A non-provisioned run has no checkout to hold
+    // edits, so it is clean by construction; an inconclusive probe (`None`) or a
+    // dirty tree both read as "not clean" (nanobpm/nano-supervisor#82).
+    let workspace_clean = if provisioned {
+        match agent_cwd.try_clone() {
+            Ok(cwd) => matches!(git_worktree_dirty_blocking(cwd).await, Some(false)),
+            Err(_) => false,
+        }
+    } else {
+        true
+    };
     let has_commits = match &git_result {
         Some(g) if !g.commits.is_empty() => true,
         _ => {
@@ -2740,6 +2849,7 @@ async fn execute(
             retain,
             pushed,
             has_commits,
+            workspace_clean,
         );
         guard.finish(durable).await;
     }
@@ -2767,7 +2877,7 @@ async fn execute(
     // reapability unconditionally and write the marker whenever the run is
     // non-reapable; only the destructive reap is skipped under `--keep-runs`.
     if matches!(settle, Settle::Complete(_)) {
-        if may_reap_completed_run(provisioned, has_commits, pushed, retain) {
+        if may_reap_completed_run(provisioned, has_commits, pushed, retain, workspace_clean) {
             // Reapable (nothing durable to lose): delete the dir unless the
             // operator asked to keep run dirs for post-mortem.
             if !cfg.keep_runs {
@@ -6538,15 +6648,29 @@ mod tests {
         // A provisioned checkout that advanced HEAD whose commits were NOT pushed
         // lives ONLY in the run dir, so a successful run must NOT reap it (that
         // would destroy the sole copy).
-        assert!(!may_reap_completed_run(true, true, false, false));
+        assert!(!may_reap_completed_run(true, true, false, false, true));
         // Once finalize PUSHED those commits they are durable off-box, so the run
         // dir reaps normally.
-        assert!(may_reap_completed_run(true, true, true, false));
+        assert!(may_reap_completed_run(true, true, true, false, true));
         // A provisioned run that made no commit has nothing durable to lose.
-        assert!(may_reap_completed_run(true, false, false, false));
+        assert!(may_reap_completed_run(true, false, false, false, true));
         // A non-repository run never holds commits, so it is always reapable.
-        assert!(may_reap_completed_run(false, false, false, false));
-        assert!(may_reap_completed_run(false, true, false, false));
+        assert!(may_reap_completed_run(false, false, false, false, true));
+        assert!(may_reap_completed_run(false, true, false, false, true));
+    }
+
+    #[test]
+    fn dirty_or_unprobed_workspace_is_retained_not_reaped() {
+        // Uncommitted edits (or a tree we could not prove clean) live ONLY in the
+        // run dir + the soon-GC'd WIP checkpoint: reaping would destroy the local
+        // copy. A provisioned run whose tree is not provably clean is retained
+        // even when its commits were pushed (nanobpm/nano-supervisor#82).
+        assert!(!may_reap_completed_run(true, true, true, false, false));
+        // ... and when there were no commits at all (uncommitted-only work).
+        assert!(!may_reap_completed_run(true, false, false, false, false));
+        // A non-provisioned run has no checkout to be dirty; its caller passes
+        // `workspace_clean = true`, so it still reaps.
+        assert!(may_reap_completed_run(false, false, false, false, true));
     }
 
     #[test]
@@ -6554,19 +6678,29 @@ mod tests {
         // The WIP/recovery checkpoint refs guard UNPUBLISHED work, so a bare
         // successful settle does NOT license deleting them. Delete only when the
         // run completed AND the work is durable (pushed, or nothing to publish)
-        // AND the checkout was not retained.
-        // Completed + pushed commits -> durable, safe to delete.
-        assert!(checkpoint_deletion_durable(true, false, true, true));
+        // AND the working tree is clean AND the checkout was not retained.
+        // Completed + pushed commits + clean tree -> durable, safe to delete.
+        assert!(checkpoint_deletion_durable(true, false, true, true, true));
         // Completed + commits but NOT pushed -> the commits live only in the
         // soon-reaped run dir; PRESERVE the checkpoint.
-        assert!(!checkpoint_deletion_durable(true, false, false, true));
-        // Completed with nothing to publish -> no work at risk, safe to delete.
-        assert!(checkpoint_deletion_durable(true, false, false, false));
+        assert!(!checkpoint_deletion_durable(true, false, false, true, true));
+        // Completed with nothing to publish + clean tree -> no work at risk, safe.
+        assert!(checkpoint_deletion_durable(true, false, false, false, true));
         // Retained checkout (stranded work / inconclusive scan) -> PRESERVE even
         // though commits were pushed.
-        assert!(!checkpoint_deletion_durable(true, true, true, true));
+        assert!(!checkpoint_deletion_durable(true, true, true, true, true));
         // Not a successful settle -> never delete.
-        assert!(!checkpoint_deletion_durable(false, false, true, false));
+        assert!(!checkpoint_deletion_durable(
+            false, false, true, false, true
+        ));
+        // Uncommitted edits remain (dirty tree) even though commits were pushed:
+        // those edits exist ONLY in the WIP checkpoint, so PRESERVE it.
+        assert!(!checkpoint_deletion_durable(true, false, true, true, false));
+        // Uncommitted-only work (no commit, dirty tree) -> PRESERVE: `!has_commits`
+        // does not prove the tree is clean.
+        assert!(!checkpoint_deletion_durable(
+            true, false, false, false, false
+        ));
     }
 
     #[cfg(unix)]
@@ -6587,10 +6721,10 @@ mod tests {
         // `keep_runs`, and the marker it must write makes a later redelivery's
         // prepare DEFER the wipe (quarantine) instead of destroying the work.
         // The decision is a pure function of (provisioned, has_commits, pushed,
-        // retain) — no `keep_runs` input — so a non-reapable verdict is reached
-        // whether or not `--keep-runs` is set.
+        // retain, workspace_clean) — no `keep_runs` input — so a non-reapable
+        // verdict is reached whether or not `--keep-runs` is set.
         assert!(
-            !may_reap_completed_run(true, true, false, false),
+            !may_reap_completed_run(true, true, false, false, true),
             "an unpushed committing run is non-reapable regardless of --keep-runs"
         );
         // ... and the marker written on that verdict is what a redelivery's
@@ -6634,10 +6768,10 @@ mod tests {
         // detached commit that is then abandoned leaves the final HEAD unchanged
         // (so `has_commits` reads false) while the only copy of that work sits in
         // the run dir — the HEAD compare alone would reap it.
-        assert!(!may_reap_completed_run(true, false, false, true));
-        assert!(!may_reap_completed_run(true, true, false, true));
+        assert!(!may_reap_completed_run(true, false, false, true, true));
+        assert!(!may_reap_completed_run(true, true, false, true, true));
         // Even a pushed run is retained when finalize flagged an incomplete scan.
-        assert!(!may_reap_completed_run(true, true, true, true));
+        assert!(!may_reap_completed_run(true, true, true, true, true));
     }
 
     #[cfg(unix)]

@@ -717,6 +717,29 @@ fn spawn_periodic(
     })
 }
 
+/// Queue a recovery promotion whenever the owned recovery ref LAGS the owned WIP
+/// ref, deriving the pending sha from the leases themselves rather than only from
+/// a WIP push's own success path. The recovery (GC-proof) ref is normally
+/// promoted to the WIP sha right after each WIP push, but two paths advance the
+/// WIP lease WITHOUT running that promotion: a self-resume that SEEDS the WIP
+/// lease ahead of an absent/older recovery ref, and [`reconcile_landed_wip`]
+/// re-basing the WIP lease onto an ambiguous push that actually landed. In both,
+/// if the workspace then stays unchanged, `push_snapshot` keeps returning
+/// `unchanged`/`clean` and the recovery ref is never repaired — so an explicit
+/// resume from the recovery ref misses the latest work. Re-deriving the pending
+/// promotion from the leases after reconciliation closes that gap: when WE own
+/// both leases and the recovery target trails the WIP target, queue the WIP sha
+/// (the retry path promotes it even on an otherwise-idle tick). Otherwise keep
+/// whatever promotion was already pending (nanobpm/nano-supervisor#82).
+fn derive_pending_recovery(leases: &LeaseState, pending: Option<String>) -> Option<String> {
+    let own = leases.own.lock().unwrap();
+    let recovered = leases.recovered.lock().unwrap();
+    if own.owned && recovered.owned && !own.expect.is_empty() && own.expect != recovered.expect {
+        return Some(own.expect.clone());
+    }
+    pending
+}
+
 async fn periodic_loop(
     runner: GitRunner,
     plan: Arc<Plan>,
@@ -750,6 +773,13 @@ async fn periodic_loop(
         // discarded worktree would never supersede the landed (now-unwanted) work
         // on the remote and it would reappear on resume.
         last_tree = reconcile_landed_wip(&runner, &plan, &leases, last_tree).await;
+        // Re-derive the pending recovery promotion from the (possibly just
+        // reconciled or self-resume-seeded) leases BEFORE snapshotting. A WIP
+        // lease that advanced WITHOUT a paired recovery push leaves the GC-proof
+        // recovery ref behind; queue the promotion now so an unchanged-workspace
+        // idle tick still repairs it instead of looping on `unchanged`/`clean`
+        // forever (nanobpm/nano-supervisor#82).
+        recovery_pending = derive_pending_recovery(&leases, recovery_pending);
         match push_snapshot(
             &runner,
             &plan,
@@ -1537,6 +1567,77 @@ mod tests {
             retry_pending_recovery(&runner, &plan, &leases, None).await,
             None
         );
+    }
+
+    fn lease_state(own: RefLease, recovered: RefLease) -> LeaseState {
+        LeaseState {
+            own: std::sync::Mutex::new(own),
+            recovered: std::sync::Mutex::new(recovered),
+        }
+    }
+
+    #[test]
+    fn derive_recovery_queues_wip_when_recovery_ref_lags() {
+        const REC: &str = "refs/nano/recovered/e";
+        // Self-resume seeds the WIP lease at S1 while recovery is ABSENT
+        // (create-only, empty expect). The recovery ref lags, so an unchanged
+        // workspace would never repair it — derive must queue the WIP sha.
+        let leases = lease_state(
+            RefLease::new(OWN.to_string(), Some("s1".into())),
+            RefLease::new(REC.to_string(), None),
+        );
+        assert_eq!(
+            derive_pending_recovery(&leases, None),
+            Some("s1".to_string())
+        );
+        // Recovery present but at an OLDER sha (S0) than the WIP ref => still lags.
+        let leases = lease_state(
+            RefLease::new(OWN.to_string(), Some("s1".into())),
+            RefLease::new(REC.to_string(), Some("s0".into())),
+        );
+        assert_eq!(
+            derive_pending_recovery(&leases, None),
+            Some("s1".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_recovery_keeps_pending_when_not_lagging() {
+        const REC: &str = "refs/nano/recovered/e";
+        // Recovery already matches the WIP ref: nothing to queue. Any pending
+        // promotion already in flight is preserved verbatim (not clobbered).
+        let leases = lease_state(
+            RefLease::new(OWN.to_string(), Some("s1".into())),
+            RefLease::new(REC.to_string(), Some("s1".into())),
+        );
+        assert_eq!(derive_pending_recovery(&leases, None), None);
+        assert_eq!(
+            derive_pending_recovery(&leases, Some("s9".into())),
+            Some("s9".to_string())
+        );
+        // A create-only WIP lease (no snapshot pushed yet) has nothing to promote.
+        let leases = lease_state(
+            RefLease::new(OWN.to_string(), None),
+            RefLease::new(REC.to_string(), None),
+        );
+        assert_eq!(derive_pending_recovery(&leases, None), None);
+    }
+
+    #[test]
+    fn derive_recovery_never_touches_unowned_leases() {
+        const REC: &str = "refs/nano/recovered/e";
+        // A lost WIP lease (a sibling moved the ref) must not drive our recovery
+        // promotion — we no longer own the work it points at.
+        let mut own_lost = RefLease::new(OWN.to_string(), Some("s1".into()));
+        own_lost.owned = false;
+        let leases = lease_state(own_lost, RefLease::new(REC.to_string(), None));
+        assert_eq!(derive_pending_recovery(&leases, None), None);
+        // A lost RECOVERY lease means a sibling owns the recovery ref; we never
+        // reclaim it, so we must not queue a promotion against it.
+        let mut rec_lost = RefLease::new(REC.to_string(), Some("s0".into()));
+        rec_lost.owned = false;
+        let leases = lease_state(RefLease::new(OWN.to_string(), Some("s1".into())), rec_lost);
+        assert_eq!(derive_pending_recovery(&leases, None), None);
     }
 
     #[test]
