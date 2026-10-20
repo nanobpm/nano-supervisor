@@ -2062,7 +2062,17 @@ pub(crate) async fn git_worktree_dirty_blocking(dir: crate::safecwd::CwdHandle) 
 fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<bool> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut cmd = Command::new("git");
+    // Resolve `git` to a trusted ABSOLUTE path on a sanitized PATH, exactly as
+    // `GitRunner::run_in` and the provisioning launcher do (provision.rs
+    // `trusted_cli`): the child `fchdir`s into the agent-controlled checkout, so
+    // a bare `git` lookup with an empty/`.`/relative PATH entry ahead of the
+    // system git could exec an agent-planted binary. That binary exiting 0 with
+    // empty stdout would falsely read a dirty tree clean, letting finalize delete
+    // the only durable copy. The sanitized PATH also constrains git's own
+    // subprocesses. A resolution failure fails closed to `None` ("unknown").
+    let (git_exe, safe_path) = crate::provision::trusted_cli("git").ok()?;
+    let mut cmd = Command::new(&git_exe);
+    cmd.env("PATH", &safe_path);
     // `--untracked-files=all` (not the config-honouring default): a local or
     // global `status.showUntrackedFiles=no` must not hide untracked work from
     // this probe — checkpointing's `git add -A` captures it, so omitting it
@@ -2146,7 +2156,76 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
     if !status.is_some_and(|s| s.success()) {
         return None;
     }
+    // Fail closed when index suppression flags may be hiding modifications.
+    // `git status` honours `--assume-unchanged` / `--skip-worktree`: a tracked
+    // file edited after being flagged reports no modification, so the porcelain
+    // probe above can read clean while the working tree carries unpublished
+    // work. Checkpointing builds a FRESH index from HEAD (`git add -A`), which
+    // ignores those flags and captures the edit — so a "clean" verdict here
+    // would let finalize delete both the checkpoint and the checkout, losing the
+    // only durable copy. When the status reads clean, refuse to prove clean
+    // while any flagged entry is present (`None` = "unknown", retained not
+    // reaped). Only a clean status with NO suppression flags is `Some(false)`.
+    if !nonempty && git_index_suppression_present(dir, &git_exe, &safe_path) {
+        return None;
+    }
     Some(nonempty)
+}
+
+/// Whether the checkout's index carries any `--assume-unchanged` or
+/// `--skip-worktree` entry — the suppression flags that let `git status` hide a
+/// working-tree modification from [`git_worktree_dirty_timeout`]. Detected via
+/// `git ls-files -v`: a lowercase tag letter (`h`, `s`, …) marks a flagged
+/// entry, an uppercase letter an unflagged one. Any spawn/read failure fails
+/// closed to `true` (treated as "suppression present"), so a probe that cannot
+/// rule out hidden work never reports the tree clean.
+fn git_index_suppression_present(
+    dir: &crate::safecwd::CwdHandle,
+    git_exe: &std::path::Path,
+    safe_path: &std::ffi::OsStr,
+) -> bool {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(git_exe);
+    cmd.env("PATH", safe_path);
+    cmd.args(["ls-files", "-v"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for k in SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+    for k in crate::provision::GIT_CONFIG_INJECTION_ENV {
+        cmd.env_remove(k);
+    }
+    if dir.apply_std(&mut cmd).is_err() {
+        return true;
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return true;
+    };
+    let mut buf = Vec::new();
+    let read_ok = child
+        .stdout
+        .take()
+        .map(|mut o| std::io::Read::read_to_end(&mut o, &mut buf))
+        .is_some_and(|r| r.is_ok());
+    let exited_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    if !read_ok || !exited_ok {
+        return true;
+    }
+    // Each line is `<tag> <path>`. The tag encodes the suppression flags:
+    // `--assume-unchanged` LOWERCASES the state letter (`H`→`h`, `M`→`m`, …),
+    // while `--skip-worktree` replaces it with an UPPERCASE `S`. So a flagged
+    // entry is either a lowercase tag or `S`. Untracked (`?`) / ignored (`!`)
+    // lines never appear here (no `-o`/`-i`), and an unflagged tracked entry is
+    // an uppercase non-`S` letter — neither is treated as suppression.
+    buf.split(|&b| b == b'\n').any(|line| {
+        line.first()
+            .is_some_and(|&tag| tag.is_ascii_lowercase() || tag == b'S')
+    })
 }
 
 /// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
@@ -2162,7 +2241,16 @@ const GIT_HEAD_POLL: Duration = Duration::from_millis(10);
 fn git_head_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut cmd = Command::new("git");
+    // Resolve `git` to a trusted ABSOLUTE path on a sanitized PATH (provision.rs
+    // `trusted_cli`), exactly as `git_worktree_dirty_timeout` and
+    // `GitRunner::run_in` do: the child `fchdir`s into the agent-controlled
+    // checkout, so a bare `git` lookup with an empty/`.`/relative PATH entry
+    // ahead of the system git could exec an agent-planted binary that spoofs the
+    // pre/post HEAD the empty-job detector relies on. A resolution failure fails
+    // closed to `None`.
+    let (git_exe, safe_path) = crate::provision::trusted_cli("git").ok()?;
+    let mut cmd = Command::new(git_exe);
+    cmd.env("PATH", &safe_path);
     cmd.args(["rev-parse", "--verify", "HEAD"])
         // An agent-controlled checkout could carry a prompt/sidebar config; keep
         // the invocation minimal and non-interactive.
@@ -6718,6 +6806,71 @@ mod tests {
             git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
             Some(false),
             "a clean tree must read Some(false)"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_fails_closed_on_assume_unchanged_edit() {
+        // The class Copilot flagged: a tracked file edited AFTER being marked
+        // `--assume-unchanged` is hidden from `git status --porcelain`, so the
+        // status probe reads clean while the working tree carries unpublished
+        // work. Checkpointing builds a FRESH index from HEAD (`git add -A`),
+        // which ignores the flag and captures the edit — so a "clean" verdict
+        // would let finalize delete both the checkpoint and the checkout. The
+        // probe must fail closed to `None` ("unknown", retained not reaped)
+        // rather than `Some(false)` whenever an index suppression flag is
+        // present.
+        let base = init_dirty_probe_repo("assume-unchanged");
+        // Flag the committed file, then modify it: `git status` now hides it.
+        let flag = std::process::Command::new("git")
+            .args(["update-index", "--assume-unchanged", "tracked"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(flag.status.success());
+        std::fs::write(base.join("tracked"), "v2-edited-after-flag").unwrap();
+        // Sanity: the naive status really does read clean (the bug's premise).
+        let naive = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            naive.stdout.is_empty(),
+            "assume-unchanged must hide the edit from plain status"
+        );
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            None,
+            "an assume-unchanged edit must fail closed to None, never read clean"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_fails_closed_on_skip_worktree_edit() {
+        // The sibling suppression flag: `--skip-worktree` also hides a
+        // working-tree edit from `git status`, so it must fail closed too.
+        let base = init_dirty_probe_repo("skip-worktree");
+        let flag = std::process::Command::new("git")
+            .args(["update-index", "--skip-worktree", "tracked"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(flag.status.success());
+        std::fs::write(base.join("tracked"), "v2-edited-after-flag").unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            None,
+            "a skip-worktree edit must fail closed to None, never read clean"
         );
         std::fs::remove_dir_all(&base).ok();
     }
