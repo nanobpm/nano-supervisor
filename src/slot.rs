@@ -2115,9 +2115,16 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
             _ => return None,
         };
         if nonempty {
-            // Drain the rest so git never blocks on a full pipe; discard it.
-            let mut sink = Vec::new();
-            let _ = out.as_mut().map(|o| o.read_to_end(&mut sink));
+            // Drain the rest so git never blocks on a full pipe, DISCARDING it
+            // into the null sink: the verdict was settled by the first byte, so
+            // retaining the listing (a `Vec` of every reported path) would grow
+            // daemon memory with the dirtiness of the tree, multiplied by
+            // concurrent probes, for bytes we never inspect. A read error leaves
+            // the verdict "unknown" (None) to the caller — fail closed.
+            let drained = out.as_mut().map(|o| std::io::copy(o, &mut std::io::sink()));
+            if !matches!(drained, Some(Ok(_))) {
+                return None;
+            }
         }
         Some(nonempty)
     });
