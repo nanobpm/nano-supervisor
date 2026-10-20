@@ -107,12 +107,19 @@ struct RefLease {
     reference: String,
     /// The sha our lease is currently pinned to (`""` demands absence).
     expect: String,
-    /// The sha we last ATTEMPTED to push. An ambiguous push failure (the server
-    /// applied the update but the client lost the response — dropped connection /
-    /// timeout) leaves `expect` behind on the pre-push value while the remote has
-    /// actually moved to this sha; remembering it lets us RECONCILE on the next
-    /// stale-lease rejection instead of concluding a sibling stole the ref.
-    attempted: String,
+    /// The shas we have ATTEMPTED to push whose outcome is UNCERTAIN. An ambiguous
+    /// push failure (the server applied the update but the client lost the
+    /// response — dropped connection / timeout) leaves `expect` behind on the
+    /// pre-push value while the remote may actually have moved to the attempted
+    /// sha. We remember EVERY still-unresolved attempt, not just the latest: if a
+    /// FIRST push lands ambiguously and a SECOND push then fails outright (e.g. the
+    /// connection drops before it reaches the server, so the remote still holds the
+    /// first), a single-slot field would overwrite the first sha with the second
+    /// and later reconcile the remote tip against the wrong value — concluding a
+    /// sibling stole the ref and halting checkpointing. Keeping the set lets us
+    /// reconcile the remote against ANY of our unresolved attempts
+    /// (nanobpm/nano-supervisor#82). Cleared once a push confirms the remote tip.
+    attempted: Vec<String>,
     owned: bool,
 }
 
@@ -130,7 +137,7 @@ impl RefLease {
         Self {
             reference,
             expect: seed.unwrap_or_default(),
-            attempted: String::new(),
+            attempted: Vec::new(),
             owned: true,
         }
     }
@@ -138,15 +145,28 @@ impl RefLease {
     /// Fold a push result into the lease. ONLY our own successful write advances
     /// the lease target; a stale-lease rejection means a sibling moved the ref, so
     /// we drop ownership; a transient error keeps the lease so the next tick
-    /// retries against the same target. Either way we record the sha we just
-    /// attempted so an ambiguous failure can be reconciled next tick. Returns the
-    /// result for convenience.
+    /// retries against the same target. An UNCERTAIN (error) attempt is remembered
+    /// — accumulated alongside any earlier unresolved attempt — so an ambiguous
+    /// failure can be reconciled later against the remote tip; a CONFIRMED success
+    /// resolves the remote to `sha`, clearing every prior uncertain attempt.
     fn apply(&mut self, result: &PushResult, sha: &str) {
-        self.attempted = sha.to_string();
         match result {
-            PushResult::Ok => self.expect = sha.to_string(),
+            PushResult::Ok => {
+                self.expect = sha.to_string();
+                // A CAS push only succeeds against the expected parent, so the
+                // remote is now definitively `sha`: no earlier attempt can still be
+                // its tip. Every prior uncertainty is resolved.
+                self.attempted.clear();
+            }
             PushResult::StaleLease { .. } => self.owned = false,
-            PushResult::Error { .. } => {}
+            PushResult::Error { .. } => {
+                // Outcome unknown: the push may have LANDED. Remember it ALONGSIDE
+                // any earlier unresolved attempt (never overwriting) so a later
+                // reconciliation can match the remote tip against ANY of them.
+                if !sha.is_empty() && !self.attempted.iter().any(|s| s == sha) {
+                    self.attempted.push(sha.to_string());
+                }
+            }
         }
     }
 }
@@ -334,7 +354,30 @@ async fn restore(
     let self_ref = plan.own_ref.as_str();
     let predecessor = predecessor_checkpoint_ref(variables, Some(self_ref), Some(element_id));
     let explicit = resume_ref_is_explicit(variables);
-    let candidates = restore_candidates(explicit, self_ref, predecessor.as_deref());
+    let mut candidates = restore_candidates(explicit, self_ref, predecessor.as_deref());
+
+    // Distinguish an ALREADY-ADOPTED retry from a NEW explicit adoption. When an
+    // explicit pointer names a predecessor but our OWN ref already exists on the
+    // remote, a prior delivery already adopted that predecessor and has since made
+    // its own (newer) progress — the process re-offers the same predecessor pointer
+    // every redelivery. Adopting the predecessor again would reset the worktree to
+    // the STALE predecessor snapshot and then fail the create-only adoption push
+    // (our ref exists), leaving ownership unseeded so the periodic loop bows out
+    // (nanobpm/nano-supervisor#82). Drop the predecessor candidate and SELF-RESUME
+    // our own newer checkpoint instead — never clobbering a concurrent writer, since
+    // the periodic loop's first CAS push drops ownership if someone else advanced it.
+    if explicit && predecessor.is_some() {
+        let existing = observe_remote_ref_sha(runner, self_ref, &plan.remote).await;
+        if !existing.is_empty() {
+            crate::runtime::log(&format!(
+                "checkpoint: {self_ref} already holds our own progress \
+                 (redelivery after adoption); resuming it instead of re-adopting \
+                 {}",
+                predecessor.as_deref().unwrap_or("")
+            ));
+            candidates = vec![self_ref.to_string()];
+        }
+    }
 
     let branch = if plan.working_branch.is_empty() {
         None
@@ -395,22 +438,25 @@ async fn restore(
                 // own successful writes.
                 let rec = observe_remote_ref_sha(runner, &plan.recovered_ref, &plan.remote).await;
                 outcome.seed_rec = (!rec.is_empty()).then_some(rec);
+                break;
             } else {
                 // Adopted an explicit predecessor: copy its snapshot onto OUR WIP
                 // ref NOW (create-only), BEFORE the orphan sweep can reclaim the
                 // predecessor's ref, so the adopted work survives even if we crash
-                // before the first periodic push. Seed the lease from it on
-                // success; on failure a sibling already holds our ref, so we leave
-                // the predecessor's ref intact and let the loop bow out.
+                // before the first periodic push. Seed the lease from it on success.
+                // A redelivery after we already adopted-and-progressed is handled
+                // earlier (the predecessor candidate is dropped when our own ref
+                // already exists), so a failure here means our ref is absent and a
+                // sibling raced us for the source — leave it intact and bow out.
                 match push_checkpoint(runner, self_ref, &fetched.sha, "", &plan.remote).await {
                     PushResult::Ok => outcome.seed_own = Some(fetched.sha.clone()),
                     other => crate::runtime::log(&format!(
-                        "checkpoint: could not adopt predecessor {reference} onto {self_ref} \
-                         — {other:?}; leaving source intact"
+                        "checkpoint: could not adopt predecessor {reference} onto \
+                         {self_ref} — {other:?}; leaving source intact"
                     )),
                 }
+                break;
             }
-            break;
         } else if !result.reason.is_empty() {
             crate::runtime::log(&format!(
                 "checkpoint: did not restore {reference} — {}{}",
@@ -698,6 +744,12 @@ async fn periodic_loop(
             _ = tokio::time::sleep(delay) => {}
         }
         delay = interval;
+        // Reconcile any earlier WIP push whose outcome was uncertain BEFORE
+        // snapshotting, so a push that actually landed updates our supersession
+        // baseline even on a clean/unchanged no-op tick — otherwise a since-
+        // discarded worktree would never supersede the landed (now-unwanted) work
+        // on the remote and it would reappear on resume.
+        last_tree = reconcile_landed_wip(&runner, &plan, &leases, last_tree).await;
         match push_snapshot(
             &runner,
             &plan,
@@ -752,22 +804,22 @@ async fn lease_push_shared(
             error: "ownership already lost".into(),
         };
     }
-    // Snapshot the sha we previously attempted BEFORE this push, so an ambiguous
-    // failure of that earlier push (server applied it, client lost the response)
+    // Snapshot the shas we previously attempted BEFORE this push, so an ambiguous
+    // failure of any earlier push (server applied it, client lost the response)
     // can be reconciled if this push is now rejected as stale.
-    let prev_attempt = { lock.lock().unwrap().attempted.clone() };
+    let prev_attempts = { lock.lock().unwrap().attempted.clone() };
     let res = push_checkpoint(runner, &reference, sha, &expect, remote).await;
-    if matches!(res, PushResult::StaleLease { .. }) && !prev_attempt.is_empty() {
+    if matches!(res, PushResult::StaleLease { .. }) && !prev_attempts.is_empty() {
         // A stale-lease rejection usually means a sibling moved the ref — but it
         // can also mean OUR OWN previous push actually LANDED while reporting a
         // transient error, leaving `expect` behind the remote. Verify the remote
-        // tip: if it holds the sha WE last attempted, that push was ours, so
-        // re-base the lease on it and RETRY this push against the recovered
-        // expectation rather than bowing out. We only ever adopt our OWN attempted
-        // sha — never an arbitrary remote tip — so a genuine sibling write (remote
-        // tip != our attempt) still drops ownership exactly as before.
+        // tip: if it holds ANY sha WE attempted-but-could-not-confirm, that push
+        // was ours, so re-base the lease on it and RETRY this push against the
+        // recovered expectation rather than bowing out. We only ever adopt our OWN
+        // attempted shas — never an arbitrary remote tip — so a genuine sibling
+        // write (remote tip matches none of our attempts) still drops ownership.
         let remote_sha = observe_remote_ref_sha(runner, &reference, remote).await;
-        if remote_sha == prev_attempt {
+        if !remote_sha.is_empty() && prev_attempts.iter().any(|s| s == &remote_sha) {
             crate::runtime::log(&format!(
                 "checkpoint: {reference} already holds our previously-attempted sha \
                  (ambiguous push landed); re-leasing and retrying"
@@ -776,6 +828,7 @@ async fn lease_push_shared(
                 let mut l = lock.lock().unwrap();
                 l.expect = remote_sha.clone();
                 l.owned = true;
+                l.attempted.clear();
             }
             let retry = push_checkpoint(runner, &reference, sha, &remote_sha, remote).await;
             lock.lock().unwrap().apply(&retry, sha);
@@ -784,6 +837,76 @@ async fn lease_push_shared(
     }
     lock.lock().unwrap().apply(&res, sha);
     res
+}
+
+/// Reconcile an earlier WIP push whose outcome was UNCERTAIN (reported an error
+/// that may actually have LANDED) BEFORE this tick takes its snapshot, so the
+/// reconciliation runs even on otherwise-idle (clean/unchanged) ticks. If the
+/// remote WIP ref holds a sha we attempted-but-could-not-confirm, that push
+/// landed: re-base our lease onto it and return it as the supersession baseline
+/// so a worktree that has since been DISCARDED publishes a clean superseding
+/// snapshot this tick instead of silently leaving the landed (now-unwanted) work
+/// on the remote to reappear on resume (nanobpm/nano-supervisor#82).
+///
+/// We ONLY advance when the remote actually holds one of our attempted shas —
+/// a push that never landed (remote still at our `expect`, or moved by a sibling)
+/// keeps its uncertainty and its retry, so this never masks a real publication
+/// failure as complete (the reviewer's explicit caution against blindly advancing
+/// `last_tree` on every error).
+async fn reconcile_landed_wip(
+    runner: &GitRunner,
+    plan: &Plan,
+    leases: &LeaseState,
+    last_tree: Option<(String, String)>,
+) -> Option<(String, String)> {
+    let attempts = {
+        let l = leases.own.lock().unwrap();
+        if !l.owned {
+            return last_tree;
+        }
+        l.attempted.clone()
+    };
+    if attempts.is_empty() {
+        return last_tree;
+    }
+    let remote_sha = observe_remote_ref_sha(runner, &plan.own_ref, &plan.remote).await;
+    if remote_sha.is_empty() || !attempts.iter().any(|s| s == &remote_sha) {
+        return last_tree;
+    }
+    // Derive the `(tree, head)` the landed snapshot recorded. A snapshot commits
+    // `commit-tree <tree> -p <head>`, so its tree is `<sha>^{tree}` and its head is
+    // its first parent (empty for a snapshot taken on an unborn HEAD). Read them
+    // BEFORE mutating the lease so a failed rev-parse leaves the lease untouched.
+    let tree = runner
+        .run(&[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{remote_sha}^{{tree}}"),
+        ])
+        .await
+        .out();
+    if tree.is_empty() {
+        return last_tree;
+    }
+    let head = runner
+        .run(&["rev-parse", "--verify", "-q", &format!("{remote_sha}^")])
+        .await
+        .out();
+    // Our ambiguous push LANDED. Re-base the lease onto the real remote tip and
+    // clear the uncertainty so later ticks (and finalize) expect the right sha.
+    {
+        let mut l = leases.own.lock().unwrap();
+        l.expect = remote_sha.clone();
+        l.owned = true;
+        l.attempted.clear();
+    }
+    crate::runtime::log(&format!(
+        "checkpoint: WIP ref {} already holds our previously-attempted sha \
+         (ambiguous push landed); reconciling supersession baseline",
+        plan.own_ref
+    ));
+    Some((tree, head))
 }
 
 /// Snapshot the worktree and push it to the WIP ref (and promote the GC-proof
@@ -1337,9 +1460,9 @@ mod tests {
         // The lease target advances to the sha WE just wrote.
         assert_eq!(lease.expect, "bbb");
         assert!(lease.owned);
-        // Every apply records the sha we attempted so an ambiguous failure can be
-        // reconciled next tick.
-        assert_eq!(lease.attempted, "bbb");
+        // A CONFIRMED success resolves the remote tip to the sha we wrote, so every
+        // prior uncertain attempt is cleared — nothing left to reconcile.
+        assert!(lease.attempted.is_empty());
     }
 
     #[test]
@@ -1359,8 +1482,30 @@ mod tests {
             lease.expect, "aaa",
             "transient error must not advance expect"
         );
-        assert_eq!(lease.attempted, "bbb", "attempted sha must be recorded");
+        assert_eq!(
+            lease.attempted,
+            vec!["bbb".to_string()],
+            "attempted sha must be recorded"
+        );
         assert!(lease.owned);
+    }
+
+    #[test]
+    fn lease_accumulates_unresolved_attempts_without_overwriting() {
+        // S1 lands ambiguously (transient error), then S2 fails outright before
+        // reaching the server. A single-slot `attempted` would overwrite S1 with
+        // S2 and later reconcile the remote (still at S1) against the wrong value,
+        // dropping ownership. The set must keep BOTH so either can be reconciled.
+        let mut lease = RefLease::new(OWN.to_string(), None);
+        lease.apply(&PushResult::Error { error: "t1".into() }, "s1");
+        lease.apply(&PushResult::Error { error: "t2".into() }, "s2");
+        assert_eq!(lease.attempted, vec!["s1".to_string(), "s2".to_string()]);
+        // The SAME sha retried must not be duplicated.
+        lease.apply(&PushResult::Error { error: "t3".into() }, "s2");
+        assert_eq!(lease.attempted, vec!["s1".to_string(), "s2".to_string()]);
+        // A confirmed success clears every uncertain attempt.
+        lease.apply(&PushResult::Ok, "s3");
+        assert!(lease.attempted.is_empty());
     }
 
     #[tokio::test]
@@ -1713,7 +1858,7 @@ mod tests {
         // ("" demands absence), but we remember S1 as our last attempt — while the
         // remote actually holds S1.
         let mut own_lease = RefLease::new(own.clone(), None);
-        own_lease.attempted = s1.clone();
+        own_lease.attempted = vec![s1.clone()];
         let leases = LeaseState {
             own: std::sync::Mutex::new(own_lease),
             recovered: std::sync::Mutex::new(RefLease::new(
@@ -1741,6 +1886,429 @@ mod tests {
             assert!(l.owned, "ownership must be retained after reconciliation");
             assert_eq!(l.expect, s2, "lease must be re-based on the landed sha");
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression (nanobpm/nano-supervisor#82, review round 10): a FIRST push can
+    /// land ambiguously (transient error, but the server applied it) and a SECOND
+    /// push then fail outright before reaching the server (so the remote still
+    /// holds the first). A single-slot `attempted` would overwrite the first sha
+    /// with the second, so the later stale-lease reconciliation would compare the
+    /// remote (still at the first) against the second and conclude a sibling stole
+    /// the ref — halting checkpointing. The accumulated attempt set must let the
+    /// reconciliation match the remote against EITHER attempt and retry.
+    #[tokio::test]
+    async fn reconcile_survives_a_second_failed_attempt_overwriting_the_landed_sha() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let runner_at = |p: &std::path::Path| GitRunner::new(CwdHandle::open(p).unwrap(), dur);
+        let root =
+            std::env::temp_dir().join(format!("nano-ambig2-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let root_git = runner_at(&root);
+        assert!(root_git.run(&["init", "--bare", "remote.git"]).await.ok());
+        assert!(root_git.run(&["clone", "remote.git", "work"]).await.ok());
+        let git = runner_at(&root.join("work"));
+        assert!(git
+            .run(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .await
+            .ok());
+        std::fs::write(root.join("work/README.md"), "base\n").unwrap();
+        assert!(git.run(&["add", "-A"]).await.ok());
+        assert!(git
+            .run(&[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-m",
+                "init"
+            ])
+            .await
+            .ok());
+        assert!(git.run(&["push", "origin", "main"]).await.ok());
+        let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+        let elem = "ambig2-elem";
+        let own = checkpoint_ref(elem).unwrap();
+
+        // S1: lands on the remote (models the first ambiguous push that applied).
+        std::fs::write(root.join("work/WIP.txt"), "first\n").unwrap();
+        let s1 = match snapshot_worktree(
+            &git,
+            &base_sha,
+            "main",
+            "run",
+            None,
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_eq!(
+            push_checkpoint(&git, &own, &s1, "", "origin").await,
+            PushResult::Ok
+        );
+
+        // S2: committed locally but NEVER pushed (models the second push failing to
+        // connect — the remote still holds S1, not S2).
+        std::fs::write(root.join("work/WIP.txt"), "second\n").unwrap();
+        let s2 = match snapshot_worktree(
+            &git,
+            &base_sha,
+            "main",
+            "run",
+            Some((s1.as_str(), base_sha.as_str())),
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+
+        // S3: the push we now retry once the connection recovers.
+        std::fs::write(root.join("work/WIP.txt"), "third\n").unwrap();
+        let s3 = match snapshot_worktree(
+            &git,
+            &base_sha,
+            "main",
+            "run",
+            Some((s2.as_str(), base_sha.as_str())),
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+
+        // The ambiguous state after two failed pushes: expect is still the
+        // create-only baseline, and BOTH S1 (landed) and S2 (never landed) are
+        // unresolved attempts — in that order, so the single-slot bug would keep
+        // only S2.
+        let mut own_lease = RefLease::new(own.clone(), None);
+        own_lease.attempted = vec![s1.clone(), s2.clone()];
+        let leases = LeaseState {
+            own: std::sync::Mutex::new(own_lease),
+            recovered: std::sync::Mutex::new(RefLease::new(
+                recovered_checkpoint_ref(elem).unwrap(),
+                None,
+            )),
+        };
+
+        // Pushing S3 fails the create-only lease (ref exists at S1); reconciliation
+        // must find the remote (S1) among our attempts and retry — landing S3 and
+        // KEEPING ownership instead of halting on the overwritten S2.
+        let res = lease_push_shared(&git, "origin", &leases.own, &s3).await;
+        assert_eq!(
+            res,
+            PushResult::Ok,
+            "reconciliation must match the remote against an earlier attempt, not halt"
+        );
+        assert_eq!(
+            observe_remote_ref_sha(&git, &own, "origin").await,
+            s3,
+            "the remote own ref must advance to our retried sha"
+        );
+        {
+            let l = leases.own.lock().unwrap();
+            assert!(l.owned, "ownership must be retained after reconciliation");
+            assert_eq!(l.expect, s3, "lease must be re-based on the landed sha");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression (nanobpm/nano-supervisor#82, review round 10): a WIP push can
+    /// land on the remote but report a transient error, so the tick leaves
+    /// `last_tree` unadvanced. If the agent then DISCARDS back to base, the clean
+    /// snapshot alone has no baseline to supersede against, so the no-op tick never
+    /// replaces the landed (now-unwanted) WIP — it reappears on resume. Reconciling
+    /// the uncertain publication BEFORE the snapshot restores the supersession
+    /// baseline so the discard publishes a superseding snapshot.
+    #[tokio::test]
+    async fn uncertain_wip_publication_is_reconciled_so_discard_supersedes() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let runner_at = |p: &std::path::Path| GitRunner::new(CwdHandle::open(p).unwrap(), dur);
+        let root =
+            std::env::temp_dir().join(format!("nano-uncwip-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let root_git = runner_at(&root);
+        assert!(root_git.run(&["init", "--bare", "remote.git"]).await.ok());
+        assert!(root_git.run(&["clone", "remote.git", "work"]).await.ok());
+        let git = runner_at(&root.join("work"));
+        assert!(git
+            .run(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .await
+            .ok());
+        std::fs::write(root.join("work/README.md"), "base\n").unwrap();
+        assert!(git.run(&["add", "-A"]).await.ok());
+        assert!(git
+            .run(&[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-m",
+                "init"
+            ])
+            .await
+            .ok());
+        assert!(git.run(&["push", "origin", "main"]).await.ok());
+        let base_sha = git.run(&["rev-parse", "HEAD"]).await.out();
+
+        let elem = "uncwip-elem";
+        let own = checkpoint_ref(elem).unwrap();
+        let plan = Plan {
+            config: CheckpointConfig::from_env(),
+            own_ref: own.clone(),
+            recovered_ref: recovered_checkpoint_ref(elem).unwrap(),
+            working_branch: "main".to_string(),
+            base_sha: base_sha.clone(),
+            base_ref: "main".to_string(),
+            run_id: "run-uncwip".to_string(),
+            remote: "origin".to_string(),
+            secret_values: Vec::new(),
+        };
+
+        // Model the landed-but-reported-failed WIP push: snapshot S1, push it so it
+        // is ON the remote, but leave the lease in the ambiguous state (expect at
+        // the create-only baseline, S1 only an unresolved attempt) and `last_tree`
+        // unadvanced — exactly what `push_snapshot` leaves behind on a WIP-push
+        // Error that actually landed.
+        std::fs::write(root.join("work/WIP.txt"), "in progress\n").unwrap();
+        let s1 = match snapshot_worktree(
+            &git,
+            &base_sha,
+            "main",
+            "run-uncwip",
+            None,
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_eq!(
+            push_checkpoint(&git, &own, &s1, "", "origin").await,
+            PushResult::Ok
+        );
+        let mut own_lease = RefLease::new(own.clone(), None);
+        own_lease.attempted = vec![s1.clone()];
+        let leases = LeaseState {
+            own: std::sync::Mutex::new(own_lease),
+            recovered: std::sync::Mutex::new(RefLease::new(
+                recovered_checkpoint_ref(elem).unwrap(),
+                None,
+            )),
+        };
+
+        // The agent DISCARDS the work back to base.
+        std::fs::remove_file(root.join("work/WIP.txt")).unwrap();
+
+        // A no-op tick with `last_tree = None` would normally report `clean` and
+        // leave S1 on the remote. Reconciliation restores the supersession baseline
+        // from the landed sha first.
+        let last_tree = reconcile_landed_wip(&git, &plan, &leases, None).await;
+        assert!(
+            last_tree.is_some(),
+            "a landed-but-uncertain WIP push must restore the supersession baseline"
+        );
+        {
+            let l = leases.own.lock().unwrap();
+            assert_eq!(l.expect, s1, "lease must be re-based on the landed WIP sha");
+            assert!(
+                l.attempted.is_empty(),
+                "the reconciled attempt must be cleared"
+            );
+        }
+
+        // With the baseline restored, the discard now publishes a SUPERSEDING
+        // snapshot that replaces S1 on the remote.
+        let out = push_snapshot(
+            &git,
+            &plan,
+            last_tree.as_ref().map(|(t, h)| (t.as_str(), h.as_str())),
+            None,
+            &leases,
+        )
+        .await;
+        assert!(
+            matches!(out, TickOutcome::Pushed { .. }),
+            "the discard must publish a superseding snapshot after reconciliation"
+        );
+        let remote_now = observe_remote_ref_sha(&git, &own, "origin").await;
+        assert_ne!(
+            remote_now, s1,
+            "the discarded WIP must be superseded on the remote, not left to reappear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression (nanobpm/nano-supervisor#82, review round 10): on a REDELIVERY
+    /// after an explicit adoption, the `resumeFromCheckpoint` pointer still names
+    /// the predecessor even though our OWN ref now holds newer progress. Restore
+    /// tries the predecessor first, its create-only adoption onto our own ref fails
+    /// (the ref already exists), and the old code bowed out — leaving `seed_own`
+    /// empty so the periodic loop's first push was rejected as a stale lease and
+    /// checkpointing stopped. Restore must instead fall through to resume our own
+    /// newer checkpoint.
+    #[tokio::test]
+    async fn redelivery_after_adoption_resumes_own_newer_progress() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let runner_at = |p: &std::path::Path| GitRunner::new(CwdHandle::open(p).unwrap(), dur);
+        let root =
+            std::env::temp_dir().join(format!("nano-redeliv-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let root_git = runner_at(&root);
+        assert!(root_git.run(&["init", "--bare", "remote.git"]).await.ok());
+        assert!(root_git.run(&["clone", "remote.git", "seed"]).await.ok());
+        let seed = runner_at(&root.join("seed"));
+        assert!(seed
+            .run(&["symbolic-ref", "HEAD", "refs/heads/main"])
+            .await
+            .ok());
+        std::fs::write(root.join("seed/README.md"), "base\n").unwrap();
+        assert!(seed.run(&["add", "-A"]).await.ok());
+        assert!(seed
+            .run(&[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-m",
+                "init"
+            ])
+            .await
+            .ok());
+        assert!(seed.run(&["push", "origin", "main"]).await.ok());
+        let base_sha = seed.run(&["rev-parse", "HEAD"]).await.out();
+
+        let pred_elem = "redeliv-pred";
+        let own_elem = "redeliv-own";
+        let pred_ref = checkpoint_ref(pred_elem).unwrap();
+        let own_ref = checkpoint_ref(own_elem).unwrap();
+
+        // Predecessor snapshot (the adopted source).
+        std::fs::write(root.join("seed/WORK.txt"), "adopted work\n").unwrap();
+        let pred_sha = match snapshot_worktree(
+            &seed,
+            &base_sha,
+            "main",
+            "run-pred",
+            None,
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_eq!(
+            push_checkpoint(&seed, &pred_ref, &pred_sha, "", "origin").await,
+            PushResult::Ok
+        );
+
+        // Our OWN ref already holds NEWER progress (what the first delivery produced
+        // after adopting the predecessor).
+        std::fs::write(root.join("seed/WORK.txt"), "newer own progress\n").unwrap();
+        let own_sha = match snapshot_worktree(
+            &seed,
+            &base_sha,
+            "main",
+            "run-own",
+            None,
+            5_000_000,
+            &[],
+            "nano: WIP",
+        )
+        .await
+        {
+            Snapshot::Committed { sha, .. } => sha,
+            Snapshot::Skipped { reason } => panic!("snapshot skipped: {reason}"),
+        };
+        assert_ne!(
+            own_sha, pred_sha,
+            "own progress must differ from predecessor"
+        );
+        assert_eq!(
+            push_checkpoint(&seed, &own_ref, &own_sha, "", "origin").await,
+            PushResult::Ok
+        );
+
+        // Fresh redelivery checkout on main, still pointed at the predecessor.
+        assert!(root_git.run(&["clone", "remote.git", "redeliv"]).await.ok());
+        let git = runner_at(&root.join("redeliv"));
+        let plan = Plan {
+            config: CheckpointConfig::from_env(),
+            own_ref: own_ref.clone(),
+            recovered_ref: recovered_checkpoint_ref(own_elem).unwrap(),
+            working_branch: "main".to_string(),
+            base_sha: base_sha.clone(),
+            base_ref: "main".to_string(),
+            run_id: "run-redeliv".to_string(),
+            remote: "origin".to_string(),
+            secret_values: Vec::new(),
+        };
+        let variables = serde_json::json!({ "resumeFromCheckpoint": pred_ref });
+        let outcome = restore(&git, &plan, &variables, "task").await;
+
+        assert_eq!(
+            outcome.seed_own.as_deref(),
+            Some(own_sha.as_str()),
+            "redelivery must resume our own newer progress, not bow out after a \
+             failed re-adoption"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("redeliv/WORK.txt")).unwrap(),
+            "newer own progress\n",
+            "the worktree must restore our own newer checkpoint"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
