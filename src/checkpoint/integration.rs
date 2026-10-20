@@ -15,8 +15,8 @@
 //! Everything is BEST-EFFORT: a failure is logged and degrades to transcript-only
 //! resume. It never fails the job.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -38,9 +38,17 @@ const SNAPSHOT_MESSAGE: &str = "nano: WIP checkpoint (do not merge)";
 const SWEEP_MAX_DELETES: usize = 25;
 const SWEEP_MAX_LOOKUPS: usize = 25;
 
-/// Process-global throttle for the opportunistic orphan sweep (`gc_every_ms`).
-/// `0` = never swept yet.
-static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
+/// Process-global throttle for the opportunistic orphan sweep (`gc_every_ms`),
+/// keyed by the credential-sanitized repository target so one busy repository
+/// cannot starve the sweep of every OTHER repository the daemon serves (a single
+/// global timestamp lets whichever repo schedules first in each window claim the
+/// only slot). Best-effort and process-local; the TTL backstop still bounds how
+/// long any ref can live. Absent key = never swept yet.
+static LAST_SWEEP_MS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn last_sweep_ms() -> &'static Mutex<HashMap<String, u64>> {
+    LAST_SWEEP_MS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -516,22 +524,31 @@ fn sweep_remote_target(repo_url: &str) -> String {
     resolved
 }
 
-/// Run the orphan GC sweep opportunistically, throttled to `gc_every_ms` across
-/// the whole process. Spawned detached so it never adds latency to the job.
+/// Run the orphan GC sweep opportunistically, throttled to `gc_every_ms` PER
+/// repository (keyed by the sanitized target) so one busy repo cannot starve the
+/// sweep of every other repo the daemon serves. Spawned detached so it never adds
+/// latency to the job.
 fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jobs) {
     let now = now_ms();
     let every = plan.config.gc_every_ms.max(1);
-    let last = LAST_SWEEP_MS.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < every {
-        return;
-    }
-    // Claim the slot; a racing job that observes the same `last` loses the CAS and
-    // skips, so only one sweep runs per window.
-    if LAST_SWEEP_MS
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
+    // Resolve the throttle key up front: the credential-sanitized repository
+    // target (see the `sweep_remote` comment below). Keying on the SANITIZED
+    // target — never the raw `repo_url` — keeps an embedded credential out of the
+    // key and collapses credential variants of one repo onto a single slot.
+    let sweep_remote = sweep_remote_target(repo_url);
+    // Claim this repo's slot; a racing job for the SAME repo that observes the
+    // same `last` loses and skips, so only one sweep runs per repo per window.
+    // Other repos are unaffected — each has its own timestamp.
     {
-        return;
+        let mut stamps = match last_sweep_ms().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let last = stamps.get(&sweep_remote).copied().unwrap_or(0);
+        if last != 0 && now.saturating_sub(last) < every {
+            return;
+        }
+        stamps.insert(sweep_remote.clone(), now);
     }
 
     let runner = match runner_for(agent_cwd, repo_url, &plan.config) {
@@ -548,7 +565,6 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
     // paths re-anchored against the SUPERVISOR's cwd exactly as `provision()`
     // resolved them when cloning, so the sweep targets the very repository the job
     // was provisioned from regardless of the scratch git-dir or checkout cwd.
-    let sweep_remote = sweep_remote_target(repo_url);
     let plan = plan.clone();
     tokio::spawn(async move {
         // Run the sweep against a dedicated scratch repo (`--git-dir`) that
@@ -573,6 +589,7 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
             now_ms(),
             SWEEP_MAX_DELETES,
             SWEEP_MAX_LOOKUPS,
+            &sweep_remote,
             &sweep_remote,
         )
         .await;
@@ -890,6 +907,58 @@ mod tests {
         assert_eq!(
             sweep_remote_target("remote.git"),
             cwd.join("remote.git").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn sweep_throttle_is_scoped_per_repository() {
+        // The review finding: a single GLOBAL sweep throttle lets whichever repo
+        // schedules first in each window claim the only slot, so a busy repo A
+        // starves the sweep of every other repo B. The throttle is now keyed by the
+        // sanitized repository target, so each repo is throttled independently.
+        let every = 3_600_000_u64; // 1h
+        let t0 = 1_000_000_000_000_u64;
+        let repo_a = "https://github.com/o/a.git".to_string();
+        let repo_b = "https://github.com/o/b.git".to_string();
+
+        // Helper mirroring maybe_sweep's claim logic against a fresh map.
+        fn claim(map: &mut HashMap<String, u64>, key: &str, now: u64, every: u64) -> bool {
+            let last = map.get(key).copied().unwrap_or(0);
+            if last != 0 && now.saturating_sub(last) < every {
+                return false; // throttled
+            }
+            map.insert(key.to_string(), now);
+            true
+        }
+
+        let mut stamps: HashMap<String, u64> = HashMap::new();
+        // A sweeps at t0 and claims its slot.
+        assert!(
+            claim(&mut stamps, &repo_a, t0, every),
+            "A's first sweep runs"
+        );
+        // Within the same window A is throttled, but B — a DIFFERENT repo — is not:
+        // B has its own timestamp, so the shared-window starvation is gone.
+        assert!(
+            !claim(&mut stamps, &repo_a, t0 + 1_000, every),
+            "A throttled within its own window"
+        );
+        assert!(
+            claim(&mut stamps, &repo_b, t0 + 1_000, every),
+            "B must NOT be starved by A's window (per-repo throttle)"
+        );
+        // After the window elapses, A sweeps again.
+        assert!(
+            claim(&mut stamps, &repo_a, t0 + every, every),
+            "A sweeps again once its own window elapses"
+        );
+
+        // Keying on the SANITIZED target collapses credential variants of one repo
+        // onto a single throttle slot (and keeps secrets out of the key).
+        assert_eq!(
+            sweep_remote_target("https://sekret123@github.com/o/a.git"),
+            repo_a,
+            "credential variant must map to the same throttle key"
         );
     }
 

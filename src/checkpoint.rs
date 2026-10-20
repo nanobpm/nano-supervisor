@@ -1829,12 +1829,31 @@ fn rotating_batch(
         .collect()
 }
 
-/// Process-local rotation cursor for [`rotating_batch`]. Advanced by the window
-/// size on every sweep so successive sweeps tile consecutive ref windows,
-/// independent of the wall clock (see [`rotating_batch`]). Best-effort: it
-/// resets on restart, which is acceptable for an opportunistic GC backstopped by
-/// the TTL.
-static SWEEP_ROTATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Process-local rotation cursors for [`rotating_batch`], keyed by the swept
+/// repository so one repo's window placement never advances (or starves) another
+/// repo's. Each repo's cursor is advanced by the window size on every sweep of
+/// THAT repo, so successive sweeps tile consecutive ref windows, independent of
+/// the wall clock and of how interleaved the daemon's repositories are (see
+/// [`rotating_batch`]). Best-effort: cursors reset on restart, which is acceptable
+/// for an opportunistic GC backstopped by the TTL.
+static SWEEP_ROTATION: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+/// Fetch and advance (by `step`) the rotation cursor for `repo`. A poisoned lock
+/// is recovered rather than panicking the best-effort sweep.
+fn next_sweep_rotation(repo: &str, step: u64) -> u64 {
+    let map =
+        SWEEP_ROTATION.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let cursor = guard.entry(repo.to_string()).or_insert(0);
+    let current = *cursor;
+    *cursor = cursor.wrapping_add(step.max(1));
+    current
+}
 
 /// Reclaim stale / orphaned nano refs across both swept namespaces. A ref is
 /// reclaimed when it ages past the TTL, OR — past a grace window — when the
@@ -1852,6 +1871,7 @@ pub async fn sweep_stale_checkpoints(
     max_deletes: usize,
     max_lookups: usize,
     remote: &str,
+    rotation_key: &str,
 ) -> SweepResult {
     let prefixes = swept_ref_prefixes();
     let prefix_of =
@@ -1894,12 +1914,13 @@ pub async fn sweep_stale_checkpoints(
     // bounded, ROTATING batch here, BEFORE building the fetch refspecs, so each
     // sweep does O(batch) work and the rotating window ensures later refs are
     // eventually considered rather than being starved behind a stable prefix.
-    // The window advances by a process-local monotonic cursor (NOT a wall-clock
-    // remainder), so consecutive sweeps tile consecutive windows even when the
-    // sweep cadence is a multiple of the ref count.
+    // The window advances by a PER-REPOSITORY monotonic cursor (keyed by
+    // `rotation_key`, NOT a wall-clock remainder, and NOT a single global
+    // counter), so consecutive sweeps of one repo tile consecutive windows even
+    // when the sweep cadence is a multiple of the ref count — and interleaving
+    // another repo's sweeps never shifts this repo's window placement.
     let batch = max_lookups.max(max_deletes);
-    let cursor =
-        SWEEP_ROTATION.fetch_add(batch.max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+    let cursor = next_sweep_rotation(rotation_key, batch.max(1) as u64);
     entries = rotating_batch(entries, batch, cursor);
 
     let local = |r: &str| -> String {

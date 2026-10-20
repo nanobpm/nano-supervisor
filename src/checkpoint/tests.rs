@@ -199,6 +199,50 @@ fn rotating_batch_bounds_and_rotates() {
 }
 
 #[test]
+fn sweep_rotation_cursor_is_per_repository() {
+    // The review finding: a single GLOBAL rotation cursor lets interleaved
+    // repositories starve each other's refs — e.g. with 100 refs and batches of
+    // 25, repo A repeatedly scans offsets 0/50 while repo B scans 25/75, so refs
+    // outside those windows never reach the TTL check. Cursors are now keyed per
+    // repository, so each repo tiles its OWN consecutive windows regardless of how
+    // the daemon interleaves sweeps.
+    let a = "nano-rotation-test/repo-A";
+    let b = "nano-rotation-test/repo-B";
+    // Interleave A and B sweeps; each must advance independently by `step`.
+    let a0 = next_sweep_rotation(a, 25);
+    let b0 = next_sweep_rotation(b, 25);
+    let a1 = next_sweep_rotation(a, 25);
+    let b1 = next_sweep_rotation(b, 25);
+    let a2 = next_sweep_rotation(a, 25);
+    assert_eq!((a0, a1, a2), (0, 25, 50), "repo A cursor must tile 0,25,50");
+    assert_eq!(
+        (b0, b1),
+        (0, 25),
+        "repo B cursor must start at 0, unaffected by A"
+    );
+
+    // With cursors keyed per repo, four sweeps of EACH repo cover all 100 refs —
+    // the exact scenario the shared global cursor starved. Drive each repo through
+    // its own independent cursor sequence (0,25,50,75) as `next_sweep_rotation`
+    // would produce, and confirm full coverage for both.
+    let mk = |n: usize| -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("refs/nano/wip/{i:03}"), format!("sha{i}")))
+            .collect()
+    };
+    for repo in ["nano-rotation-test/cov-A", "nano-rotation-test/cov-B"] {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            let cursor = next_sweep_rotation(repo, 25);
+            for e in rotating_batch(mk(100), 25, cursor) {
+                seen.insert(e.0);
+            }
+        }
+        assert_eq!(seen.len(), 100, "per-repo tiling left refs uncovered");
+    }
+}
+
+#[test]
 fn make_temp_index_dir_is_absolute() {
     // Fix B: Git resolves `GIT_INDEX_FILE` relative to the checkout it runs in,
     // so the snapshot's temp index dir MUST be absolute — a relative `TMPDIR`
@@ -965,8 +1009,19 @@ async fn sweep_spares_active_escalation_but_reclaims_orphans_and_ttl() {
     // now_ms far in the future so age > grace; probe spares -> nothing deleted.
     let now = 10_u64.pow(15);
     let spare = FakeProbe { orphan: false };
-    let res =
-        sweep_stale_checkpoints(&git, None, u64::MAX, 0, Some(&spare), now, 50, 20, "origin").await;
+    let res = sweep_stale_checkpoints(
+        &git,
+        None,
+        u64::MAX,
+        0,
+        Some(&spare),
+        now,
+        50,
+        20,
+        "origin",
+        "origin",
+    )
+    .await;
     assert_eq!(res.deleted.len(), 0, "active escalation must be spared");
     assert_eq!(res.scanned, 2);
 
@@ -981,6 +1036,7 @@ async fn sweep_spares_active_escalation_but_reclaims_orphans_and_ttl() {
         now,
         50,
         20,
+        "origin",
         "origin",
     )
     .await;
@@ -999,7 +1055,8 @@ async fn sweep_spares_active_escalation_but_reclaims_orphans_and_ttl() {
         push_checkpoint(&git, &ref_ttl, &sha, "", "origin").await,
         PushResult::Ok
     );
-    let res = sweep_stale_checkpoints(&git, None, 1, 0, None, now, 50, 20, "origin").await;
+    let res =
+        sweep_stale_checkpoints(&git, None, 1, 0, None, now, 50, 20, "origin", "origin").await;
     assert_eq!(res.deleted.len(), 1);
     assert_eq!(res.deleted[0].why, "ttl");
 
@@ -1049,8 +1106,19 @@ async fn sweep_reclaims_through_a_scratch_git_dir_runner() {
 
     // Through the scratch git-dir, "origin" is undefined -> the sweep errors and
     // reclaims nothing (this is the bug the fix guards against).
-    let via_origin =
-        sweep_stale_checkpoints(&scratch_runner, None, 1, 0, None, now, 50, 20, "origin").await;
+    let via_origin = sweep_stale_checkpoints(
+        &scratch_runner,
+        None,
+        1,
+        0,
+        None,
+        now,
+        50,
+        20,
+        "origin",
+        "origin",
+    )
+    .await;
     assert!(
         via_origin.error.is_some() && via_origin.deleted.is_empty(),
         "origin must not resolve against the scratch git-dir: {via_origin:?}"
@@ -1058,8 +1126,19 @@ async fn sweep_reclaims_through_a_scratch_git_dir_runner() {
 
     // Targeting the repository by path works through the scratch git-dir: the
     // TTL-expired orphan is reclaimed.
-    let via_url =
-        sweep_stale_checkpoints(&scratch_runner, None, 1, 0, None, now, 50, 20, &remote_url).await;
+    let via_url = sweep_stale_checkpoints(
+        &scratch_runner,
+        None,
+        1,
+        0,
+        None,
+        now,
+        50,
+        20,
+        &remote_url,
+        &remote_url,
+    )
+    .await;
     assert!(
         via_url.error.is_none(),
         "scratch-path sweep errored: {via_url:?}"
