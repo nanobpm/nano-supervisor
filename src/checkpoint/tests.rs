@@ -79,6 +79,23 @@ fn authenticated_remote_detection() {
     assert!(!is_authenticated_remote(
         "http://example.com/path@segment/x"
     ));
+    // Host-only scp-style SSH targets (no `user@`) authenticate through the
+    // agent's SSH transport and are push-capable — they must NOT be read as
+    // unauthenticated (which would silently disable checkpointing).
+    assert!(is_authenticated_remote("github:org/repo.git"));
+    assert!(is_authenticated_remote("example.com:deep/path/repo.git"));
+    assert!(is_authenticated_remote("git@server:repo"));
+    // Local and Windows paths are NOT SSH remotes: a lone drive letter, a colon
+    // only after a slash, and plain relative/absolute paths all stay local.
+    assert!(!is_authenticated_remote("C:/Users/me/repo"));
+    assert!(!is_authenticated_remote("C:\\work\\repo"));
+    assert!(!is_authenticated_remote("./weird:name"));
+    assert!(!is_authenticated_remote("sub/dir:name"));
+    assert!(!is_authenticated_remote("/abs/path/repo"));
+    assert!(!is_authenticated_remote("relative/path/repo"));
+    // Other explicit schemes carry no push credential.
+    assert!(!is_authenticated_remote("file:///srv/repo.git"));
+    assert!(!is_authenticated_remote("git://host/repo.git"));
 }
 
 #[test]

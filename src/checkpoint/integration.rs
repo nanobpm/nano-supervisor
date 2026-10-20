@@ -438,10 +438,15 @@ async fn restore(
 ///     pre-created directory or symlink planted by another user. We create the
 ///     root 0700 and, on reuse, require it to be a real directory we own and not
 ///     a symlink before trusting it.
-async fn sweep_scratch_repo(runner: &GitRunner) -> Option<std::path::PathBuf> {
-    let root = std::path::absolute(std::env::temp_dir())
-        .ok()?
-        .join(format!("nano-gc-scratch-{}", current_uid()));
+async fn sweep_scratch_repo(runner: &GitRunner) -> Option<(std::path::PathBuf, CwdHandle)> {
+    // Canonicalize the temp base so the scratch path carries no symlinked
+    // component: `CwdHandle::open` below pins the directory with a no-follow walk
+    // that refuses a symlink anywhere in the path (e.g. macOS `/var` ->
+    // `/private/var`), and the system temp root is a trusted prefix.
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .or_else(|_| std::path::absolute(std::env::temp_dir()))
+        .ok()?;
+    let root = base.join(format!("nano-gc-scratch-{}", current_uid()));
     create_private_dir(&root)?;
     let git_dir = root.join("repo.git");
     // `git init --bare` is idempotent for an existing repo, so this both creates
@@ -453,7 +458,12 @@ async fn sweep_scratch_repo(runner: &GitRunner) -> Option<std::path::PathBuf> {
     if !init.ok() {
         return None;
     }
-    Some(git_dir)
+    // Pin the persistent scratch ROOT as the sweep's cwd. The scratch repo
+    // outlives the job checkout, but `with_git_dir` only redirects the
+    // `--git-dir`; without rebinding cwd, every sweep git child still `fchdir`s
+    // into the (reapable) job checkout and aborts once settlement removes it.
+    let cwd = CwdHandle::open(&root).ok()?;
+    Some((git_dir, cwd))
 }
 
 /// Create `dir` as a PRIVATE (0700) directory we own, or validate an existing one
@@ -572,13 +582,13 @@ fn maybe_sweep(agent_cwd: &CwdHandle, repo_url: &str, plan: &Arc<Plan>, jobs: Jo
         // `refs/nano-gc/*` inside the job's `.git`, which settlement may reap
         // mid-sweep — failing every later git op while the hourly throttle
         // suppresses a retry (so repeated short jobs starve reclamation).
-        let Some(git_dir) = sweep_scratch_repo(&runner).await else {
+        let Some((git_dir, scratch_cwd)) = sweep_scratch_repo(&runner).await else {
             crate::runtime::log(
                 "checkpoint: orphan sweep skipped — could not prepare a scratch repo",
             );
             return;
         };
-        let runner = runner.with_git_dir(git_dir);
+        let runner = runner.with_git_dir(git_dir).with_cwd(scratch_cwd);
         let probe = SdkOrphanProbe { jobs };
         let r = sweep_stale_checkpoints(
             &runner,
@@ -765,9 +775,31 @@ async fn push_snapshot(
     }
     // Promote a GC-proof recovery copy so a human escalation can still be resumed
     // even if the per-checkpoint WIP ref is later reclaimed (#295). A lost recovery
-    // lease (a sibling holds it) is non-fatal: our WIP ref still carries the work.
-    let _ = lease_push_shared(runner, &plan.remote, &leases.recovered, &sha).await;
+    // lease (a sibling holds it) is non-fatal and terminal: our WIP ref still
+    // carries the work and we never retry a lost lease. But a TRANSIENT recovery
+    // push error must NOT advance `last_tree`: doing so lets the next tick observe
+    // an unchanged tree, skip snapshotting, and never retry the promotion — leaving
+    // the recovery ref absent/stale while finalize believes both publications
+    // completed. Keep `last_tree` unadvanced (return `Idle`) so the next tick
+    // re-snapshots and re-promotes; this converges as soon as the transient clears.
+    let rec = lease_push_shared(runner, &plan.remote, &leases.recovered, &sha).await;
+    if recovery_requires_retry(&rec) {
+        crate::runtime::log(&format!(
+            "checkpoint: recovery promotion to {} failed transiently; will retry next tick",
+            plan.recovered_ref
+        ));
+        return TickOutcome::Idle;
+    }
     TickOutcome::Pushed(tree, head)
+}
+
+/// Whether a recovery-promotion push result must be retried on a later tick
+/// (so `push_snapshot` withholds `last_tree` advancement). Only a TRANSIENT
+/// error retries: a successful push published the recovery copy, and a
+/// stale-lease rejection means a sibling owns the recovery ref (terminal — we
+/// never reclaim it), so neither should stall snapshot dedup.
+fn recovery_requires_retry(rec: &PushResult) -> bool {
+    matches!(rec, PushResult::Error { .. })
 }
 
 /// Live background checkpointer. Aborts its loop on drop.
@@ -1108,6 +1140,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[tokio::test]
+    async fn sweep_runs_after_job_checkout_cwd_is_reaped() {
+        // The orphan sweep binds its runner to a persistent scratch directory so
+        // reaping the job checkout mid-sweep cannot fail its git ops. Regression:
+        // with_git_dir alone left the runner's cwd on the (reapable) checkout, so
+        // once settlement removed it `getcwd` failed with ENOENT and every sweep
+        // git child aborted even with an absolute --git-dir.
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let dur = Duration::from_secs(30);
+        let checkout = std::env::temp_dir().join(format!(
+            "nano-sweep-cwd-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+        let checkout = std::fs::canonicalize(&checkout).unwrap();
+        let runner = GitRunner::new(CwdHandle::open(&checkout).unwrap(), dur);
+
+        // Prepare the scratch repo + persistent cwd exactly as the sweep does,
+        // then rebind the runner onto the scratch directory.
+        let (git_dir, scratch_cwd) = sweep_scratch_repo(&runner).await.expect("scratch repo");
+        let runner = runner.with_git_dir(git_dir).with_cwd(scratch_cwd);
+
+        // Reap the job checkout the runner was originally built on.
+        std::fs::remove_dir_all(&checkout).unwrap();
+
+        // A git op must still succeed because the sweep's cwd is the live scratch
+        // directory, not the removed checkout.
+        let r = runner.run(&["rev-parse", "--is-bare-repository"]).await;
+        assert!(
+            r.ok(),
+            "sweep git op failed after checkout cwd was reaped: {}",
+            r.err_text()
+        );
+        assert_eq!(r.out(), "true");
+    }
+
     #[test]
     fn non_explicit_resume_refuses_sibling_predecessor() {
         // WITHOUT an occurrence-authoritative resume pointer, a discovered
@@ -1144,6 +1220,23 @@ mod tests {
         // The lease target advances to the sha WE just wrote.
         assert_eq!(lease.expect, "bbb");
         assert!(lease.owned);
+    }
+
+    #[test]
+    fn recovery_retry_only_on_transient_error() {
+        // A transient recovery-promotion error must retry (so `push_snapshot`
+        // withholds `last_tree` and the next tick re-promotes instead of masking
+        // the failed publication as complete).
+        assert!(recovery_requires_retry(&PushResult::Error {
+            error: "connection reset".into()
+        }));
+        // A successful promotion published the recovery copy — no retry.
+        assert!(!recovery_requires_retry(&PushResult::Ok));
+        // A stale lease means a sibling owns the recovery ref; we never reclaim
+        // it, so it is terminal, not a retryable transient failure.
+        assert!(!recovery_requires_retry(&PushResult::StaleLease {
+            error: "rejected".into()
+        }));
     }
 
     #[test]

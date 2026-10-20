@@ -197,18 +197,10 @@ pub fn is_authenticated_remote(url: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    // scp-like SSH syntax `[user@]host:path` (no URL scheme).
-    if let Some(at) = s.find('@') {
-        let (user, rest) = s.split_at(at);
-        let rest = &rest[1..];
-        if !user.contains('/')
-            && !rest.is_empty()
-            && rest.contains(':')
-            && !rest.split(':').next().unwrap_or("").contains('/')
-        {
-            return true;
-        }
-    }
+    // A scheme URL is authoritative: `ssh://` always carries SSH auth; an
+    // `http(s)://` URL carries push auth only when its authority has userinfo.
+    // Any OTHER explicit scheme (`file://`, `git://`, …) carries no push
+    // credential, so it is not an authenticated remote.
     if let Some((scheme, rest)) = s.split_once("://") {
         let scheme = scheme.to_ascii_lowercase();
         if scheme == "ssh" {
@@ -217,12 +209,43 @@ pub fn is_authenticated_remote(url: &str) -> bool {
         if scheme == "https" || scheme == "http" {
             // userinfo present iff the authority (before the first '/') has an '@'.
             let authority = rest.split('/').next().unwrap_or("");
-            if authority.contains('@') {
-                return true;
-            }
+            return authority.contains('@');
+        }
+        return false;
+    }
+    // No scheme: an scp-like SSH remote `[user@]host:path`. A `user@` is NOT
+    // required — `github:org/repo.git` authenticates through the agent's SSH
+    // transport exactly like `git@github.com:org/repo.git`, so a host-only scp
+    // target is just as push-capable and must not disable checkpointing.
+    is_scp_like_ssh(s)
+}
+
+/// scp-like SSH remote detection mirroring git's own URL-vs-local rule: a colon
+/// BEFORE the first slash marks an `[user@]host:path` remote. A colon only AFTER
+/// a slash is a local path (`./weird:name`), and a lone single-character host is
+/// a Windows drive (`C:\work`, `C:/work`) — neither is a push-capable SSH remote.
+fn is_scp_like_ssh(s: &str) -> bool {
+    let first_colon = match s.find(':') {
+        Some(c) => c,
+        None => return false,
+    };
+    // A colon that appears only after the first slash is a local path, not an
+    // scp-like remote.
+    if let Some(first_slash) = s.find('/') {
+        if first_slash < first_colon {
+            return false;
         }
     }
-    false
+    // A `host:path` remote must carry a non-empty path after the colon.
+    if first_colon + 1 >= s.len() {
+        return false;
+    }
+    // Strip an optional `user@`; what remains is the host segment.
+    let host = &s[..first_colon];
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    // Reject an empty host, a single-character host (a Windows drive letter like
+    // `C:`), and a host carrying a path separator.
+    !host.is_empty() && host.chars().count() > 1 && !host.contains('\\')
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +815,18 @@ impl GitRunner {
     /// scratch repo that survives the job checkout's teardown.
     pub fn with_git_dir(mut self, git_dir: std::path::PathBuf) -> Self {
         self.git_dir = Some(git_dir);
+        self
+    }
+
+    /// Rebind every git invocation's working directory to `cwd`. The orphan-GC
+    /// sweep uses this to pin its runner to a persistent scratch directory that
+    /// outlives the job checkout: `with_git_dir` alone only redirects the
+    /// `--git-dir`, while the child still `fchdir`s into the checkout the runner
+    /// was built on. Once settlement reaps that checkout, `getcwd` fails with
+    /// `ENOENT` and git aborts setup even with an absolute `--git-dir`, so the
+    /// sweep must run from a directory that still exists.
+    pub fn with_cwd(mut self, cwd: CwdHandle) -> Self {
+        self.cwd = cwd;
         self
     }
 
