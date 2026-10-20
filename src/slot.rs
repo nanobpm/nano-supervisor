@@ -2166,7 +2166,10 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
     // only durable copy. When the status reads clean, refuse to prove clean
     // while any flagged entry is present (`None` = "unknown", retained not
     // reaped). Only a clean status with NO suppression flags is `Some(false)`.
-    if !nonempty && git_index_suppression_present(dir, &git_exe, &safe_path) {
+    // The suppression check is a second Git child; pass the SAME `deadline` so
+    // it shares the remaining budget instead of starting a fresh timeout past
+    // the point this probe already committed to.
+    if !nonempty && git_index_suppression_present(dir, &git_exe, &safe_path, deadline) {
         return None;
     }
     Some(nonempty)
@@ -2179,10 +2182,23 @@ fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration
 /// entry, an uppercase letter an unflagged one. Any spawn/read failure fails
 /// closed to `true` (treated as "suppression present"), so a probe that cannot
 /// rule out hidden work never reports the tree clean.
+///
+/// This is a SECOND Git child spawned after the timed `git status` probe, so it
+/// shares that probe's remaining `deadline` rather than starting a fresh budget:
+/// an `ls-files` wedged on checkout metadata or filesystem I/O must not block
+/// `execute` past the point the caller already committed to, and aborting
+/// `execute` cannot cancel the `spawn_blocking` closure running this. stdout is
+/// drained concurrently and the child is killed + reaped on expiry, mirroring
+/// [`git_worktree_dirty_timeout`]. The verdict is a single boolean, so the
+/// reader streams the per-line tag byte and DISCARDS the filename — it never
+/// buffers the listing, which for a large checkout would otherwise grow daemon
+/// memory by the full tracked-file set on every completed job, multiplied by
+/// concurrent slots.
 fn git_index_suppression_present(
     dir: &crate::safecwd::CwdHandle,
     git_exe: &std::path::Path,
     safe_path: &std::ffi::OsStr,
+    deadline: Instant,
 ) -> bool {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(git_exe);
@@ -2206,26 +2222,62 @@ fn git_index_suppression_present(
     let Ok(mut child) = cmd.spawn() else {
         return true;
     };
-    let mut buf = Vec::new();
-    let read_ok = child
-        .stdout
-        .take()
-        .map(|mut o| std::io::Read::read_to_end(&mut o, &mut buf))
-        .is_some_and(|r| r.is_ok());
-    let exited_ok = child.wait().map(|s| s.success()).unwrap_or(false);
-    if !read_ok || !exited_ok {
+    // Drain stdout CONCURRENTLY with the wait, keeping only a boolean "saw a
+    // flagged tag" instead of the listing. Each line is `<tag> <path>`; the tag
+    // encodes the suppression flags: `--assume-unchanged` LOWERCASES the state
+    // letter (`H`→`h`, `M`→`m`, …), while `--skip-worktree` replaces it with an
+    // UPPERCASE `S`. So a flagged entry is either a lowercase tag or `S`.
+    // Untracked (`?`) / ignored (`!`) lines never appear here (no `-o`/`-i`),
+    // and an unflagged tracked entry is an uppercase non-`S` letter — neither is
+    // treated as suppression. A read error fails closed to `true` ("unknown").
+    let mut out = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut flagged = false;
+        let mut byte = [0u8; 1];
+        // Whether the next byte read is a line's tag byte (the first byte).
+        let mut at_line_start = true;
+        loop {
+            match out.as_mut().map(|o| std::io::Read::read(o, &mut byte)) {
+                Some(Ok(0)) => break Some(flagged), // clean EOF
+                Some(Ok(_)) => {
+                    if at_line_start {
+                        // Only the tag byte is inspected; the filename is dropped.
+                        if byte[0].is_ascii_lowercase() || byte[0] == b'S' {
+                            flagged = true;
+                        }
+                        at_line_start = false;
+                    }
+                    if byte[0] == b'\n' {
+                        at_line_start = true;
+                    }
+                }
+                // No pipe or a read error: signal "unknown" (fail closed).
+                _ => return None,
+            }
+        }
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_HEAD_POLL),
+            Ok(None) => {
+                // Past the shared deadline: kill + reap so a wedged `ls-files`
+                // cannot block settlement, and fail closed to "unknown".
+                let _ = child.kill();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = child.wait();
+    // Join the drainer (bounded: the pipe is closed once git exits or is
+    // killed). A read failure fails closed to `true` ("unknown").
+    let flagged = reader.join().ok().flatten();
+    if !status.is_some_and(|s| s.success()) {
         return true;
     }
-    // Each line is `<tag> <path>`. The tag encodes the suppression flags:
-    // `--assume-unchanged` LOWERCASES the state letter (`H`→`h`, `M`→`m`, …),
-    // while `--skip-worktree` replaces it with an UPPERCASE `S`. So a flagged
-    // entry is either a lowercase tag or `S`. Untracked (`?`) / ignored (`!`)
-    // lines never appear here (no `-o`/`-i`), and an unflagged tracked entry is
-    // an uppercase non-`S` letter — neither is treated as suppression.
-    buf.split(|&b| b == b'\n').any(|line| {
-        line.first()
-            .is_some_and(|&tag| tag.is_ascii_lowercase() || tag == b'S')
-    })
+    // `None` from the reader (no pipe / read error) fails closed to `true`.
+    flagged.unwrap_or(true)
 }
 
 /// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
@@ -6902,6 +6954,59 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "the probe must drain concurrently, not pay the full timeout ({elapsed:?})"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_clean_tree_streams_a_large_tracked_listing() {
+        // The class Copilot flagged on the suppression check: it buffered EVERY
+        // tracked filename and had no deadline, so a clean checkout with a large
+        // tracked set (an `ls-files` listing far past the ~64KiB pipe capacity)
+        // both ballooned daemon memory and could block settlement on a stall.
+        // The check now streams the tag bytes (discarding filenames) and shares
+        // the caller's deadline, so a clean tree with many tracked files reads
+        // `Some(false)` promptly, well under the deadline.
+        let base = init_dirty_probe_repo("bigtracked");
+        // Commit far more TRACKED files than the pipe buffer holds in
+        // `ls-files` lines, so the suppression check must drain concurrently
+        // rather than buffer or block.
+        for i in 0..8000 {
+            std::fs::write(base.join(format!("tracked-{i:05}")), "x").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "tracked",
+        ]);
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let started = Instant::now();
+        let verdict = git_worktree_dirty_timeout(&handle, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            verdict,
+            Some(false),
+            "a clean tree with a large tracked listing must read clean, not time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the suppression check must stream + share the deadline, not stall ({elapsed:?})"
         );
         std::fs::remove_dir_all(&base).ok();
     }
