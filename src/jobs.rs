@@ -386,6 +386,40 @@ impl Jobs {
             .await
             .map_err(sdk_error)
     }
+
+    /// Element-instance state and its owning process-instance key, for the
+    /// checkpoint orphan probe (#295/#296). Returns the canonical state string
+    /// (`ACTIVE`/`COMPLETED`/`TERMINATED`) and the process-instance key, or an
+    /// error the probe treats as "unknown" (fail closed → spare the checkpoint).
+    pub async fn element_instance_state(
+        &self,
+        element_instance_key: &str,
+    ) -> Result<(String, String)> {
+        let r = self
+            .client
+            .get_element_instance(
+                camunda_orchestration_sdk::apis::element_instance_api::GetElementInstanceParams {
+                    element_instance_key: element_instance_key.to_string(),
+                },
+            )
+            .await
+            .map_err(sdk_error)?;
+        Ok((
+            r.state.to_string(),
+            r.process_instance_key.value().to_string(),
+        ))
+    }
+
+    /// Process-instance state (`ACTIVE`/`COMPLETED`/`SUSPENDED`/`TERMINATED`),
+    /// for the checkpoint orphan probe. An error is "unknown" (fail closed).
+    pub async fn process_instance_state(&self, process_instance_key: &str) -> Result<String> {
+        let r = self
+            .client
+            .get_process_instance(process_instance_key)
+            .await
+            .map_err(sdk_error)?;
+        Ok(r.state.to_string())
+    }
 }
 
 #[cfg(test)]

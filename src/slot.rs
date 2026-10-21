@@ -501,7 +501,12 @@ async fn handle(
     // task too — never detach it (see `run`). Returning here (rather than
     // aborting) leaves the task running so the slot can settle the job; only a
     // drain/loss aborts it.
-    let mut exec = AbortOnDrop(tokio::spawn(execute(cfg.clone(), key.clone(), job.clone())));
+    let mut exec = AbortOnDrop(tokio::spawn(execute(
+        cfg.clone(),
+        key.clone(),
+        job.clone(),
+        jobs.clone(),
+    )));
     let raced = tokio::select! {
         r = &mut exec.0 => Some(reconcile_exec_join(&key, r, cfg.propagate_job_panic)),
         // Drop the watch guard immediately; the abort/await happens below.
@@ -2028,6 +2033,270 @@ pub(crate) async fn git_head_blocking(dir: crate::safecwd::CwdHandle) -> Option<
         .flatten()
 }
 
+/// Post-run working-tree verdict for a provisioned checkout, dispatched to the
+/// blocking pool like [`git_head_blocking`]. `Some(false)` is a PROVEN-clean
+/// tree (no uncommitted edits); `Some(true)` is a dirty tree (edits that were
+/// never committed, so neither `pushed` nor the HEAD compare sees them); `None`
+/// means the check could not run (timeout / wedged checkout / non-git dir).
+/// Callers treat anything other than `Some(false)` as "not provably clean" and
+/// fail closed — preserving the checkpoint and retaining the checkout — because
+/// a dirty tree's only durable copy of that work is the WIP checkpoint and its
+/// only local copy is the run dir (nanobpm/nano-supervisor#82). Best-effort and
+/// bounded for the same reason as the HEAD probe: a wedged agent-controlled
+/// checkout must never stall settlement or starve the runtime.
+pub(crate) async fn git_worktree_dirty_blocking(dir: crate::safecwd::CwdHandle) -> Option<bool> {
+    tokio::task::spawn_blocking(move || git_worktree_dirty_timeout(&dir, GIT_HEAD_TIMEOUT))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Bounded `git status --porcelain` probe. Returns `Some(true)` when the tree
+/// carries any change (porcelain output non-empty), `Some(false)` when it is
+/// clean (git exited 0 with empty output), and `None` when the probe could not
+/// conclude — a non-zero exit (e.g. a non-git dir), a timeout on a wedged
+/// checkout, or a spawn/read error. Mirrors the hardening of
+/// [`git_head_timeout`]: pinned no-follow entry through the capability handle,
+/// null stdin, piped stdout owned by the deadline, and a kill+reap on timeout so
+/// a git wedged on agent-planted blocking metadata cannot hang forever.
+fn git_worktree_dirty_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<bool> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    // Resolve `git` to a trusted ABSOLUTE path on a sanitized PATH, exactly as
+    // `GitRunner::run_in` and the provisioning launcher do (provision.rs
+    // `trusted_cli`): the child `fchdir`s into the agent-controlled checkout, so
+    // a bare `git` lookup with an empty/`.`/relative PATH entry ahead of the
+    // system git could exec an agent-planted binary. That binary exiting 0 with
+    // empty stdout would falsely read a dirty tree clean, letting finalize delete
+    // the only durable copy. The sanitized PATH also constrains git's own
+    // subprocesses. A resolution failure fails closed to `None` ("unknown").
+    let (git_exe, safe_path) = crate::provision::trusted_cli("git").ok()?;
+    let mut cmd = Command::new(&git_exe);
+    cmd.env("PATH", &safe_path);
+    // `--untracked-files=all` (not the config-honouring default): a local or
+    // global `status.showUntrackedFiles=no` must not hide untracked work from
+    // this probe — checkpointing's `git add -A` captures it, so omitting it
+    // here would read a dirty tree as clean and let finalize delete the only
+    // durable copy (nanobpm/nano-supervisor#82). `-c core.fsmonitor=false`
+    // pins the fsmonitor hook OFF: an agent-configured `core.fsmonitor` command
+    // would otherwise run during `git status` in this daemon process.
+    // `--ignore-submodules=none` overrides any `submodule.<name>.ignore`
+    // (including one committed in `.gitmodules`): without it a `status`-hiding
+    // `=all`/`=dirty` setting lets an initialized submodule carry uncommitted
+    // work while this probe prints nothing — the same read-dirty-as-clean class
+    // as the untracked and suppression-flag bypasses — so finalize would reap
+    // that submodule's only local copy. Checkpointing's `git add -A` records the
+    // submodule's gitlink, so the probe must not under-report it here.
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ])
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_OPTIONAL_LOCKS", "0")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    // Strip the daemon's engine-connection secrets before spawning, matching
+    // `GitRunner::run_in` and provision.rs: this probe runs for provisioned
+    // checkouts even when checkpointing is disabled, and a repo-configured
+    // hook/helper reachable from `git status` would otherwise inherit
+    // daemon-only `CAMUNDA_*`/`ZEEBE_*` secrets and basic-auth passwords.
+    for k in SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+    // Strip git's environment-based config-injection channels too, so a tainted
+    // daemon environment cannot re-enable an fsmonitor hook (or inject any
+    // other config) above the `-c` pins.
+    for k in crate::provision::GIT_CONFIG_INJECTION_ENV {
+        cmd.env_remove(k);
+    }
+    dir.apply_std(&mut cmd).ok()?;
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    // Take stdout and drain it CONCURRENTLY with the wait: the verdict only
+    // needs "did git print anything", so the reader keeps a bounded
+    // first-bytes indicator instead of the whole listing. Without this, a
+    // porcelain listing larger than the pipe capacity makes git block writing
+    // while the wait loop below blocks on exit — a healthy but very dirty
+    // checkout would then always pay the full timeout and be killed.
+    let mut out = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut first = [0u8; 1];
+        let nonempty = match out.as_mut().map(|o| o.read(&mut first)) {
+            Some(Ok(n)) => n > 0,
+            // No pipe or a read error: signal "unknown" (None) to the caller.
+            _ => return None,
+        };
+        if nonempty {
+            // Drain the rest so git never blocks on a full pipe, DISCARDING it
+            // into the null sink: the verdict was settled by the first byte, so
+            // retaining the listing (a `Vec` of every reported path) would grow
+            // daemon memory with the dirtiness of the tree, multiplied by
+            // concurrent probes, for bytes we never inspect. A read error leaves
+            // the verdict "unknown" (None) to the caller — fail closed.
+            let drained = out.as_mut().map(|o| std::io::copy(o, &mut std::io::sink()));
+            if !matches!(drained, Some(Ok(_))) {
+                return None;
+            }
+        }
+        Some(nonempty)
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_HEAD_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = child.wait();
+    // Join the drainer (bounded: the pipe is closed once git exits or is
+    // killed). A read failure fails closed to `None` ("unknown").
+    let nonempty = reader.join().ok().flatten()?;
+    if !status.is_some_and(|s| s.success()) {
+        return None;
+    }
+    // Fail closed when index suppression flags may be hiding modifications.
+    // `git status` honours `--assume-unchanged` / `--skip-worktree`: a tracked
+    // file edited after being flagged reports no modification, so the porcelain
+    // probe above can read clean while the working tree carries unpublished
+    // work. Checkpointing builds a FRESH index from HEAD (`git add -A`), which
+    // ignores those flags and captures the edit — so a "clean" verdict here
+    // would let finalize delete both the checkpoint and the checkout, losing the
+    // only durable copy. When the status reads clean, refuse to prove clean
+    // while any flagged entry is present (`None` = "unknown", retained not
+    // reaped). Only a clean status with NO suppression flags is `Some(false)`.
+    // The suppression check is a second Git child; pass the SAME `deadline` so
+    // it shares the remaining budget instead of starting a fresh timeout past
+    // the point this probe already committed to.
+    if !nonempty && git_index_suppression_present(dir, &git_exe, &safe_path, deadline) {
+        return None;
+    }
+    Some(nonempty)
+}
+
+/// Whether the checkout's index carries any `--assume-unchanged` or
+/// `--skip-worktree` entry — the suppression flags that let `git status` hide a
+/// working-tree modification from [`git_worktree_dirty_timeout`]. Detected via
+/// `git ls-files -v`: a lowercase tag letter (`h`, `s`, …) marks a flagged
+/// entry, an uppercase letter an unflagged one. Any spawn/read failure fails
+/// closed to `true` (treated as "suppression present"), so a probe that cannot
+/// rule out hidden work never reports the tree clean.
+///
+/// This is a SECOND Git child spawned after the timed `git status` probe, so it
+/// shares that probe's remaining `deadline` rather than starting a fresh budget:
+/// an `ls-files` wedged on checkout metadata or filesystem I/O must not block
+/// `execute` past the point the caller already committed to, and aborting
+/// `execute` cannot cancel the `spawn_blocking` closure running this. stdout is
+/// drained concurrently and the child is killed + reaped on expiry, mirroring
+/// [`git_worktree_dirty_timeout`]. The verdict is a single boolean, so the
+/// reader streams the per-line tag byte and DISCARDS the filename — it never
+/// buffers the listing, which for a large checkout would otherwise grow daemon
+/// memory by the full tracked-file set on every completed job, multiplied by
+/// concurrent slots.
+fn git_index_suppression_present(
+    dir: &crate::safecwd::CwdHandle,
+    git_exe: &std::path::Path,
+    safe_path: &std::ffi::OsStr,
+    deadline: Instant,
+) -> bool {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(git_exe);
+    cmd.env("PATH", safe_path);
+    cmd.args(["ls-files", "-v"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for k in SENSITIVE_DAEMON_ENV {
+        cmd.env_remove(k);
+    }
+    for k in crate::provision::GIT_CONFIG_INJECTION_ENV {
+        cmd.env_remove(k);
+    }
+    if dir.apply_std(&mut cmd).is_err() {
+        return true;
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return true;
+    };
+    // Drain stdout CONCURRENTLY with the wait, keeping only a boolean "saw a
+    // flagged tag" instead of the listing. Each line is `<tag> <path>`; the tag
+    // encodes the suppression flags: `--assume-unchanged` LOWERCASES the state
+    // letter (`H`→`h`, `M`→`m`, …), while `--skip-worktree` replaces it with an
+    // UPPERCASE `S`. So a flagged entry is either a lowercase tag or `S`.
+    // Untracked (`?`) / ignored (`!`) lines never appear here (no `-o`/`-i`),
+    // and an unflagged tracked entry is an uppercase non-`S` letter — neither is
+    // treated as suppression. A read error fails closed to `true` ("unknown").
+    //
+    // Wrap the raw `ChildStdout` in a `BufReader` before the per-byte scan:
+    // `ChildStdout` is unbuffered, so reading a byte at a time off it would
+    // issue one `read(2)` syscall per byte of every tracked filename — on a
+    // large checkout that is a syscall storm that can burn the shared deadline.
+    // `BufReader` serves each byte from a fixed-size in-memory buffer (one
+    // syscall per buffer-fill, not per byte) while keeping memory bounded to
+    // that fixed buffer — it never accumulates the listing.
+    let out = child.stdout.take().map(std::io::BufReader::new);
+    let reader = std::thread::spawn(move || {
+        let mut out = out;
+        let mut flagged = false;
+        let mut byte = [0u8; 1];
+        // Whether the next byte read is a line's tag byte (the first byte).
+        let mut at_line_start = true;
+        loop {
+            match out.as_mut().map(|o| std::io::Read::read(o, &mut byte)) {
+                Some(Ok(0)) => break Some(flagged), // clean EOF
+                Some(Ok(_)) => {
+                    if at_line_start {
+                        // Only the tag byte is inspected; the filename is dropped.
+                        if byte[0].is_ascii_lowercase() || byte[0] == b'S' {
+                            flagged = true;
+                        }
+                        at_line_start = false;
+                    }
+                    if byte[0] == b'\n' {
+                        at_line_start = true;
+                    }
+                }
+                // No pipe or a read error: signal "unknown" (fail closed).
+                _ => return None,
+            }
+        }
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_HEAD_POLL),
+            Ok(None) => {
+                // Past the shared deadline: kill + reap so a wedged `ls-files`
+                // cannot block settlement, and fail closed to "unknown".
+                let _ = child.kill();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = child.wait();
+    // Join the drainer (bounded: the pipe is closed once git exits or is
+    // killed). A read failure fails closed to `true` ("unknown").
+    let flagged = reader.join().ok().flatten();
+    if !status.is_some_and(|s| s.success()) {
+        return true;
+    }
+    // `None` from the reader (no pipe / read error) fails closed to `true`.
+    flagged.unwrap_or(true)
+}
+
 /// Upper bound on one `git rev-parse HEAD` probe of an agent-controlled
 /// checkout. A healthy read is milliseconds; 5s is generous headroom for a
 /// loaded host while still bounding a blocked one well under any activation
@@ -2041,7 +2310,16 @@ const GIT_HEAD_POLL: Duration = Duration::from_millis(10);
 fn git_head_timeout(dir: &crate::safecwd::CwdHandle, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut cmd = Command::new("git");
+    // Resolve `git` to a trusted ABSOLUTE path on a sanitized PATH (provision.rs
+    // `trusted_cli`), exactly as `git_worktree_dirty_timeout` and
+    // `GitRunner::run_in` do: the child `fchdir`s into the agent-controlled
+    // checkout, so a bare `git` lookup with an empty/`.`/relative PATH entry
+    // ahead of the system git could exec an agent-planted binary that spoofs the
+    // pre/post HEAD the empty-job detector relies on. A resolution failure fails
+    // closed to `None`.
+    let (git_exe, safe_path) = crate::provision::trusted_cli("git").ok()?;
+    let mut cmd = Command::new(git_exe);
+    cmd.env("PATH", &safe_path);
     cmd.args(["rev-parse", "--verify", "HEAD"])
         // An agent-controlled checkout could carry a prompt/sidebar config; keep
         // the invocation minimal and non-interactive.
@@ -2157,19 +2435,66 @@ fn retained_result_counts_as_commits(
 /// of the HEAD compare: a side-branch/detached commit that is then abandoned
 /// leaves the final HEAD unchanged (so `has_commits` reads false) while the only
 /// copy of that work sits in the run dir — the HEAD compare alone would reap it.
+///
+/// `workspace_clean` is the post-run working-tree verdict for a PROVISIONED
+/// checkout: `false` means the tree still holds UNCOMMITTED edits (or the check
+/// could not prove it clean — fail closed). Such edits were never committed, so
+/// neither `pushed` nor the HEAD compare sees them: their only durable copy is
+/// the WIP checkpoint, and their only LOCAL copy is this run dir. Reaping it
+/// would destroy that local copy (and the checkpoint is a soon-GC'd safety net),
+/// so a provisioned run whose tree is not provably clean is retained like an
+/// unpushed one (nanobpm/nano-supervisor#82). A non-provisioned run has no
+/// checkout to hold edits, so its caller passes `workspace_clean = true`.
 fn may_reap_completed_run(
     provisioned: bool,
     has_commits: bool,
     pushed: bool,
     retained: bool,
+    workspace_clean: bool,
 ) -> bool {
     if retained {
+        return false;
+    }
+    if provisioned && !workspace_clean {
         return false;
     }
     !(provisioned && has_commits && !pushed)
 }
 
-async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> Result<Settle> {
+/// Whether the WIP/recovery checkpoint refs may be DELETED on finalize. The
+/// checkpoint is a safety net for UNPUBLISHED work, so a bare `Settle::Complete`
+/// is not enough: the work must be durably published — its commits reached the
+/// real branch (`pushed`), or there was nothing to publish (`!has_commits`) — the
+/// working tree must be provably CLEAN (`workspace_clean`), and the checkout must
+/// not be flagged for retention (`!retained`). Otherwise the work may live ONLY
+/// in the soon-reaped run dir, so the checkpoint must be preserved for a resumed
+/// run to adopt.
+///
+/// `workspace_clean` closes the uncommitted-edits gap: `pushed` confirms
+/// publication of COMMITS, and `!has_commits` only means no commit was made —
+/// NEITHER proves the working tree is free of unpublished edits. A run can
+/// return a valid result (e.g. a blocked ACP outcome) while leaving checkpointed
+/// edits uncommitted; those edits exist only in the WIP checkpoint, so deleting
+/// it — even when commits were pushed — would strand them. We therefore require
+/// a positive clean verdict (dirty, or an inconclusive check, reads `false` and
+/// preserves the checkpoint) before declaring the work durable
+/// (nanobpm/nano-supervisor#82).
+fn checkpoint_deletion_durable(
+    complete: bool,
+    retained: bool,
+    pushed: bool,
+    has_commits: bool,
+    workspace_clean: bool,
+) -> bool {
+    complete && !retained && workspace_clean && (pushed || !has_commits)
+}
+
+async fn execute(
+    cfg: Arc<SlotConfig>,
+    key: String,
+    job: ActivatedJobResult,
+    jobs: Jobs,
+) -> Result<Settle> {
     let custom_headers: Map<String, Value> = job.custom_headers.clone().into_iter().collect();
     let variables: Map<String, Value> = job.variables.clone().into_iter().collect();
     let env = envelope::assemble(&custom_headers, &variables);
@@ -2335,6 +2660,39 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Err(_) => None,
     };
 
+    // WIP checkpointing (#66): restore any prior interrupted workspace, launch
+    // the throttled orphan sweep, and start the periodic background checkpointer
+    // so this attempt's work survives an abrupt interruption (crash / SLA cancel)
+    // even when the job future is aborted before settlement. Best-effort: a
+    // failure degrades to transcript-only resume and never fails the job. The
+    // guard is held until settlement (`finish` below), and its `Drop` stops the
+    // loop if the future is aborted first.
+    let mut checkpoint_guard: Option<crate::checkpoint::integration::CheckpointGuard> = None;
+    let mut checkpoint_note: Option<String> = None;
+    if let (Some(repo), Some(prep)) = (env.repository.as_ref(), git_prep.as_ref()) {
+        let started = crate::checkpoint::integration::start(
+            &agent_cwd,
+            &repo.url,
+            branch_push,
+            prep.working_branch.as_deref(),
+            branch_base.as_deref(),
+            // Provisioning's effective base (configured base, else remote default,
+            // else the checked-out branch the fallback was cut from) — recorded as
+            // the snapshot BaseRef so a retry on a generated fallback branch
+            // recognises its checkpoint even when `branch.base` is omitted.
+            prep.effective_base.as_deref(),
+            job.element_instance_key.value(),
+            job.element_id.value(),
+            &key,
+            start_head.as_deref(),
+            &Value::Object(variables.clone()),
+            jobs.clone(),
+        )
+        .await;
+        checkpoint_guard = started.guard;
+        checkpoint_note = started.restore_note;
+    }
+
     let result_file = run_dir.join("result.json");
     let agent_env = build_agent_env(
         &cfg,
@@ -2344,7 +2702,16 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         &run_dir,
         Some(prepared.agent_cwd()),
     )?;
-    let payload = build_agent_payload(&cfg, &job, &env);
+    let mut payload = build_agent_payload(&cfg, &job, &env);
+    // Fold the restored-checkpoint note into the agent prompt so a resumed run is
+    // told its workspace already carries interrupted WIP (append after redaction,
+    // which `build_agent_payload` already applied).
+    if let Some(note) = &checkpoint_note {
+        if let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) {
+            let combined = format!("{prompt}{note}");
+            payload["prompt"] = Value::String(combined);
+        }
+    }
     // Use the EFFECTIVE protocol (the hub's `NANO_AGENTIC_PROTOCOL` override, if
     // any), resolved in one place, so this `acp` flag — which selects the
     // result-nudge encoding below — never diverges from how `run_agent` actually
@@ -2567,6 +2934,22 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Ok(cwd) => git_head_blocking(cwd).await,
         Err(_) => None,
     };
+    // Post-run working-tree verdict for a provisioned checkout: `pushed`/HEAD see
+    // only COMMITS, so a run that left checkpointed edits UNCOMMITTED (e.g. a
+    // blocked ACP outcome) would otherwise look durable while its only copies are
+    // the WIP checkpoint and this soon-reaped run dir. Probe cleanliness so the
+    // checkpoint-deletion and reap decisions below can fail closed on any tree
+    // that is not PROVABLY clean. A non-provisioned run has no checkout to hold
+    // edits, so it is clean by construction; an inconclusive probe (`None`) or a
+    // dirty tree both read as "not clean" (nanobpm/nano-supervisor#82).
+    let workspace_clean = if provisioned {
+        match agent_cwd.try_clone() {
+            Ok(cwd) => matches!(git_worktree_dirty_blocking(cwd).await, Some(false)),
+            Err(_) => false,
+        }
+    } else {
+        true
+    };
     let has_commits = match &git_result {
         Some(g) if !g.commits.is_empty() => true,
         _ => {
@@ -2656,6 +3039,27 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
         Settle::Complete(vars)
     };
 
+    // Finalize checkpointing (#66): the WIP + recovery refs are a safety net for
+    // UNPUBLISHED work, so they may be deleted ONLY once the work is durably
+    // published — i.e. the run settled successfully AND its commits reached the
+    // real branch (`pushed`), or there was nothing to publish (`!has_commits`),
+    // AND finalize did not flag the checkout for retention (`!retain`). A
+    // `Settle::Complete` is NOT by itself proof of durable success: a completed
+    // round can still leave commits only in this (soon-reaped) run dir. When the
+    // work is not durably published, STOP the loop but LEAVE the last checkpoint
+    // on the remote for a resumed run to adopt. Must run while the checkout still
+    // exists (the reap below may delete the run dir).
+    if let Some(guard) = checkpoint_guard.take() {
+        let durable = checkpoint_deletion_durable(
+            matches!(settle, Settle::Complete(_)),
+            retain,
+            pushed,
+            has_commits,
+            workspace_clean,
+        );
+        guard.finish(durable).await;
+    }
+
     // Reap the run directory unless `--keep-runs`. Only successful runs are
     // reaped here; a failed run is left for post-mortem and aged out by
     // `sweep_stale_runs`. Best-effort, pinned no-follow (see `reap_run_dir`), and
@@ -2679,7 +3083,7 @@ async fn execute(cfg: Arc<SlotConfig>, key: String, job: ActivatedJobResult) -> 
     // reapability unconditionally and write the marker whenever the run is
     // non-reapable; only the destructive reap is skipped under `--keep-runs`.
     if matches!(settle, Settle::Complete(_)) {
-        if may_reap_completed_run(provisioned, has_commits, pushed, retain) {
+        if may_reap_completed_run(provisioned, has_commits, pushed, retain, workspace_clean) {
             // Reapable (nothing durable to lose): delete the dir unless the
             // operator asked to keep run dirs for post-mortem.
             if !cfg.keep_runs {
@@ -6389,6 +6793,350 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Shared setup for the `git_worktree_dirty_timeout` regressions: a real
+    /// git work tree under a canonicalized temp dir (canonicalized so the
+    /// no-follow cwd bind is not refused on a symlinked `/var` ancestor), with
+    /// one committed file so `git status` has a HEAD to diff against.
+    #[cfg(unix)]
+    fn init_dirty_probe_repo(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "nano-git-dirty-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(base.join("tracked"), "v1").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        base
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_honours_untracked_despite_config_no() {
+        // The class Copilot flagged: `git status --porcelain` honours a local
+        // `status.showUntrackedFiles=no`, which would hide untracked work that
+        // checkpointing's `git add -A` WOULD capture — reading a dirty tree as
+        // clean and letting finalize delete the only durable copy. The probe
+        // forces `--untracked-files=all`, so the untracked file is still seen.
+        let base = init_dirty_probe_repo("untracked");
+        // Suppress untracked reporting in the repo's own config.
+        let cfg = std::process::Command::new("git")
+            .args(["config", "status.showUntrackedFiles", "no"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(cfg.status.success());
+        // Untracked work the checkpoint would capture but the naive status
+        // (honouring the config) would omit.
+        std::fs::write(base.join("new-work"), "uncommitted").unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            Some(true),
+            "an untracked file must read dirty even with status.showUntrackedFiles=no"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_clean_tree_reads_clean() {
+        // The complementary leg: a clean tree is `Some(false)` (proven clean),
+        // so a genuinely clean run still deletes its checkpoint and reaps.
+        let base = init_dirty_probe_repo("clean");
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            Some(false),
+            "a clean tree must read Some(false)"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_fails_closed_on_assume_unchanged_edit() {
+        // The class Copilot flagged: a tracked file edited AFTER being marked
+        // `--assume-unchanged` is hidden from `git status --porcelain`, so the
+        // status probe reads clean while the working tree carries unpublished
+        // work. Checkpointing builds a FRESH index from HEAD (`git add -A`),
+        // which ignores the flag and captures the edit — so a "clean" verdict
+        // would let finalize delete both the checkpoint and the checkout. The
+        // probe must fail closed to `None` ("unknown", retained not reaped)
+        // rather than `Some(false)` whenever an index suppression flag is
+        // present.
+        let base = init_dirty_probe_repo("assume-unchanged");
+        // Flag the committed file, then modify it: `git status` now hides it.
+        let flag = std::process::Command::new("git")
+            .args(["update-index", "--assume-unchanged", "tracked"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(flag.status.success());
+        std::fs::write(base.join("tracked"), "v2-edited-after-flag").unwrap();
+        // Sanity: the naive status really does read clean (the bug's premise).
+        let naive = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            naive.stdout.is_empty(),
+            "assume-unchanged must hide the edit from plain status"
+        );
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            None,
+            "an assume-unchanged edit must fail closed to None, never read clean"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_fails_closed_on_skip_worktree_edit() {
+        // The sibling suppression flag: `--skip-worktree` also hides a
+        // working-tree edit from `git status`, so it must fail closed too.
+        let base = init_dirty_probe_repo("skip-worktree");
+        let flag = std::process::Command::new("git")
+            .args(["update-index", "--skip-worktree", "tracked"])
+            .current_dir(&base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(flag.status.success());
+        std::fs::write(base.join("tracked"), "v2-edited-after-flag").unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            None,
+            "a skip-worktree edit must fail closed to None, never read clean"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_detects_ignored_dirty_submodule() {
+        // `submodule.<name>.ignore=all` (settable in `.git/config` or committed
+        // in `.gitmodules`) makes `git status` omit a dirty submodule entirely.
+        // Without `--ignore-submodules=none` the probe would read the
+        // superproject clean while an initialized submodule carries uncommitted
+        // work — the same read-dirty-as-clean class as the untracked and
+        // suppression-flag bypasses — letting finalize reap that work's only
+        // copy. The probe overrides the ignore setting, so a dirty submodule
+        // reads dirty (never `Some(false)`).
+        let base = init_dirty_probe_repo("submod-super");
+        let sub = init_dirty_probe_repo("submod-inner");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        // Embed the second repo as a submodule (local path needs the file
+        // protocol explicitly allowed on modern git), then commit it.
+        git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.to_str().unwrap(),
+            "inner",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "add submodule",
+        ]);
+        // Tell git to ignore the submodule entirely, then dirty a TRACKED file
+        // inside it so only the ignore override can surface the change.
+        git(&["config", "submodule.inner.ignore", "all"]);
+        std::fs::write(base.join("inner").join("tracked"), "dirty-inside-submodule").unwrap();
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        assert_eq!(
+            git_worktree_dirty_timeout(&handle, Duration::from_secs(5)),
+            Some(true),
+            "an ignored dirty submodule must read dirty, not clean"
+        );
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&sub).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_drains_a_pipe_overflowing_listing() {
+        // The class Copilot flagged: stdout was drained only AFTER git exited,
+        // so a porcelain listing larger than the pipe capacity made git block
+        // writing while the wait loop blocked on exit — a healthy but very
+        // dirty checkout always paid the full timeout and was killed (read as
+        // `None`). The drainer now runs concurrently, so the probe returns
+        // `Some(true)` promptly, well under the deadline.
+        let base = init_dirty_probe_repo("overflow");
+        // Far more untracked files than the ~64KiB pipe buffer holds in
+        // porcelain lines, so git must block on a full pipe if nobody drains.
+        for i in 0..8000 {
+            std::fs::write(base.join(format!("filler-{i:05}")), "x").unwrap();
+        }
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let started = Instant::now();
+        let verdict = git_worktree_dirty_timeout(&handle, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            verdict,
+            Some(true),
+            "a very dirty tree must read dirty, not time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the probe must drain concurrently, not pay the full timeout ({elapsed:?})"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_clean_tree_streams_a_large_tracked_listing() {
+        // The class Copilot flagged on the suppression check: it buffered EVERY
+        // tracked filename and had no deadline, so a clean checkout with a large
+        // tracked set (an `ls-files` listing far past the ~64KiB pipe capacity)
+        // both ballooned daemon memory and could block settlement on a stall.
+        // The check now streams the tag bytes (discarding filenames) and shares
+        // the caller's deadline, so a clean tree with many tracked files reads
+        // `Some(false)` promptly, well under the deadline.
+        let base = init_dirty_probe_repo("bigtracked");
+        // Commit far more TRACKED files than the pipe buffer holds in
+        // `ls-files` lines, so the suppression check must drain concurrently
+        // rather than buffer or block.
+        for i in 0..8000 {
+            std::fs::write(base.join(format!("tracked-{i:05}")), "x").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "tracked",
+        ]);
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let started = Instant::now();
+        let verdict = git_worktree_dirty_timeout(&handle, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            verdict,
+            Some(false),
+            "a clean tree with a large tracked listing must read clean, not time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the suppression check must stream + share the deadline, not stall ({elapsed:?})"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_dirty_clean_tree_streams_long_tracked_filenames() {
+        // The per-byte class Copilot flagged on the suppression check: the tag
+        // scan read a byte at a time off the UNBUFFERED `ChildStdout`, so every
+        // byte of every tracked filename cost a `read(2)` syscall. A clean tree
+        // whose `ls-files` listing is dominated by long filenames (many bytes
+        // per line) therefore paid a syscall storm that could burn the shared
+        // deadline. The scan now reads through a `BufReader`, so a clean tree
+        // with long filenames still reads `Some(false)` well under the deadline.
+        let base = init_dirty_probe_repo("longnames");
+        // Long filenames maximise the bytes the tag scan must consume per line;
+        // combined with many files this is the per-byte path under test.
+        let long = "a".repeat(180);
+        for i in 0..4000 {
+            std::fs::write(base.join(format!("{long}-{i:05}")), "x").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "longnames",
+        ]);
+        let handle = crate::safecwd::CwdHandle::open(&base).unwrap();
+        let started = Instant::now();
+        let verdict = git_worktree_dirty_timeout(&handle, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            verdict,
+            Some(false),
+            "a clean tree with long tracked filenames must read clean, not time out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the buffered tag scan must not stall on a long-filename listing ({elapsed:?})"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn detect_commits_recognises_advance_and_first_commit() {
         // An existing HEAD that advanced is a commit.
@@ -6450,15 +7198,59 @@ mod tests {
         // A provisioned checkout that advanced HEAD whose commits were NOT pushed
         // lives ONLY in the run dir, so a successful run must NOT reap it (that
         // would destroy the sole copy).
-        assert!(!may_reap_completed_run(true, true, false, false));
+        assert!(!may_reap_completed_run(true, true, false, false, true));
         // Once finalize PUSHED those commits they are durable off-box, so the run
         // dir reaps normally.
-        assert!(may_reap_completed_run(true, true, true, false));
+        assert!(may_reap_completed_run(true, true, true, false, true));
         // A provisioned run that made no commit has nothing durable to lose.
-        assert!(may_reap_completed_run(true, false, false, false));
+        assert!(may_reap_completed_run(true, false, false, false, true));
         // A non-repository run never holds commits, so it is always reapable.
-        assert!(may_reap_completed_run(false, false, false, false));
-        assert!(may_reap_completed_run(false, true, false, false));
+        assert!(may_reap_completed_run(false, false, false, false, true));
+        assert!(may_reap_completed_run(false, true, false, false, true));
+    }
+
+    #[test]
+    fn dirty_or_unprobed_workspace_is_retained_not_reaped() {
+        // Uncommitted edits (or a tree we could not prove clean) live ONLY in the
+        // run dir + the soon-GC'd WIP checkpoint: reaping would destroy the local
+        // copy. A provisioned run whose tree is not provably clean is retained
+        // even when its commits were pushed (nanobpm/nano-supervisor#82).
+        assert!(!may_reap_completed_run(true, true, true, false, false));
+        // ... and when there were no commits at all (uncommitted-only work).
+        assert!(!may_reap_completed_run(true, false, false, false, false));
+        // A non-provisioned run has no checkout to be dirty; its caller passes
+        // `workspace_clean = true`, so it still reaps.
+        assert!(may_reap_completed_run(false, false, false, false, true));
+    }
+
+    #[test]
+    fn checkpoint_refs_deleted_only_when_work_is_durable() {
+        // The WIP/recovery checkpoint refs guard UNPUBLISHED work, so a bare
+        // successful settle does NOT license deleting them. Delete only when the
+        // run completed AND the work is durable (pushed, or nothing to publish)
+        // AND the working tree is clean AND the checkout was not retained.
+        // Completed + pushed commits + clean tree -> durable, safe to delete.
+        assert!(checkpoint_deletion_durable(true, false, true, true, true));
+        // Completed + commits but NOT pushed -> the commits live only in the
+        // soon-reaped run dir; PRESERVE the checkpoint.
+        assert!(!checkpoint_deletion_durable(true, false, false, true, true));
+        // Completed with nothing to publish + clean tree -> no work at risk, safe.
+        assert!(checkpoint_deletion_durable(true, false, false, false, true));
+        // Retained checkout (stranded work / inconclusive scan) -> PRESERVE even
+        // though commits were pushed.
+        assert!(!checkpoint_deletion_durable(true, true, true, true, true));
+        // Not a successful settle -> never delete.
+        assert!(!checkpoint_deletion_durable(
+            false, false, true, false, true
+        ));
+        // Uncommitted edits remain (dirty tree) even though commits were pushed:
+        // those edits exist ONLY in the WIP checkpoint, so PRESERVE it.
+        assert!(!checkpoint_deletion_durable(true, false, true, true, false));
+        // Uncommitted-only work (no commit, dirty tree) -> PRESERVE: `!has_commits`
+        // does not prove the tree is clean.
+        assert!(!checkpoint_deletion_durable(
+            true, false, false, false, false
+        ));
     }
 
     #[cfg(unix)]
@@ -6479,10 +7271,10 @@ mod tests {
         // `keep_runs`, and the marker it must write makes a later redelivery's
         // prepare DEFER the wipe (quarantine) instead of destroying the work.
         // The decision is a pure function of (provisioned, has_commits, pushed,
-        // retain) — no `keep_runs` input — so a non-reapable verdict is reached
-        // whether or not `--keep-runs` is set.
+        // retain, workspace_clean) — no `keep_runs` input — so a non-reapable
+        // verdict is reached whether or not `--keep-runs` is set.
         assert!(
-            !may_reap_completed_run(true, true, false, false),
+            !may_reap_completed_run(true, true, false, false, true),
             "an unpushed committing run is non-reapable regardless of --keep-runs"
         );
         // ... and the marker written on that verdict is what a redelivery's
@@ -6526,10 +7318,10 @@ mod tests {
         // detached commit that is then abandoned leaves the final HEAD unchanged
         // (so `has_commits` reads false) while the only copy of that work sits in
         // the run dir — the HEAD compare alone would reap it.
-        assert!(!may_reap_completed_run(true, false, false, true));
-        assert!(!may_reap_completed_run(true, true, false, true));
+        assert!(!may_reap_completed_run(true, false, false, true, true));
+        assert!(!may_reap_completed_run(true, true, false, true, true));
         // Even a pushed run is retained when finalize flagged an incomplete scan.
-        assert!(!may_reap_completed_run(true, true, true, true));
+        assert!(!may_reap_completed_run(true, true, true, true, true));
     }
 
     #[cfg(unix)]

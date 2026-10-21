@@ -598,12 +598,12 @@ fn is_hex_sha(s: &str) -> bool {
 /// it unread. Permit the fields to go unread there so the non-Unix build stays
 /// warning-clean (`-D warnings`).
 #[cfg_attr(not(unix), allow(dead_code))]
-struct GitCredential {
+pub(crate) struct GitCredential {
     /// Host (without port) the credential is scoped to, so the helper never
     /// hands the token to a differently-hosted submodule remote.
-    host: String,
-    username: String,
-    password: String,
+    pub(crate) host: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
 }
 
 /// Re-anchor a *relative local* clone source against the supervisor's working
@@ -652,7 +652,7 @@ fn resolve_local_source(url: &str, supervisor_cwd: &Path) -> String {
 /// Re-apply the same re-anchor here, then lift any embedded credential out of
 /// argv exactly as the clone did. Remote URLs and absolute paths pass through
 /// unchanged, so this is a no-op for the common case.
-fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
+pub(crate) fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
     let supervisor_cwd = std::env::current_dir();
     let resolved = match &supervisor_cwd {
         Ok(cwd) => resolve_local_source(url, cwd),
@@ -674,7 +674,7 @@ fn trusted_fetch_source(url: &str) -> (String, Option<GitCredential>) {
 /// username with an empty password, mirroring how git itself would interpret
 /// the original URL. A credential-free URL yields `(url, None)` and is returned
 /// byte-for-byte unchanged.
-fn split_url_credential(url: &str) -> (String, Option<GitCredential>) {
+pub(crate) fn split_url_credential(url: &str) -> (String, Option<GitCredential>) {
     let sanitized = scrub_url_credentials(url);
     // Only the `scheme://[userinfo@]authority…` form carries an embeddable
     // credential; anything else (or a URL the scrub left untouched) has none.
@@ -802,6 +802,13 @@ pub struct GitPrep {
     /// (a detached HEAD, or a failed branch cut), not that `branch.push = false`;
     /// finalize then has no branch to enumerate or push.
     pub working_branch: Option<String>,
+    /// The EFFECTIVE base identity the work branch was cut from: the configured
+    /// base (`branch.base`/`repository.base_ref`), else the remote default branch,
+    /// else the checked-out branch a fallback was composed from. Checkpointing
+    /// records THIS as the snapshot's BaseRef trailer so a retry on a generated
+    /// fallback branch can recognise its own checkpoint; `branch.base` alone is
+    /// empty whenever the envelope omits it. `None` only when no base is known.
+    pub effective_base: Option<String>,
     /// Whether the envelope asked for a push (`branch.push`, default true).
     pub want_push: bool,
     /// HEAD at provision time, so finalize can enumerate the agent's new commits
@@ -1292,8 +1299,19 @@ pub async fn prepare_work_branch(
         }
     }
 
+    // The base identity a checkpoint snapshot must record so a retry on a
+    // generated fallback branch recognises it: the configured base when known,
+    // else the remote default, else the checked-out branch a fallback was cut
+    // from. This is what `create_names_base`/`cut_fallback` actually used, so it
+    // stays correct even when `branch.base` is omitted.
+    let effective_base = configured_base
+        .clone()
+        .or_else(|| remote_default.clone())
+        .or_else(|| checked_out.clone());
+
     GitPrep {
         working_branch,
+        effective_base,
         want_push,
         start_sha,
         provision_tips,
@@ -2108,6 +2126,15 @@ async fn finalize_git_with_deadline(
                     let mut parts = line.split_whitespace();
                     let refname = parts.next().unwrap_or("");
                     if refname.starts_with("refs/heads/") {
+                        continue;
+                    }
+                    // Nano's own checkpoint machinery (#66) materialises local
+                    // refs under `refs/nano/` (fetched WIP/recovery snapshots) and
+                    // `refs/nano-gc/` (sweep bookkeeping). Their commits are WIP
+                    // SNAPSHOTS, not stranded agent work — counting them would make
+                    // finalize treat every checkpoint-enabled run as having unpushed
+                    // work and refuse to push. Skip them exactly like local heads.
+                    if refname.starts_with("refs/nano/") || refname.starts_with("refs/nano-gc/") {
                         continue;
                     }
                     // `%(*objectname)` is the peeled commit for an annotated tag
@@ -3043,7 +3070,7 @@ async fn git(
 /// the agent's injection surface is on-disk config (handled by the global/system
 /// isolation and `insteadOf` stripping on the finalize push) and `.git/hooks`
 /// (handled by `core.hooksPath=/dev/null`), not the environment.
-const GIT_CONFIG_INJECTION_ENV: &[&str] =
+pub(crate) const GIT_CONFIG_INJECTION_ENV: &[&str] =
     &["GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
 
 async fn git_untruncated(
@@ -3158,7 +3185,7 @@ const GIT_CRED_HELPER: &str = "!f() { \
 /// Unix-only: the secret-file mechanism is built on `std::os::unix` / `libc`,
 /// which do not exist on other targets.
 #[cfg(unix)]
-struct CredFile {
+pub(crate) struct CredFile {
     dir: std::path::PathBuf,
 }
 
@@ -3179,7 +3206,7 @@ impl Drop for CredFile {
 /// instead — out-of-band credential delivery is not implemented off Unix), so
 /// this carries no state.
 #[cfg(not(unix))]
-struct CredFile;
+pub(crate) struct CredFile;
 
 /// Write the credential secret to a `0600` file inside a freshly-created,
 /// private `0700` per-command directory, and return the guard that removes that
@@ -3295,7 +3322,7 @@ fn cred_secret_file(secret: &[u8]) -> Result<(CredFile, std::path::PathBuf)> {
 /// `std::process::Command` (tests) so both receive the identical `-c` args and
 /// credential environment. Mirrors the `UnixCommandExt` pattern in `safecwd`.
 #[cfg(unix)]
-trait CredCommand {
+pub(crate) trait CredCommand {
     fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>);
     fn env(&mut self, key: &str, val: impl AsRef<std::ffi::OsStr>);
 }
@@ -3348,7 +3375,10 @@ impl CredCommand for std::process::Command {
 /// the `CredCommand` bound exists only under `#[cfg(unix)]`. The
 /// `#[cfg(not(unix))]` stub below keeps non-Unix targets compiling.
 #[cfg(unix)]
-fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Result<CredFile> {
+pub(crate) fn apply_git_credential<C: CredCommand>(
+    cmd: &mut C,
+    c: &GitCredential,
+) -> Result<CredFile> {
     let (guard, file) = cred_secret_file(c.password.as_bytes())?;
 
     cmd.arg("-c");
@@ -3373,7 +3403,7 @@ fn apply_git_credential<C: CredCommand>(cmd: &mut C, c: &GitCredential) -> Resul
 /// caller, in [`git_with_env_capture`]): the `CredCommand` abstraction exists
 /// only under `#[cfg(unix)]`, so the generic form cannot be named here.
 #[cfg(not(unix))]
-fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredFile> {
+pub(crate) fn apply_git_credential(_cmd: &mut Command, c: &GitCredential) -> Result<CredFile> {
     let _ = c;
     Err(anyhow::anyhow!(
         "out-of-band git credential delivery is not supported on this \
@@ -3654,7 +3684,7 @@ const MAX_REFLOG_SCAN: usize = 512;
 
 /// Bytes of a child stream's *tail* retained for diagnostics. The stream is
 /// still drained fully; only the last `GIT_STDERR_TAIL` bytes are kept.
-const GIT_STDERR_TAIL: usize = 8 * 1024;
+pub(crate) const GIT_STDERR_TAIL: usize = 8 * 1024;
 
 /// Read `reader` to EOF, retaining only its last `cap` bytes. Always consumes the
 /// whole stream (so the writer never blocks on a full pipe) while bounding memory
@@ -3664,7 +3694,7 @@ const GIT_STDERR_TAIL: usize = 8 * 1024;
 /// short (a partial buffer we must not trust as the whole stream). A security
 /// scrub that must see the COMPLETE listing uses it to fail closed rather than
 /// act on a silently truncated — or silently short-read — tail.
-async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
+pub(crate) async fn drain_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -4136,7 +4166,7 @@ fn gh_pr_list_args(slug: Option<&str>, branch: &str) -> Vec<String> {
 /// same `fchdir`) resolves only against trusted absolute directories too. Fails
 /// closed: a program not found on an absolute `PATH` is an error, never a
 /// fallback to the vulnerable bare-name search.
-fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
+pub(crate) fn trusted_cli(program: &str) -> Result<(std::path::PathBuf, std::ffi::OsString)> {
     let raw = std::env::var_os("PATH").unwrap_or_default();
     trusted_cli_from(program, &raw)
 }
@@ -5846,6 +5876,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_base_is_populated_when_branch_base_is_omitted() {
+        // With no explicit `branch.base`, checkpointing must still record the
+        // EFFECTIVE base (the checked-out default branch the fallback is cut
+        // from), or a retry on the generated fallback branch rejects its own
+        // checkpoint for want of a matching BaseRef.
+        let dir = git_workspace("effbase").await;
+        let prep = prepare_work_branch(
+            &dir,
+            &test_repo(),
+            None, // branch.base omitted
+            None,
+            true,
+            "u-eb",
+            Duration::from_secs(30),
+        )
+        .await;
+        // The workspace checks out `main`; with push on and no explicit base, the
+        // effective base resolves to the checked-out default branch.
+        assert_eq!(
+            prep.effective_base.as_deref(),
+            Some("main"),
+            "effective base must be populated even without branch.base"
+        );
+        // An explicit branch.base still wins over the fallback.
+        let dir2 = git_workspace("effbase2").await;
+        let prep2 = prepare_work_branch(
+            &dir2,
+            &test_repo(),
+            Some("release"),
+            None,
+            true,
+            "u-eb2",
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(prep2.effective_base.as_deref(), Some("release"));
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+        let _ = std::fs::remove_dir_all(dir_path(&dir2));
+    }
+
+    #[tokio::test]
     async fn branch_cut_rejects_invalid_explicit_create() {
         // A job-controlled `branch.create` that is not a valid branch name must
         // not be honoured: the checkout stays on the base and no working branch
@@ -6428,6 +6499,90 @@ mod tests {
         assert!(
             res.retain,
             "a stranded detached-HEAD commit must set retain (the reflog scan finds it)"
+        );
+        let _ = std::fs::remove_dir_all(dir_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn finalize_ignores_parked_nano_checkpoint_refs() {
+        // nano's checkpoint machinery (#66) materialises LOCAL refs under
+        // `refs/nano/...` (fetched WIP/recovery snapshots) and `refs/nano-gc/...`
+        // (sweep bookkeeping). Their commits are checkpoint SNAPSHOTS, not
+        // stranded agent work — the stranded-work scan must SKIP them (like
+        // `refs/heads/`), or every checkpoint-enabled run would be wrongly
+        // retained and refuse to push. Without the skip, the parked commit below
+        // is enumerated as stranded work and this test goes red (retain=true).
+        let dir = git_workspace("fin-nano-ref").await;
+        let t = Duration::from_secs(30);
+        let prep = prepare_work_branch(
+            &dir,
+            &test_repo(),
+            None,
+            Some("feat/work"),
+            true,
+            "u-nano",
+            t,
+        )
+        .await;
+        assert_eq!(prep.working_branch.as_deref(), Some("feat/work"));
+        // Park a snapshot commit under nano refs WITHOUT moving HEAD (exactly as
+        // `fetch_checkpoint` leaves a local WIP ref behind), so the HEAD-reflog
+        // net cannot independently catch it — this isolates the `refs/nano*` skip.
+        let head = git(&["rev-parse".into(), "HEAD".into()], Some(&dir), t, None)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = git(
+            &["rev-parse".into(), "HEAD^{tree}".into()],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        let parked = git(
+            &[
+                "-c".into(),
+                "user.email=t@t".into(),
+                "-c".into(),
+                "user.name=t".into(),
+                "commit-tree".into(),
+                tree,
+                "-p".into(),
+                head,
+                "-m".into(),
+                "nano: WIP checkpoint".into(),
+            ],
+            Some(&dir),
+            t,
+            None,
+        )
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+        for reference in ["refs/nano/wip/elem-x", "refs/nano-gc/elem-x"] {
+            git(
+                &["update-ref".into(), reference.into(), parked.clone()],
+                Some(&dir),
+                t,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let res = finalize_git(&dir, &prep, &test_repo(), false, t).await;
+        assert!(
+            !res.retain,
+            "nano checkpoint refs are snapshots, not stranded work, and must not force retain"
+        );
+        assert!(
+            !res.scan_incomplete,
+            "the stranded-work scan must complete, not bail, in the presence of nano refs"
         );
         let _ = std::fs::remove_dir_all(dir_path(&dir));
     }
@@ -7660,6 +7815,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7719,6 +7875,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7743,6 +7900,7 @@ mod tests {
         let dir = empty_base_workspace("unborn-noop").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7790,6 +7948,7 @@ mod tests {
         commit(&dir, "first work").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7848,6 +8007,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7908,6 +8068,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -7988,6 +8149,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -8058,6 +8220,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -8111,6 +8274,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("main".into()),
+            effective_base: None,
             want_push: false,
             start_sha: Some(start.clone()),
             provision_tips: Some(std::collections::BTreeMap::from([(
@@ -8162,6 +8326,7 @@ mod tests {
         // No prepared work branch and push disabled: the read-only path.
         let prep = GitPrep {
             working_branch: None,
+            effective_base: None,
             want_push: false,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -9344,6 +9509,7 @@ mod tests {
         }
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -9516,6 +9682,7 @@ mod tests {
         .unwrap();
         let prep = GitPrep {
             working_branch: None,
+            effective_base: None,
             want_push: false,
             start_sha: Some(start),
             provision_tips: None,
@@ -9595,6 +9762,7 @@ mod tests {
         commit(&dir, "work commit").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
@@ -9659,6 +9827,7 @@ mod tests {
         commit(&dir, "work commit").await;
         let prep = GitPrep {
             working_branch: Some("feat/work".into()),
+            effective_base: None,
             want_push: true,
             start_sha: None,
             provision_tips: Some(std::collections::BTreeMap::new()),
