@@ -2013,9 +2013,8 @@ pub async fn sweep_stale_checkpoints(
     let owned_key: Option<&str> = own_ref.and_then(|r| ref_prefix(r).map(|p| &r[p.len()..]));
     let is_owned = |reference: &str| -> bool {
         Some(reference) == own_ref
-            || owned_key.is_some_and(|k| {
-                prefix_of(reference).is_some_and(|p| &reference[p.len()..] == k)
-            })
+            || owned_key
+                .is_some_and(|k| prefix_of(reference).is_some_and(|p| &reference[p.len()..] == k))
     };
 
     let mut ls_args: Vec<String> = vec!["ls-remote".into(), "--refs".into(), remote.into()];
