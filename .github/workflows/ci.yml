@@ -212,7 +212,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [lint, test, contract-tests-node, contract-tests-rust, parity-ledger]
+    needs: [lint, test, contract-tests-node, contract-tests-rust, parity-ledger, d-kernel]
     runs-on: ubuntu-latest
     steps:
       - name: all jobs passed
@@ -223,3 +223,17 @@ jobs:
           test "${{ needs.contract-tests-node.result }}" = success
           test "${{ needs.contract-tests-rust.result }}" = success
           test "${{ needs.parity-ledger.result }}" = success
+          test "${{ needs.d-kernel.result }}" = success
+
+  d-kernel:
+    name: D kernel (dub test + drift gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.43.0
+      - name: drift gate (kernel/table.json -> source/nano_sup/kernel.d)
+        run: make check-drift
+      - name: dub test (Safer D check runs as the pre-build hook)
+        run: dub test
