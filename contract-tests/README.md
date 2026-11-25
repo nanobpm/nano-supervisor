@@ -90,7 +90,7 @@ output.
 | --- | --- | --- |
 | No AgentInstance producer yet (job transcript only local) | rust | nanobpm/nano-supervisor#59 |
 | Create conflict (409) is retried, not adopted | node | jwulf/c8ctl-plugin-nano#289 (fixed in 1.70.3) |
-| Producer drives the terminal AgentInstance update the engine owns (422s, instance stranded) | node | jwulf/c8ctl-plugin-nano#274 |
+| Producer drives the terminal AgentInstance update the engine owns (422s, instance stranded) | node | nanobpm/nano-supervisor#74 (#274 fixed in 1.73.2; pin not bumped) |
 
 #250 (reactivating a terminal AgentInstance re-runs the agent) has **no
 reproducible scenario yet**, so it is deliberately not asserted here; it is a
