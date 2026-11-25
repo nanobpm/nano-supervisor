@@ -47,6 +47,10 @@ def main():
     guards, effects, fields = t["guards"], t["effects"], t["fields"]
     if errors[0] != "Ok" or "Illegal" not in errors:
         die("errors must start with Ok and include Illegal")
+    if fields.get("nested") != "bool":
+        die("fields must include nested: bool (used by the Slot constructor)")
+    if "state" in fields:
+        die("field name 'state' is reserved")
     seen = set()
     rows = {}
     for tr in t["transitions"]:
@@ -95,19 +99,20 @@ def main():
     w("struct Slot")
     w("{")
     w("    private State state_ = State.Empty;")
-    w("    private bool pinned_;")
-    w("    private bool leaseHeld_;")
-    w("    private uint inFlight_;")
-    w("    private bool nested_;")
+    dty = {"bool": "bool", "uint": "uint"}
+    for f, ty in fields.items():
+        if not (isinstance(f, str) and f.isidentifier() and f.isascii()):
+            die("bad field name %r" % (f,))
+        if ty not in dty:
+            die("field %s: unsupported type %r" % (f, ty))
+        w("    private %s %s_;" % (dty[ty], f))
     w("")
     w("    /// A fresh empty slot; `nested` marks a supervisor running under another.")
     w("    this(bool nested) pure nothrow @nogc { nested_ = nested; }")
     w("")
     w("    State state() const pure nothrow @nogc { return state_; }")
-    w("    bool pinned() const pure nothrow @nogc { return pinned_; }")
-    w("    bool leaseHeld() const pure nothrow @nogc { return leaseHeld_; }")
-    w("    uint inFlight() const pure nothrow @nogc { return inFlight_; }")
-    w("    bool nested() const pure nothrow @nogc { return nested_; }")
+    for f, ty in fields.items():
+        w("    %s %s() const pure nothrow @nogc { return %s_; }" % (dty[ty], f, f))
     w("}")
     w("")
     w("/// Apply `e` to `s`. On any error `s` is left unchanged.")
