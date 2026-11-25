@@ -63,7 +63,11 @@ def check_invariants(t):
         if tr["to"] != "Dead":
             continue
         for f, v in (("leaseHeld", False), ("inFlight", 0)):
-            if not (_guarded(tr, guards, f, v) or _effect_of(tr, effects, f) == v):
+            # The last effect writing a field decides its post-state; a guard
+            # only proves the post-state when no effect overwrites the field.
+            eff = _effect_of(tr, effects, f)
+            ok = (eff == v) if eff is not None else _guarded(tr, guards, f, v)
+            if not ok:
                 die("invariant: %s -> Dead does not ensure %s == %s"
                     % (tr["event"], f, d_lit(v)))
     # 2) Abstract reachability over (state, leaseHeld): every state that can
