@@ -11,10 +11,40 @@ def die(msg):
     sys.exit("generate: " + msg)
 
 
+def check_rec(r, fields, what):
+    f, v = r.get("field"), r.get("value")
+    if f not in fields:
+        die("%s: unknown field %r" % (what, f))
+    ty = fields[f]
+    if ty == "bool":
+        ok = isinstance(v, bool)
+    elif ty == "uint":
+        ok = isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 0xFFFFFFFF
+    else:
+        die("field %s: unsupported type %r" % (f, ty))
+    if not ok:
+        die("%s: value %r does not fit %s %s" % (what, v, ty, f))
+
+
+def d_lit(v):
+    return ("true" if v else "false") if isinstance(v, bool) else str(v)
+
+
+def d_guard(g):
+    f, v = "s.%s_" % g["field"], g["value"]
+    if isinstance(v, bool):
+        return f if v else "!" + f
+    return "%s == %s" % (f, d_lit(v))
+
+
+def d_effect(e):
+    return "s.%s_ = %s;" % (e["field"], d_lit(e["value"]))
+
+
 def main():
     t = json.load(open(TABLE))
     states, events, errors = t["states"], t["events"], t["errors"]
-    guards, effects = t["guards"], t["effects"]
+    guards, effects, fields = t["guards"], t["effects"], t["fields"]
     if errors[0] != "Ok" or "Illegal" not in errors:
         die("errors must start with Ok and include Illegal")
     seen = set()
@@ -28,11 +58,15 @@ def main():
         for g in tr.get("guards", []):
             if g not in guards:
                 die("unknown guard " + g)
+            check_rec(guards[g], fields, "guard " + g)
+            if guards[g].get("op") != "eq":
+                die("guard %s: unsupported op %r" % (g, guards[g].get("op")))
             if guards[g]["err"] not in errors:
                 die("unknown error " + guards[g]["err"])
         for e in tr.get("effects", []):
             if e not in effects:
                 die("unknown effect " + e)
+            check_rec(effects[e], fields, "effect " + e)
         for st in tr["from"]:
             if st not in states:
                 die("unknown state " + st)
@@ -92,9 +126,9 @@ def main():
         for st, tr in evrows:
             w("        case State.%s:" % st)
             for g in tr.get("guards", []):
-                w("            if (!(%s)) return Err.%s;" % (guards[g]["expr"], guards[g]["err"]))
+                w("            if (!(%s)) return Err.%s;" % (d_guard(guards[g]), guards[g]["err"]))
             for e in tr.get("effects", []):
-                w("            " + effects[e])
+                w("            " + d_effect(effects[e]))
             if tr["to"] is not None:
                 w("            s.state_ = State.%s;" % tr["to"])
             w("            return Err.Ok;")
