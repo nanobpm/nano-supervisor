@@ -99,3 +99,27 @@ unittest
     static assert(!__traits(compiles, s.state_ = State.Running));
     static assert(!__traits(compiles, s.state = State.Running));
 }
+
+@("golden: exec-successor refuses while the lease is still held")
+unittest
+{
+    auto s = drive(false, [Event.Start, Event.Lease, Event.Drain]);
+    const before = s;
+    assert(step(s, Event.ExecSuccessor) == Err.LeaseStillHeld);
+    assert(s == before && s.state == State.Draining && s.leaseHeld);
+}
+
+@("golden: exec-successor after lease lost reaches dead without a lease")
+unittest
+{
+    auto s = drive(false, [Event.Start, Event.Lease, Event.Drain, Event.LeaseLost]);
+    assert(step(s, Event.ExecSuccessor) == Err.Ok);
+    assert(s.state == State.Dead && !s.leaseHeld && s.inFlight == 0);
+}
+
+@("golden: force from draining with a lease reaches dead without a lease")
+unittest
+{
+    auto s = drive(false, [Event.Start, Event.Lease, Event.Drain, Event.Force]);
+    assert(s.state == State.Dead && !s.leaseHeld && s.inFlight == 0);
+}

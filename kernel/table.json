@@ -32,6 +32,6 @@
     {"event": "Abandon",       "from": ["Draining"],                                "to": null,       "guards": ["lease_lost"], "effects": ["end_work"]},
     {"event": "Drain",         "from": ["Empty", "Starting", "Leased", "Running"],  "to": "Draining"},
     {"event": "Force",         "from": ["Empty", "Starting", "Leased", "Running", "Draining"], "to": "Dead", "effects": ["end_work", "drop_lease"]},
-    {"event": "ExecSuccessor", "from": ["Draining"],                                "to": "Dead",     "guards": ["no_in_flight"]}
+    {"event": "ExecSuccessor", "from": ["Draining"],                                "to": "Dead",     "guards": ["no_in_flight", "lease_lost"]}
   ]
 }

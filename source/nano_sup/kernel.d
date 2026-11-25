@@ -273,6 +273,7 @@ Err step(ref Slot s, Event e) pure nothrow @nogc
         {
         case State.Draining:
             if (!(s.inFlight_ == 0)) return Err.InFlight;
+            if (!(!s.leaseHeld_)) return Err.LeaseStillHeld;
             s.state_ = State.Dead;
             return Err.Ok;
         case State.Empty:

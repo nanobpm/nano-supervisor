@@ -41,6 +41,56 @@ def d_effect(e):
     return "s.%s_ = %s;" % (e["field"], d_lit(e["value"]))
 
 
+def _guarded(tr, guards, field, value):
+    return any(guards[g]["field"] == field and guards[g]["value"] == value
+               for g in tr.get("guards", []))
+
+
+def _effect_of(tr, effects, field):
+    v = None
+    for e in tr.get("effects", []):
+        if effects[e]["field"] == field:
+            v = effects[e]["value"]
+    return v
+
+
+def check_invariants(t):
+    """Fail generation if the table can strand a lease or in-flight work."""
+    guards, effects = t["guards"], t["effects"]
+    # 1) Every transition into Dead must guarantee leaseHeld == false and
+    #    inFlight == 0, either by a guard or by an effect.
+    for tr in t["transitions"]:
+        if tr["to"] != "Dead":
+            continue
+        for f, v in (("leaseHeld", False), ("inFlight", 0)):
+            if not (_guarded(tr, guards, f, v) or _effect_of(tr, effects, f) == v):
+                die("invariant: %s -> Dead does not ensure %s == %s"
+                    % (tr["event"], f, d_lit(v)))
+    # 2) Abstract reachability over (state, leaseHeld): every state that can
+    #    hold a lease needs an outgoing transition that drops it.
+    seen, todo = set(), [(t["states"][0], False)]
+    while todo:
+        st, lh = todo.pop()
+        if (st, lh) in seen:
+            continue
+        seen.add((st, lh))
+        for tr in t["transitions"]:
+            if st not in tr["from"]:
+                continue
+            if _guarded(tr, guards, "leaseHeld", not lh):
+                continue
+            eff = _effect_of(tr, effects, "leaseHeld")
+            todo.append((tr["to"] or st, lh if eff is None else eff))
+    for st, lh in sorted(seen):
+        if not lh:
+            continue
+        if not any(st in tr["from"] and not _guarded(tr, guards, "leaseHeld", False)
+                   and _effect_of(tr, effects, "leaseHeld") is False
+                   for tr in t["transitions"]):
+            die("invariant: state %s can hold a lease but has no transition "
+                "that drops it" % st)
+
+
 def main():
     t = json.load(open(TABLE))
     states, events, errors = t["states"], t["events"], t["errors"]
@@ -78,6 +128,8 @@ def main():
                 die("duplicate transition %s/%s" % (st, ev))
             seen.add((st, ev))
             rows.setdefault(ev, []).append((st, tr))
+
+    check_invariants(t)
 
     o = []
     w = o.append
