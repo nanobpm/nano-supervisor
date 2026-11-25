@@ -1389,10 +1389,13 @@ mod tests {
                     "final": true
                 }),
             );
+            // Generous budget: this is the success path, so it returns as soon as
+            // the frame arrives; a tight 2s budget flaked on loaded macOS runners
+            // (the full suite runs ~700 tests in parallel).
             let sup = inspect_supervisor(
                 sock,
                 &[PathBuf::from("/tmp")],
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(15),
             );
             assert!(
                 sup.responsive,

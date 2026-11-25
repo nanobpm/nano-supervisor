@@ -1136,7 +1136,9 @@ pub const PARITY_GAPS: &[ParityGap] = &[
     // terminal status update the engine owns (#274: UPDATE accepts only active
     // statuses, so it 422s and strands the instance non-terminal), and retries
     // a permanent 409 "already associated" instead of adopting the instance.
-    ParityGap::new(Target::Node, "jwulf/c8ctl-plugin-nano#274"),
+    // #274 is fixed upstream (plugin 1.73.2) but the pin has not moved, so the
+    // gap is now tracked by the pin-drift issue.
+    ParityGap::new(Target::Node, "nanobpm/nano-supervisor#74"),
     ParityGap::new(Target::Node, "jwulf/c8ctl-plugin-nano#289"),
 ];
 

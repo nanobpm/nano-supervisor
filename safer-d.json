@@ -1,0 +1,17 @@
+{
+  "sources": ["source"],
+  "budgets": {
+    "cast": 0,
+    "catch": 0,
+    "class": 0,
+    "class-null": 0,
+    "isolation": 0,
+    "null-local": 0,
+    "nullable": 0,
+    "nullable-mark": 0,
+    "pure-throw": 0,
+    "subtraction": 0,
+    "trusted": 0,
+    "trusted-io": 0
+  }
+}

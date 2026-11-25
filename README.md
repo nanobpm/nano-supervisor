@@ -144,3 +144,11 @@ behaviour has moved; it never blocks PRs — it opens or updates a tracking issu
 (label `contract-drift`) listing the failing tests, and closes it when the run
 goes green again. When the drift job is red, bump the pins in a deliberate PR
 that also refreshes the snapshots/tests and adds parity-ledger rows.
+
+## D kernel seam (unproved)
+
+`kernel/table.json` is the neutral slot transition table (states × events → next | error).
+`make generate` emits `source/nano_sup/kernel.d` (generated, committed, never hand-edited);
+`dub test` runs the golden vectors in `source/nano_sup/kernel_vectors.d` and the
+Safer D check (`safer-d:check@~>2.0`). CI fails if the generated file drifts from the table.
+The Rust binary remains the product; this tree does not change it.

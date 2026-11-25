@@ -1,0 +1,45 @@
+{
+	"name": "nano-sup-kernel",
+	"description": "nano-supervisor slot kernel: generated D transition step + stub (unproved seam)",
+	"license": "Apache-2.0",
+	"targetType": "executable",
+	"targetPath": "build",
+	"sourcePaths": [
+		"source"
+	],
+	"importPaths": [
+		"source"
+	],
+	"dflags": [
+		"-preview=dip1000",
+		"-preview=in",
+		"-preview=nosharedaccess",
+		"-allinst"
+	],
+	"dependencies": {
+		"safer-d": "~>2.0"
+	},
+	"preBuildCommands": [
+		"dub run -q --root \"$SAFER_D_PACKAGE_DIR\" :check -- --root \"$PACKAGE_DIR\""
+	],
+	"toolchainRequirements": {
+		"dmd": "no",
+		"gdc": "no",
+		"ldc": ">=1.43.0"
+	},
+	"dflags-ldc": [
+		"-fno-delete-null-pointer-checks"
+	],
+	"buildTypes": {
+		"release": {
+			"dflags-ldc": [
+				"-boundscheck=on"
+			],
+			"buildOptions": [
+				"releaseMode",
+				"inline",
+				"optimize"
+			]
+		}
+	}
+}

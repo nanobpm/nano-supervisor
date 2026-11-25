@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Generate source/nano_sup/kernel.d from kernel/table.json. Deterministic; no deps."""
+import json, os, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TABLE = os.path.join(ROOT, "kernel", "table.json")
+OUT = os.path.join(ROOT, "source", "nano_sup", "kernel.d")
+
+
+def die(msg):
+    sys.exit("generate: " + msg)
+
+
+def check_rec(r, fields, what):
+    f, v = r.get("field"), r.get("value")
+    if f not in fields:
+        die("%s: unknown field %r" % (what, f))
+    ty = fields[f]
+    if ty == "bool":
+        ok = isinstance(v, bool)
+    elif ty == "uint":
+        ok = isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 0xFFFFFFFF
+    else:
+        die("field %s: unsupported type %r" % (f, ty))
+    if not ok:
+        die("%s: value %r does not fit %s %s" % (what, v, ty, f))
+
+
+def d_lit(v):
+    return ("true" if v else "false") if isinstance(v, bool) else str(v)
+
+
+def d_guard(g):
+    f, v = "s.%s_" % g["field"], g["value"]
+    if isinstance(v, bool):
+        return f if v else "!" + f
+    return "%s == %s" % (f, d_lit(v))
+
+
+def d_effect(e):
+    return "s.%s_ = %s;" % (e["field"], d_lit(e["value"]))
+
+
+def _guarded(tr, guards, field, value):
+    return any(guards[g]["field"] == field and guards[g]["value"] == value
+               for g in tr.get("guards", []))
+
+
+def _effect_of(tr, effects, field):
+    v = None
+    for e in tr.get("effects", []):
+        if effects[e]["field"] == field:
+            v = effects[e]["value"]
+    return v
+
+
+def check_invariants(t):
+    """Fail generation if the table can strand a lease or in-flight work."""
+    guards, effects = t["guards"], t["effects"]
+    # 1) Every transition into Dead must guarantee leaseHeld == false and
+    #    inFlight == 0, either by a guard or by an effect.
+    for tr in t["transitions"]:
+        if tr["to"] != "Dead":
+            continue
+        for f, v in (("leaseHeld", False), ("inFlight", 0)):
+            # The last effect writing a field decides its post-state; a guard
+            # only proves the post-state when no effect overwrites the field.
+            eff = _effect_of(tr, effects, f)
+            ok = (eff == v) if eff is not None else _guarded(tr, guards, f, v)
+            if not ok:
+                die("invariant: %s -> Dead does not ensure %s == %s"
+                    % (tr["event"], f, d_lit(v)))
+    # 2) Abstract reachability over (state, leaseHeld): every state that can
+    #    hold a lease needs an outgoing transition that drops it.
+    seen, todo = set(), [(t["states"][0], False)]
+    while todo:
+        st, lh = todo.pop()
+        if (st, lh) in seen:
+            continue
+        seen.add((st, lh))
+        for tr in t["transitions"]:
+            if st not in tr["from"]:
+                continue
+            if _guarded(tr, guards, "leaseHeld", not lh):
+                continue
+            eff = _effect_of(tr, effects, "leaseHeld")
+            todo.append((tr["to"] or st, lh if eff is None else eff))
+    for st, lh in sorted(seen):
+        if not lh:
+            continue
+        if not any(st in tr["from"] and not _guarded(tr, guards, "leaseHeld", False)
+                   and _effect_of(tr, effects, "leaseHeld") is False
+                   for tr in t["transitions"]):
+            die("invariant: state %s can hold a lease but has no transition "
+                "that drops it" % st)
+
+
+def main():
+    t = json.load(open(TABLE))
+    states, events, errors = t["states"], t["events"], t["errors"]
+    guards, effects, fields = t["guards"], t["effects"], t["fields"]
+    if errors[0] != "Ok" or "Illegal" not in errors:
+        die("errors must start with Ok and include Illegal")
+    if fields.get("nested") != "bool":
+        die("fields must include nested: bool (used by the Slot constructor)")
+    if "state" in fields:
+        die("field name 'state' is reserved")
+    seen = set()
+    rows = {}
+    for tr in t["transitions"]:
+        ev = tr["event"]
+        if ev not in events:
+            die("unknown event " + ev)
+        if tr["to"] is not None and tr["to"] not in states:
+            die("unknown target " + tr["to"])
+        for g in tr.get("guards", []):
+            if g not in guards:
+                die("unknown guard " + g)
+            check_rec(guards[g], fields, "guard " + g)
+            if guards[g].get("op") != "eq":
+                die("guard %s: unsupported op %r" % (g, guards[g].get("op")))
+            if guards[g]["err"] not in errors:
+                die("unknown error " + guards[g]["err"])
+        for e in tr.get("effects", []):
+            if e not in effects:
+                die("unknown effect " + e)
+            check_rec(effects[e], fields, "effect " + e)
+        for st in tr["from"]:
+            if st not in states:
+                die("unknown state " + st)
+            if (st, ev) in seen:
+                die("duplicate transition %s/%s" % (st, ev))
+            seen.add((st, ev))
+            rows.setdefault(ev, []).append((st, tr))
+
+    check_invariants(t)
+
+    o = []
+    w = o.append
+    w("// GENERATED by kernel/generate.py from kernel/table.json — DO NOT EDIT.")
+    w("// Regenerate with `make generate`; CI fails if this file drifts.")
+    w("module nano_sup.kernel;")
+    w("")
+    w("@safe:")
+    w("")
+    for name, vals in (("State", states), ("Event", events), ("Err", errors)):
+        w("/// %s of the slot kernel." % name)
+        w("enum %s : ubyte" % name)
+        w("{")
+        for v in vals:
+            w("    %s," % v)
+        w("}")
+        w("")
+    w("/// A supervisor slot. Fields are module-private: only `step` advances it.")
+    w("struct Slot")
+    w("{")
+    w("    private State state_ = State.Empty;")
+    dty = {"bool": "bool", "uint": "uint"}
+    for f, ty in fields.items():
+        if not (isinstance(f, str) and f.isidentifier() and f.isascii()):
+            die("bad field name %r" % (f,))
+        if ty not in dty:
+            die("field %s: unsupported type %r" % (f, ty))
+        w("    private %s %s_;" % (dty[ty], f))
+    w("")
+    w("    /// A fresh empty slot; `nested` marks a supervisor running under another.")
+    w("    this(bool nested) pure nothrow @nogc { nested_ = nested; }")
+    w("")
+    w("    State state() const pure nothrow @nogc { return state_; }")
+    for f, ty in fields.items():
+        w("    %s %s() const pure nothrow @nogc { return %s_; }" % (dty[ty], f, f))
+    w("}")
+    w("")
+    w("/// Apply `e` to `s`. On any error `s` is left unchanged.")
+    w("Err step(ref Slot s, Event e) pure nothrow @nogc")
+    w("{")
+    w("    final switch (e)")
+    w("    {")
+    for ev in events:
+        w("    case Event.%s:" % ev)
+        evrows = rows.get(ev, [])
+        if not evrows:
+            w("        return Err.Illegal;")
+            continue
+        w("        final switch (s.state_)")
+        w("        {")
+        for st, tr in evrows:
+            w("        case State.%s:" % st)
+            for g in tr.get("guards", []):
+                w("            if (!(%s)) return Err.%s;" % (d_guard(guards[g]), guards[g]["err"]))
+            for e in tr.get("effects", []):
+                w("            " + d_effect(effects[e]))
+            if tr["to"] is not None:
+                w("            s.state_ = State.%s;" % tr["to"])
+            w("            return Err.Ok;")
+        froms = {st for st, _ in evrows}
+        rest = [x for x in states if x not in froms]
+        if rest:
+            w("        " + "\n        ".join("case State.%s:" % x for x in rest))
+            w("            return Err.Illegal;")
+        w("        }")
+    w("    }")
+    w("}")
+    w("")
+    with open(OUT, "w", newline="\n") as f:
+        f.write("\n".join(o))
+
+
+if __name__ == "__main__":
+    main()

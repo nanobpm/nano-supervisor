@@ -233,7 +233,8 @@ fn job_writes_an_agent_instance_record() {
 /// and the instance must read ACTIVE/non-terminal with no `completionDate`
 /// while the process is open.
 ///
-/// Markers: Rust = #59 (no producer at all). Node = the reference's own #274;
+/// Markers: Rust = #59 (no producer at all). Node = the reference's own #274 (fixed in 1.73.2,
+/// now tracked by the pin-drift issue nanobpm/nano-supervisor#74);
 /// the marker drops when the pin moves to a plugin release carrying the #274
 /// fix (issue #58) and the Node target passes.
 #[test]
@@ -278,7 +279,7 @@ fn agent_instance_stays_active_while_the_process_stays_open() {
 
     let gap = match target {
         Target::Rust => Some("nanobpm/nano-supervisor#59"),
-        Target::Node => Some("jwulf/c8ctl-plugin-nano#274"),
+        Target::Node => Some("nanobpm/nano-supervisor#74"),
     };
     let instances = engine.agent_instances(&outcome.process_instance_key);
     let restraint = match instances.first() {
